@@ -62,6 +62,11 @@ defmodule DashFloat.LLM.ChatStream do
       uri.host in [nil, ""] ->
         {:error, "base_url must include a host"}
 
+      not printable_ascii?(uri.host) ->
+        # finch cannot resolve a non-ASCII host: Mint raises (or exits :badarg)
+        # before a request exists.
+        {:error, "base_url must have an ASCII host"}
+
       uri.port not in 1..65_535 ->
         {:error, "base_url has an invalid port"}
 

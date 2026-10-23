@@ -495,6 +495,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
           {"test-key-123", "http:///v1"},
           {"test-key-123", "ftp://127.0.0.1/v1"},
           {"test-key-123", "http://127.0.0.1:99999999999/v1"},
+          {"test-key-123", "http://exämple.com/v1"},
           {"test-key-é123", "http://127.0.0.1:1"},
           {<<"test", 0, "key">>, "http://127.0.0.1:1"}
         ] do
