@@ -458,45 +458,58 @@ defmodule DashFloat.LLM.ChatStreamTest do
   end
 
   test "the API key is redacted from a failure message that quotes it" do
-    # A header value with a non-ASCII byte makes Mint raise with the header
-    # in the message; the key must never reach the chat log.
-    provider = %Config{base_url: "http://127.0.0.1:1", model: "m", api_key: "test-key-é123"}
+    # The request must actually reach Mint's header validation for its message
+    # to quote the header, so point at a listener that accepts and stalls.
+    server = start_server([{:sleep, 500}, :close])
     ui = self()
 
-    {:ok, pid} =
-      Task.start(fn -> ChatStream.run(ui, provider, "hi") end)
+    for key <- ["test-key-é123", "test-key\n123", ~s(test-key"123)] do
+      provider = %Config{base_url: SSEServer.base_url(server), model: "m", api_key: key}
+      {:ok, pid} = Task.start(fn -> ChatStream.run(ui, provider, "hi") end)
+      ref = Process.monitor(pid)
 
-    ref = Process.monitor(pid)
-    messages = collect()
-
-    assert [message] = system_entries(messages)
-    assert message =~ "[llm: connection failed: "
-    refute message =~ "test-key-é123"
-    await_exit(ref)
+      assert [message] = collect() |> system_entries()
+      assert message =~ "[llm: connection failed: "
+      refute message =~ key
+      refute message =~ "test-key"
+      await_exit(ref)
+    end
   end
 
-  test "an escape-rendered key and a provider error body echoing it are redacted" do
-    # Mint inspect()s a header value containing a newline, so the escaped form
-    # is what a failure message carries.
-    key = "test-key\n123"
-    provider = %Config{base_url: "http://127.0.0.1:1", model: "m", api_key: key}
-    ui = self()
-
-    {:ok, pid} = Task.start(fn -> ChatStream.run(ui, provider, "hi") end)
-    ref = Process.monitor(pid)
-
-    assert [message] = system_entries(collect())
-    assert message =~ "[llm: connection failed: "
-    refute message =~ "123"
-    await_exit(ref)
-
-    # A provider may echo the key in its error body.
+  test "a provider error body echoing the key is redacted" do
     echoed = ~s({"error":{"message":"bad key: test-key-123"}})
     server = start_server([{:send, json_response(401, echoed)}, :close])
     {_pid, ref} = start_stream(SSEServer.base_url(server))
 
     assert ["[llm: HTTP 401 — bad key: [redacted]]"] = system_entries(collect())
     await_exit(ref)
+  end
+
+  test "an unusable base_url or a non-printable api_key is a connection failure" do
+    # These would make Req raise (missing host/scheme) or finch exit(:badarg)
+    # (port out of range), and Mint quotes the header for a non-ASCII key;
+    # every case degrades to a chat entry that never carries the key.
+    for {key, base} <- [
+          {"test-key-123", "http://bad host/x"},
+          {"test-key-123", "api.example.com/v1"},
+          {"test-key-123", "http:///v1"},
+          {"test-key-123", "ftp://127.0.0.1/v1"},
+          {"test-key-123", "http://127.0.0.1:99999999999/v1"},
+          {"test-key-é123", "http://127.0.0.1:1"},
+          {<<"test", 0, "key">>, "http://127.0.0.1:1"}
+        ] do
+      provider = %Config{base_url: base, model: "m", api_key: key}
+      ui = self()
+      {:ok, pid} = Task.start(fn -> ChatStream.run(ui, provider, "hi") end)
+      ref = Process.monitor(pid)
+
+      messages = collect()
+      assert [message] = system_entries(messages)
+      assert message =~ "[llm: connection failed: "
+      refute message =~ "test-key"
+      assert {:phase, :idle} == List.last(messages)
+      await_exit(ref)
+    end
   end
 
   defp json_response(status, body) do

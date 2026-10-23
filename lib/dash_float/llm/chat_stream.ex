@@ -16,10 +16,10 @@ defmodule DashFloat.LLM.ChatStream do
   @default_idle_timeout 60_000
   @drain_limit 64 * 1024
   @drain_timeout 5_000
-  # finch's socket `receive_timeout` sits one grace period behind the stream
-  # loop's own timer: the `after` clause is the detector (ADR 0004), finch is
-  # the backstop for a wedged socket process, and its 15 s default can never
-  # cut a healthy stream first.
+  # finch's socket `receive_timeout` and the stream loop's own `after` share
+  # one deadline. Whichever fires, the entry is the same timeout message; the
+  # socket timeout is the backstop for a wedged socket process, and it keeps
+  # finch's 15 s default from cutting a healthy stream first.
   @timeout_grace 1_000
 
   @doc """
@@ -35,14 +35,73 @@ defmodule DashFloat.LLM.ChatStream do
       when is_pid(ui) and is_binary(prompt) do
     idle_timeout = Keyword.get(opts, :idle_timeout, @default_idle_timeout)
 
-    # `Req.post` raises on a bad base_url (no scheme, stray space) — a config
-    # typo must still degrade to a chat entry, never a crashed producer.
-    try do
-      post(provider, prompt, idle_timeout)
-    rescue
-      exception -> {:error, exception}
+    case request_url(provider) do
+      {:error, message} ->
+        fail(ui, "[llm: connection failed: " <> message <> "]")
+
+      {:ok, url} ->
+        post(url, provider, prompt, idle_timeout)
+        |> handle_response(ui, provider, idle_timeout)
     end
-    |> handle_response(ui, provider, idle_timeout)
+  end
+
+  # An unusable base_url (no scheme, embedded whitespace, bad host/port) makes
+  # Req raise — or finch exit(:badarg) before any request exists — so pre-flight
+  # it: a config typo must degrade to a chat entry, not a crashed producer.
+  defp request_url(provider) do
+    base = String.trim_trailing(provider.base_url, "/")
+    uri = URI.parse(base)
+
+    cond do
+      whitespace?(base) ->
+        {:error, "base_url contains whitespace"}
+
+      uri.scheme not in ["http", "https"] ->
+        {:error, "base_url must be an http(s) URL"}
+
+      uri.host in [nil, ""] ->
+        {:error, "base_url must include a host"}
+
+      uri.port not in 1..65_535 ->
+        {:error, "base_url has an invalid port"}
+
+      not printable_ascii?(provider.api_key) ->
+        # Mint would raise with the header value quoted — and its escaping
+        # varies (inspect, binary form), so no scrub can catch every case.
+        # Refuse the key instead of ever handing it to a message.
+        {:error, "api_key must be printable ASCII"}
+
+      true ->
+        {:ok, base <> "/chat/completions"}
+    end
+  end
+
+  defp whitespace?(string), do: Regex.match?(~r/\s/, string)
+
+  defp printable_ascii?(string), do: Regex.match?(~r/\A[\x20-\x7E]*\z/, string)
+
+  defp post(url, provider, prompt, idle_timeout) do
+    Req.post(
+      url,
+      json: %{
+        model: provider.model,
+        stream: true,
+        messages: [%{role: "user", content: prompt}]
+      },
+      headers: [
+        {"authorization", "Bearer " <> provider.api_key},
+        {"accept", "text/event-stream"}
+      ],
+      into: :self,
+      # A streaming completions POST is not resumable: a retry or a followed
+      # redirect would duplicate generation and billing (ADR 0004).
+      retry: false,
+      redirect: false,
+      # Shares the stream loop's deadline (see @timeout_grace).
+      receive_timeout: idle_timeout + @timeout_grace
+    )
+  rescue
+    exception -> {:error, exception}
   end
 
   defp handle_response({:error, exception}, ui, provider, _idle_timeout) do
@@ -87,30 +146,6 @@ defmodule DashFloat.LLM.ChatStream do
     end)
   end
 
-  # A streaming completions POST is not resumable: `retry: false` and no
-  # redirect following — either one could duplicate generation and billing.
-  # `receive_timeout` bounds the header wait and outlives the stream loop's
-  # own timer, so the ADR's `after` is always the detector of a silent
-  # stream and finch's 15 s default can never cut a healthy one first.
-  defp post(provider, prompt, idle_timeout) do
-    Req.post(
-      String.trim_trailing(provider.base_url, "/") <> "/chat/completions",
-      json: %{
-        model: provider.model,
-        stream: true,
-        messages: [%{role: "user", content: prompt}]
-      },
-      headers: [
-        {"authorization", "Bearer " <> provider.api_key},
-        {"accept", "text/event-stream"}
-      ],
-      into: :self,
-      retry: false,
-      redirect: false,
-      receive_timeout: idle_timeout + @timeout_grace
-    )
-  end
-
   ## Streaming
 
   defp stream(ui, resp, timeout, parser) do
@@ -133,9 +168,9 @@ defmodule DashFloat.LLM.ChatStream do
     end
   end
 
-  # finch reports its idle `receive_timeout` (one grace period behind the
-  # stream loop's `after`) as a socket error; that is still "no data for
-  # :idle_timeout" (ADR 0004), so it reads as a timeout, not a lost connection.
+  # finch's socket `receive_timeout` shares the stream loop's deadline; it is
+  # still "no data for :idle_timeout" (ADR 0004), so it reads as a timeout,
+  # never a lost connection.
   defp stream_error(%{reason: :timeout}), do: "[llm: timed out waiting for stream data]"
   defp stream_error(_reason), do: "[llm: connection lost mid-stream]"
 
