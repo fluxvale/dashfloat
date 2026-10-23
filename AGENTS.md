@@ -69,9 +69,9 @@ Planning and task tracking live in GitHub issues at
   fixes it demanded — gets a delta re-check (same reviewer, fresh diff) before
   the merge is requested. A green CI run is not a review.
 - **Run CI locally.** Run the exact checks CI runs —
-  `mix format --check-formatted`, `mix compile --warnings-as-errors`,
-  `mix test --warnings-as-errors` — and make them pass before opening a PR.
-  CI is the last check, never the first.
+  `mix deps.get --check-locked`, `mix format --check-formatted`,
+  `mix compile --warnings-as-errors`, `mix test --warnings-as-errors` — and
+  make them pass before opening a PR. CI is the last check, never the first.
 
 ### 5. Commits and PR titles
 
@@ -95,9 +95,10 @@ this is what lets multiple agents work in parallel on the same repo.
   One branch, one worktree, one issue.
 - **Keep the primary checkout clean.** It stays on `main` as the reference
   point; no direct edits there. (Sole exception: the bootstrap task that
-  created `main` itself, before any branch could exist — it pushed directly to
-  `main` but still ran the hostile review after the push. The exception covers
-  branching mechanics only, never Rule 4.)
+  created `main` itself, before any branch could exist. It pushed directly to
+  `main` as a documented deviation — including of Rule 4's pre-merge timing,
+  since its hostile review ran after the push. The exception covers branching
+  mechanics only.)
 - **Clean up when merged.** Remove the worktree (`git worktree remove`) and
   delete its branch after the PR merges.
 

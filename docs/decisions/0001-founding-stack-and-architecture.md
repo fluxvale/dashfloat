@@ -23,7 +23,7 @@ workloads (streaming, tool execution, session management).
 
 | Concern | Choice | Pin | Verified notes |
 | --- | --- | --- | --- |
-| Language / runtime | Elixir / Erlang OTP | 1.20.4 / 29 | ex_ratatui supports Elixir 1.17+, OTP 26–29 |
+| Language / runtime | Elixir / Erlang OTP | `mix.exs` requires `~> 1.20.0`; dev and CI run 1.20.4 / OTP 29 | ex_ratatui supports Elixir 1.17+, OTP 26–29 |
 | TUI | `ex_ratatui` | `~> 0.17.1` | Rustler-backed ratatui bindings; precompiled NIFs for OTP 26–29 (ABI 2.17 loads on OTP 29) |
 | HTTP + SSE | `req` | `~> 0.7.5` | stable line (0.8 is release-candidate only) |
 | JSON | `jason` | `~> 1.4` | 1.4.5 is the latest stable |
@@ -55,7 +55,8 @@ rather than crashing the BEAM node.
 The TUI is three regions: a header/status bar (model info, context-size
 indicator, execution state — idle / streaming / executing tool), a scrollable
 main log view (markdown-formatted model messages, tool calls, shell outputs),
-and a multi-line input box with history navigation.
+and a multi-line input box with history navigation and an execution trigger
+(`Enter` / `Ctrl+Enter`).
 
 The core toolset is fixed and structured (JSON function calls):
 
@@ -66,8 +67,8 @@ The core toolset is fixed and structured (JSON function calls):
 - `list_directory(path)`
 
 File mutation uses explicit, structured search-and-replace blocks — no
-line-number or best-guess edits. Destructive changes are previewed in the TUI
-before being applied whenever user confirmation is required.
+line-number or best-guess edits. Changes are previewed in the TUI before they
+are applied whenever user confirmation is required.
 
 ### Roadmap
 
@@ -99,7 +100,8 @@ before being applied whenever user confirmation is required.
 - The transitive dependency tree is pinned in `mix.lock`; dependency bumps are
   deliberate, reviewed PRs.
 - Elixir/OTP upgrades must stay inside `ex_ratatui`'s support window
-  (currently OTP 26–29, Elixir 1.17+).
+  (currently OTP 26–29, Elixir 1.17+); the project's own floor is stricter and
+  lives in `mix.exs` (`~> 1.20.0`).
 - The four-process shape is the review lens for every later phase: I/O found in
   the UI process is a bug, and subprocess failures must degrade to chat
   messages, never crashes.

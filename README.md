@@ -30,9 +30,9 @@ isolated subprocess execution — with an
 
 ```sh
 mix deps.get
-mix test
+mix test --warnings-as-errors
 ```
 
 CI runs `mix format --check-formatted`, `mix compile --warnings-as-errors`, and
-`mix test` on every push to `main`. See [AGENTS.md](AGENTS.md) for the
-repository conventions.
+`mix test --warnings-as-errors` on every push to `main`. See
+[AGENTS.md](AGENTS.md) for the repository conventions.
