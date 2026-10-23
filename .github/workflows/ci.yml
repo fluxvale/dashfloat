@@ -69,7 +69,7 @@ jobs:
       # The report stays inspectable when the coverage floor reds.
       - name: Upload coverage HTML
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-report
           path: cover/
@@ -79,9 +79,16 @@ jobs:
       # fail_ci_if_error: the v2 upload watchdog — a codecov.io outage reds
       # this step rather than silently dropping coverage. Fork PRs get no
       # secrets (so no token), and with fail_ci_if_error that would red every
-      # external contribution: upload only for same-repo refs.
+      # external contribution: upload only for same-repo refs. Dependabot's
+      # same-repo PRs are equally tokenless — GitHub withholds repo secrets
+      # from pull_request runs attributed to dependabot[bot], re-runs
+      # included (verified 2026-10-23, run 39931638996 / PR #9: the
+      # attempt-2 human re-run still sent "Token length: 0"). Skip that
+      # actor: github.actor stays dependabot[bot] on re-runs, and a human
+      # *push* to the branch flips the actor and does restore secrets — so
+      # the actor is the right key, not the PR author (#13).
       - name: Upload coverage to Codecov
-        if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        if: ${{ !cancelled() && github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           flags: dashfloat

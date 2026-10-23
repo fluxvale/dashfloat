@@ -56,6 +56,12 @@ guaranteed present. The skipped arm is future-proofing for path-gated jobs.
 upload failure or a codecov.io outage reds the step instead of silently
 dropping coverage. It is skipped for fork PRs — they receive no secrets, and a
 missing token with `fail_ci_if_error` would red every external contribution.
+Same-repo Dependabot PRs are skipped for the same reason
+([#13](https://github.com/fluxvale/dashfloat/issues/13)): GitHub withholds
+repo secrets from `pull_request` runs attributed to `dependabot[bot]` —
+re-runs included (on [PR #9](https://github.com/fluxvale/dashfloat/pull/9),
+run 39931638996, the attempt-2 human re-run still sent an empty token), so
+the skip keys on `github.actor`, which stays `dependabot[bot]` on re-runs.
 
 ## Alternatives considered
 
@@ -69,6 +75,10 @@ missing token with `fail_ci_if_error` would red every external contribution.
   --type json --type html` runs the suite once and writes both; chosen.
 - **Codecov `fail_ci_if_error: false`** — a silent coverage drop is worse than
   a red build on a third-party outage; revisit only if outages bite.
+- **Keying the Dependabot skip on the PR author**
+  (`github.event.pull_request.user.login`) — a human push to a Dependabot
+  branch flips the run's actor and does get secrets, so the run actor is the
+  semantically correct key; rejected.
 - **A `.credo.exs` with relaxed rules** — nothing in the current code fails the
   default ruleset, so no config file ships at all. (Reversed by
   [ADR 0004](0004-credo-fleet-ruleset.md), which ships the fleet's config.)
@@ -81,3 +91,5 @@ missing token with `fail_ci_if_error` would red every external contribution.
 - A Dialyzer PLT build is slow on a cache miss (minutes); the separate cache
   key keeps that rare.
 - `priv/plts/` is gitignored and rebuilt as needed, never committed.
+- Dependabot PRs (and their re-runs) land with no Codecov upload at all —
+  `mix ci` still gates them; only the upload is skipped.
