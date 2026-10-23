@@ -1,0 +1,8 @@
+data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":", "},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"x"
+
+data: [DONE]
+

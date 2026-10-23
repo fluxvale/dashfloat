@@ -50,8 +50,20 @@ defmodule DashFloat.TUI.StateTest do
       assert State.input_text(state) == ""
     end
 
-    test "mount opts carry the demo stream opts" do
-      assert new_state(demo_stream_opts: [interval_ms: 1]).demo_stream_opts == [interval_ms: 1]
+    test "mount opts carry the provider" do
+      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "m", api_key: "k"}}
+      assert new_state(provider: provider).provider == provider
+      assert new_state().provider == nil
+    end
+  end
+
+  describe "provider_model/1" do
+    test "returns the model for a usable provider, nil otherwise" do
+      ok = {:ok, %DashFloat.Config{base_url: "http://x", model: "gpt-test", api_key: "k"}}
+
+      assert State.provider_model(new_state(provider: ok)) == "gpt-test"
+      assert State.provider_model(new_state(provider: {:error, "nope"})) == nil
+      assert State.provider_model(new_state()) == nil
     end
   end
 
@@ -383,24 +395,46 @@ defmodule DashFloat.TUI.StateTest do
   end
 
   describe "task monitoring" do
-    test "claim_task records the monitor ref" do
+    test "claim_task records the pid and monitor ref" do
+      pid = self()
       ref = make_ref()
-      state = State.claim_task(new_state(), ref)
+      state = new_state() |> State.claim_task(pid, ref)
+      assert state.task_pid == pid
+      assert state.task_ref == ref
       assert state.task_ref == ref
     end
 
-    test "a normal task DOWN finalizes a partial reply and ensures idle" do
+    test "Esc cancels only while streaming with a live task" do
+      pid = spawn(fn -> Process.sleep(1_000) end)
+      state = new_state() |> State.claim_task(pid, make_ref())
+
+      assert {%{phase: :streaming} = streaming, :cancel} =
+               State.handle_key(%{state | phase: :streaming}, "esc", [])
+
+      assert streaming == %{state | phase: :streaming}
+
+      # Idle: no cancel, and the key does not reach the textarea.
+      assert {%{phase: :idle} = idle, nil} = State.handle_key(%{state | phase: :idle}, "esc", [])
+      assert State.input_text(idle) == ""
+
+      # Streaming without a task pid (already released) is a no-op.
+      assert {%{task_pid: nil}, nil} =
+               State.handle_key(%{state | phase: :streaming, task_pid: nil}, "esc", [])
+    end
+
+    test "a normal task DOWN finalizes a partial reply, ensures idle, clears the pid" do
       ref = make_ref()
 
       state =
         new_state()
-        |> State.claim_task(ref)
+        |> State.claim_task(self(), ref)
         |> State.stream_message({:token, "partial"})
 
       {after_down, handled} = State.task_down(state, ref, :normal)
       assert handled == :handled
       assert after_down.phase == :idle
       assert after_down.task_ref == nil
+      assert after_down.task_pid == nil
       assert after_down.in_flight == nil
       assert {:assistant, "partial"} in after_down.entries
     end
@@ -410,7 +444,7 @@ defmodule DashFloat.TUI.StateTest do
 
       state =
         new_state()
-        |> State.claim_task(ref)
+        |> State.claim_task(self(), ref)
         |> State.stream_message({:phase, :idle})
 
       {after_down, handled} = State.task_down(state, ref, :noproc)
@@ -425,7 +459,7 @@ defmodule DashFloat.TUI.StateTest do
 
       state =
         new_state()
-        |> State.claim_task(ref)
+        |> State.claim_task(self(), ref)
         |> State.stream_message({:token, "partial reply"})
 
       {after_down, handled} = State.task_down(state, ref, :killed)
@@ -441,11 +475,22 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "a foreign DOWN ref is ignored" do
-      state = State.claim_task(new_state(), make_ref())
+      state = new_state() |> State.claim_task(self(), make_ref())
       {after_down, handled} = State.task_down(state, make_ref(), :killed)
       assert handled == :ignored
       assert after_down.phase == :idle
       assert after_down.entries == []
+    end
+  end
+
+  describe "stream_failed/2" do
+    test "binary reasons are used verbatim, others are inspected" do
+      state = State.stream_failed(new_state(), "[llm: HTTP 502]")
+      assert {:system, "[llm: HTTP 502]"} in state.entries
+      assert state.phase == :idle
+
+      state = State.stream_failed(new_state(), :killed)
+      assert {:system, "[stream failed: :killed]"} in state.entries
     end
   end
 

@@ -47,7 +47,7 @@ defmodule DashFloat.TUI.ViewTest do
              ] = widgets
     end
 
-    test "status bar carries placeholders and the phase label" do
+    test "status bar carries the model and context placeholders plus the phase label" do
       line = hd(status_line(new_state()))
 
       text =
@@ -59,6 +59,14 @@ defmodule DashFloat.TUI.ViewTest do
       assert text =~ "model: —"
       assert text =~ "ctx: —"
       assert text =~ "Idle"
+    end
+
+    test "the configured model replaces the status bar placeholder" do
+      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "gpt-test", api_key: "k"}}
+      text = status_text(new_state(provider: provider))
+      assert text =~ "model: gpt-test"
+      assert text =~ "model: gpt-test  ctx: —"
+      refute text =~ "model: —"
     end
 
     test "each phase maps to its status label" do
