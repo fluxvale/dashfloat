@@ -41,10 +41,13 @@ runner.
 **Coverage floor as a ratchet.** `coveralls.json` sets `minimum_coverage` to
 the codebase's measured coverage — enforced by ExCoveralls on every gate run.
 Introduced at 100 (the bootstrap baseline), re-baselined to **94.3** when the
-TUI skeleton ([ADR 0002](0002-tui-skeleton.md), #6) merged mid-flight: the floor
-tracks the measured baseline of the code that lands, never a wish about it.
-From here it is a ratchet — raised as coverage improves, never lowered to make
-a red run green.
+TUI skeleton ([ADR 0002](0002-tui-skeleton.md), #6) merged mid-flight, and to
+**96.8** with the streaming engine ([ADR 0004](0004-llm-streaming-engine.md),
+#8): the floor tracks the measured baseline of the code that lands, never a
+wish about it. From here it is a ratchet — raised as coverage improves, never
+lowered to make a red run green. `skip_files` excludes `test/`: test-support
+code (the loopback SSE server, [ADR 0004](0004-llm-streaming-engine.md)) is
+harness, not shipped, and the floor guards `lib/`.
 
 **`Wait for CI` as the required check.** The `wait-for-ci` umbrella job runs
 `if: always()` and passes only when every job in `needs` succeeded or was
