@@ -70,8 +70,8 @@ Planning and task tracking live in GitHub issues at
   the merge is requested. A green CI run is not a review.
 - **Run CI locally.** Run the exact checks CI runs —
   `mix format --check-formatted`, `mix compile --warnings-as-errors`,
-  `mix test` — and make them pass before opening a PR. CI is the last check,
-  never the first.
+  `mix test --warnings-as-errors` — and make them pass before opening a PR.
+  CI is the last check, never the first.
 
 ### 5. Commits and PR titles
 
@@ -88,13 +88,16 @@ All work happens in a dedicated git worktree, never in the primary checkout —
 this is what lets multiple agents work in parallel on the same repo.
 
 - **One worktree per task.** Branch off `main` and create the worktree in one
-  step, named `dashfloat-<issue_number>-<part-of-the-issue-name-in-kebab-case>`
-  — e.g. issue #3 "TUI skeleton" becomes
-  `git worktree add ../dashfloat-3-tui-skeleton -b <branch>`. One branch, one
-  worktree, one issue.
+  step; directory and branch share the name
+  `dashfloat-<issue_number>-<part-of-the-issue-name-in-kebab-case>` — e.g.
+  issue #3 "TUI skeleton" becomes
+  `git worktree add ../dashfloat-3-tui-skeleton -b dashfloat-3-tui-skeleton`.
+  One branch, one worktree, one issue.
 - **Keep the primary checkout clean.** It stays on `main` as the reference
   point; no direct edits there. (Sole exception: the bootstrap task that
-  created `main` itself, before any branch could exist.)
+  created `main` itself, before any branch could exist — it pushed directly to
+  `main` but still ran the hostile review after the push. The exception covers
+  branching mechanics only, never Rule 4.)
 - **Clean up when merged.** Remove the worktree (`git worktree remove`) and
   delete its branch after the PR merges.
 

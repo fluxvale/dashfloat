@@ -31,3 +31,8 @@ dash_float-*.tar
 # Local agent model pins — never committed.
 /opencode.jsonc
 
+# Editor / language-server artifacts.
+/.elixir_ls/
+/.lexical/
+/.vscode/
+
