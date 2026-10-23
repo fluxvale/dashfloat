@@ -115,7 +115,8 @@ text carries status codes and provider-supplied text only.
 | Valid JSON frame without `choices[0].delta.content` (role-only, usage, keepalive frames) | shape miss | skipped silently — not an error |
 | Connection dropped mid-stream | `{ref, {:error, _}}` | `[llm: connection lost mid-stream]` |
 | Stream ended without `[DONE]` | `{ref, :done}` before `[DONE]` | `[llm: stream ended without completion]` |
-| No data for 60 s (configurable via `:idle_timeout`) | receive `after` | cancel + `[llm: timed out waiting for stream data]` |
+| No data for 60 s (configurable via `:idle_timeout`) | socket `receive_timeout`, with the receive `after` as backstop | cancel + `[llm: timed out waiting for stream data]` |
+| Single SSE frame larger than 1 MiB (a stream that never delimits a frame) | buffer cap in `ChatStream` | cancel + `[llm: SSE frame exceeded 1 MiB — stream aborted]` |
 | SSE comment / unknown field lines | parser | ignored per the SSE spec (keepalives) |
 
 ### SSE parsing — a pure incremental parser
@@ -124,7 +125,9 @@ text carries status codes and provider-supplied text only.
 holding back partial frames in a buffer until a blank line completes them.
 Line endings: LF and CRLF (the OpenAI-compatible ecosystem; lone CR is not
 handled). Only `data:` lines are extracted — `event:`/`id:`/comments are
-dropped per spec. `[DONE]` is interpreted by `ChatStream`, not the parser.
+dropped per spec. `[DONE]` is interpreted by `ChatStream`, not the parser. The
+parser is unbounded by design; `ChatStream` caps the held-back buffer at 1 MiB
+and aborts a stream that never delimits a frame.
 
 ### Provider config — one endpoint, file + env
 
@@ -174,7 +177,8 @@ dependencies. Live-key smoke is a documented manual step.
   ADR-0002 contract; the synthetic demo module is deleted.
 - Tests open real loopback sockets; CI stays offline and deterministic.
 - The parser covers LF/CRLF only; a lone-CR server would stall (none exists in
-  this ecosystem).
+  this ecosystem). A frame over 1 MiB aborts the stream rather than growing the
+  buffer without bound.
 - Without provider config the TUI can no longer produce replies — the demo
   path is gone by design; the config error entry carries setup instructions.
 - One in-flight request at a time stands (ADR 0002); queueing stays out.

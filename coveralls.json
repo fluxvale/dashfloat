@@ -1,4 +1,4 @@
 {
-  "coverage_options": {"minimum_coverage": 97.8},
+  "coverage_options": {"minimum_coverage": 98.1},
   "skip_files": ["^test/"]
 }

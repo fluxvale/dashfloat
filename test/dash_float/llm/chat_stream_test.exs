@@ -24,8 +24,8 @@ defmodule DashFloat.LLM.ChatStreamTest do
     server
   end
 
-  defp provider(base_url) do
-    %Config{base_url: base_url, model: "test-model", api_key: "test-key-123"}
+  defp provider(base_url, api_key) do
+    %Config{base_url: base_url, model: "test-model", api_key: api_key}
   end
 
   # Runs the producer as a Task (like the TUI does), with the test process as
@@ -33,9 +33,12 @@ defmodule DashFloat.LLM.ChatStreamTest do
   defp start_stream(base_url, opts \\ []) do
     ui = self()
     prompt = Keyword.get(opts, :prompt, "hello")
+    key = Keyword.get(opts, :api_key, "test-key-123")
     run_opts = Keyword.take(opts, [:idle_timeout])
 
-    {:ok, pid} = Task.start(fn -> ChatStream.run(ui, provider(base_url), prompt, run_opts) end)
+    {:ok, pid} =
+      Task.start(fn -> ChatStream.run(ui, provider(base_url, key), prompt, run_opts) end)
+
     {pid, Process.monitor(pid)}
   end
 
@@ -476,12 +479,31 @@ defmodule DashFloat.LLM.ChatStreamTest do
     end
   end
 
-  test "a provider error body echoing the key is redacted" do
-    echoed = ~s({"error":{"message":"bad key: test-key-123"}})
+  test "a provider error body echoing the key is redacted in every form" do
+    # Both the bare key and the quote-delimited echo must be redacted.
+    echoed = ~s({"error":{"message":"bad key: test-key-123 and \\"test-key-123\\""}})
     server = start_server([{:send, json_response(401, echoed)}, :close])
     {_pid, ref} = start_stream(SSEServer.base_url(server))
 
-    assert ["[llm: HTTP 401 — bad key: [redacted]]"] = system_entries(collect())
+    assert ["[llm: HTTP 401 — bad key: [redacted] and \"[redacted]\"]"] =
+             system_entries(collect())
+
+    await_exit(ref)
+  end
+
+  test "a provider error body with the inspect-escaped key form is redacted too" do
+    # For a key containing a quote, Mint's error renders the header value with
+    # inspect escaping; a provider (or upstream proxy) can echo that back.
+    key = ~s(test"key-123)
+    escaped = key |> inspect() |> String.slice(1..-2//1)
+
+    body = Jason.encode!(%{"error" => %{"message" => "raw: #{key} escaped: #{escaped}"}})
+    server = start_server([{:send, json_response(401, body)}, :close])
+    {_pid, ref} = start_stream(SSEServer.base_url(server), api_key: key)
+
+    assert ["[llm: HTTP 401 — raw: [redacted] escaped: [redacted]]"] =
+             system_entries(collect())
+
     await_exit(ref)
   end
 
@@ -511,6 +533,28 @@ defmodule DashFloat.LLM.ChatStreamTest do
       assert {:phase, :idle} == List.last(messages)
       await_exit(ref)
     end
+  end
+
+  test "a single SSE frame over 1 MiB aborts the stream instead of growing the buffer" do
+    # No blank line ever completes the frame: the parser buffers forever unless
+    # ChatStream caps it.
+    blob = String.duplicate("x", 512 * 1024)
+
+    script =
+      [{:send, @headers}, {:send, "data: " <> blob}] ++
+        Enum.flat_map(1..2, fn _ -> [{:send, blob}, {:sleep, 10}] end) ++
+        [{:wait_close, 2_000}]
+
+    server = start_server(script)
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    messages = collect()
+
+    assert system_entries(messages) == ["[llm: SSE frame exceeded 1 MiB — stream aborted]"]
+    assert {:phase, :idle} == List.last(messages)
+    assert tokens(messages) == ""
+    assert_receive {:sse_closed}, 3_000
+    await_exit(ref)
   end
 
   defp json_response(status, body) do

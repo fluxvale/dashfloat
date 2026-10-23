@@ -15,11 +15,13 @@ defmodule DashFloat.LLM.ChatStream do
 
   @default_idle_timeout 60_000
   @drain_limit 64 * 1024
+  # A single SSE frame that never completes would grow the parser buffer until
+  # the node dies: cap it (the parser itself stays pure and unbounded).
+  @frame_limit 1024 * 1024
   @drain_timeout 5_000
-  # finch's socket `receive_timeout` and the stream loop's own `after` share
-  # one deadline. Whichever fires, the entry is the same timeout message; the
-  # socket timeout is the backstop for a wedged socket process, and it keeps
-  # finch's 15 s default from cutting a healthy stream first.
+  # finch's socket `receive_timeout` is the primary idle detector (it is
+  # strictly shorter than the stream loop's timer, so its error arrives first);
+  # the loop's `after` is the backstop for a wedged socket process.
   @timeout_grace 1_000
 
   @doc """
@@ -102,11 +104,9 @@ defmodule DashFloat.LLM.ChatStream do
       # redirect would duplicate generation and billing (ADR 0004).
       retry: false,
       redirect: false,
-      # Shares the stream loop's deadline (see @timeout_grace).
-      receive_timeout: idle_timeout + @timeout_grace
+      # The idle detector; the stream loop's `after` sits @timeout_grace behind.
+      receive_timeout: idle_timeout
     )
-  rescue
-    exception -> {:error, exception}
   end
 
   defp handle_response({:error, exception}, ui, provider, _idle_timeout) do
@@ -165,27 +165,40 @@ defmodule DashFloat.LLM.ChatStream do
 
   defp handle_stream_message(ui, resp, timeout, parser, message) do
     case Req.parse_message(resp, message) do
-      {:ok, [data: bytes]} -> handle_frames(ui, resp, timeout, parser, bytes)
-      {:ok, [:done]} -> cancel_and_fail(ui, resp, "[llm: stream ended without completion]")
-      {:ok, [trailers: _trailers]} -> stream(ui, resp, timeout, parser)
-      {:error, reason} -> cancel_and_fail(ui, resp, stream_error(reason))
-      :unknown -> stream(ui, resp, timeout, parser)
+      {:ok, [data: bytes]} ->
+        handle_frames(ui, resp, timeout, parser, bytes)
+
+      {:ok, [:done]} ->
+        cancel_and_fail(ui, resp, "[llm: stream ended without completion]")
+
+      {:ok, [trailers: _trailers]} ->
+        stream(ui, resp, timeout, parser)
+
+      # A finch socket `receive_timeout` is the primary idle detector (see
+      # @timeout_grace); it still means "no data for :idle_timeout" (ADR 0004).
+      {:error, reason} ->
+        if match?(%{reason: :timeout}, reason) do
+          cancel_and_fail(ui, resp, "[llm: timed out waiting for stream data]")
+        else
+          cancel_and_fail(ui, resp, "[llm: connection lost mid-stream]")
+        end
+
+      :unknown ->
+        stream(ui, resp, timeout, parser)
     end
   end
-
-  # finch's socket `receive_timeout` shares the stream loop's deadline; it is
-  # still "no data for :idle_timeout" (ADR 0004), so it reads as a timeout,
-  # never a lost connection.
-  defp stream_error(%{reason: :timeout}), do: "[llm: timed out waiting for stream data]"
-  defp stream_error(_reason), do: "[llm: connection lost mid-stream]"
 
   defp handle_frames(ui, resp, timeout, parser, bytes) do
     {frames, parser} = SSE.feed(parser, bytes)
 
-    case emit_frames(ui, resp, frames) do
-      :cont -> stream(ui, resp, timeout, parser)
-      :done -> :ok
-      {:error, message} -> cancel_and_fail(ui, resp, message)
+    if byte_size(parser.buffer) > @frame_limit do
+      cancel_and_fail(ui, resp, "[llm: SSE frame exceeded 1 MiB — stream aborted]")
+    else
+      case emit_frames(ui, resp, frames) do
+        :cont -> stream(ui, resp, timeout, parser)
+        :done -> :ok
+        {:error, message} -> cancel_and_fail(ui, resp, message)
+      end
     end
   end
 
