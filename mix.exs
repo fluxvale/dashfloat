@@ -12,9 +12,11 @@ defmodule DashFloat.MixProject do
       # coveralls.multiple writes cover/excoveralls.json (Codecov) and
       # cover/excoveralls.html (CI artifact) from one suite run
       test_coverage: [tool: ExCoveralls],
-      # PLT in priv/plts (gitignored), exact-version CI cache key
+      # PLT in priv/plts (gitignored), exact-version CI cache key. :mix — the
+      # TUI guards a test-only path with Code.ensure_loaded?(Mix) + Mix.env/0,
+      # which needs :mix in the PLT or dialyzer reports a false unknown function
       dialyzer: [
-        plt_add_apps: [:ex_unit],
+        plt_add_apps: [:ex_unit, :mix],
         plt_file: {:no_warn, "priv/plts/project.plt"},
         list_unused_filters: true
       ]
