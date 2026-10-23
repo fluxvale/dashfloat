@@ -13,7 +13,7 @@ isolated subprocess execution — with an
 ## Status
 
 **Pre-alpha — Phase 2.** The LLM streaming engine is in
-([ADR 0004](docs/decisions/0004-llm-streaming-engine.md)): an OpenAI-compatible
+([ADR 0005](docs/decisions/0005-llm-streaming-engine.md)): an OpenAI-compatible
 SSE client streams tokens into the existing TUI
 ([ADR 0002](docs/decisions/0002-tui-skeleton.md)). Next up per the
 [ADR 0001](docs/decisions/0001-founding-stack-and-architecture.md) roadmap: tool

@@ -1,4 +1,4 @@
-# 0004 — LLM streaming engine: SSE adapter process architecture
+# 0005 — LLM streaming engine: SSE adapter process architecture
 
 - **Status:** Accepted
 - **Date:** 2026-10-23

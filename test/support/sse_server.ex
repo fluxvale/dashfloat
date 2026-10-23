@@ -7,7 +7,7 @@ defmodule DashFloat.SSEServer do
   `:reset`, or `{:wait_close, timeout}`. The request is forwarded to the
   owner as `{:sse_request, method, path, headers, body}`; `{:wait_close, _}`
   reports `{:sse_closed}` once the client hangs up. Raw `:gen_tcp`, no new
-  dependencies, no external network (ADR 0004).
+  dependencies, no external network (ADR 0005).
   """
 
   use GenServer

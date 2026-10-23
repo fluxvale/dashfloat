@@ -6,7 +6,7 @@ defmodule DashFloat.Config do
   overlays per-field environment variables, so a value can be overridden
   without editing the file. Loading happens once in `DashFloat.Application`
   and rides into the TUI as a mount opt — the UI process performs no file I/O.
-  See ADR 0004.
+  See ADR 0005.
   """
 
   @fields [
@@ -16,7 +16,7 @@ defmodule DashFloat.Config do
   ]
 
   # The provider rides in the TUI state, and a UI crash logs that state: never
-  # let the key into a log line (ADR 0004).
+  # let the key into a log line (ADR 0005).
   @derive {Inspect, except: [:api_key]}
   defstruct [:base_url, :model, :api_key]
 

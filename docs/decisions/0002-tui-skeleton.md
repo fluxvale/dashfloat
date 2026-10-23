@@ -199,7 +199,7 @@ safety net, not the reporter of record.
 
 ### Synthetic-update demo path
 
-Superseded by [ADR 0004](0004-llm-streaming-engine.md): the demo module is
+Superseded by [ADR 0005](0005-llm-streaming-engine.md): the demo module is
 deleted and the real SSE producer takes its place. The description below is
 kept as the record of what Phase 1 shipped.
 

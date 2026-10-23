@@ -8,7 +8,7 @@ defmodule DashFloat.LLM.ChatStream do
   `DashFloat.StreamSupervisor`. It performs all network I/O — the UI process
   stays pure. Every exit path sends its own terminal `{:phase, _}` first, so
   the UI's monitor is only a safety net. Architecture and the error taxonomy
-  are settled in ADR 0004.
+  are settled in ADR 0005.
   """
 
   alias DashFloat.LLM.SSE
@@ -101,7 +101,7 @@ defmodule DashFloat.LLM.ChatStream do
       ],
       into: :self,
       # A streaming completions POST is not resumable: a retry or a followed
-      # redirect would duplicate generation and billing (ADR 0004).
+      # redirect would duplicate generation and billing (ADR 0005).
       retry: false,
       redirect: false,
       # The idle detector; the stream loop's `after` sits @timeout_grace behind.
@@ -138,7 +138,7 @@ defmodule DashFloat.LLM.ChatStream do
   end
 
   # Failure text and provider-supplied error bodies can quote the offending
-  # header value; the key never reaches the chat log (ADR 0004). Mint renders
+  # header value; the key never reaches the chat log (ADR 0005). Mint renders
   # header values with inspect, so the escaped form is redacted too.
   defp scrub(message, key) do
     needles =
@@ -175,7 +175,7 @@ defmodule DashFloat.LLM.ChatStream do
         stream(ui, resp, timeout, parser)
 
       # A finch socket `receive_timeout` is the primary idle detector (see
-      # @timeout_grace); it still means "no data for :idle_timeout" (ADR 0004).
+      # @timeout_grace); it still means "no data for :idle_timeout" (ADR 0005).
       {:error, reason} ->
         if match?(%{reason: :timeout}, reason) do
           cancel_and_fail(ui, resp, "[llm: timed out waiting for stream data]")
@@ -226,7 +226,7 @@ defmodule DashFloat.LLM.ChatStream do
   defp emit_frames(_ui, _resp, []), do: :cont
 
   # Role-only frames, empty choices, and usage frames are shape misses: skip
-  # them silently (ADR 0004).
+  # them silently (ADR 0005).
   defp emit_content(ui, %{"choices" => [%{"delta" => %{"content" => content}} | _]})
        when is_binary(content) and content != "" do
     send(ui, {:token, content})
@@ -314,7 +314,7 @@ defmodule DashFloat.LLM.ChatStream do
   defp fail(ui, message), do: terminal(ui, message)
 
   # One exit path: the explanation, then the terminal idle phase which
-  # finalizes any partial reply (ADR 0004 fixes this order).
+  # finalizes any partial reply (ADR 0005 fixes this order).
   defp terminal(ui, message) do
     send(ui, {:entry, :system, message})
     send(ui, {:phase, :idle})

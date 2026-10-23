@@ -3,7 +3,7 @@ defmodule DashFloat.TUI do
   The DashFloat terminal UI: a thin `ExRatatui.App` whose state logic lives in
   `DashFloat.TUI.State` and rendering in `DashFloat.TUI.View`. Process shape,
   key bindings, and teardown guarantees are settled in ADR 0002; the producer
-  started on submit is the SSE adapter from ADR 0004.
+  started on submit is the SSE adapter from ADR 0005.
 
   Run with `mix run --no-halt`. Quit with Ctrl+Q or Ctrl+C.
   """

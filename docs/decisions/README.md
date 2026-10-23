@@ -27,4 +27,4 @@ their replacement.
 | [0002](0002-tui-skeleton.md) | TUI skeleton: process shape, event flow, and terminal lifecycle | Accepted |
 | [0003](0003-ci-gate-and-coverage-ratchet.md) | CI gate and coverage ratchet | Accepted |
 | [0004](0004-credo-fleet-ruleset.md) | Credo ruleset pinned to the FluxVale fleet config | Accepted |
-| [0004](0004-llm-streaming-engine.md) | LLM streaming engine: SSE adapter process architecture | Accepted |
+| [0005](0005-llm-streaming-engine.md) | LLM streaming engine: SSE adapter process architecture | Accepted |

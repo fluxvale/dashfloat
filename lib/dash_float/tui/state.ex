@@ -69,7 +69,7 @@ defmodule DashFloat.TUI.State do
   the size comes from the opts; live, it is read from the terminal (falling
   back to 80x24 without a TTY) and kept fresh by later Resize events. The
   provider is loaded once by the Application and handed in as `:provider`
-  (ADR 0004).
+  (ADR 0005).
   """
   @spec new(keyword()) :: t()
   def new(opts) do
@@ -133,7 +133,7 @@ defmodule DashFloat.TUI.State do
   def handle_key(state, "enter", ["shift"]), do: forward(state, "enter", [])
   def handle_key(state, "enter", ["alt"]), do: forward(state, "enter", [])
 
-  # Esc cancels a running stream; a no-op otherwise (ADR 0004).
+  # Esc cancels a running stream; a no-op otherwise (ADR 0005).
   def handle_key(%{phase: :streaming, task_pid: pid} = state, "esc", _) when is_pid(pid),
     do: {state, :cancel}
 

@@ -138,7 +138,7 @@ defmodule DashFloat.TUITest do
     assert system_entries(state) == []
     assert state.task_ref == nil
 
-    # The status bar names the configured model (ADR 0004).
+    # The status bar names the configured model (ADR 0005).
     assert State.provider_model(state) == "test-model"
     assert status_text(state) =~ "model: test-model"
   end

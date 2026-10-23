@@ -6,7 +6,7 @@ defmodule DashFloat.LLM.SSE do
   line, keeping any partial frame buffered for the next call. Only `data:`
   lines are extracted; `event:`/`id:`/`retry:`, comments, and unknown fields
   are dropped per the SSE spec. Line endings are LF and CRLF — lone CR is not
-  supported (ADR 0004). `[DONE]` is interpreted by `DashFloat.LLM.ChatStream`,
+  supported (ADR 0005). `[DONE]` is interpreted by `DashFloat.LLM.ChatStream`,
   not here.
   """
 
