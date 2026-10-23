@@ -25,7 +25,12 @@ source before deciding:
   the socket is closed. Cancellation is therefore kill-safe in both directions.
 - Req's default retry only covers safe methods, but a streaming
   `POST /chat/completions` is non-idempotent and billed; we set `retry: false`
-  explicitly.
+  explicitly. Redirects are refused for the same reason (`redirect: false`):
+  following one would silently re-POST the completion.
+- Two inputs bypass the request path entirely: Req raises — or finch
+  `exit(:badarg)` — before a request exists for an unusable `base_url` (no
+  scheme or host, embedded whitespace, out of range port, non-ASCII host) or
+  an `api_key` containing non-printable ASCII (Mint validates header values).
 
 ## Decision
 
@@ -50,6 +55,20 @@ UI process (ExRatatui.Server)          DashFloat.LLM.ChatStream (Task, temporary
 The stream handler always sends its own terminal `{:phase, _}` before exiting
 (the ADR-0002 rule); the UI's monitor stays a safety net, never the reporter
 of record.
+
+**No retries, no redirects, no bad inputs at the door.** `ChatStream` sets
+`retry: false` and `redirect: false`: a retried or followed streaming
+completions POST duplicates generation and billing, so both are refused. It
+also validates the endpoint and key before calling Req — `base_url` must be an
+`http(s)` URL with an ASCII host, no embedded whitespace, and a port in range;
+`api_key` must be printable ASCII. Unguarded, such a config would kill the
+producer before its terminal message, surfacing as `[stream failed: …]`
+instead of the `[llm: …]` taxonomy. Validated, each case degrades to a
+`[llm: connection failed: …]` entry naming the problem (never the value) and
+the terminal idle phase, exactly like a transport failure. A non-ASCII key is
+refused outright rather than scrubbed after the fact: Mint quotes header
+values in its error, and the quoting form varies, so no replace list is
+reliable.
 
 ### Token granularity and backpressure — no drop policy
 
@@ -142,8 +161,9 @@ dependencies. Live-key smoke is a documented manual step.
 - **Token batching / drop policy in the producer** — lossy complexity
   defending a render loop that already coalesces; violates "messages are
   data". Rejected.
-- **Retries** — a streaming completions POST is not resumable; retrying
-  duplicates generation and billing. None.
+- **Retries and redirect following** — a streaming completions POST is not
+  resumable; retrying or following a 307/308 duplicates generation and
+  billing. Neither.
 - **TOML config** — adds a dependency; jason already ships. JSON chosen.
 - **Reading config in `mount/1`** — file I/O in the UI process; loaded in
   `Application.start/1` instead.
@@ -158,3 +178,7 @@ dependencies. Live-key smoke is a documented manual step.
 - Without provider config the TUI can no longer produce replies — the demo
   path is gone by design; the config error entry carries setup instructions.
 - One in-flight request at a time stands (ADR 0002); queueing stays out.
+- The endpoint/key pre-flight narrows what config is usable: a key outside
+  printable ASCII cannot be used at all, and a non-HTTP(S), non-ASCII-hosted,
+  or otherwise malformed base URL is reported at submit time as
+  `[llm: connection failed: …]` instead of reaching the network.
