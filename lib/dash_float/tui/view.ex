@@ -75,7 +75,7 @@ defmodule DashFloat.TUI.View do
       text: [
         Line.new([
           Span.new("DashFloat", style: %Style{modifiers: [:bold]}),
-          Span.new("  model: —  ctx: —", style: %Style{fg: :dark_gray}),
+          Span.new("  model: #{model(state)}  ctx: —", style: %Style{fg: :dark_gray}),
           Span.new("  ● ", style: %Style{fg: color}),
           Span.new(label, style: %Style{fg: color}),
           Span.new("  #{position(state, log_height)}", style: %Style{fg: :dark_gray})
@@ -83,6 +83,8 @@ defmodule DashFloat.TUI.View do
       ]
     }
   end
+
+  defp model(state), do: State.provider_model(state) || "—"
 
   defp position(state, log_height) do
     total = State.log_line_count(state)

@@ -16,11 +16,13 @@ defmodule DashFloat.Application do
 
   # The TUI owns the real terminal; `mix test` must never start it. Releases
   # don't ship Mix, so the guard keeps working in production (ADR 0002).
+  # Provider config is loaded here, once, so the UI process performs no file
+  # I/O (ADR 0004).
   defp tui_child do
     if Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) and Mix.env() == :test do
       []
     else
-      [DashFloat.TUI]
+      [{DashFloat.TUI, provider: DashFloat.Config.load()}]
     end
   end
 end
