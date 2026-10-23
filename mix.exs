@@ -52,7 +52,9 @@ defmodule DashFloat.MixProject do
       {:jason, "~> 1.4"},
       {:req, "~> 0.7.5"},
       # Dev/test-only analysis tools
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      # Exact pin, matching the fleet reference — the enumerated .credo.exs
+      # freezes the rule set; this freezes check implementations (ADR 0004).
+      {:credo, "1.7.19", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:excoveralls, "~> 0.18", only: :test, runtime: false}
     ]

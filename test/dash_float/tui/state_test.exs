@@ -276,8 +276,9 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "contract violations crash instead of corrupting state" do
-      # Built dynamically so the compile-time type checker cannot narrow them
-      # into an "impossible input" warning — these are runtime garbage.
+      # Tuples assembled at runtime via List.to_tuple so the compile-time type
+      # checker cannot narrow the call into an "impossible input" warning —
+      # the payloads are runtime garbage.
       bogus = :bogus
       not_binary = :not_binary
       user = :user

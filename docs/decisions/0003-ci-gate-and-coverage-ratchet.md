@@ -70,7 +70,8 @@ missing token with `fail_ci_if_error` would red every external contribution.
 - **Codecov `fail_ci_if_error: false`** — a silent coverage drop is worse than
   a red build on a third-party outage; revisit only if outages bite.
 - **A `.credo.exs` with relaxed rules** — nothing in the current code fails the
-  default ruleset, so no config file ships at all.
+  default ruleset, so no config file ships at all. (Reversed by
+  [ADR 0004](0004-credo-fleet-ruleset.md), which ships the fleet's config.)
 
 ## Consequences
 

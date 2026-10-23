@@ -16,7 +16,7 @@ defmodule DashFloat.TUI do
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
 
-  @spec child_spec(term()) :: Supervisor.child_spec()
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
     %{
       id: __MODULE__,
