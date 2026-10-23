@@ -41,10 +41,16 @@ history, PageUp/PageDown scroll the log, Ctrl+Q (or Ctrl+C) quits.
 ## Development
 
 ```sh
-mix deps.get --check-locked
-mix test --warnings-as-errors
+mix deps.get
+mix ci
 ```
 
-CI runs `mix format --check-formatted`, `mix compile --warnings-as-errors`, and
-`mix test --warnings-as-errors` on every pull request and every push to `main`.
-See [AGENTS.md](AGENTS.md) for the repository conventions.
+`mix ci` is the whole gate — the same list CI runs, so local and CI cannot
+drift ([ADR 0003](docs/decisions/0003-ci-gate-and-coverage-ratchet.md)):
+format, compile with warnings as errors, `credo --strict`, `dialyzer`, and the
+test suite under ExCoveralls with a coverage floor (`coveralls.json`).
+
+CI runs it on every pull request and every push to `main`, uploads the HTML
+coverage report as an artifact, and sends the JSON report to Codecov. The
+required branch-protection check is **Wait for CI**. See
+[AGENTS.md](AGENTS.md) for the repository conventions.

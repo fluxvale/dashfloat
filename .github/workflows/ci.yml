@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   # The whole gate is `mix ci` — the same alias local devs run, so CI and
-  # local can't drift (ADR 0002).
+  # local can't drift (ADR 0003).
   ci:
     name: mix ci
     runs-on: ubuntu-latest
@@ -36,7 +36,7 @@ jobs:
 
       # Key on the *resolved* full versions (setup-beam outputs), not the
       # requested ones, so a runner patch bump busts the cache instead of
-      # restoring a binary-incompatible build (ADR 0002).
+      # restoring a binary-incompatible build (ADR 0003).
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |

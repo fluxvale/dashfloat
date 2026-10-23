@@ -8,7 +8,7 @@ Each ADR uses a lightweight Nygard-style format:
 
 - **Status** — Accepted / Superseded / Deprecated
 - **Date** — when the decision was made
-- **Context** — the forces at play and the problem being solved
+- **Context** — the forces at play and the problem to be solved
 - **Decision** — what we chose
 - **Alternatives considered** — what we rejected and why
 - **Consequences** — what this decision implies, including trade-offs
@@ -25,3 +25,4 @@ their replacement.
 | --- | ----- | ------ |
 | [0001](0001-founding-stack-and-architecture.md) | Founding stack and architecture | Accepted |
 | [0002](0002-tui-skeleton.md) | TUI skeleton: process shape, event flow, and terminal lifecycle | Accepted |
+| [0003](0003-ci-gate-and-coverage-ratchet.md) | CI gate and coverage ratchet | Accepted |
