@@ -90,7 +90,7 @@ defmodule DashFloat.TUI.State do
   @doc "Inserts pasted text at the cursor (bracketed paste)."
   def paste(%__MODULE__{input: input} = state, content) when is_binary(content) do
     ExRatatui.textarea_insert_str(input, content)
-    state
+    leave_history(state)
   end
 
   ## Key routing
@@ -244,17 +244,22 @@ defmodule DashFloat.TUI.State do
 
   @doc """
   Applies a producer-task `{:DOWN, ref, :process, _pid, reason}`. Normal exits
-  only ensure the phase is `:idle` (idempotent); abnormal exits finalize the
-  stream, log a `:system` entry explaining what happened, and return to
-  `:idle` so input keeps working. A dead producer must never brick the UI
-  (ADR 0001: failures degrade to chat messages). Returns `{state, :handled}`
-  when the ref was ours, `{state, :ignored}` otherwise.
+  only ensure the phase is `:idle` (finalizing any partial reply);
+  `:noproc` — the monitor attaching after an already-finished task — is
+  treated the same, because a producer that exits between `start_child/2`
+  returning and `Process.monitor/1` attaching cannot be distinguished from a
+  successful one after the fact (the fast demo cadence hits this window).
+  Other exits finalize the stream, log a `:system` entry explaining what
+  happened, and return to `:idle` so input keeps working — a dead producer
+  must never brick the UI (ADR 0001: failures degrade to chat messages).
+  Returns `{state, :handled}` when the ref was ours, `{state, :ignored}`
+  otherwise.
   """
   def task_down(%{task_ref: ref} = state, ref, reason) do
     state = %{state | task_ref: nil}
 
     state =
-      if reason == :normal do
+      if reason in [:normal, :noproc] do
         stream_message(state, {:phase, :idle})
       else
         stream_failed(state, reason)

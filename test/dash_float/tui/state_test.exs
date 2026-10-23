@@ -351,7 +351,23 @@ defmodule DashFloat.TUI.StateTest do
       assert state.task_ref == ref
     end
 
-    test "a normal task DOWN ensures idle without logging anything" do
+    test "a normal task DOWN finalizes a partial reply and ensures idle" do
+      ref = make_ref()
+
+      state =
+        new_state()
+        |> State.claim_task(ref)
+        |> State.stream_message({:token, "partial"})
+
+      {state, handled} = State.task_down(state, ref, :normal)
+      assert handled == :handled
+      assert state.phase == :idle
+      assert state.task_ref == nil
+      assert state.in_flight == nil
+      assert {:assistant, "partial"} in state.entries
+    end
+
+    test "a :noproc DOWN (monitor attached after a fast exit) is a success" do
       ref = make_ref()
 
       state =
@@ -359,11 +375,11 @@ defmodule DashFloat.TUI.StateTest do
         |> State.claim_task(ref)
         |> State.stream_message({:phase, :idle})
 
-      {state, handled} = State.task_down(state, ref, :normal)
+      {state, handled} = State.task_down(state, ref, :noproc)
       assert handled == :handled
       assert state.phase == :idle
-      assert state.task_ref == nil
       assert state.entries == []
+      assert state.task_ref == nil
     end
 
     test "an abnormal task DOWN degrades to idle with a system entry" do
@@ -411,6 +427,18 @@ defmodule DashFloat.TUI.StateTest do
     test "inserts multi-line text at the cursor" do
       state = new_state() |> State.paste("line one\nline two")
       assert State.input_text(state) == "line one\nline two"
+    end
+
+    test "pasting while browsing history keeps the edited text as the draft" do
+      base = new_state() |> idle_submit("prev")
+
+      {state, nil} = State.handle_key(base, "up", [])
+      state = State.paste(state, "pasted")
+      assert state.history_index == nil
+      assert State.input_text(state) == "prevpasted"
+
+      {state, nil} = State.handle_key(state, "down", [])
+      assert State.input_text(state) == "prevpasted"
     end
   end
 end

@@ -154,6 +154,28 @@ defmodule DashFloat.TUITest do
     eventually(pid, fn s -> s.phase == :streaming and State.input_text(s) == "" end)
   end
 
+  test "a fast producer never logs spurious stream failures (noproc race)" do
+    # interval_ms: 0 finishes inside the start_child→monitor window — the
+    # DOWN arrives as :noproc, which must be treated as success.
+    {:ok, pid} = start_tui(demo_stream_opts: [interval_ms: 0, sentences: 1])
+
+    Enum.each(1..3, fn i ->
+      type(pid, "q#{i}")
+      press(pid, "enter")
+
+      eventually(pid, fn s ->
+        s.phase == :idle and match?({:assistant, _}, List.last(s.entries))
+      end)
+    end)
+
+    state = get_state(pid)
+    assert state.task_ref == nil
+
+    refute Enum.any?(state.entries, fn {kind, text} ->
+             kind == :system and String.contains?(text, "stream failed")
+           end)
+  end
+
   @tag :capture_log
   test "the UI stays responsive while a stream lands at cadence into a large log" do
     {:ok, pid} = start_tui()
@@ -163,16 +185,19 @@ defmodule DashFloat.TUITest do
     eventually(pid, &(State.log_line_count(&1) == 400))
 
     # Burst coalescing with a big log: hundreds of messages, few frames.
-    burst_size = 300
+    burst = Enum.map(1..300, &"b#{&1} ")
+    burst_text = IO.iodata_to_binary(burst)
     before = Runtime.snapshot(pid).render_count
-    Enum.each(1..burst_size, fn i -> send(pid, {:token, "b#{i} "}) end)
-    eventually(pid, &String.contains?(&1.in_flight || "", "b#{burst_size} "))
+    Enum.each(burst, &send(pid, {:token, &1}))
+    eventually(pid, &(&1.in_flight == burst_text))
     assert Runtime.snapshot(pid).render_count - before < 50
 
     # Cadence phase: tokens every 2ms while the user keeps typing.
+    cadence_count = 200
+
     cadence =
       spawn(fn ->
-        Enum.each(1..200, fn _i ->
+        Enum.each(1..cadence_count, fn _i ->
           send(pid, {:token, "c"})
           Process.sleep(2)
         end)
@@ -185,13 +210,19 @@ defmodule DashFloat.TUITest do
       end)
 
     max_ms = Enum.max(timings_ms)
-    assert max_ms < 500, "input round-trips #{inspect(timings_ms)}ms while streaming at cadence"
+    assert max_ms < 100, "input round-trips #{inspect(timings_ms)}ms while streaming at cadence"
 
     ref = Process.monitor(cadence)
     assert_receive {:DOWN, ^ref, :process, ^cadence, :normal}, 2_000
 
-    state = eventually(pid, &(String.length(&1.in_flight || "") >= 500))
-    # every token landed and every keystroke was kept
+    # Exact count: every burst and cadence token landed, and every keystroke
+    # was kept — a single dropped message fails this.
+    expected = burst_text <> String.duplicate("c", cadence_count)
+
+    state =
+      eventually(pid, &(String.length(&1.in_flight || "") >= String.length(expected)))
+
+    assert state.in_flight == expected
     assert State.input_text(state) == "zzzzz"
   end
 
