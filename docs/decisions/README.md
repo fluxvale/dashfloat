@@ -24,3 +24,4 @@ their replacement.
 | ADR | Title | Status |
 | --- | ----- | ------ |
 | [0001](0001-founding-stack-and-architecture.md) | Founding stack and architecture | Accepted |
+| [0002](0002-tui-skeleton.md) | TUI skeleton: process shape, event flow, and terminal lifecycle | Accepted |

@@ -1,6 +1,4 @@
 defmodule DashFloat.Application do
-  # See https://hexdocs.pm/elixir/Application.html
-  # for more information on OTP Applications
   @moduledoc false
 
   use Application
@@ -8,13 +6,21 @@ defmodule DashFloat.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: DashFloat.Worker.start_link(arg)
-      # {DashFloat.Worker, arg}
+      {Task.Supervisor, name: DashFloat.StreamSupervisor}
+      | tui_child()
     ]
 
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
     opts = [strategy: :one_for_one, name: DashFloat.Supervisor]
     Supervisor.start_link(children, opts)
+  end
+
+  # The TUI owns the real terminal; `mix test` must never start it. Releases
+  # don't ship Mix, so the guard keeps working in production (ADR 0002).
+  defp tui_child do
+    if Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) and Mix.env() == :test do
+      []
+    else
+      [DashFloat.TUI]
+    end
   end
 end

@@ -12,10 +12,22 @@ isolated subprocess execution — with an
 
 ## Status
 
-**Pre-alpha — bootstrap.** The founding decisions are recorded in
-[ADR 0001](docs/decisions/0001-founding-stack-and-architecture.md); its roadmap
-(TUI skeleton → LLM streaming engine → tool call execution → context management
-& history persistence) is the build order. There is no product code yet.
+**Pre-alpha — Phase 1.** The TUI skeleton is in ([ADR 0002](docs/decisions/0002-tui-skeleton.md)):
+status bar, scrollable log, multi-line input with history, and a synthetic
+streaming demo. Next up per the [ADR 0001](docs/decisions/0001-founding-stack-and-architecture.md)
+roadmap: LLM streaming engine, tool call execution, context management &
+history persistence.
+
+## Run it
+
+```sh
+mix run --no-halt
+```
+
+Type a message and press Enter; a synthetic reply streams in. Shift+Enter
+inserts a newline on terminals that report enhanced key events (kitty
+protocol, modifyOtherKeys) — on others, use Alt+Enter. Up/Down walk input
+history, PageUp/PageDown scroll the log, Ctrl+Q (or Ctrl+C) quits.
 
 ## Stack
 
