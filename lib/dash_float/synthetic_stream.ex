@@ -28,6 +28,7 @@ defmodule DashFloat.SyntheticStream do
       Tests pass `1` to finish in milliseconds.
     * `:sentences` — reply sentences before the tool interlude (default all).
   """
+  @spec emit(pid(), String.t(), keyword()) :: :ok
   def emit(ui, prompt, opts \\ []) when is_pid(ui) and is_binary(prompt) do
     interval = Keyword.get(opts, :interval_ms, @default_interval_ms)
     sentences = Keyword.get(opts, :sentences, length(@reply_sentences))

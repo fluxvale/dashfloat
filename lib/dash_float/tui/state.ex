@@ -13,6 +13,7 @@ defmodule DashFloat.TUI.State do
 
   @type phase :: :idle | :streaming | :executing_tool
   @type entry_kind :: :user | :assistant | :tool | :system
+  @type action :: :quit | {:submit, String.t()} | nil
 
   @max_history 500
   @default_size {80, 24}
@@ -50,6 +51,15 @@ defmodule DashFloat.TUI.State do
           task_ref: reference() | nil
         }
 
+  @typedoc """
+  One message of the stream contract (see `stream_message/2` and ADR 0002).
+  """
+  @type stream_msg ::
+          {:token, String.t()}
+          | {:phase, :streaming}
+          | {:phase, :executing_tool | :idle}
+          | {:entry, :tool | :system, String.t()}
+
   ## Construction
 
   @doc """
@@ -57,6 +67,7 @@ defmodule DashFloat.TUI.State do
   the size comes from the opts; live, it is read from the terminal (falling
   back to 80x24 without a TTY) and kept fresh by later Resize events.
   """
+  @spec new(keyword()) :: t()
   def new(opts) do
     %__MODULE__{
       input: ExRatatui.textarea_new(),
@@ -74,7 +85,7 @@ defmodule DashFloat.TUI.State do
       nil ->
         case ExRatatui.terminal_size() do
           {w, h} when is_integer(w) and is_integer(h) -> {w, h}
-          {:error, _} -> @default_size
+          {:error, _reason} -> @default_size
         end
     end
   end
@@ -82,12 +93,15 @@ defmodule DashFloat.TUI.State do
   ## Input draft
 
   @doc "Current draft text (lines joined with `\\n`)."
+  @spec input_text(t()) :: String.t()
   def input_text(%__MODULE__{input: input}), do: ExRatatui.textarea_get_value(input)
 
   @doc "Number of lines in the draft."
+  @spec input_line_count(t()) :: non_neg_integer()
   def input_line_count(%__MODULE__{input: input}), do: ExRatatui.textarea_line_count(input)
 
   @doc "Inserts pasted text at the cursor (bracketed paste)."
+  @spec paste(t(), String.t()) :: t()
   def paste(%__MODULE__{input: input} = state, content) when is_binary(content) do
     ExRatatui.textarea_insert_str(input, content)
     leave_history(state)
@@ -99,6 +113,7 @@ defmodule DashFloat.TUI.State do
   Routes one key event. Modifiers arrive as `ExRatatui` strings
   (`["ctrl"]`, `["shift"]`, ...). Returns `{state, action}`.
   """
+  @spec handle_key(t(), String.t(), [String.t()]) :: {t(), action()}
   def handle_key(state, code, modifiers)
 
   # Quit (raw mode turns Ctrl+C into a key event, not SIGINT).
@@ -111,15 +126,15 @@ defmodule DashFloat.TUI.State do
   def handle_key(state, "enter", ["alt"]), do: forward(state, "enter", [])
 
   # Log scrolling.
-  def handle_key(state, "page_up", _), do: {page_up(state), nil}
-  def handle_key(state, "page_down", _), do: {page_down(state), nil}
+  def handle_key(state, "page_up", _modifiers), do: {page_up(state), nil}
+  def handle_key(state, "page_down", _modifiers), do: {page_down(state), nil}
 
   # History-aware Up/Down: history only at the draft's row boundaries.
-  def handle_key(state, "up", _) do
+  def handle_key(state, "up", _modifiers) do
     if on_first_row?(state), do: {history_prev(state), nil}, else: forward(state, "up", [])
   end
 
-  def handle_key(state, "down", _) do
+  def handle_key(state, "down", _modifiers) do
     if on_last_row?(state), do: {history_next(state), nil}, else: forward(state, "down", [])
   end
 
@@ -143,12 +158,12 @@ defmodule DashFloat.TUI.State do
   end
 
   defp on_first_row?(state) do
-    {row, _} = ExRatatui.textarea_cursor(state.input)
+    {row, _col} = ExRatatui.textarea_cursor(state.input)
     row == 0
   end
 
   defp on_last_row?(state) do
-    {row, _} = ExRatatui.textarea_cursor(state.input)
+    {row, _col} = ExRatatui.textarea_cursor(state.input)
     row == ExRatatui.textarea_line_count(state.input) - 1
   end
 
@@ -160,6 +175,7 @@ defmodule DashFloat.TUI.State do
   draft is blank or a request is already in flight (one at a time; queueing is
   Phase 2).
   """
+  @spec submit(t()) :: {t(), {:submit, String.t()} | nil}
   def submit(%__MODULE__{} = state) do
     text = input_text(state)
 
@@ -183,7 +199,7 @@ defmodule DashFloat.TUI.State do
       if state.history != [] and List.last(state.history) == text do
         state.history
       else
-        (state.history ++ [text]) |> Enum.take(-@max_history)
+        Enum.take(state.history ++ [text], -@max_history)
       end
 
     %{state | history: history, history_index: nil, draft: ""}
@@ -210,6 +226,7 @@ defmodule DashFloat.TUI.State do
   Messages that violate the contract have no matching clause and crash —
   contract violations are bugs.
   """
+  @spec stream_message(t(), stream_msg()) :: t()
   def stream_message(state, {:token, text}) when is_binary(text) do
     %{state | in_flight: (state.in_flight || "") <> text}
   end
@@ -229,8 +246,11 @@ defmodule DashFloat.TUI.State do
   defp finalize_in_flight(%{in_flight: in_flight} = state) when in_flight in [nil, ""],
     do: %{state | in_flight: nil}
 
-  defp finalize_in_flight(%{in_flight: in_flight} = state),
-    do: state |> append_entry(:assistant, in_flight) |> Map.put(:in_flight, nil)
+  defp finalize_in_flight(%{in_flight: in_flight} = state) do
+    state
+    |> append_entry(:assistant, in_flight)
+    |> Map.put(:in_flight, nil)
+  end
 
   defp append_entry(state, kind, text) do
     text = String.trim_trailing(text, "\n")
@@ -240,6 +260,7 @@ defmodule DashFloat.TUI.State do
   ## Producer-task monitoring
 
   @doc "Records the monitor ref of the producer Task started for this stream."
+  @spec claim_task(t(), reference()) :: t()
   def claim_task(state, ref) when is_reference(ref), do: %{state | task_ref: ref}
 
   @doc """
@@ -255,14 +276,15 @@ defmodule DashFloat.TUI.State do
   Returns `{state, :handled}` when the ref was ours, `{state, :ignored}`
   otherwise.
   """
+  @spec task_down(t(), reference(), term()) :: {t(), :handled | :ignored}
   def task_down(%{task_ref: ref} = state, ref, reason) do
-    state = %{state | task_ref: nil}
+    cleared = %{state | task_ref: nil}
 
     state =
       if reason in [:normal, :noproc] do
-        stream_message(state, {:phase, :idle})
+        stream_message(cleared, {:phase, :idle})
       else
-        stream_failed(state, reason)
+        stream_failed(cleared, reason)
       end
 
     {state, :handled}
@@ -271,13 +293,18 @@ defmodule DashFloat.TUI.State do
   def task_down(state, _other_ref, _reason), do: {state, :ignored}
 
   @doc "Degrades to `:idle` with a `:system` entry explaining the failure."
+  @spec stream_failed(t(), term()) :: t()
   def stream_failed(state, reason) do
     state
     |> stream_message({:entry, :system, "[stream failed: #{format_reason(reason)}]"})
     |> stream_message({:phase, :idle})
   end
 
-  defp format_reason(reason), do: reason |> inspect() |> String.slice(0, 120)
+  defp format_reason(reason) do
+    reason
+    |> inspect()
+    |> String.slice(0, 120)
+  end
 
   ## History navigation
 
@@ -311,7 +338,11 @@ defmodule DashFloat.TUI.State do
   defp maybe_save_draft(state), do: state
 
   defp set_history_index(state, index) do
-    text = state.history |> Enum.reverse() |> Enum.at(index)
+    text =
+      state.history
+      |> Enum.reverse()
+      |> Enum.at(index)
+
     set_draft(state, text)
     %{state | history_index: index}
   end
@@ -323,15 +354,22 @@ defmodule DashFloat.TUI.State do
   end
 
   defp move_cursor_to_end(input, text) do
-    lines = text |> String.split("\n") |> length()
+    lines =
+      text
+      |> String.split("\n")
+      |> length()
+
     # set_value leaves the cursor at {0, 0}; walk to the last line, then end.
-    (List.duplicate("down", max(lines - 1, 0)) ++ ["end"])
-    |> Enum.each(&ExRatatui.textarea_handle_key(input, &1, []))
+    Enum.each(
+      List.duplicate("down", max(lines - 1, 0)) ++ ["end"],
+      &ExRatatui.textarea_handle_key(input, &1, [])
+    )
   end
 
   ## Scrolling
 
   @doc "Total display lines in the log (entries plus any in-flight entry)."
+  @spec log_line_count(t()) :: non_neg_integer()
   def log_line_count(%{entries: entries, in_flight: in_flight}) do
     # Count via :binary.matches — avoids String.split's per-line list building
     # on the hot render path.
@@ -350,6 +388,7 @@ defmodule DashFloat.TUI.State do
   Effective scroll offset for a viewport of `height` lines: the intent
   clamped to the content. When following, it is pinned to the bottom.
   """
+  @spec effective_scroll(t(), non_neg_integer()) :: non_neg_integer()
   def effective_scroll(state, height) when is_integer(height) and height >= 0 do
     total = log_line_count(state)
     max_offset = max(total - height, 0)
@@ -391,6 +430,7 @@ defmodule DashFloat.TUI.State do
   ## Resize
 
   @doc "Records the new terminal size; scroll intents stay and are clamped at render."
+  @spec resize(t(), integer(), integer()) :: t()
   def resize(state, width, height) when is_integer(width) and is_integer(height),
     do: %{state | size: {max(width, 1), max(height, 1)}}
 end

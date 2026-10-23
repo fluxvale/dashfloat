@@ -5,20 +5,34 @@ defmodule DashFloat.TUI.StateTest do
   alias DashFloat.TUI.State
 
   defp new_state(opts \\ []) do
-    State.new(Keyword.merge([test_mode: {80, 24}], opts))
+    [test_mode: {80, 24}]
+    |> Keyword.merge(opts)
+    |> State.new()
   end
 
   defp type(state, text) do
-    Enum.reduce(String.codepoints(text), state, fn c, acc ->
+    points = String.codepoints(text)
+
+    Enum.reduce(points, state, fn c, acc ->
       {acc, nil} = State.handle_key(acc, c, [])
       acc
     end)
   end
 
+  # Sends the key asserting it produces no action; returns the new state.
+  defp press(state, code, modifiers) do
+    {state, nil} = State.handle_key(state, code, modifiers)
+    state
+  end
+
   # Submits text and returns the state with the phase forced back to idle
   # (mid-stream submits are refused by design).
   defp idle_submit(state, text) do
-    {state, action} = state |> type(text) |> State.handle_key("enter", [])
+    {state, action} =
+      state
+      |> type(text)
+      |> State.handle_key("enter", [])
+
     assert {:submit, ^text} = action
     Map.put(state, :phase, :idle)
   end
@@ -43,8 +57,8 @@ defmodule DashFloat.TUI.StateTest do
 
   describe "handle_key/3 — quit" do
     test "Ctrl+C and Ctrl+Q quit" do
-      assert {_, :quit} = new_state() |> State.handle_key("c", ["ctrl"])
-      assert {_, :quit} = new_state() |> State.handle_key("q", ["ctrl"])
+      assert {_state, :quit} = State.handle_key(new_state(), "c", ["ctrl"])
+      assert {_state, :quit} = State.handle_key(new_state(), "q", ["ctrl"])
     end
 
     test "plain c and q type" do
@@ -55,8 +69,11 @@ defmodule DashFloat.TUI.StateTest do
 
   describe "handle_key/3 — enter semantics" do
     test "Enter submits the draft" do
-      state = type(new_state(), "hello")
-      {state, action} = State.handle_key(state, "enter", [])
+      {state, action} =
+        new_state()
+        |> type("hello")
+        |> State.handle_key("enter", [])
+
       assert {:submit, "hello"} = action
       assert State.input_text(state) == ""
       assert state.entries == [{:user, "hello"}]
@@ -71,34 +88,40 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "Shift+Enter and Alt+Enter insert newlines" do
-      state = type(new_state(), "one")
-      {state, nil} = State.handle_key(state, "enter", ["shift"])
-      state = type(state, "two")
-      # cursor sits at the end, so Alt+Enter appends a trailing newline
-      {state, nil} = State.handle_key(state, "enter", ["alt"])
+      state =
+        new_state()
+        |> type("one")
+        |> press("enter", ["shift"])
+        |> type("two")
+        # cursor sits at the end, so Alt+Enter appends a trailing newline
+        |> press("enter", ["alt"])
+
       assert State.input_text(state) == "one\ntwo\n"
       assert State.input_line_count(state) == 3
     end
 
     test "blank and whitespace-only drafts do not submit" do
-      {state, nil} = new_state() |> State.handle_key("enter", [])
-      assert state.entries == []
+      {empty, nil} = State.handle_key(new_state(), "enter", [])
+      assert empty.entries == []
 
-      {state, nil} =
+      {blank, nil} =
         new_state()
         |> type("  ")
         |> State.handle_key("enter", [])
 
-      assert state.entries == []
-      assert state.phase == :idle
+      assert blank.entries == []
+      assert blank.phase == :idle
     end
 
     test "submit is refused while a request is in flight" do
-      state = idle_submit(new_state(), "first")
-      # put ourselves back into a streaming phase
-      state = Map.put(state, :phase, :streaming)
-      state = type(state, "second")
-      {state, action} = State.handle_key(state, "enter", [])
+      streaming =
+        new_state()
+        |> idle_submit("first")
+        # put ourselves back into a streaming phase
+        |> Map.put(:phase, :streaming)
+        |> type("second")
+
+      {state, action} = State.handle_key(streaming, "enter", [])
       assert action == nil
       assert state.entries == [{:user, "first"}]
       assert State.input_text(state) == "second"
@@ -107,84 +130,98 @@ defmodule DashFloat.TUI.StateTest do
 
   describe "handle_key/3 — history-aware Up/Down" do
     test "Up on the first row enters history; Down on the last row leaves it" do
-      base = new_state() |> idle_submit("one") |> idle_submit("two")
+      base =
+        new_state()
+        |> idle_submit("one")
+        |> idle_submit("two")
 
-      {state, nil} = State.handle_key(base, "up", [])
-      assert state.history_index == 0
-      assert State.input_text(state) == "two"
+      {up_one, nil} = State.handle_key(base, "up", [])
+      assert up_one.history_index == 0
+      assert State.input_text(up_one) == "two"
 
-      {state, nil} = State.handle_key(state, "up", [])
-      assert state.history_index == 1
-      assert State.input_text(state) == "one"
+      {up_two, nil} = State.handle_key(up_one, "up", [])
+      assert up_two.history_index == 1
+      assert State.input_text(up_two) == "one"
 
-      {state, nil} = State.handle_key(state, "down", [])
-      assert state.history_index == 0
-      assert State.input_text(state) == "two"
+      {down_one, nil} = State.handle_key(up_two, "down", [])
+      assert down_one.history_index == 0
+      assert State.input_text(down_one) == "two"
 
-      {state, nil} = State.handle_key(state, "down", [])
-      assert state.history_index == nil
-      assert State.input_text(state) == ""
+      {down_two, nil} = State.handle_key(down_one, "down", [])
+      assert down_two.history_index == nil
+      assert State.input_text(down_two) == ""
     end
 
     test "the pre-navigation draft is restored" do
-      base = new_state() |> idle_submit("kept") |> type("dra")
+      base =
+        new_state()
+        |> idle_submit("kept")
+        |> type("dra")
 
-      {state, nil} = State.handle_key(base, "up", [])
-      assert State.input_text(state) == "kept"
+      {browsing, nil} = State.handle_key(base, "up", [])
+      assert State.input_text(browsing) == "kept"
 
-      {state, nil} = State.handle_key(state, "down", [])
-      assert State.input_text(state) == "dra"
+      {restored, nil} = State.handle_key(browsing, "down", [])
+      assert State.input_text(restored) == "dra"
     end
 
     test "Up inside a multi-line draft moves the cursor, not history" do
-      state = type(new_state(), "one")
-      {state, nil} = State.handle_key(state, "enter", ["shift"])
-      state = type(state, "two")
+      state =
+        new_state()
+        |> type("one")
+        |> press("enter", ["shift"])
+        |> type("two")
+        |> press("up", [])
 
-      {state, nil} = State.handle_key(state, "up", [])
       assert state.history_index == nil
       assert State.input_text(state) == "one\ntwo"
     end
 
     test "Up with empty history is a no-op" do
-      {state, nil} = new_state() |> State.handle_key("up", [])
+      {state, nil} = State.handle_key(new_state(), "up", [])
       assert state.history_index == nil
     end
 
     test "Down at the last row with live draft is a no-op" do
-      {state, nil} = new_state() |> State.handle_key("down", [])
+      {state, nil} = State.handle_key(new_state(), "down", [])
       assert state.history_index == nil
     end
 
     test "editing while browsing history keeps the edited text as the draft" do
-      base = new_state() |> idle_submit("prev")
+      base = idle_submit(new_state(), "prev")
 
-      {state, nil} = State.handle_key(base, "up", [])
-      assert State.input_text(state) == "prev"
+      {browsing, nil} = State.handle_key(base, "up", [])
+      assert State.input_text(browsing) == "prev"
 
-      {state, nil} = State.handle_key(state, "x", [])
-      assert state.history_index == nil
-      assert State.input_text(state) == "prevx"
+      {edited, nil} = State.handle_key(browsing, "x", [])
+      assert edited.history_index == nil
+      assert State.input_text(edited) == "prevx"
 
       # Down no longer discards the edit
-      {state, nil} = State.handle_key(state, "down", [])
-      assert State.input_text(state) == "prevx"
+      {after_down, nil} = State.handle_key(edited, "down", [])
+      assert State.input_text(after_down) == "prevx"
     end
 
     test "consecutive duplicate submits are not stored twice" do
-      state = new_state() |> idle_submit("same") |> idle_submit("same")
+      state =
+        new_state()
+        |> idle_submit("same")
+        |> idle_submit("same")
+
       assert state.history == ["same"]
     end
 
     test "history is capped at 500 entries" do
-      state = %{new_state() | history: Enum.map(1..500, &"h#{&1}")}
-      {state, _} = submit(state, "new")
+      seeded = %{new_state() | history: Enum.map(1..500, &"h#{&1}")}
+      {state, _action} = submit(seeded, "new")
       assert length(state.history) == 500
       assert List.last(state.history) == "new"
     end
 
     defp submit(state, text) do
-      state |> type(text) |> State.handle_key("enter", [])
+      state
+      |> type(text)
+      |> State.handle_key("enter", [])
     end
   end
 
@@ -224,9 +261,9 @@ defmodule DashFloat.TUI.StateTest do
       assert state.in_flight == nil
       assert state.phase == :executing_tool
 
-      state = State.stream_message(state, {:phase, :idle})
-      assert state.phase == :idle
-      assert state.entries == [{:assistant, "one\ntwo"}]
+      idle = State.stream_message(state, {:phase, :idle})
+      assert idle.phase == :idle
+      assert idle.entries == [{:assistant, "one\ntwo"}]
     end
 
     test "tool and system entries append as complete entries" do
@@ -239,25 +276,26 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "contract violations crash instead of corrupting state" do
-      # Built dynamically so the compile-time type checker cannot narrow them
-      # into an "impossible input" warning — these are runtime garbage.
-      bogus = String.to_atom("bogus")
-      not_binary = String.to_atom("not_binary")
-      user = String.to_atom("user")
+      # Tuples assembled at runtime via List.to_tuple so the compile-time type
+      # checker cannot narrow the call into an "impossible input" warning —
+      # the payloads are runtime garbage.
+      bogus = :bogus
+      not_binary = :not_binary
+      user = :user
       bad_phase = List.to_tuple([:phase, bogus])
       bad_token = List.to_tuple([:token, not_binary])
       bad_entry = List.to_tuple([:entry, user, "not allowed via messages"])
 
       assert_raise FunctionClauseError, fn ->
-        new_state() |> State.stream_message(bad_phase)
+        State.stream_message(new_state(), bad_phase)
       end
 
       assert_raise FunctionClauseError, fn ->
-        new_state() |> State.stream_message(bad_token)
+        State.stream_message(new_state(), bad_token)
       end
 
       assert_raise FunctionClauseError, fn ->
-        new_state() |> State.stream_message(bad_entry)
+        State.stream_message(new_state(), bad_entry)
       end
     end
   end
@@ -270,24 +308,24 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "empty log: offsets are zero and page_up keeps following" do
-      {state, nil} = new_state() |> State.handle_key("page_up", [])
+      {state, nil} = State.handle_key(new_state(), "page_up", [])
       assert state.follow?
       assert State.effective_scroll(state, 20) == 0
     end
 
     test "page_up on a viewport-sized log is a no-op (stays pinned)" do
-      state = full_state(20)
-      {state, nil} = State.handle_key(state, "page_up", [])
-      assert state.follow?
-      assert State.effective_scroll(state, 20) == 0
+      base = full_state(20)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      assert paged.follow?
+      assert State.effective_scroll(paged, 20) == 0
     end
 
     test "submit re-pins the log so the new reply is visible" do
-      state = full_state(100)
-      {state, nil} = State.handle_key(state, "page_up", [])
-      refute state.follow?
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      refute paged.follow?
 
-      state = idle_submit(state, "next question")
+      state = idle_submit(paged, "next question")
       assert state.follow?
       # 100 log lines + the new user entry = 101; bottom is 101 - 20
       assert State.effective_scroll(state, 20) == 81
@@ -296,37 +334,37 @@ defmodule DashFloat.TUI.StateTest do
     test "follow pins to the bottom as content grows" do
       state = full_state(50)
       assert State.effective_scroll(state, 20) == 30
-      state = State.stream_message(state, {:entry, :system, "more"})
-      assert State.effective_scroll(state, 20) == 31
+      grown = State.stream_message(state, {:entry, :system, "more"})
+      assert State.effective_scroll(grown, 20) == 31
     end
 
     test "page_up unfollows and pages back; page_down re-pins at the bottom" do
-      state = full_state(100)
-      {state, nil} = State.handle_key(state, "page_up", [])
-      refute state.follow?
-      assert State.effective_scroll(state, 20) == 60
+      base = full_state(100)
+      {up_one, nil} = State.handle_key(base, "page_up", [])
+      refute up_one.follow?
+      assert State.effective_scroll(up_one, 20) == 60
 
-      {state, nil} = State.handle_key(state, "page_up", [])
-      assert State.effective_scroll(state, 20) == 40
+      {up_two, nil} = State.handle_key(up_one, "page_up", [])
+      assert State.effective_scroll(up_two, 20) == 40
 
-      {state, nil} = State.handle_key(state, "page_down", [])
-      assert State.effective_scroll(state, 20) == 60
+      {down_one, nil} = State.handle_key(up_two, "page_down", [])
+      assert State.effective_scroll(down_one, 20) == 60
 
-      {state, nil} = State.handle_key(state, "page_down", [])
-      assert state.follow?
-      assert State.effective_scroll(state, 20) == 80
+      {down_two, nil} = State.handle_key(down_one, "page_down", [])
+      assert down_two.follow?
+      assert State.effective_scroll(down_two, 20) == 80
     end
 
     test "new content does not move an unfollowed view, but clamping still holds" do
-      state = full_state(100)
-      {state, nil} = State.handle_key(state, "page_up", [])
-      offset = State.effective_scroll(state, 20)
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      offset = State.effective_scroll(paged, 20)
 
-      state = State.stream_message(state, {:entry, :system, "more"})
-      assert State.effective_scroll(state, 20) == offset
+      grown = State.stream_message(paged, {:entry, :system, "more"})
+      assert State.effective_scroll(grown, 20) == offset
 
       # shrink the viewport: the intent clamps to the new maximum
-      assert State.effective_scroll(state, 10) <= 91
+      assert State.effective_scroll(grown, 10) <= 91
     end
 
     test "stale scroll intents clamp to content" do
@@ -347,7 +385,7 @@ defmodule DashFloat.TUI.StateTest do
   describe "task monitoring" do
     test "claim_task records the monitor ref" do
       ref = make_ref()
-      state = new_state() |> State.claim_task(ref)
+      state = State.claim_task(new_state(), ref)
       assert state.task_ref == ref
     end
 
@@ -359,12 +397,12 @@ defmodule DashFloat.TUI.StateTest do
         |> State.claim_task(ref)
         |> State.stream_message({:token, "partial"})
 
-      {state, handled} = State.task_down(state, ref, :normal)
+      {after_down, handled} = State.task_down(state, ref, :normal)
       assert handled == :handled
-      assert state.phase == :idle
-      assert state.task_ref == nil
-      assert state.in_flight == nil
-      assert {:assistant, "partial"} in state.entries
+      assert after_down.phase == :idle
+      assert after_down.task_ref == nil
+      assert after_down.in_flight == nil
+      assert {:assistant, "partial"} in after_down.entries
     end
 
     test "a :noproc DOWN (monitor attached after a fast exit) is a success" do
@@ -375,11 +413,11 @@ defmodule DashFloat.TUI.StateTest do
         |> State.claim_task(ref)
         |> State.stream_message({:phase, :idle})
 
-      {state, handled} = State.task_down(state, ref, :noproc)
+      {after_down, handled} = State.task_down(state, ref, :noproc)
       assert handled == :handled
-      assert state.phase == :idle
-      assert state.entries == []
-      assert state.task_ref == nil
+      assert after_down.phase == :idle
+      assert after_down.entries == []
+      assert after_down.task_ref == nil
     end
 
     test "an abnormal task DOWN degrades to idle with a system entry" do
@@ -390,55 +428,55 @@ defmodule DashFloat.TUI.StateTest do
         |> State.claim_task(ref)
         |> State.stream_message({:token, "partial reply"})
 
-      {state, handled} = State.task_down(state, ref, :killed)
+      {after_down, handled} = State.task_down(state, ref, :killed)
       assert handled == :handled
-      assert state.task_ref == nil
-      assert state.phase == :idle
+      assert after_down.task_ref == nil
+      assert after_down.phase == :idle
       # the partial reply is kept as an assistant entry, then explained
-      assert {:assistant, "partial reply"} in state.entries
+      assert {:assistant, "partial reply"} in after_down.entries
 
-      assert Enum.any?(state.entries, fn {kind, text} ->
+      assert Enum.any?(after_down.entries, fn {kind, text} ->
                kind == :system and text =~ "stream failed"
              end)
     end
 
     test "a foreign DOWN ref is ignored" do
-      state = new_state() |> State.claim_task(make_ref())
-      {state, handled} = State.task_down(state, make_ref(), :killed)
+      state = State.claim_task(new_state(), make_ref())
+      {after_down, handled} = State.task_down(state, make_ref(), :killed)
       assert handled == :ignored
-      assert state.phase == :idle
-      assert state.entries == []
+      assert after_down.phase == :idle
+      assert after_down.entries == []
     end
   end
 
   describe "resize/3" do
     test "records the new size" do
-      state = new_state() |> State.resize(120, 40)
+      state = State.resize(new_state(), 120, 40)
       assert state.size == {120, 40}
     end
 
     test "degenerate sizes clamp to 1x1" do
-      state = new_state() |> State.resize(0, -3)
+      state = State.resize(new_state(), 0, -3)
       assert state.size == {1, 1}
     end
   end
 
   describe "paste/2" do
     test "inserts multi-line text at the cursor" do
-      state = new_state() |> State.paste("line one\nline two")
+      state = State.paste(new_state(), "line one\nline two")
       assert State.input_text(state) == "line one\nline two"
     end
 
     test "pasting while browsing history keeps the edited text as the draft" do
-      base = new_state() |> idle_submit("prev")
+      base = idle_submit(new_state(), "prev")
 
-      {state, nil} = State.handle_key(base, "up", [])
-      state = State.paste(state, "pasted")
-      assert state.history_index == nil
-      assert State.input_text(state) == "prevpasted"
+      {browsing, nil} = State.handle_key(base, "up", [])
+      pasted = State.paste(browsing, "pasted")
+      assert pasted.history_index == nil
+      assert State.input_text(pasted) == "prevpasted"
 
-      {state, nil} = State.handle_key(state, "down", [])
-      assert State.input_text(state) == "prevpasted"
+      {after_down, nil} = State.handle_key(pasted, "down", [])
+      assert State.input_text(after_down) == "prevpasted"
     end
   end
 end
