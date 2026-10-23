@@ -146,6 +146,14 @@ defmodule DashFloat.TUI.ViewTest do
       assert flatten(first) =~ "❯ hello"
     end
 
+    test "multi-line user entries prefix the first line and indent continuations" do
+      state = State.stream_message(new_state(), {:entry, :system, "x"})
+      with_user = put_in(state.entries, [{:user, "line one\nline two"}])
+      [first, second | _rest] = log_lines(with_user)
+      assert flatten(first) =~ "❯ line one"
+      assert flatten(second) =~ "  line two"
+    end
+
     test "very long entries do not break rendering" do
       long = String.duplicate("x", 5_000)
       state = State.stream_message(new_state(), {:entry, :system, long})
