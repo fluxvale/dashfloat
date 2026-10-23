@@ -60,8 +60,11 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
   defp system_entries(messages), do: for({:entry, :system, text} <- messages, do: text)
 
+  # A pre-flight rejection can finish before the monitor attaches, so the DOWN
+  # arrives as :noproc — the same race State.task_down/3 documents.
   defp await_exit(ref) do
-    assert_receive {:DOWN, ^ref, :process, _pid, :normal}, 2_000
+    assert_receive {:DOWN, ^ref, :process, _pid, reason}, 2_000
+    assert reason in [:normal, :noproc]
   end
 
   test "happy path streams tokens in order, finalizes with idle, exits normal" do
