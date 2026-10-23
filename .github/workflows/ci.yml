@@ -14,25 +14,94 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: mix format, compile, test
+  # The whole gate is `mix ci` — the same alias local devs run, so CI and
+  # local can't drift (ADR 0003).
+  ci:
+    name: mix ci
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
-      # actions pinned to commit — mutable tags execute unreviewed code
+      # actions pinned to commit — mutable tags execute unreviewed code.
+      # persist-credentials: false — mix ci runs PR-controlled code; the
+      # default persisted token would be readable by it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        id: setup-beam
         with:
           elixir-version: "1.20.x"
           otp-version: "29"
+
+      # Key on the *resolved* full versions (setup-beam outputs), not the
+      # requested ones, so a runner patch bump busts the cache instead of
+      # restoring a binary-incompatible build (ADR 0003).
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             deps
             _build
-          key: mix-${{ runner.os }}-otp29-elixir120x-${{ hashFiles('mix.lock') }}
-          restore-keys: mix-${{ runner.os }}-otp29-elixir120x-
-      - run: mix deps.get --check-locked
-      - run: mix format --check-formatted
-      - run: mix compile --warnings-as-errors
-      - run: mix test --warnings-as-errors
+          key: ${{ runner.os }}-mix-${{ steps.setup-beam.outputs.elixir-version }}-${{ steps.setup-beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-${{ steps.setup-beam.outputs.elixir-version }}-${{ steps.setup-beam.outputs.otp-version }}-
+
+      # Separate PLT cache, same resolved-version keying: a PLT is a binary
+      # tied to the exact OTP patch — a stale restore crashes dialyzer with
+      # "Old PLT file". Two paths: the project PLT lives in priv/plts, the
+      # Erlang/Elixir *core* PLTs live in MIX_HOME (~/.mix) — without the
+      # second, a fresh runner rebuilds them on every run.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            priv/plts
+            ~/.mix/*.plt
+          key: ${{ runner.os }}-dialyzer-${{ steps.setup-beam.outputs.elixir-version }}-${{ steps.setup-beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-dialyzer-${{ steps.setup-beam.outputs.elixir-version }}-${{ steps.setup-beam.outputs.otp-version }}-
+
+      # No `mix deps.get` bootstrap: `deps.get --check-locked` (first step of
+      # mix ci) fetches the deps itself AND verifies mix.lock. A plain
+      # deps.get first would silently rewrite a stale lock, leaving the
+      # check-locked gate passing on a lockfile it just repaired.
+      - run: mix ci
+
+      # The report stays inspectable when the coverage floor reds.
+      - name: Upload coverage HTML
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report
+          path: cover/
+          # Re-runs of the same workflow run find the name already taken
+          overwrite: true
+
+      # fail_ci_if_error: the v2 upload watchdog — a codecov.io outage reds
+      # this step rather than silently dropping coverage. Fork PRs get no
+      # secrets (so no token), and with fail_ci_if_error that would red every
+      # external contribution: upload only for same-repo refs.
+      - name: Upload coverage to Codecov
+        if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          flags: dashfloat
+          files: cover/excoveralls.json
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+
+  # The umbrella: branch protection requires THIS check. Runs regardless of
+  # the gate's outcome — "skipped" is accepted for future path-gated jobs.
+  wait-for-ci:
+    name: Wait for CI
+    needs: [ci]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -e 'to_entries | map("\(.key): \(.value.result)") | .[]' >&2
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' >/dev/null \
+            && echo "All CI checks passed or were not needed" \
+            || { echo "One or more CI jobs failed or were cancelled"; exit 1; }

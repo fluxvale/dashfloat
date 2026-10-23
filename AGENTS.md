@@ -68,10 +68,10 @@ Planning and task tracking live in GitHub issues at
 - **Re-review deltas.** Any commit pushed after the hostile review — including
   fixes it demanded — gets a delta re-check (same reviewer, fresh diff) before
   the merge is requested. A green CI run is not a review.
-- **Run CI locally.** Run the exact checks CI runs —
-  `mix deps.get --check-locked`, `mix format --check-formatted`,
-  `mix compile --warnings-as-errors`, `mix test --warnings-as-errors` — and
-  make them pass before opening a PR. CI is the last check, never the first.
+- **Run CI locally.** Run `mix ci` — the exact gate list CI runs, one
+  command, so local and CI cannot drift — and make it pass before opening a
+  PR. The required GitHub check is **Wait for CI**. CI is the last check,
+  never the first.
 
 ### 5. Commits and PR titles
 

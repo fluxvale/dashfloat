@@ -123,23 +123,29 @@ defmodule DashFloat.TUI.View do
         if skipped + n <= offset do
           {:cont, {skipped + n, acc}}
         else
-          taken =
-            pair
-            |> entry_lines()
-            |> Enum.drop(max(offset - skipped, 0))
-            |> Enum.take(height - length(acc))
-
-          acc = acc ++ taken
-
-          if length(acc) >= height do
-            {:halt, {skipped, acc}}
-          else
-            {:cont, {skipped + n, acc}}
-          end
+          take_window(pair, skipped, n, acc, offset, height)
         end
       end)
 
     acc
+  end
+
+  # Windowing step of log_lines/3: build Lines for the first entry that
+  # intersects [offset, offset + height) and report whether the walk is done.
+  defp take_window(pair, skipped, n, acc, offset, height) do
+    taken =
+      pair
+      |> entry_lines()
+      |> Enum.drop(max(offset - skipped, 0))
+      |> Enum.take(height - length(acc))
+
+    acc = acc ++ taken
+
+    if length(acc) >= height do
+      {:halt, {skipped, acc}}
+    else
+      {:cont, {skipped + n, acc}}
+    end
   end
 
   defp line_count(text), do: length(:binary.matches(text, "\n")) + 1

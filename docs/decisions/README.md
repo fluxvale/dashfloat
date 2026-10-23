@@ -25,3 +25,4 @@ their replacement.
 | --- | ----- | ------ |
 | [0001](0001-founding-stack-and-architecture.md) | Founding stack and architecture | Accepted |
 | [0002](0002-tui-skeleton.md) | TUI skeleton: process shape, event flow, and terminal lifecycle | Accepted |
+| [0003](0003-ci-gate-and-coverage-ratchet.md) | CI gate and coverage ratchet | Accepted |
