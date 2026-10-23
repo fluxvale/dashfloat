@@ -5,7 +5,7 @@ defmodule DashFloat.MixProject do
     [
       app: :dash_float,
       version: "0.0.0",
-      elixir: "1.20.4",
+      elixir: "~> 1.20.0",
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]
