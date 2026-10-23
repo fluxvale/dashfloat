@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-23
+- **Implements:** [issue #5](https://github.com/fluxvale/dashfloat/issues/5).
 
 ## Context
 
@@ -16,18 +17,25 @@ than retrofitted over a grown codebase.
 
 **One gate alias.** `mix ci` in `mix.exs` is the single list of checks, and CI
 invokes only that alias — never the steps individually. Locally, `mix ci` is the
-same command (all CI-grade tasks are pinned to `:test` via
-`cli/preferred_envs`, so a dev-env invocation works). Checks: `deps.get
+same command: the alias is pinned to `:test` via `cli/preferred_envs`, so a
+dev-env invocation works without a `MIX_ENV` prefix. Checks: `deps.get
 --check-locked`, `format --check-formatted`, `compile --warnings-as-errors`,
 `credo --strict`, `dialyzer`, `coveralls.multiple --type json --type html`.
+
+`deps.get --check-locked` fetches a missing `deps/` itself, so CI has no
+`mix deps.get` bootstrap step: a plain `deps.get` first would silently rewrite
+a stale lock, leaving the check-locked gate passing on a lockfile it just
+repaired.
 
 **Cache keying on resolved versions.** Both caches key on setup-beam's
 `elixir-version`/`otp-version` outputs — the versions actually installed — not
 the requested `"1.20.x"`/`"29"` strings, plus `hashFiles('mix.lock')`. A runner
 patch bump therefore busts the cache instead of restoring a binary-incompatible
-build. Dialyzer's PLT gets a separate cache (`dialyzer-` prefix, `priv/plts`):
-a PLT is a binary tied to the exact OTP patch, and a stale restore fails with
-"Old PLT file".
+build. Dialyzer's PLTs get a separate cache (`dialyzer-` prefix): the project
+PLT in `priv/plts` and the Erlang/Elixir core PLTs in `~/.mix` — a PLT is a
+binary tied to the exact OTP patch, and a stale restore fails with "Old PLT
+file", while leaving the core PLTs out would rebuild them on every fresh
+runner.
 
 **Coverage floor as a ratchet.** `coveralls.json` sets `minimum_coverage` to
 the codebase's measured coverage — enforced by ExCoveralls on every gate run.
@@ -45,7 +53,8 @@ guaranteed present. The skipped arm is future-proofing for path-gated jobs.
 
 **Codecov upload watchdog.** The upload sets `fail_ci_if_error: true`: an
 upload failure or a codecov.io outage reds the step instead of silently
-dropping coverage.
+dropping coverage. It is skipped for fork PRs — they receive no secrets, and a
+missing token with `fail_ci_if_error` would red every external contribution.
 
 ## Alternatives considered
 

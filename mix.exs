@@ -35,13 +35,11 @@ defmodule DashFloat.MixProject do
     [
       # excoveralls is only: :test, so its @preferred_cli_env can't be read
       # before the dep loads — pin here or a dev-env `mix ci` dies with
-      # "task could not be found"
+      # "task could not be found". `ci: :test` covers every task inside the
+      # alias; the coveralls entries cover a direct invocation.
       preferred_envs: [
         ci: :test,
         coveralls: :test,
-        "coveralls.detail": :test,
-        "coveralls.json": :test,
-        "coveralls.html": :test,
         "coveralls.multiple": :test
       ]
     ]
@@ -56,17 +54,14 @@ defmodule DashFloat.MixProject do
       # Dev/test-only analysis tools
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:excoveralls, "~> 0.18", only: :test}
+      {:excoveralls, "~> 0.18", only: :test, runtime: false}
     ]
   end
 
   defp aliases do
     [
-      # CI-grade gate: the one list CI and local devs run (#5) — no drift.
-      # The coverage floor lives in coveralls.json. One suite run produces
-      # both artifacts: Codecov reads the JSON, CI ships the HTML (the
-      # pair of coveralls tasks would skip the second suite and emit no
-      # HTML).
+      # CI-grade gate: the one list CI and local devs run — no drift.
+      # See ADR 0003.
       ci: [
         "deps.get --check-locked",
         "format --check-formatted",
