@@ -18,8 +18,14 @@ throwaway script under `mix run`, not committed). Facts that shaped this ADR:
   `start_link/1`/`child_spec/1`). We do **not** hand-roll the `ExRatatui.run/2`
   loop; the Server already owns polling, rendering, and teardown.
 - The Server polls input every 16 ms on a DirtyIo scheduler, traps exits, and
-  **coalesces renders**: a burst of queued messages produces one frame with the
-  final state. Streaming token rates therefore don't translate into frame rates.
+  **coalesces renders when messages are queued**: a burst that arrives while
+  the mailbox is backed up produces one frame with the final state. Spaced
+  messages (one token every N ms, mailbox empty in between) each render a
+  frame — so per-frame cost must be bounded by the viewport, not the log
+  (see the log-rendering rule below).
+- `Task.Supervisor` restarts its children by default; producer tasks must be
+  `restart: :temporary` or a killed/crashed producer would re-run and
+  duplicate its reply.
 - Teardown (verified with `[:ex_ratatui, :transport, :disconnect]` telemetry):
   terminal restore + BEAM reader reattach run both on a normal `{:stop, _}`
   transition **and** when a callback raises (the GenServer calls `terminate/2`
@@ -119,20 +125,33 @@ page-scroll arithmetic — one source of truth.
   `scroll` to `max(0, total_lines − view_height)` — stale intents after a
   resize or new content can never render past the end.
 - New content while `follow?` stays pinned to the bottom. `PageUp` clears
-  `follow?` and scrolls up one log viewport; `PageDown` scrolls down and
-  re-pins when the bottom is reached. Keyboard-only: no mouse capture, so the
-  terminal's native text selection (copy out of the log) keeps working.
-- An empty log renders a gray placeholder line. Log storage is a plain list;
-  persistence and size caps are Phase 4 concerns.
+  `follow?` and scrolls up one log viewport — but is a **no-op when there is
+  nothing to scroll** (empty or viewport-sized log), so the pin is never lost
+  for content that cannot move. `PageDown` scrolls down and re-pins when the
+  bottom is reached. **Submit re-pins**: a new question implies the user
+  wants to watch its answer arrive, even if they had paged up first.
+  Keyboard-only: no mouse capture, so the terminal's native text selection
+  (copy out of the log) keeps working.
+- **Rendering is windowed**: each frame builds and encodes only the visible
+  slice of the log (`O(viewport)`), not the whole log — the paragraph's
+  `scroll` stays `{0, 0}` and the slice is pre-selected. This bounds
+  per-frame cost regardless of log size, which matters because spaced stream
+  messages render a frame each. The full log stays in memory (plain list,
+  `O(n)` append per entry, acceptable at Phase 1 scale); persistence and
+  size caps are Phase 4 concerns.
+- An empty log renders a gray placeholder line.
 
 ### Input mechanics and Enter vs Ctrl+Enter
 
 - **Enter and Ctrl+Enter submit** ([ADR 0001](0001-founding-stack-and-architecture.md)
   names both as the execution trigger; on terminals where Ctrl+Enter is
   indistinguishable from Enter the outcome is identical, so the ambiguity is
-  harmless). **Shift+Enter and Alt+Enter insert a newline** (forwarded to the
-  textarea as a plain Enter). All other printable keys and unbound Emacs
-  shortcuts go to the textarea.
+  harmless). **Shift+Enter and Alt+Enter insert a newline** — with the
+  caveat that only terminals that report enhanced key events (kitty keyboard
+  protocol, modifyOtherKeys) distinguish Shift+Enter from plain Enter; on
+  legacy terminals it arrives as Enter and submits. Alt+Enter is the
+  portable fallback. All other printable keys and unbound Emacs shortcuts go
+  to the textarea.
 - **Up/Down are history-aware**: `Up` navigates history only when the cursor
   is on the textarea's first row, `Down` only on its last row; otherwise they
   move the cursor (multi-line editing). History navigation overwrites the
@@ -151,12 +170,21 @@ Everything that isn't keyboard input reaches the UI as plain messages into
 | Message | Effect |
 | --- | --- |
 | `{:token, text}` | append to the in-flight streaming entry (opened lazily) |
-| `{:phase, :streaming \| :executing_tool \| :idle}` | set the status phase; entering `:executing_tool` or `:idle` finalizes the in-flight entry into the log |
+| `{:phase, :streaming}` | set the phase only — re-announcing streaming **never finalizes**; a producer resuming after a tool interlude must not fragment its reply |
+| `{:phase, :executing_tool \| :idle}` | set the status phase and finalize the in-flight entry into the log |
 | `{:entry, :tool \| :system, text}` | append a complete entry |
 
 Phase 2's stream handler replaces the demo producer but sends these same
 messages — that is the entire integration surface between the streaming engine
 and the UI.
+
+The producer runs as a **monitored, `restart: :temporary` task** under
+`DashFloat.StreamSupervisor`. A dead producer must never brick the UI (the
+[ADR 0001](0001-founding-stack-and-architecture.md) rule: failures degrade to
+chat messages): its `{:DOWN, …}` monitor message finalizes any partial reply,
+appends a `:system` entry explaining the failure, and returns the phase to
+`:idle` so input keeps working. Abnormal exits are never restarted — the
+handler owns retry semantics, and an auto-restart would duplicate the reply.
 
 ### Synthetic-update demo path
 
@@ -177,10 +205,14 @@ The terminal must never be left broken:
 - **Callback crash**: same `terminate/2` path runs (verified empirically) —
   terminal restored, then the `:temporary` child is gone and the application
   stops with a non-zero status.
-- **`DashFloat.TUI.terminate/2`** calls `System.stop(0)` on clean shutdown and
-  `System.stop(1)` otherwise, but only when mounted against a real terminal —
-  under `test_mode` it does nothing. This makes `mix run --no-halt` (and the
-  future burrito binary) exit when the TUI quits, without breaking tests.
+- **`DashFloat.TUI.terminate/2`** calls `System.stop/1` — `0` **only** for an
+  explicit user quit (`:normal`); `1` for everything else, including
+  supervisor-driven `:shutdown` (a sibling crash-loop arrives as `:shutdown`
+  and must not masquerade as success). SIGTERM-to-exit-code mapping is
+  deferred to the burrito release work. This runs only when mounted against
+  a real terminal — under `test_mode` it does nothing. It makes
+  `mix run --no-halt` (and the future binary) exit when the TUI quits,
+  without breaking tests.
 - **Ctrl+C in raw mode** arrives as a key event (not SIGINT), so it is bound
   to quit. The only unprotected window is before `init_terminal` enters raw
   mode; a Ctrl+C there never left the terminal modified.
@@ -223,8 +255,8 @@ logged, loop continues).
 - Review lens inherited from [ADR 0001](0001-founding-stack-and-architecture.md):
   I/O found in the UI process is a bug. Phase 1 adds one sanctioned exception —
   the submit-time `Task.Supervisor.start_child/2`.
-- Log text is rebuilt each frame (`O(n)` in log lines) — fine at Phase 1
-  scale; revisit with persistence (Phase 4).
+- Log rendering is `O(viewport)` per frame; log *storage* is a plain list with
+  `O(n)` appends, bounded only by memory until Phase 4 persistence.
 - The demo producer's cadence is configurable through mount opts
   (`:demo_stream_opts`) purely so tests can run it in milliseconds; defaults
   are the human-visible demo.

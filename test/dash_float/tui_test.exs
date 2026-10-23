@@ -13,17 +13,19 @@ defmodule DashFloat.TUITest do
 
   @opts [test_mode: {80, 24}, name: nil, demo_stream_opts: [interval_ms: 1, sentences: 1]]
 
-  defp start_tui(opts \\ @opts) do
-    # Unlink: the supervisor must outlive the test process so on_exit can
-    # stop it (and the TUI) deterministically.
+  defp start_tui(opts \\ []) do
+    opts = Keyword.merge(@opts, opts)
+
+    # A real supervisor, mirroring the Application wiring (restart: :temporary).
     {:ok, sup} =
       Supervisor.start_link(
         [%{id: TUI, start: {TUI, :start_link, [opts]}, type: :worker, restart: :temporary}],
         strategy: :one_for_one
       )
 
+    # Unlink: the supervisor must outlive the test process so on_exit can
+    # stop it (and the TUI) deterministically.
     Process.unlink(sup)
-
     on_exit(fn -> if Process.alive?(sup), do: Supervisor.stop(sup) end)
 
     [{TUI, pid, :worker, _}] = Supervisor.which_children(sup)
@@ -42,30 +44,19 @@ defmodule DashFloat.TUITest do
     Enum.each(String.codepoints(text), &press(pid, &1))
   end
 
+  # The runtime's own state carries our user_state; no test backdoor needed.
   defp get_state(pid) do
-    send(pid, {:inspect_state, self()})
-
-    receive do
-      {:tui_state, state} -> state
-    after
-      1_000 -> flunk("no state reply from #{inspect(pid)}")
-    end
+    :sys.get_state(pid) |> Map.get(:user_state)
   end
 
-  defp eventually(pid, fun, tries \\ 100) do
+  defp eventually(pid, fun, tries \\ 200) do
     state = get_state(pid)
 
     if fun.(state) do
       state
     else
       true = tries > 0
-
-      receive do
-        _ -> :ok
-      after
-        20 -> :ok
-      end
-
+      Process.sleep(15)
       eventually(pid, fun, tries - 1)
     end
   end
@@ -110,7 +101,8 @@ defmodule DashFloat.TUITest do
 
     # {:phase, :bogus} violates the stream contract; State.stream_message/2 has
     # no clause for it, so the callback raises like any real bug would.
-    send(pid, {:phase, :bogus})
+    bogus = String.to_atom("bogus")
+    send(pid, {:phase, bogus})
 
     assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 1_000
     assert reason != :normal
@@ -138,44 +130,82 @@ defmodule DashFloat.TUITest do
     assert State.input_text(get_state(pid)) == ""
   end
 
-  @tag :capture_log
-  test "the UI stays responsive while a flood of updates lands" do
-    {:ok, pid} = start_tui()
-    flood_size = 500
+  test "a dead producer degrades to idle instead of bricking input" do
+    # Slow cadence so the producer is still alive when we kill it.
+    {:ok, pid} = start_tui(demo_stream_opts: [interval_ms: 100, sentences: 3])
+    type(pid, "hello")
+    press(pid, "enter")
 
-    flooder =
-      spawn(fn ->
-        Enum.each(1..flood_size, fn i -> send(pid, {:token, "w#{i} "}) end)
+    [task] = Task.Supervisor.children(DashFloat.StreamSupervisor)
+    Process.exit(task, :kill)
+
+    state =
+      eventually(pid, fn s ->
+        s.phase == :idle and
+          Enum.any?(s.entries, fn {k, t} -> k == :system and t =~ "stream failed" end)
       end)
 
-    ref = Process.monitor(flooder)
-    before = Runtime.snapshot(pid).render_count
+    assert state.task_ref == nil
+    assert {:user, "hello"} in state.entries
 
-    # A key event routed through the same mailbox as the token flood: the
-    # round-trip includes draining whatever arrived before it.
-    {micros, :ok} = :timer.tc(fn -> press(pid, "z") end)
-    millis = div(micros, 1000)
-    assert millis < 1_000, "input round-trip took #{millis}ms under a #{flood_size}-message flood"
-
-    assert_receive {:DOWN, ^ref, :process, ^flooder, :normal}, 1_000
-
-    # Every token landed and the typed character was kept — nothing dropped,
-    # nothing blocked.
-    state =
-      eventually(pid, fn s -> String.contains?(s.in_flight || "", "w#{flood_size} ") end)
-
-    assert State.input_text(state) =~ "z"
-
-    # Frame coalescing: hundreds of messages produced few frames, so the loop
-    # is not doing per-message work.
-    assert Runtime.snapshot(pid).render_count - before < 200
+    # Input is usable again: submit works.
+    type(pid, "again")
+    press(pid, "enter")
+    eventually(pid, fn s -> s.phase == :streaming and State.input_text(s) == "" end)
   end
 
-  test "the app is absent from the application supervision tree in test env" do
-    assert Process.whereis(DashFloat.StreamSupervisor) != nil
-    # Live mode registers the TUI under its module name; in :test it must
-    # not be there.
-    assert Process.whereis(DashFloat.TUI) == nil
+  @tag :capture_log
+  test "the UI stays responsive while a stream lands at cadence into a large log" do
+    {:ok, pid} = start_tui()
+
+    # Preload a log far beyond the viewport (400 lines).
+    Enum.each(1..400, fn i -> send(pid, {:entry, :system, "warm #{i}"}) end)
+    eventually(pid, &(State.log_line_count(&1) == 400))
+
+    # Burst coalescing with a big log: hundreds of messages, few frames.
+    burst_size = 300
+    before = Runtime.snapshot(pid).render_count
+    Enum.each(1..burst_size, fn i -> send(pid, {:token, "b#{i} "}) end)
+    eventually(pid, &String.contains?(&1.in_flight || "", "b#{burst_size} "))
+    assert Runtime.snapshot(pid).render_count - before < 50
+
+    # Cadence phase: tokens every 2ms while the user keeps typing.
+    cadence =
+      spawn(fn ->
+        Enum.each(1..200, fn _i ->
+          send(pid, {:token, "c"})
+          Process.sleep(2)
+        end)
+      end)
+
+    timings_ms =
+      Enum.map(1..5, fn _i ->
+        {micros, :ok} = :timer.tc(fn -> press(pid, "z") end)
+        div(micros, 1000)
+      end)
+
+    max_ms = Enum.max(timings_ms)
+    assert max_ms < 500, "input round-trips #{inspect(timings_ms)}ms while streaming at cadence"
+
+    ref = Process.monitor(cadence)
+    assert_receive {:DOWN, ^ref, :process, ^cadence, :normal}, 2_000
+
+    state = eventually(pid, &(String.length(&1.in_flight || "") >= 500))
+    # every token landed and every keystroke was kept
+    assert State.input_text(state) == "zzzzz"
+  end
+
+  test "exit_code/1 maps only an explicit quit to success" do
+    assert TUI.exit_code(:normal) == 0
+    assert TUI.exit_code(:shutdown) == 1
+    assert TUI.exit_code({:error, :boom}) == 1
+  end
+
+  test "the TUI is absent from the application supervision tree in test env" do
+    children = Supervisor.which_children(DashFloat.Supervisor) |> Enum.map(&elem(&1, 0))
+    # the stream supervisor is up; the TUI is gated out of :test
+    assert DashFloat.StreamSupervisor in children
+    refute TUI in children
   end
 
   defp attach_disconnect_listener do

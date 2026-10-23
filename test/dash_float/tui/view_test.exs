@@ -82,14 +82,53 @@ defmodule DashFloat.TUI.ViewTest do
       assert length(lines) == 2
     end
 
-    test "the scroll offset is applied to the log paragraph" do
+    test "only the visible window is built — log text is bounded by the viewport" do
       state =
         Enum.reduce(1..100, new_state(), fn i, acc ->
           State.stream_message(acc, {:entry, :system, "line #{i}"})
         end)
 
       widget = log_widget(state, 80, 24)
-      assert widget.scroll == {80, 0}
+      lines = widget.text
+      assert length(lines) == 20
+      assert flatten(hd(lines)) =~ "line 81"
+      assert flatten(List.last(lines)) =~ "line 100"
+      # the window is pre-scrolled; the paragraph itself does no scrolling
+      assert widget.scroll == {0, 0}
+    end
+
+    test "a scrolled-up view windows onto its slice, not the tail" do
+      state =
+        Enum.reduce(1..100, new_state(), fn i, acc ->
+          State.stream_message(acc, {:entry, :system, "line #{i}"})
+        end)
+
+      {state, nil} = State.handle_key(state, "page_up", [])
+      widget = log_widget(state, 80, 24)
+      assert flatten(hd(widget.text)) =~ "line 61"
+    end
+
+    test "huge logs keep the widget text at viewport size" do
+      state =
+        Enum.reduce(1..10_000, new_state(), fn i, acc ->
+          State.stream_message(acc, {:entry, :system, "line #{i}"})
+        end)
+
+      widget = log_widget(state, 80, 24)
+      assert length(widget.text) == 20
+    end
+
+    test "the status position never shows an inverted range on tiny frames" do
+      state =
+        Enum.reduce(1..30, new_state(), fn i, acc ->
+          State.stream_message(acc, {:entry, :system, "line #{i}"})
+        end)
+
+      {state, nil} = State.handle_key(state, "page_up", [])
+      # 80x4: status(1) + log(0) + input(3); log height 0
+      text = status_text_at(state, 80, 4)
+      refute Regex.match?(~r/L(\d+)-(\d+)/, text)
+      assert text =~ "/30"
     end
 
     test "user entries are prefixed" do
@@ -133,8 +172,16 @@ defmodule DashFloat.TUI.ViewTest do
 
   ## helpers
 
-  defp status_text(state) do
-    state |> status_line() |> hd() |> spans() |> Enum.join()
+  defp status_text(state), do: status_text_at(state, 80, 24)
+
+  defp status_text_at(state, w, h) do
+    {widget, _rect} =
+      state
+      |> View.render(%ExRatatui.Frame{width: w, height: h})
+      |> List.first()
+
+    [line] = widget.text
+    spans(line) |> Enum.join()
   end
 
   defp status_line(state) do

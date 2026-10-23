@@ -25,14 +25,14 @@ defmodule DashFloat.TUI.View do
       when is_integer(width) and is_integer(height) and is_integer(input_lines) do
     area = %Rect{x: 0, y: 0, width: max(width, 0), height: max(height, 0)}
 
-    case ExRatatui.Layout.split(area, :vertical, [
-           {:length, 1},
-           {:min, 0},
-           {:length, input_height(input_lines, height)}
-         ]) do
-      [status, log, input] -> %{status: status, log: log, input: input}
-      {:error, reason} -> raise ArgumentError, "layout failed: #{inspect(reason)}"
-    end
+    [status, log, input] =
+      ExRatatui.Layout.split(area, :vertical, [
+        {:length, 1},
+        {:min, 0},
+        {:length, input_height(input_lines, height)}
+      ])
+
+    %{status: status, log: log, input: input}
   end
 
   @doc "Input region height: borders plus draft lines, capped at a third of the frame."
@@ -80,6 +80,9 @@ defmodule DashFloat.TUI.View do
       state.follow? ->
         "follow L#{total}"
 
+      log_height <= 0 ->
+        "L#{min(State.effective_scroll(state, log_height) + 1, total)}/#{total}"
+
       true ->
         top = State.effective_scroll(state, log_height) + 1
         bottom = min(top + log_height - 1, total)
@@ -89,23 +92,57 @@ defmodule DashFloat.TUI.View do
 
   ## Log
 
+  # Only the visible window is built and encoded per frame: per-frame cost is
+  # O(viewport), not O(total log) — the full log stays in memory until Phase 4
+  # persistence (ADR 0002).
   defp log_widget(state, height) do
     %Paragraph{
-      text: log_lines(state),
-      scroll: {State.effective_scroll(state, height), 0}
+      text: log_lines(state, State.effective_scroll(state, height), height),
+      scroll: {0, 0}
     }
   end
 
-  defp log_lines(%State{entries: [], in_flight: in_flight}) when in_flight in [nil, ""] do
+  defp log_lines(%State{entries: [], in_flight: in_flight}, _offset, _height)
+       when in_flight in [nil, ""] do
     [Line.new([Span.new("(log is empty — say something)", style: %Style{fg: :dark_gray})])]
   end
 
-  defp log_lines(state) do
-    state.entries
-    |> Enum.map(&entry_lines/1)
-    |> append_in_flight(state)
-    |> List.flatten()
+  defp log_lines(state, offset, height) do
+    pairs =
+      case state.in_flight do
+        in_flight when in_flight in [nil, ""] -> state.entries
+        in_flight -> state.entries ++ [{:assistant, in_flight}]
+      end
+
+    # Walk entries counting display lines; build Lines only for entries that
+    # intersect [offset, offset + height).
+    {_, acc} =
+      Enum.reduce_while(pairs, {0, []}, fn {_kind, text} = pair, {skipped, acc} ->
+        n = line_count(text)
+
+        if skipped + n <= offset do
+          {:cont, {skipped + n, acc}}
+        else
+          taken =
+            pair
+            |> entry_lines()
+            |> Enum.drop(max(offset - skipped, 0))
+            |> Enum.take(height - length(acc))
+
+          acc = acc ++ taken
+
+          if length(acc) >= height do
+            {:halt, {skipped, acc}}
+          else
+            {:cont, {skipped + n, acc}}
+          end
+        end
+      end)
+
+    acc
   end
+
+  defp line_count(text), do: length(:binary.matches(text, "\n")) + 1
 
   defp entry_lines({:user, text}) do
     text
@@ -126,11 +163,6 @@ defmodule DashFloat.TUI.View do
   defp entry_lines({:assistant, text}) do
     text |> String.split("\n") |> Enum.map(&Line.new([Span.new(&1)]))
   end
-
-  defp append_in_flight(lines, %{in_flight: in_flight}) when in_flight in [nil, ""], do: lines
-
-  defp append_in_flight(lines, %{in_flight: in_flight}),
-    do: lines ++ entry_lines({:assistant, in_flight})
 
   ## Input
 

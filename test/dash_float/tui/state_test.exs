@@ -156,6 +156,21 @@ defmodule DashFloat.TUI.StateTest do
       assert state.history_index == nil
     end
 
+    test "editing while browsing history keeps the edited text as the draft" do
+      base = new_state() |> idle_submit("prev")
+
+      {state, nil} = State.handle_key(base, "up", [])
+      assert State.input_text(state) == "prev"
+
+      {state, nil} = State.handle_key(state, "x", [])
+      assert state.history_index == nil
+      assert State.input_text(state) == "prevx"
+
+      # Down no longer discards the edit
+      {state, nil} = State.handle_key(state, "down", [])
+      assert State.input_text(state) == "prevx"
+    end
+
     test "consecutive duplicate submits are not stored twice" do
       state = new_state() |> idle_submit("same") |> idle_submit("same")
       assert state.history == ["same"]
@@ -185,7 +200,21 @@ defmodule DashFloat.TUI.StateTest do
       assert State.log_line_count(state) == 1
     end
 
-    test "leaving :streaming finalizes the in-flight entry as :assistant" do
+    test "re-announcing :streaming never finalizes the in-flight entry" do
+      state =
+        new_state()
+        |> State.stream_message({:token, "The answer is "})
+        |> State.stream_message({:token, "42."})
+        |> State.stream_message({:phase, :streaming})
+        |> State.stream_message({:token, " (confident)"})
+        |> State.stream_message({:phase, :idle})
+
+      assert state.entries == [{:assistant, "The answer is 42. (confident)"}]
+      assert state.in_flight == nil
+      assert state.phase == :idle
+    end
+
+    test "leaving :streaming for :executing_tool finalizes the in-flight entry" do
       state =
         new_state()
         |> State.stream_message({:token, "one\ntwo"})
@@ -240,10 +269,28 @@ defmodule DashFloat.TUI.StateTest do
       end)
     end
 
-    test "empty log: offsets are zero and page_up only clears follow" do
+    test "empty log: offsets are zero and page_up keeps following" do
       {state, nil} = new_state() |> State.handle_key("page_up", [])
-      refute state.follow?
+      assert state.follow?
       assert State.effective_scroll(state, 20) == 0
+    end
+
+    test "page_up on a viewport-sized log is a no-op (stays pinned)" do
+      state = full_state(20)
+      {state, nil} = State.handle_key(state, "page_up", [])
+      assert state.follow?
+      assert State.effective_scroll(state, 20) == 0
+    end
+
+    test "submit re-pins the log so the new reply is visible" do
+      state = full_state(100)
+      {state, nil} = State.handle_key(state, "page_up", [])
+      refute state.follow?
+
+      state = idle_submit(state, "next question")
+      assert state.follow?
+      # 100 log lines + the new user entry = 101; bottom is 101 - 20
+      assert State.effective_scroll(state, 20) == 81
     end
 
     test "follow pins to the bottom as content grows" do
@@ -294,6 +341,57 @@ defmodule DashFloat.TUI.StateTest do
         |> State.stream_message({:token, "c\nd"})
 
       assert State.log_line_count(state) == 4
+    end
+  end
+
+  describe "task monitoring" do
+    test "claim_task records the monitor ref" do
+      ref = make_ref()
+      state = new_state() |> State.claim_task(ref)
+      assert state.task_ref == ref
+    end
+
+    test "a normal task DOWN ensures idle without logging anything" do
+      ref = make_ref()
+
+      state =
+        new_state()
+        |> State.claim_task(ref)
+        |> State.stream_message({:phase, :idle})
+
+      {state, handled} = State.task_down(state, ref, :normal)
+      assert handled == :handled
+      assert state.phase == :idle
+      assert state.task_ref == nil
+      assert state.entries == []
+    end
+
+    test "an abnormal task DOWN degrades to idle with a system entry" do
+      ref = make_ref()
+
+      state =
+        new_state()
+        |> State.claim_task(ref)
+        |> State.stream_message({:token, "partial reply"})
+
+      {state, handled} = State.task_down(state, ref, :killed)
+      assert handled == :handled
+      assert state.task_ref == nil
+      assert state.phase == :idle
+      # the partial reply is kept as an assistant entry, then explained
+      assert {:assistant, "partial reply"} in state.entries
+
+      assert Enum.any?(state.entries, fn {kind, text} ->
+               kind == :system and text =~ "stream failed"
+             end)
+    end
+
+    test "a foreign DOWN ref is ignored" do
+      state = new_state() |> State.claim_task(make_ref())
+      {state, handled} = State.task_down(state, make_ref(), :killed)
+      assert handled == :ignored
+      assert state.phase == :idle
+      assert state.entries == []
     end
   end
 

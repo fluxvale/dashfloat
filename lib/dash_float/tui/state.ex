@@ -30,7 +30,8 @@ defmodule DashFloat.TUI.State do
     history_index: nil,
     draft: "",
     size: @default_size,
-    live?: false
+    live?: false,
+    task_ref: nil
   ]
 
   @type t :: %__MODULE__{
@@ -45,7 +46,8 @@ defmodule DashFloat.TUI.State do
           history_index: non_neg_integer() | nil,
           draft: String.t(),
           size: {pos_integer(), pos_integer()},
-          live?: boolean()
+          live?: boolean(),
+          task_ref: reference() | nil
         }
 
   ## Construction
@@ -127,7 +129,17 @@ defmodule DashFloat.TUI.State do
 
   defp forward(state, code, modifiers) do
     ExRatatui.textarea_handle_key(state.input, code, modifiers)
-    {state, nil}
+    # Editing while browsing history keeps the edited text: it becomes the
+    # live draft (no longer restorable by navigating down).
+    {leave_history(state), nil}
+  end
+
+  # Only for actual editing keys; history_prev/next call the textarea API
+  # directly and must not trip this.
+  defp leave_history(%{history_index: nil} = state), do: state
+
+  defp leave_history(state) do
+    %{state | history_index: nil, draft: input_text(state)}
   end
 
   defp on_first_row?(state) do
@@ -157,6 +169,9 @@ defmodule DashFloat.TUI.State do
       |> append_entry(:user, text)
       |> clear_input()
       |> Map.put(:phase, :streaming)
+      # A new question re-pins the log: the user wants to watch its answer
+      # arrive even if they had paged up first.
+      |> Map.put(:follow?, true)
       |> then(&{&1, {:submit, text}})
     else
       {state, nil}
@@ -185,8 +200,11 @@ defmodule DashFloat.TUI.State do
   Applies one stream-contract message:
 
     * `{:token, text}` — append to the in-flight entry
-    * `{:phase, phase}` — set the status phase; leaving `:streaming`
-      finalizes the in-flight entry
+    * `{:phase, :streaming}` — set the phase only; re-announcing streaming
+      never finalizes (a producer resuming after a tool interlude must not
+      fragment its reply)
+    * `{:phase, :executing_tool | :idle}` — set the phase and finalize the
+      in-flight entry
     * `{:entry, kind, text}` — append a complete entry
 
   Messages that violate the contract have no matching clause and crash —
@@ -196,7 +214,9 @@ defmodule DashFloat.TUI.State do
     %{state | in_flight: (state.in_flight || "") <> text}
   end
 
-  def stream_message(state, {:phase, phase}) when phase in [:streaming, :executing_tool, :idle] do
+  def stream_message(state, {:phase, :streaming}), do: %{state | phase: :streaming}
+
+  def stream_message(state, {:phase, phase}) when phase in [:executing_tool, :idle] do
     state
     |> finalize_in_flight()
     |> Map.put(:phase, phase)
@@ -216,6 +236,43 @@ defmodule DashFloat.TUI.State do
     text = String.trim_trailing(text, "\n")
     %{state | entries: state.entries ++ [{kind, text}]}
   end
+
+  ## Producer-task monitoring
+
+  @doc "Records the monitor ref of the producer Task started for this stream."
+  def claim_task(state, ref) when is_reference(ref), do: %{state | task_ref: ref}
+
+  @doc """
+  Applies a producer-task `{:DOWN, ref, :process, _pid, reason}`. Normal exits
+  only ensure the phase is `:idle` (idempotent); abnormal exits finalize the
+  stream, log a `:system` entry explaining what happened, and return to
+  `:idle` so input keeps working. A dead producer must never brick the UI
+  (ADR 0001: failures degrade to chat messages). Returns `{state, :handled}`
+  when the ref was ours, `{state, :ignored}` otherwise.
+  """
+  def task_down(%{task_ref: ref} = state, ref, reason) do
+    state = %{state | task_ref: nil}
+
+    state =
+      if reason == :normal do
+        stream_message(state, {:phase, :idle})
+      else
+        stream_failed(state, reason)
+      end
+
+    {state, :handled}
+  end
+
+  def task_down(state, _other_ref, _reason), do: {state, :ignored}
+
+  @doc "Degrades to `:idle` with a `:system` entry explaining the failure."
+  def stream_failed(state, reason) do
+    state
+    |> stream_message({:entry, :system, "[stream failed: #{format_reason(reason)}]"})
+    |> stream_message({:phase, :idle})
+  end
+
+  defp format_reason(reason), do: reason |> inspect() |> String.slice(0, 120)
 
   ## History navigation
 
@@ -271,20 +328,17 @@ defmodule DashFloat.TUI.State do
 
   @doc "Total display lines in the log (entries plus any in-flight entry)."
   def log_line_count(%{entries: entries, in_flight: in_flight}) do
-    count = entries |> line_count()
+    # Count via :binary.matches — no split allocations on the hot render path.
+    count = Enum.reduce(entries, 0, fn {_kind, text}, acc -> acc + line_count(text) end)
 
     if in_flight in [nil, ""] do
       count
     else
-      count + line_count([{:assistant, in_flight}])
+      count + line_count(in_flight)
     end
   end
 
-  defp line_count(entries),
-    do:
-      entries
-      |> Enum.map(fn {_kind, text} -> text |> String.split("\n") |> length() end)
-      |> Enum.sum()
+  defp line_count(text), do: length(:binary.matches(text, "\n")) + 1
 
   @doc """
   Effective scroll offset for a viewport of `height` lines: the intent
@@ -301,7 +355,14 @@ defmodule DashFloat.TUI.State do
 
   defp page_up(state) do
     height = log_height(state)
-    %{state | follow?: false, scroll: max(effective_scroll(state, height) - max(height, 1), 0)}
+
+    # Nothing to scroll (empty or viewport-sized log): stay pinned. Unfollowing
+    # here would make the user miss the next reply entirely.
+    if log_line_count(state) - height <= 0 do
+      state
+    else
+      %{state | follow?: false, scroll: max(effective_scroll(state, height) - max(height, 1), 0)}
+    end
   end
 
   defp page_down(state) do

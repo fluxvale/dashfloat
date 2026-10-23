@@ -25,8 +25,9 @@ mix run --no-halt
 ```
 
 Type a message and press Enter; a synthetic reply streams in. Shift+Enter
-inserts a newline, Up/Down walk input history, PageUp/PageDown scroll the log,
-Ctrl+Q (or Ctrl+C) quits.
+inserts a newline on terminals that report enhanced key events (kitty
+protocol, modifyOtherKeys) — on others, use Alt+Enter. Up/Down walk input
+history, PageUp/PageDown scroll the log, Ctrl+Q (or Ctrl+C) quits.
 
 ## Stack
 

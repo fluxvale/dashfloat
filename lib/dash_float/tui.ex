@@ -47,8 +47,7 @@ defmodule DashFloat.TUI do
         {:stop, state}
 
       {:submit, prompt} ->
-        start_stream(prompt, state)
-        {:noreply, state}
+        {:noreply, start_stream(prompt, state)}
 
       nil ->
         {:noreply, state}
@@ -67,35 +66,52 @@ defmodule DashFloat.TUI do
   def handle_event(_event, state), do: {:noreply, state}
 
   @impl true
-  def handle_info({:inspect_state, pid}, state) when is_pid(pid) do
-    send(pid, {:tui_state, state})
-    {:noreply, state}
-  end
-
   def handle_info({:entry, _, _} = msg, state),
     do: {:noreply, State.stream_message(state, msg)}
 
   def handle_info({kind, _} = msg, state) when kind in [:token, :phase],
     do: {:noreply, State.stream_message(state, msg)}
 
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    {state, _} = State.task_down(state, ref, reason)
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
   def terminate(reason, state) do
     # Standalone runs (`mix run --no-halt`, future burrito binary) exit the VM
-    # when the TUI quits so the shell prompt comes back. Test-mode instances
-    # own no real terminal and must not stop the test VM.
-    if state.live?, do: System.stop(if reason in [:normal, :shutdown], do: 0, else: 1)
+    # when the TUI quits so the shell prompt comes back. Only an explicit quit
+    # is a success — a supervisor-driven or failing shutdown reports 1 (ADR
+    # 0002). Test-mode instances own no real terminal and must not stop the
+    # test VM.
+    if state.live?, do: System.stop(exit_code(reason))
 
     :ok
   end
+
+  @doc """
+  Exit status for a standalone run: `0` only for a user quit (`:normal`),
+  `1` for anything else — supervisor shutdowns, crashes, failures.
+  """
+  def exit_code(:normal), do: 0
+  def exit_code(_), do: 1
 
   defp start_stream(prompt, state) do
     ui = self()
     opts = state.demo_stream_opts
 
-    Task.Supervisor.start_child(DashFloat.StreamSupervisor, fn ->
-      SyntheticStream.emit(ui, prompt, opts)
-    end)
+    case Task.Supervisor.start_child(
+           DashFloat.StreamSupervisor,
+           fn -> SyntheticStream.emit(ui, prompt, opts) end,
+           restart: :temporary
+         ) do
+      {:ok, pid} ->
+        State.claim_task(state, Process.monitor(pid))
+
+      {:error, reason} ->
+        State.stream_failed(state, reason)
+    end
   end
 end
