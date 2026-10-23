@@ -77,7 +77,8 @@ Planning and task tracking live in GitHub issues at
 
 - **Conventional commits.** Commit messages follow the conventional commits
   format: `type(scope): short imperative description` — e.g.
-  `feat(tui): scroll the log view on wheel events`.
+  `feat(tui): scroll the log view on wheel events`. (Sole exception: the
+  owner-ordered bootstrap commit, `initial commit`.)
 - **Squash merges only.** PRs are squash-merged, so the PR title becomes the
   commit message. Write PR titles as conventional commits that summarize the
   whole PR, not the last commit on it.
@@ -89,8 +90,8 @@ this is what lets multiple agents work in parallel on the same repo.
 
 - **One worktree per task.** Branch off `main` and create the worktree in one
   step; directory and branch share the name
-  `dashfloat-<issue_number>-<part-of-the-issue-name-in-kebab-case>` — e.g.
-  issue #3 "TUI skeleton" becomes
+  `dashfloat-<issue_number>-<part-of-the-issue-name-in-kebab-case>` — e.g. a
+  future issue #3 "TUI skeleton" becomes
   `git worktree add ../dashfloat-3-tui-skeleton -b dashfloat-3-tui-skeleton`.
   One branch, one worktree, one issue.
 - **Keep the primary checkout clean.** It stays on `main` as the reference
