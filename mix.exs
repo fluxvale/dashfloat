@@ -1,0 +1,30 @@
+defmodule DashFloat.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :dash_float,
+      version: "0.0.0",
+      elixir: "~> 1.20.0",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  # Run "mix help compile.app" to learn about applications.
+  def application do
+    [
+      extra_applications: [:logger],
+      mod: {DashFloat.Application, []}
+    ]
+  end
+
+  defp deps do
+    [
+      {:burrito, "~> 1.6"},
+      {:ex_ratatui, "~> 0.17.1"},
+      {:jason, "~> 1.4"},
+      {:req, "~> 0.7.5"}
+    ]
+  end
+end

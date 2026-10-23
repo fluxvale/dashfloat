@@ -1,0 +1,26 @@
+# Architecture Decision Records
+
+This directory contains Architecture Decision Records (ADRs) for DashFloat.
+
+## Format
+
+Each ADR uses a lightweight Nygard-style format:
+
+- **Status** — Accepted / Superseded / Deprecated
+- **Date** — when the decision was made
+- **Context** — the forces at play and the problem being solved
+- **Decision** — what we chose
+- **Alternatives considered** — what we rejected and why
+- **Consequences** — what this decision implies, including trade-offs
+
+## Numbering
+
+Files are prefixed with a 4-digit padded sequence number starting at `0001`.
+Numbers are never reused. Superseded ADRs keep their number and gain a link to
+their replacement.
+
+## Index
+
+| ADR | Title | Status |
+| --- | ----- | ------ |
+| [0001](0001-founding-stack-and-architecture.md) | Founding stack and architecture | Accepted |
