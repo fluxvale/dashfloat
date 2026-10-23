@@ -1,0 +1,160 @@
+# 0004 — LLM streaming engine: SSE adapter process architecture
+
+- **Status:** Accepted
+- **Date:** 2026-10-23
+- **Implements:** [issue #8](https://github.com/fluxvale/dashfloat/issues/8) — Phase 2 of the
+  [ADR 0001](0001-founding-stack-and-architecture.md) roadmap. Supersedes the
+  synthetic demo path in [ADR 0002](0002-tui-skeleton.md); the stream message
+  contract there is unchanged and remains the integration surface.
+
+## Context
+
+Phase 2 replaces the synthetic producer with a real OpenAI-compatible SSE
+client. The `req` 0.7.5 / `finch` 0.24 surface was read from the dependency
+source before deciding:
+
+- `Req.post(url, …, into: :self)` returns once status + headers have arrived
+  (it issues `Finch.async_request` and receives them internally). Connection
+  failures — DNS, refused, TLS, pool/header-phase timeouts — return
+  `{:error, exception}` from that call; no receive loop has started yet.
+- Afterwards body events land in **the caller's mailbox** as
+  `{ref, {:data, binary}}`, `{ref, :done}`, `{ref, {:trailers, _}}`,
+  `{ref, {:error, reason}}`; `Req.parse_message/2` normalizes them and
+  `Req.cancel_async_response/1` closes the connection.
+- Finch's HTTP/1 async helper **monitors the requesting process**: if it dies,
+  the socket is closed. Cancellation is therefore kill-safe in both directions.
+- Req's default retry only covers safe methods, but a streaming
+  `POST /chat/completions` is non-idempotent and billed; we set `retry: false`
+  explicitly.
+
+## Decision
+
+### Process architecture — the producer slot, no new processes
+
+`DashFloat.LLM.ChatStream.run(ui, provider, prompt, opts \\ [])` is the Task
+body started by the TUI on submit under `DashFloat.StreamSupervisor`
+(`restart: :temporary`, monitored by the UI) — exactly the producer slot ADR
+0002 defined. The UI process is untouched: it still performs zero I/O, still
+understands only the ADR-0002 message contract
+(`{:token, _}` / `{:phase, _}` / `{:entry, _, _}` / `{:DOWN, …}`).
+
+```
+UI process (ExRatatui.Server)          DashFloat.LLM.ChatStream (Task, temporary)
+  submit ──Task.Supervisor.start_child──▶ build request
+                                          Req.post(into: :self, retry: false)
+  ◀── {:token, delta} ──────────────────  receive loop (parse_message + SSE)
+  ◀── {:entry, :system, …} ─────────────  error/cancel paths
+  ◀── {:phase, :idle} ─────────────────  terminal message, then exit :normal
+```
+
+The stream handler always sends its own terminal `{:phase, _}` before exiting
+(the ADR-0002 rule); the UI's monitor stays a safety net, never the reporter
+of record.
+
+### Token granularity and backpressure — no drop policy
+
+One `{:token, text}` message per **SSE data frame** (the provider-native delta
+granularity) — not per socket chunk, not per line, no batching, no flushing
+timer, no drops. Rationale: token messages are pure data appended in `O(1)`;
+the render loop coalesces queued messages into single frames
+([ADR 0002](0002-tui-skeleton.md)), so a burst of N tokens costs N appends and
+one render, bounded by the viewport. The coalescer *is* the backpressure
+valve; the Phase-1 responsiveness test already proves keystroke round-trips
+stay under 100 ms through a 300-token burst at cadence, and a Phase-2 test
+re-proves it through the real engine. Dropping or sampling tokens in the
+producer would corrupt replies to defend a render loop that needs no defense.
+
+### Cancellation semantics
+
+`Esc` while the phase is `:streaming` cancels. Order of events:
+
+1. The TUI sends `:cancel` to the task pid (a no-op if the task already died).
+2. The task calls `Req.cancel_async_response/1` — the upstream connection
+   closes; the provider stops generating (and billing).
+3. The task sends `{:entry, :system, "[cancelled]"}` and `{:phase, :idle}`
+   (which finalizes the partial reply as an assistant entry), then exits
+   `:normal`.
+4. The later `{:DOWN, _, :process, _, :normal}` is a no-op safety net.
+
+What dies: the HTTP request first, then the task. What the UI shows: the
+partial reply kept, a gray `[cancelled]` line, status `Idle`, input usable
+immediately. If the task is wedged and ignores `:cancel`, the existing
+monitor/kill safety net from ADR 0002 still applies — and finch's
+owner-monitor closes the socket the moment the task dies.
+
+### Error taxonomy — every path degrades to a chat entry
+
+Failures never crash the node and never bypass the terminal message. Partial
+content is always finalized. The API key never appears in any message — error
+text carries status codes and provider-supplied text only.
+
+| Failure | Detection | Chat log entry |
+| --- | --- | --- |
+| Connect refused / DNS / TLS / header timeout | `Req.post` returns `{:error, e}` | `[llm: connection failed: <message>]` |
+| HTTP non-2xx | initial status; drain body ≤ 64 KiB, ≤ 5 s | `[llm: HTTP 401 — <provider error.message>]` (fallback `[llm: HTTP 502]`) |
+| Malformed frame (`data:` payload is not valid JSON) | decode error mid-loop | cancel + `[llm: malformed SSE data frame — stream aborted]` |
+| Valid JSON frame without `choices[0].delta.content` (role-only, usage, keepalive frames) | shape miss | skipped silently — not an error |
+| Connection dropped mid-stream | `{ref, {:error, _}}` | `[llm: connection lost mid-stream]` |
+| Stream ended without `[DONE]` | `{ref, :done}` before `[DONE]` | `[llm: stream ended without completion]` |
+| No data for 60 s (configurable via `:idle_timeout`) | receive `after` | cancel + `[llm: timed out waiting for stream data]` |
+| SSE comment / unknown field lines | parser | ignored per the SSE spec (keepalives) |
+
+### SSE parsing — a pure incremental parser
+
+`DashFloat.LLM.SSE` is pure: `new/0`, `feed/2 → {[%{data: binary}], parser}`,
+holding back partial frames in a buffer until a blank line completes them.
+Line endings: LF and CRLF (the OpenAI-compatible ecosystem; lone CR is not
+handled). Only `data:` lines are extracted — `event:`/`id:`/comments are
+dropped per spec. `[DONE]` is interpreted by `ChatStream`, not the parser.
+
+### Provider config — one endpoint, file + env
+
+`DashFloat.Config.load/0` reads JSON at
+`:filename.basedir(:user_config, "dashfloat")` → `config.json` (honors
+`XDG_CONFIG_HOME`; fields `base_url`, `model`, `api_key`), then overlays
+per-field env overrides `DASHFLOAT_BASE_URL`, `DASHFLOAT_MODEL`,
+`DASHFLOAT_API_KEY`. Missing/blank fields after the merge yield
+`{:error, message}` naming **only the missing fields** — never the values
+present. Loading happens once in `Application.start/1` and rides into the TUI
+as mount opts (`provider:`), keeping file I/O out of the UI process. Without a
+usable provider the TUI still runs; submitting degrades to a system entry with
+setup instructions. The endpoint is one OpenAI-compatible URL:
+`base_url <> "/chat/completions"`, `stream: true`, `Authorization: Bearer`.
+
+### Testing — recorded bytes and a loopback server
+
+The SSE parser is tested on recorded byte-stream fixtures (fed whole and
+byte-by-byte). `ChatStream` and the TUI integration run against a one-shot
+`:gen_tcp` loopback server (127.0.0.1, ephemeral port) scripted per test with
+exact bytes, sleeps, and closes — deterministic, no external network, no new
+dependencies. Live-key smoke is a documented manual step.
+
+## Alternatives considered
+
+- **`into: fun` / `into: collectable`** — chunks are delivered while blocked
+  inside Req; cannot select on cancel or timeouts between chunks. Control is
+  the point; rejected.
+- **Raw finch/mint** — re-implements URL/headers/JSON handling req already
+  owns; [ADR 0001](0001-founding-stack-and-architecture.md) already chose req.
+- **Kill-only cancellation** — a `:killed` DOWN reads
+  `[stream failed: :killed]` and skips graceful partial finalize; kept as the
+  safety net, not the user path.
+- **Token batching / drop policy in the producer** — lossy complexity
+  defending a render loop that already coalesces; violates "messages are
+  data". Rejected.
+- **Retries** — a streaming completions POST is not resumable; retrying
+  duplicates generation and billing. None.
+- **TOML config** — adds a dependency; jason already ships. JSON chosen.
+- **Reading config in `mount/1`** — file I/O in the UI process; loaded in
+  `Application.start/1` instead.
+
+## Consequences
+
+- The UI seam is unchanged: `ChatStream` is just a new producer speaking the
+  ADR-0002 contract; the synthetic demo module is deleted.
+- Tests open real loopback sockets; CI stays offline and deterministic.
+- The parser covers LF/CRLF only; a lone-CR server would stall (none exists in
+  this ecosystem).
+- Without provider config the TUI can no longer produce replies — the demo
+  path is gone by design; the config error entry carries setup instructions.
+- One in-flight request at a time stands (ADR 0002); queueing stays out.
