@@ -14,7 +14,8 @@ defmodule DashFloat.ConfigTest do
   end
 
   defp write!(path, map) do
-    File.mkdir_p!(Path.dirname(path))
+    dir = Path.dirname(path)
+    File.mkdir_p!(dir)
     File.write!(path, Jason.encode!(map))
     path
   end
@@ -61,7 +62,8 @@ defmodule DashFloat.ConfigTest do
 
   test "invalid JSON is reported without echoing the file contents" do
     path = tmp_path()
-    File.mkdir_p!(Path.dirname(path))
+    dir = Path.dirname(path)
+    File.mkdir_p!(dir)
     File.write!(path, ~s({"api_key": "secret-file-key",))
 
     assert {:error, message} = Config.load(path, %{})
@@ -81,7 +83,8 @@ defmodule DashFloat.ConfigTest do
 
   test "a JSON file that is not an object is reported as invalid" do
     path = tmp_path()
-    File.mkdir_p!(Path.dirname(path))
+    dir = Path.dirname(path)
+    File.mkdir_p!(dir)
     File.write!(path, "[1, 2, 3]")
 
     assert {:error, message} = Config.load(path, %{})

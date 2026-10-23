@@ -33,7 +33,7 @@ defmodule DashFloat.SSEServer do
   @spec base_url(GenServer.server()) :: String.t()
   def base_url(server), do: "http://127.0.0.1:#{port(server)}"
 
-  @impl true
+  @impl GenServer
   def init({script, owner}) do
     ip = {127, 0, 0, 1}
 
@@ -46,7 +46,7 @@ defmodule DashFloat.SSEServer do
     {:ok, %{listen: listen, port: port}}
   end
 
-  @impl true
+  @impl GenServer
   def handle_call(:port, _from, state), do: {:reply, state.port, state}
 
   ## Acceptor
@@ -94,7 +94,7 @@ defmodule DashFloat.SSEServer do
 
   defp parse_head(head) do
     [request_line | header_lines] = String.split(head, "\r\n")
-    [method, path | _] = String.split(request_line, " ")
+    [method, path | _rest] = String.split(request_line, " ")
 
     headers =
       Map.new(header_lines, fn line ->
@@ -106,7 +106,11 @@ defmodule DashFloat.SSEServer do
   end
 
   defp read_request_body(socket, headers, acc) do
-    length = headers |> Map.get("content-length", "0") |> String.to_integer()
+    length =
+      headers
+      |> Map.get("content-length", "0")
+      |> String.to_integer()
+
     read_body(socket, length, acc)
   end
 

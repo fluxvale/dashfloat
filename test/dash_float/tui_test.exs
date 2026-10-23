@@ -11,7 +11,8 @@ defmodule DashFloat.TUITest do
   alias DashFloat.Config
   alias DashFloat.SSEServer
   alias DashFloat.TUI
-  alias DashFloat.TUI.{State, View}
+  alias DashFloat.TUI.State
+  alias DashFloat.TUI.View
   alias ExRatatui.Runtime
 
   @opts [test_mode: {80, 24}, name: nil]
@@ -37,7 +38,7 @@ defmodule DashFloat.TUITest do
     # assert on the app-wide supervisor's children, so drain before they run.
     on_exit(fn -> await_no_tasks(200) end)
 
-    [{TUI, pid, :worker, _}] = Supervisor.which_children(sup)
+    [{TUI, pid, :worker, _modules}] = Supervisor.which_children(sup)
     {:ok, pid}
   end
 
@@ -124,12 +125,12 @@ defmodule DashFloat.TUITest do
 
     # Mid-stream: the reply grows in flight (one token per frame) and is not
     # finalized until the idle phase.
-    state = eventually(pid, fn s -> s.in_flight == "Hello" end)
-    assert state.phase == :streaming
-    assert {:user, "hello tui"} in state.entries
+    streaming = eventually(pid, fn s -> s.in_flight == "Hello" end)
+    assert streaming.phase == :streaming
+    assert {:user, "hello tui"} in streaming.entries
 
-    state = eventually(pid, fn s -> s.in_flight == "Hello from the engine" end)
-    assert state.phase == :streaming
+    grown = eventually(pid, fn s -> s.in_flight == "Hello from the engine" end)
+    assert grown.phase == :streaming
 
     state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
 
@@ -165,7 +166,7 @@ defmodule DashFloat.TUITest do
       end)
 
     assert {:assistant, "partial"} in state.entries
-    refute Enum.any?(state.entries, fn {_, text} -> text =~ "late" end)
+    refute Enum.any?(state.entries, fn {_kind, text} -> text =~ "late" end)
 
     # Input is usable again.
     submit(pid, "again")
@@ -188,7 +189,8 @@ defmodule DashFloat.TUITest do
 
     # Still typeable.
     type(pid, "next")
-    assert State.input_text(get_state(pid)) == "next"
+    typed_again = get_state(pid)
+    assert State.input_text(typed_again) == "next"
   end
 
   test "without a provider, submit degrades to setup instructions and stays usable" do
@@ -197,8 +199,10 @@ defmodule DashFloat.TUITest do
 
     state =
       eventually(pid, fn s ->
+        entries = system_entries(s)
+
         s.phase == :idle and
-          Enum.any?(system_entries(s), &String.contains?(&1, "[llm: no provider configured"))
+          Enum.any?(entries, &String.contains?(&1, "[llm: no provider configured"))
       end)
 
     assert {:user, "hello"} in state.entries
@@ -206,7 +210,8 @@ defmodule DashFloat.TUITest do
     assert status_text(state) =~ "model: —"
 
     type(pid, "again")
-    assert State.input_text(get_state(pid)) == "again"
+    typed_again = get_state(pid)
+    assert State.input_text(typed_again) == "again"
   end
 
   test "quit keys stop the supervised app with reason :normal" do
@@ -279,8 +284,8 @@ defmodule DashFloat.TUITest do
 
     state =
       eventually(pid, fn s ->
-        s.phase == :idle and
-          Enum.any?(system_entries(s), &String.contains?(&1, "stream failed"))
+        entries = system_entries(s)
+        s.phase == :idle and Enum.any?(entries, &String.contains?(&1, "stream failed"))
       end)
 
     assert state.task_ref == nil
@@ -400,30 +405,36 @@ defmodule DashFloat.TUITest do
 
     state =
       eventually(pid, fn s ->
+        entries = system_entries(s)
+
         s.phase == :idle and
-          Enum.any?(system_entries(s), &String.contains?(&1, "[llm: no provider configured"))
+          Enum.any?(entries, &String.contains?(&1, "[llm: no provider configured"))
       end)
 
-    refute Enum.any?(system_entries(state), &String.contains?(&1, "/x/config.json"))
+    entries = system_entries(state)
+    refute Enum.any?(entries, &String.contains?(&1, "/x/config.json"))
   end
 
   test "paste, resize, key releases, unknown events, and stray messages are handled" do
     {:ok, pid} = start_tui()
 
     inject(pid, %ExRatatui.Event.Paste{content: "pasted text"})
-    assert State.input_text(get_state(pid)) == "pasted text"
+    pasted = get_state(pid)
+    assert State.input_text(pasted) == "pasted text"
 
     inject(pid, %ExRatatui.Event.Resize{width: 100, height: 30})
     assert get_state(pid).size == {100, 30}
 
     # Key releases are ignored (kitty protocol).
     inject(pid, %ExRatatui.Event.Key{code: "x", modifiers: [], kind: "release"})
-    assert State.input_text(get_state(pid)) == "pasted text"
+    released = get_state(pid)
+    assert State.input_text(released) == "pasted text"
 
     # Events and messages we do not use are dropped, not crashes.
     inject(pid, %ExRatatui.Event.Mouse{kind: "down"})
     send(pid, :stray_message)
-    assert State.input_text(get_state(pid)) == "pasted text"
+    after_stray = get_state(pid)
+    assert State.input_text(after_stray) == "pasted text"
   end
 
   test "child_spec/1 is temporary and a worker" do

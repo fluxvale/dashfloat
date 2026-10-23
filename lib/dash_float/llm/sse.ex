@@ -31,9 +31,14 @@ defmodule DashFloat.LLM.SSE do
     # buffer on every chunk would be quadratic on a large frame.
     {buffer, chunk} = move_trailing_cr(buffer, chunk)
 
-    {frames, rest} = (buffer <> normalize(chunk)) |> split_frames([])
+    {frames, rest} = split_frames(buffer <> normalize(chunk), [])
 
-    {frames |> Enum.reverse() |> Enum.flat_map(&parse_frame/1), %__MODULE__{buffer: rest}}
+    parsed =
+      frames
+      |> Enum.reverse()
+      |> Enum.flat_map(&parse_frame/1)
+
+    {parsed, %__MODULE__{buffer: rest}}
   end
 
   # A "\r" at the very end of the buffer may be half of a CRLF whose "\n"

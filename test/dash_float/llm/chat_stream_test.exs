@@ -12,7 +12,10 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
   @fixture_dir Path.expand("../../fixtures/sse", __DIR__)
 
-  defp fixture(name), do: File.read!(Path.join(@fixture_dir, name))
+  defp fixture(name) do
+    path = Path.join(@fixture_dir, name)
+    File.read!(path)
+  end
 
   defp frame(content) do
     ~s(data: {"choices":[{"index":0,"delta":{"content":"#{content}"}}]}\n\n)
@@ -45,10 +48,10 @@ defmodule DashFloat.LLM.ChatStreamTest do
   # Collects contract messages through the terminal {:phase, :idle}.
   defp collect(acc \\ []) do
     receive do
-      {:token, _} = msg -> collect([msg | acc])
-      {:entry, _, _} = msg -> collect([msg | acc])
+      {:token, _text} = msg -> collect([msg | acc])
+      {:entry, _kind, _text} = msg -> collect([msg | acc])
       {:phase, :idle} = msg -> Enum.reverse([msg | acc])
-      {:phase, _} = msg -> collect([msg | acc])
+      {:phase, _phase} = msg -> collect([msg | acc])
     after
       2_000 -> Enum.reverse(acc)
     end
@@ -214,12 +217,12 @@ defmodule DashFloat.LLM.ChatStreamTest do
     assert {:phase, :idle} == List.last(messages)
     await_exit(ref)
 
-    server = start_server([{:send, json_response(502, "bad gateway")}, :close])
-    {_pid, ref} = start_stream(SSEServer.base_url(server))
-    messages = collect()
+    server2 = start_server([{:send, json_response(502, "bad gateway")}, :close])
+    {_pid2, ref2} = start_stream(SSEServer.base_url(server2))
+    messages2 = collect()
 
-    assert system_entries(messages) == ["[llm: HTTP 502]"]
-    await_exit(ref)
+    assert system_entries(messages2) == ["[llm: HTTP 502]"]
+    await_exit(ref2)
   end
 
   test "a non-2xx drain honors :cancel" do
@@ -283,7 +286,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
     body = ~s({"error":{"message":"boom"}})
 
-    server =
+    server2 =
       start_server([
         {:send, [chunked_error, chunk(body)]},
         {:sleep, 50},
@@ -291,9 +294,9 @@ defmodule DashFloat.LLM.ChatStreamTest do
         :close
       ])
 
-    {_pid, ref} = start_stream(SSEServer.base_url(server))
+    {_pid2, ref2} = start_stream(SSEServer.base_url(server2))
     assert ["[llm: HTTP 500 — boom]"] = system_entries(collect())
-    await_exit(ref)
+    await_exit(ref2)
   end
 
   test "the happy path closes the connection at [DONE]" do
@@ -398,7 +401,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
         "content-length: 500\r\nconnection: close\r\n\r\n"
 
     # Trickle a byte every 400 ms: the 5 s budget is absolute, not per message.
-    trickle = Enum.flat_map(1..20, fn _ -> [{:send, "{"}, {:sleep, 400}] end)
+    trickle = Enum.flat_map(1..20, fn _i -> [{:send, "{"}, {:sleep, 400}] end)
     server = start_server([{:send, headers} | trickle])
     {_pid, ref} = start_stream(SSEServer.base_url(server))
 
@@ -474,7 +477,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
       {:ok, pid} = Task.start(fn -> ChatStream.run(ui, provider, "hi") end)
       ref = Process.monitor(pid)
 
-      assert [message] = collect() |> system_entries()
+      assert [message] = system_entries(collect())
       assert message =~ "[llm: connection failed: "
       refute message =~ key
       refute message =~ "test-key"
@@ -498,7 +501,11 @@ defmodule DashFloat.LLM.ChatStreamTest do
     # For a key containing a quote, Mint's error renders the header value with
     # inspect escaping; a provider (or upstream proxy) can echo that back.
     key = ~s(test"key-123)
-    escaped = key |> inspect() |> String.slice(1..-2//1)
+
+    escaped =
+      key
+      |> inspect()
+      |> String.slice(1..-2//1)
 
     body = Jason.encode!(%{"error" => %{"message" => "raw: #{key} escaped: #{escaped}"}})
     server = start_server([{:send, json_response(401, body)}, :close])
@@ -545,7 +552,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
     script =
       [{:send, @headers}, {:send, "data: " <> blob}] ++
-        Enum.flat_map(1..2, fn _ -> [{:send, blob}, {:sleep, 10}] end) ++
+        Enum.flat_map(1..2, fn _i -> [{:send, blob}, {:sleep, 10}] end) ++
         [{:wait_close, 2_000}]
 
     server = start_server(script)
@@ -565,7 +572,10 @@ defmodule DashFloat.LLM.ChatStreamTest do
       "content-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n" <> body
   end
 
-  defp chunk(data), do: Integer.to_string(byte_size(data), 16) <> "\r\n" <> data <> "\r\n"
+  defp chunk(data) do
+    size = byte_size(data)
+    Integer.to_string(size, 16) <> "\r\n" <> data <> "\r\n"
+  end
 
   # An ephemeral port with nothing listening on it.
   defp free_port do

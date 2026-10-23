@@ -6,7 +6,10 @@ defmodule DashFloat.LLM.SSETest do
 
   @fixture_dir Path.expand("../../fixtures/sse", __DIR__)
 
-  defp fixture(name), do: File.read!(Path.join(@fixture_dir, name))
+  defp fixture(name) do
+    path = Path.join(@fixture_dir, name)
+    File.read!(path)
+  end
 
   defp parse(chunks) do
     {frames, parser} = Enum.reduce(chunks, {[], SSE.new()}, &feed/2)
@@ -32,7 +35,12 @@ defmodule DashFloat.LLM.SSETest do
 
   test "happy.txt fed byte-by-byte yields the same frames" do
     whole = fixture("happy.txt")
-    {frames, parser} = whole |> :binary.bin_to_list() |> Enum.map(&<<&1>>) |> parse()
+
+    {frames, parser} =
+      whole
+      |> :binary.bin_to_list()
+      |> Enum.map(&<<&1>>)
+      |> parse()
 
     assert data(frames) == data(elem(parse([whole]), 0))
     assert parser.buffer == ""
@@ -40,20 +48,20 @@ defmodule DashFloat.LLM.SSETest do
 
   test "CRLF line endings parse identically to LF" do
     {crlf, parser} = parse([fixture("happy_crlf.txt")])
-    {lf, _} = parse([fixture("happy.txt")])
+    {lf, _parser} = parse([fixture("happy.txt")])
 
     assert data(crlf) == data(lf)
     assert parser.buffer == ""
   end
 
   test "frames split mid-field and mid-JSON complete across chunks" do
-    {frames, _} = parse(["data: {\"a\":", "1}\n", "\n"])
+    {frames, _parser} = parse(["data: {\"a\":", "1}\n", "\n"])
 
     assert data(frames) == [~s({"a":1})]
   end
 
   test "a CRLF split across chunks still delimits the frame" do
-    {frames, _} =
+    {frames, _parser} =
       parse([
         "data: one\n\r",
         "\ndata: two\r\n\r\n"
@@ -70,19 +78,19 @@ defmodule DashFloat.LLM.SSETest do
   end
 
   test "invalid UTF-8 bytes survive the parser without raising" do
-    {frames, _} = parse(["data: ", <<0xFF, 0xFE>>, "\n\n"])
+    {frames, _parser} = parse(["data: ", <<0xFF, 0xFE>>, "\n\n"])
 
     assert [%{data: <<0xFF, 0xFE>>}] = frames
   end
 
   test "multiple data lines in one frame join with a newline" do
-    {frames, _} = parse(["data: first\ndata: second\n\n"])
+    {frames, _parser} = parse(["data: first\ndata: second\n\n"])
 
     assert data(frames) == ["first\nsecond"]
   end
 
   test "event, id, retry, and unknown fields are dropped" do
-    {frames, _} =
+    {frames, _parser} =
       parse(["event: message\nid: 7\nretry: 100\nfoo: bar\ndata: kept\n\n"])
 
     assert data(frames) == ["kept"]
@@ -100,13 +108,13 @@ defmodule DashFloat.LLM.SSETest do
     assert frames == []
     assert parser.buffer == "data: partial"
 
-    {frames, parser} = SSE.feed(parser, "\n\n")
-    assert data(frames) == ["partial"]
-    assert parser.buffer == ""
+    {frames2, parser2} = SSE.feed(parser, "\n\n")
+    assert data(frames2) == ["partial"]
+    assert parser2.buffer == ""
   end
 
   test "data without a leading space keeps its value intact" do
-    {frames, _} = parse(["data:no-space\n\n"])
+    {frames, _parser} = parse(["data:no-space\n\n"])
 
     assert data(frames) == ["no-space"]
   end

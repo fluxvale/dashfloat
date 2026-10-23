@@ -14,7 +14,8 @@ defmodule DashFloat.TUI do
   @behaviour ExRatatui.App
 
   alias DashFloat.LLM.ChatStream
-  alias DashFloat.TUI.{State, View}
+  alias DashFloat.TUI.State
+  alias DashFloat.TUI.View
 
   @no_provider "[llm: no provider configured — set base_url/model/api_key in " <>
                  "~/.config/dashfloat/config.json or " <>

@@ -13,7 +13,7 @@ defmodule DashFloat.TUI.State do
 
   @type phase :: :idle | :streaming | :executing_tool
   @type entry_kind :: :user | :assistant | :tool | :system
-  @type action :: :quit | {:submit, String.t()} | nil
+  @type action :: :quit | {:submit, String.t()} | :cancel | nil
 
   @max_history 500
   @default_size {80, 24}
@@ -82,6 +82,7 @@ defmodule DashFloat.TUI.State do
   end
 
   @doc "The configured model name for the status bar, or nil when unusable."
+  @spec provider_model(t()) :: String.t() | nil
   def provider_model(%__MODULE__{provider: {:ok, %{model: model}}}), do: model
   def provider_model(%__MODULE__{}), do: nil
 
@@ -134,10 +135,11 @@ defmodule DashFloat.TUI.State do
   def handle_key(state, "enter", ["alt"]), do: forward(state, "enter", [])
 
   # Esc cancels a running stream; a no-op otherwise (ADR 0005).
-  def handle_key(%{phase: :streaming, task_pid: pid} = state, "esc", _) when is_pid(pid),
-    do: {state, :cancel}
+  def handle_key(%{phase: :streaming, task_pid: pid} = state, "esc", _modifiers)
+      when is_pid(pid),
+      do: {state, :cancel}
 
-  def handle_key(state, "esc", _), do: {state, nil}
+  def handle_key(state, "esc", _modifiers), do: {state, nil}
 
   # Log scrolling.
   def handle_key(state, "page_up", _modifiers), do: {page_up(state), nil}
@@ -319,7 +321,7 @@ defmodule DashFloat.TUI.State do
   end
 
   defp format_reason(reason) when is_binary(reason), do: reason
-  defp format_reason(reason), do: "[stream failed: #{inspect(reason) |> String.slice(0, 120)}]"
+  defp format_reason(reason), do: "[stream failed: #{String.slice(inspect(reason), 0, 120)}]"
 
   ## History navigation
 

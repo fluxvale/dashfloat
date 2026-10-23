@@ -33,7 +33,8 @@ defmodule DashFloat.Config do
   @doc "The per-user config file path (`XDG_CONFIG_HOME` respected)."
   @spec default_path() :: String.t()
   def default_path do
-    :filename.basedir(:user_config, "dashfloat") |> Path.join("config.json")
+    config_dir = :filename.basedir(:user_config, "dashfloat")
+    Path.join(config_dir, "config.json")
   end
 
   @doc """
@@ -92,7 +93,11 @@ defmodule DashFloat.Config do
 
   defp value(_other), do: nil
 
-  defp env_value(env, var), do: env |> Map.get(var) |> value()
+  defp env_value(env, var) do
+    env
+    |> Map.get(var)
+    |> value()
+  end
 
   defp field_names(fields) do
     Enum.map_join(fields, ", ", fn {field, _var} -> Atom.to_string(field) end)

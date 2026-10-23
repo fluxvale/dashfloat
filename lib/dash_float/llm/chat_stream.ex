@@ -42,8 +42,8 @@ defmodule DashFloat.LLM.ChatStream do
         fail(ui, "[llm: connection failed: " <> message <> "]")
 
       {:ok, url} ->
-        post(url, provider, prompt, idle_timeout)
-        |> handle_response(ui, provider, idle_timeout)
+        response = post(url, provider, prompt, idle_timeout)
+        handle_response(response, ui, provider, idle_timeout)
     end
   end
 
@@ -141,8 +141,13 @@ defmodule DashFloat.LLM.ChatStream do
   # header value; the key never reaches the chat log (ADR 0005). Mint renders
   # header values with inspect, so the escaped form is redacted too.
   defp scrub(message, key) do
+    escaped =
+      key
+      |> inspect()
+      |> String.slice(1..-2//1)
+
     needles =
-      [key, key |> inspect() |> String.slice(1..-2//1)]
+      [key, escaped]
       |> Enum.reject(&(&1 in [nil, ""]))
       |> Enum.uniq()
 
@@ -218,7 +223,7 @@ defmodule DashFloat.LLM.ChatStream do
         emit_frames(ui, resp, rest)
 
       # A data frame that is not JSON is a broken stream, not a keepalive.
-      {:error, _} ->
+      {:error, _error} ->
         {:error, "[llm: malformed SSE data frame — stream aborted]"}
     end
   end
@@ -227,7 +232,7 @@ defmodule DashFloat.LLM.ChatStream do
 
   # Role-only frames, empty choices, and usage frames are shape misses: skip
   # them silently (ADR 0005).
-  defp emit_content(ui, %{"choices" => [%{"delta" => %{"content" => content}} | _]})
+  defp emit_content(ui, %{"choices" => [%{"delta" => %{"content" => content}} | _rest]})
        when is_binary(content) and content != "" do
     send(ui, {:token, content})
     :ok
