@@ -8,10 +8,4 @@ defmodule DashFloat do
 
   Run the TUI with `mix run --no-halt`.
   """
-
-  # Deliberate credo violation for the red-leg proof of the Wait for CI
-  # umbrella — reverted in the next commit. Do not "fix".
-  def red_leg_probe do
-    IO.inspect("red-leg probe")
-  end
 end
