@@ -56,3 +56,7 @@ CI runs it on every pull request and every push to `main`, uploads the HTML
 coverage report as an artifact, and sends the JSON report to Codecov. The
 required branch-protection check is **Wait for CI**. See
 [AGENTS.md](AGENTS.md) for the repository conventions.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
