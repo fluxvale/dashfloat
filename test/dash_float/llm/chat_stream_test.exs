@@ -290,19 +290,126 @@ defmodule DashFloat.LLM.ChatStreamTest do
     await_exit(ref)
   end
 
+  test "the happy path closes the connection at [DONE]" do
+    server =
+      start_server([
+        {:send, [@headers, frame("done")]},
+        {:send, "data: [DONE]\n\n"},
+        {:wait_close, 2_000}
+      ])
+
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    assert tokens(collect()) == "done"
+    assert_receive {:sse_closed}, 2_000
+    await_exit(ref)
+  end
+
+  test "the idle timeout resets on every chunk" do
+    script =
+      [{:send, [@headers, frame("a")]}] ++
+        Enum.flat_map(1..8, fn i -> [{:sleep, 60}, {:send, frame("b#{i}")}] end) ++
+        [{:send, "data: [DONE]\n\n"}, :close]
+
+    server = start_server(script)
+
+    # Each gap is well under the timeout; only a total-budget implementation
+    # would abort here.
+    {_pid, ref} = start_stream(SSEServer.base_url(server), idle_timeout: 150)
+
+    messages = collect()
+    assert tokens(messages) == "a" <> Enum.map_join(1..8, "", &"b#{&1}")
+    assert system_entries(messages) == []
+    await_exit(ref)
+  end
+
+  test "a redirect is not followed and reports the status" do
+    server =
+      start_server([
+        {:send,
+         "HTTP/1.1 307 Temporary Redirect\r\nlocation: /chat/completions\r\n" <>
+           "content-length: 0\r\nconnection: close\r\n\r\n"},
+        {:wait_close, 1_000}
+      ])
+
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    # Exactly one request: a followed redirect would POST again (and bill).
+    assert_receive {:sse_request, "POST", "/chat/completions", _headers, _body}, 2_000
+    assert ["[llm: HTTP 307]"] = system_entries(collect())
+    refute_receive {:sse_request, _, _, _, _}, 300
+
+    await_exit(ref)
+  end
+
   test "an error body over the drain cap is truncated; unrelated messages are ignored" do
-    body = String.duplicate("x", 70_000)
+    # A valid provider message past the 64 KiB cap must NOT be reported: only
+    # the first 64 KiB survive (an unbounded drain would print "late").
+    prefix = String.duplicate(" ", 70_000)
+    body = prefix <> ~s({"error":{"message":"late"}})
 
     headers =
       "HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain\r\n" <>
         "content-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n"
 
-    server = start_server([{:send, [headers, body]}, :close])
+    # Two writes so the second lands with the cap already reached.
+    server =
+      start_server([
+        {:send, headers},
+        {:send, prefix},
+        {:sleep, 20},
+        {:send, ~s({"error":{"message":"late"}})},
+        :close
+      ])
+
     {pid, ref} = start_stream(SSEServer.base_url(server))
 
     send(pid, {:unrelated, :junk})
 
     assert ["[llm: HTTP 502]"] = system_entries(collect())
+    await_exit(ref)
+  end
+
+  test "cancel while waiting for response headers is honored at the next check" do
+    # The server accepts but never answers: Req.post blocks in the header
+    # phase, where our mailbox is not read. The cancel is picked up as soon as
+    # the header wait ends.
+    server = start_server([{:sleep, 1_000}, :close])
+    {pid, ref} = start_stream(SSEServer.base_url(server), idle_timeout: 200)
+
+    assert_receive {:sse_request, _, _, _, _}, 1_000
+    send(pid, :cancel)
+
+    messages = collect()
+    assert system_entries(messages) == ["[cancelled]"]
+    assert {:phase, :idle} == List.last(messages)
+    await_exit(ref)
+  end
+
+  test "a body that never finishes hits the drain deadline" do
+    headers =
+      "HTTP/1.1 504 Slow\r\ncontent-type: application/json\r\n" <>
+        "content-length: 500\r\nconnection: close\r\n\r\n"
+
+    # Trickle a byte every 400 ms: the 5 s budget is absolute, not per message.
+    trickle = Enum.flat_map(1..20, fn _ -> [{:send, "{"}, {:sleep, 400}] end)
+    server = start_server([{:send, headers} | trickle])
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    assert_receive {:entry, :system, "[llm: HTTP 504]"}, 7_000
+    assert_receive {:phase, :idle}, 1_000
+    await_exit(ref)
+  end
+
+  test "a dropped connection while draining an error still reports the status" do
+    headers =
+      "HTTP/1.1 503 Busy\r\ncontent-type: application/json\r\n" <>
+        "content-length: 500\r\nconnection: close\r\n\r\n"
+
+    server = start_server([{:send, [headers, "partial"]}, :close])
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    assert ["[llm: HTTP 503]"] = system_entries(collect())
     await_exit(ref)
   end
 
@@ -336,6 +443,35 @@ defmodule DashFloat.LLM.ChatStreamTest do
     assert [message] = system_entries(messages)
     assert message =~ "[llm: connection failed: "
     assert {:phase, :idle} == List.last(messages)
+    await_exit(ref)
+  end
+
+  test "a malformed base_url is a connection failure, not a crashed producer" do
+    {_pid, ref} = start_stream("api.example.com/v1")
+
+    messages = collect()
+
+    assert [message] = system_entries(messages)
+    assert message =~ "[llm: connection failed: "
+    assert {:phase, :idle} == List.last(messages)
+    await_exit(ref)
+  end
+
+  test "the API key is redacted from a failure message that quotes it" do
+    # A header value with a non-ASCII byte makes Mint raise with the header
+    # in the message; the key must never reach the chat log.
+    provider = %Config{base_url: "http://127.0.0.1:1", model: "m", api_key: "test-key-é123"}
+    ui = self()
+
+    {:ok, pid} =
+      Task.start(fn -> ChatStream.run(ui, provider, "hi") end)
+
+    ref = Process.monitor(pid)
+    messages = collect()
+
+    assert [message] = system_entries(messages)
+    assert message =~ "[llm: connection failed: "
+    refute message =~ "test-key-é123"
     await_exit(ref)
   end
 

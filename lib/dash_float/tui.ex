@@ -118,6 +118,9 @@ defmodule DashFloat.TUI do
     end
   end
 
+  # Spec-mandated: both "no config at all" and "config unreadable" degrade to
+  # the setup instructions; the Config error text is deliberately not surfaced
+  # (values are never echoed either way).
   defp start_stream(_prompt, state), do: State.stream_failed(state, @no_provider)
 
   defp cancel_stream(state) do

@@ -1,6 +1,7 @@
 defmodule DashFloat.ConfigTest do
   @moduledoc false
-  use ExUnit.Case, async: true
+  # Not async: the load/0 test manipulates process-wide env vars.
+  use ExUnit.Case, async: false
 
   alias DashFloat.Config
 
@@ -78,13 +79,13 @@ defmodule DashFloat.ConfigTest do
     refute message =~ "file.example"
   end
 
-  test "a non-object JSON file contributes no fields" do
+  test "a JSON file that is not an object is reported as invalid" do
     path = tmp_path()
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "[1, 2, 3]")
 
-    assert {:error, "missing provider config: base_url, model, api_key"} =
-             Config.load(path, %{})
+    assert {:error, message} = Config.load(path, %{})
+    assert message == "invalid JSON in #{path}: expected a JSON object"
   end
 
   test "an unreadable path is reported, not raised" do
@@ -94,6 +95,13 @@ defmodule DashFloat.ConfigTest do
 
     assert {:error, message} = Config.load(path, %{})
     assert message =~ "cannot read #{path}:"
+  end
+
+  test "a blank env var falls back to the file value" do
+    path = write!(tmp_path(), full_file())
+    env = %{"DASHFLOAT_MODEL" => "   ", "DASHFLOAT_API_KEY" => ""}
+
+    assert {:ok, %Config{model: "file-model", api_key: "file-key"}} = Config.load(path, env)
   end
 
   test "trailing whitespace is trimmed from values" do
@@ -109,28 +117,32 @@ defmodule DashFloat.ConfigTest do
              Config.load(path, %{})
   end
 
-  test "load/0 reads the default path with the real environment" do
-    # The path is derived from the user config dir; assert the shape only.
-    assert Config.default_path() =~ "dashfloat/config.json"
-
-    original = {System.get_env("DASHFLOAT_MODEL"), System.get_env("DASHFLOAT_BASE_URL")}
-    on_exit(fn -> restore_env(original) end)
-
-    System.delete_env("DASHFLOAT_MODEL")
-    System.delete_env("DASHFLOAT_BASE_URL")
-
-    assert {:error, message} = Config.load()
-    assert message =~ "missing provider config:"
-    refute message =~ "test-key-123"
+  test "Inspect never prints the api key" do
+    config = %Config{base_url: "http://x", model: "m", api_key: "test-key-123"}
+    refute inspect(config) =~ "test-key-123"
+    refute inspect(%{provider: {:ok, config}}) =~ "test-key-123"
   end
 
-  defp restore_env({model, base_url}) do
-    if model,
-      do: System.put_env("DASHFLOAT_MODEL", model),
-      else: System.delete_env("DASHFLOAT_MODEL")
+  test "load/0 uses the default path and the real environment" do
+    # Point the user-config dir at an empty temp dir, so a real config on the
+    # developer's machine cannot make this test pass or fail by accident.
+    dir = Path.join(@tmp_dir, "xdg-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
 
-    if base_url,
-      do: System.put_env("DASHFLOAT_BASE_URL", base_url),
-      else: System.delete_env("DASHFLOAT_BASE_URL")
+    vars = ["XDG_CONFIG_HOME", "DASHFLOAT_BASE_URL", "DASHFLOAT_MODEL", "DASHFLOAT_API_KEY"]
+    saved = Map.new(vars, &{&1, System.get_env(&1)})
+    on_exit(fn -> Enum.each(saved, fn {var, value} -> restore(var, value) end) end)
+
+    System.put_env("XDG_CONFIG_HOME", dir)
+
+    for var <- ["DASHFLOAT_BASE_URL", "DASHFLOAT_MODEL", "DASHFLOAT_API_KEY"] do
+      System.delete_env(var)
+    end
+
+    assert Config.default_path() == Path.join(dir, "dashfloat/config.json")
+    assert {:error, "missing provider config: base_url, model, api_key"} = Config.load()
   end
+
+  defp restore(var, nil), do: System.delete_env(var)
+  defp restore(var, value), do: System.put_env(var, value)
 end

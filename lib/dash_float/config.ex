@@ -15,6 +15,9 @@ defmodule DashFloat.Config do
     api_key: "DASHFLOAT_API_KEY"
   ]
 
+  # The provider rides in the TUI state, and a UI crash logs that state: never
+  # let the key into a log line (ADR 0004).
+  @derive {Inspect, except: [:api_key]}
   defstruct [:base_url, :model, :api_key]
 
   @type t :: %__MODULE__{
@@ -72,7 +75,7 @@ defmodule DashFloat.Config do
   defp decode(path, contents) do
     case Jason.decode(contents) do
       {:ok, map} when is_map(map) -> {:ok, map}
-      {:ok, _other} -> {:ok, %{}}
+      {:ok, _other} -> {:error, "invalid JSON in #{path}: expected a JSON object"}
       {:error, error} -> {:error, "invalid JSON in #{path}: #{Exception.message(error)}"}
     end
   end

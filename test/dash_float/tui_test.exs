@@ -33,8 +33,20 @@ defmodule DashFloat.TUITest do
     Process.unlink(sup)
     on_exit(fn -> if Process.alive?(sup), do: Supervisor.stop(sup) end)
 
-    [{TUI, pid, :worker, _args}] = Supervisor.which_children(sup)
+    # A torn-down TUI can leave its producer running for a few ms; later tests
+    # assert on the app-wide supervisor's children, so drain before they run.
+    on_exit(fn -> await_no_tasks(200) end)
+
+    [{TUI, pid, :worker, _}] = Supervisor.which_children(sup)
     {:ok, pid}
+  end
+
+  defp await_no_tasks(tries) do
+    cond do
+      Task.Supervisor.children(DashFloat.StreamSupervisor) == [] -> :ok
+      tries > 0 -> Process.sleep(10) && await_no_tasks(tries - 1)
+      true -> :ok
+    end
   end
 
   defp provider(base_url) do
@@ -378,6 +390,21 @@ defmodule DashFloat.TUITest do
     expected = Enum.map_join(1..40, "", &"t#{&1} ")
     assert {:assistant, expected} in state.entries
     assert State.input_text(state) == "zzzzz"
+  end
+
+  test "an unreadable or invalid config still degrades to the setup instructions" do
+    # {:error, _} and nil both land on the same guidance: the TUI stays usable
+    # and never echoes the file contents or values.
+    {:ok, pid} = start_tui(provider: {:error, "invalid JSON in /x/config.json"})
+    submit(pid, "hello")
+
+    state =
+      eventually(pid, fn s ->
+        s.phase == :idle and
+          Enum.any?(system_entries(s), &String.contains?(&1, "[llm: no provider configured"))
+      end)
+
+    refute Enum.any?(system_entries(state), &String.contains?(&1, "/x/config.json"))
   end
 
   test "paste, resize, key releases, unknown events, and stray messages are handled" do

@@ -26,14 +26,29 @@ defmodule DashFloat.LLM.SSE do
   """
   @spec feed(t(), binary()) :: {[frame()], t()}
   def feed(%__MODULE__{buffer: buffer}, chunk) when is_binary(chunk) do
-    {frames, rest} = buffer |> Kernel.<>(chunk) |> normalize() |> split_frames([])
+    # Normalize only the new chunk (plus a "\r" held back from the previous
+    # one, so a CRLF split across chunks stays intact) — re-scanning the whole
+    # buffer on every chunk would be quadratic on a large frame.
+    {buffer, chunk} = move_trailing_cr(buffer, chunk)
+
+    {frames, rest} = (buffer <> normalize(chunk)) |> split_frames([])
 
     {frames |> Enum.reverse() |> Enum.flat_map(&parse_frame/1), %__MODULE__{buffer: rest}}
   end
 
-  # Normalizing the whole buffer (not just the new chunk) keeps a CRLF split
-  # across two chunks intact: the held-back "\r" meets the next "\n" here.
-  defp normalize(buffer), do: String.replace(buffer, "\r\n", "\n")
+  # A "\r" at the very end of the buffer may be half of a CRLF whose "\n"
+  # arrives in this chunk: hold it back so normalize/1 can see the pair.
+  defp move_trailing_cr(buffer, chunk) do
+    size = byte_size(buffer)
+
+    if size > 0 and :binary.last(buffer) == ?\r do
+      {binary_part(buffer, 0, size - 1), "\r" <> chunk}
+    else
+      {buffer, chunk}
+    end
+  end
+
+  defp normalize(chunk), do: String.replace(chunk, "\r\n", "\n")
 
   defp split_frames(buffer, acc) do
     case :binary.split(buffer, "\n\n") do

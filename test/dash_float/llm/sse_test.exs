@@ -62,6 +62,19 @@ defmodule DashFloat.LLM.SSETest do
     assert data(frames) == ["one", "two"]
   end
 
+  test "a CRLF split after multi-byte content still delimits the frame" do
+    {frames, parser} = parse(["data: héllo\r", "\n\r\n"])
+
+    assert data(frames) == ["héllo"]
+    assert parser.buffer == ""
+  end
+
+  test "invalid UTF-8 bytes survive the parser without raising" do
+    {frames, _} = parse(["data: ", <<0xFF, 0xFE>>, "\n\n"])
+
+    assert [%{data: <<0xFF, 0xFE>>}] = frames
+  end
+
   test "multiple data lines in one frame join with a newline" do
     {frames, _} = parse(["data: first\ndata: second\n\n"])
 
