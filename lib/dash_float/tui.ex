@@ -1,0 +1,101 @@
+defmodule DashFloat.TUI do
+  @moduledoc """
+  The DashFloat terminal UI: a thin `ExRatatui.App` whose state logic lives in
+  `DashFloat.TUI.State` and rendering in `DashFloat.TUI.View`. Process shape,
+  key bindings, and teardown guarantees are settled in ADR 0002.
+
+  Run with `mix run --no-halt`. Quit with Ctrl+Q or Ctrl+C.
+  """
+
+  # No `use ExRatatui.App`: it injects a :transient child_spec that would
+  # shadow ours. A crashed UI must exit the application instead of bouncing
+  # back blank (ADR 0002). The behaviour form is documented as equivalent.
+  @behaviour ExRatatui.App
+
+  alias DashFloat.SyntheticStream
+  alias DashFloat.TUI.{State, View}
+
+  def child_spec(opts) do
+    %{
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, [opts]},
+      type: :worker,
+      restart: :temporary
+    }
+  end
+
+  @doc false
+  def start_link(opts \\ []) when is_list(opts) do
+    opts |> Keyword.put(:mod, __MODULE__) |> ExRatatui.App.dispatch_start()
+  end
+
+  @impl true
+  def mount(opts) do
+    {:ok, State.new(opts)}
+  end
+
+  @impl true
+  def render(state, frame), do: View.render(state, frame)
+
+  @impl true
+  def handle_event(%ExRatatui.Event.Key{kind: kind} = key, state)
+      when kind in ["press", "repeat"] do
+    {state, action} = State.handle_key(state, key.code, key.modifiers)
+
+    case action do
+      :quit ->
+        {:stop, state}
+
+      {:submit, prompt} ->
+        start_stream(prompt, state)
+        {:noreply, state}
+
+      nil ->
+        {:noreply, state}
+    end
+  end
+
+  # kitty-protocol terminals also report key releases; ignore them.
+  def handle_event(%ExRatatui.Event.Key{}, state), do: {:noreply, state}
+
+  def handle_event(%ExRatatui.Event.Paste{content: content}, state),
+    do: {:noreply, State.paste(state, content)}
+
+  def handle_event(%ExRatatui.Event.Resize{width: w, height: h}, state),
+    do: {:noreply, State.resize(state, w, h)}
+
+  def handle_event(_event, state), do: {:noreply, state}
+
+  @impl true
+  def handle_info({:inspect_state, pid}, state) when is_pid(pid) do
+    send(pid, {:tui_state, state})
+    {:noreply, state}
+  end
+
+  def handle_info({:entry, _, _} = msg, state),
+    do: {:noreply, State.stream_message(state, msg)}
+
+  def handle_info({kind, _} = msg, state) when kind in [:token, :phase],
+    do: {:noreply, State.stream_message(state, msg)}
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(reason, state) do
+    # Standalone runs (`mix run --no-halt`, future burrito binary) exit the VM
+    # when the TUI quits so the shell prompt comes back. Test-mode instances
+    # own no real terminal and must not stop the test VM.
+    if state.live?, do: System.stop(if reason in [:normal, :shutdown], do: 0, else: 1)
+
+    :ok
+  end
+
+  defp start_stream(prompt, state) do
+    ui = self()
+    opts = state.demo_stream_opts
+
+    Task.Supervisor.start_child(DashFloat.StreamSupervisor, fn ->
+      SyntheticStream.emit(ui, prompt, opts)
+    end)
+  end
+end
