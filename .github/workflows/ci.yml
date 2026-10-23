@@ -56,10 +56,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-dialyzer-${{ steps.setup-beam.outputs.elixir-version }}-${{ steps.setup-beam.outputs.otp-version }}-
 
-      # Bootstrap so `deps.get --check-locked` (first step of mix ci) has a
-      # lockfile to verify against and compile has code.
-      - run: mix deps.get
-
+      # No `mix deps.get` bootstrap: `deps.get --check-locked` (first step of
+      # mix ci) fetches the deps itself AND verifies mix.lock. A plain
+      # deps.get first would silently rewrite a stale lock, leaving the
+      # check-locked gate passing on a lockfile it just repaired.
       - run: mix ci
 
       # The report stays inspectable when the coverage floor reds.
@@ -69,10 +69,15 @@ jobs:
         with:
           name: coverage-report
           path: cover/
+          # Re-runs of the same workflow run find the name already taken
+          overwrite: true
 
       # fail_ci_if_error: the v2 upload watchdog — a codecov.io outage reds
-      # this step rather than silently dropping coverage.
+      # this step rather than silently dropping coverage. Fork PRs get no
+      # secrets (so no token), and with fail_ci_if_error that would red every
+      # external contribution: upload only for same-repo refs.
       - name: Upload coverage to Codecov
+        if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           flags: dashfloat
