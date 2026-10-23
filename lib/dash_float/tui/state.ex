@@ -333,7 +333,8 @@ defmodule DashFloat.TUI.State do
 
   @doc "Total display lines in the log (entries plus any in-flight entry)."
   def log_line_count(%{entries: entries, in_flight: in_flight}) do
-    # Count via :binary.matches — no split allocations on the hot render path.
+    # Count via :binary.matches — avoids String.split's per-line list building
+    # on the hot render path.
     count = Enum.reduce(entries, 0, fn {_kind, text}, acc -> acc + line_count(text) end)
 
     if in_flight in [nil, ""] do

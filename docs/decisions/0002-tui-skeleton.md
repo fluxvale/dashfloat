@@ -136,11 +136,12 @@ page-scroll arithmetic — one source of truth.
   slice of the log, so the expensive part of a frame — constructing widgets
   and shipping them through the NIF bridge — is `O(viewport)`. Line
   *accounting* (totals, offsets, finding the entry that contains the scroll
-  offset) remains a cheap allocation-free scan of the entry list: negligible
-  at session scale (hundreds of entries), ~4 ms at an implausible 100k-line
-  in-memory log. A prefix-sum index is deferred until Phase 4 persistence
-  makes logs actually huge. The full log stays in memory (plain list,
-  `O(n)` append per entry); size caps are Phase 4 concerns.
+  offset) remains a cheap scan of the entry list (no `String.split` list
+  building — `:binary.matches` allocates only its small result list):
+  negligible at session scale (hundreds of entries), ~10 ms at an
+  implausible 100k-line in-memory log. A prefix-sum index is deferred until
+  Phase 4 persistence makes logs actually huge. The full log stays in memory
+  (plain list, `O(n)` append per entry); size caps are Phase 4 concerns.
 - An empty log renders a gray placeholder line.
 
 ### Input mechanics and Enter vs Ctrl+Enter
@@ -190,7 +191,11 @@ handler owns retry semantics, and an auto-restart would duplicate the reply.
 One race is accepted by policy: a producer that exits between
 `start_child/2` returning and the monitor attaching yields `:noproc`, which
 is indistinguishable from success after the fact — it is treated as a normal
-exit (the fast demo cadence hits this window routinely).
+exit (the fast demo cadence hits this window routinely). Note the flip side:
+a producer that *crashes* that early is swallowed the same way — no error
+entry, just a missing reply. Phase 2 producers must therefore always send
+their own terminal `{:phase, _}` message before exiting; the monitor is a
+safety net, not the reporter of record.
 
 ### Synthetic-update demo path
 
@@ -262,7 +267,8 @@ logged, loop continues).
   I/O found in the UI process is a bug. Phase 1 adds one sanctioned exception —
   the submit-time `Task.Supervisor.start_child/2`.
 - Log widget building/encoding is `O(viewport)` per frame; line accounting
-  is an allocation-free `O(total)` scan. Log *storage* is a plain list with
+  is a cheap `O(total)` scan (~10 ms at an implausible 100k in-memory lines).
+  Log *storage* is a plain list with
   `O(n)` appends, bounded only by memory until Phase 4 persistence.
 - The demo producer's cadence is configurable through mount opts
   (`:demo_stream_opts`) purely so tests can run it in milliseconds; defaults
