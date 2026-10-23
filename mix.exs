@@ -16,7 +16,7 @@ defmodule DashFloat.MixProject do
       # TUI guards a test-only path with Code.ensure_loaded?(Mix) + Mix.env/0,
       # which needs :mix in the PLT or dialyzer reports a false unknown function
       dialyzer: [
-        plt_add_apps: [:ex_unit, :mix],
+        plt_add_apps: [:mix],
         plt_file: {:no_warn, "priv/plts/project.plt"},
         list_unused_filters: true
       ]

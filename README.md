@@ -41,14 +41,16 @@ history, PageUp/PageDown scroll the log, Ctrl+Q (or Ctrl+C) quits.
 ## Development
 
 ```sh
-mix deps.get
 mix ci
 ```
 
 `mix ci` is the whole gate — the same list CI runs, so local and CI cannot
 drift ([ADR 0003](docs/decisions/0003-ci-gate-and-coverage-ratchet.md)):
 format, compile with warnings as errors, `credo --strict`, `dialyzer`, and the
-test suite under ExCoveralls with a coverage floor (`coveralls.json`).
+test suite under ExCoveralls with a coverage floor (`coveralls.json`). It
+fetches any missing deps itself — there is deliberately no separate
+`mix deps.get` first, as it would silently repair a stale lock before the gate
+could catch it.
 
 CI runs it on every pull request and every push to `main`, uploads the HTML
 coverage report as an artifact, and sends the JSON report to Codecov. The

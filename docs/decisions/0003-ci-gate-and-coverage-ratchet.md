@@ -25,7 +25,8 @@ dev-env invocation works without a `MIX_ENV` prefix. Checks: `deps.get
 `deps.get --check-locked` fetches a missing `deps/` itself, so CI has no
 `mix deps.get` bootstrap step: a plain `deps.get` first would silently rewrite
 a stale lock, leaving the check-locked gate passing on a lockfile it just
-repaired.
+repaired. NB: the alias runs under `MIX_ENV=test`, so the lock check sees the
+dev+test dep set — a future `only: :dev` dep would need its own care.
 
 **Cache keying on resolved versions.** Both caches key on setup-beam's
 `elixir-version`/`otp-version` outputs — the versions actually installed — not

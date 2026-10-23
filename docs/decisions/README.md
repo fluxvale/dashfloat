@@ -8,7 +8,7 @@ Each ADR uses a lightweight Nygard-style format:
 
 - **Status** — Accepted / Superseded / Deprecated
 - **Date** — when the decision was made
-- **Context** — the forces at play and the problem to be solved
+- **Context** — the forces at play and the problem being solved
 - **Decision** — what we chose
 - **Alternatives considered** — what we rejected and why
 - **Consequences** — what this decision implies, including trade-offs
