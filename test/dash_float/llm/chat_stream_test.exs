@@ -475,6 +475,30 @@ defmodule DashFloat.LLM.ChatStreamTest do
     await_exit(ref)
   end
 
+  test "an escape-rendered key and a provider error body echoing it are redacted" do
+    # Mint inspect()s a header value containing a newline, so the escaped form
+    # is what a failure message carries.
+    key = "test-key\n123"
+    provider = %Config{base_url: "http://127.0.0.1:1", model: "m", api_key: key}
+    ui = self()
+
+    {:ok, pid} = Task.start(fn -> ChatStream.run(ui, provider, "hi") end)
+    ref = Process.monitor(pid)
+
+    assert [message] = system_entries(collect())
+    assert message =~ "[llm: connection failed: "
+    refute message =~ "123"
+    await_exit(ref)
+
+    # A provider may echo the key in its error body.
+    echoed = ~s({"error":{"message":"bad key: test-key-123"}})
+    server = start_server([{:send, json_response(401, echoed)}, :close])
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    assert ["[llm: HTTP 401 — bad key: [redacted]]"] = system_entries(collect())
+    await_exit(ref)
+  end
+
   defp json_response(status, body) do
     "HTTP/1.1 #{status} Error\r\ncontent-type: application/json\r\n" <>
       "content-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n" <> body

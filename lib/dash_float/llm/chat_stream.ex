@@ -16,9 +16,10 @@ defmodule DashFloat.LLM.ChatStream do
   @default_idle_timeout 60_000
   @drain_limit 64 * 1024
   @drain_timeout 5_000
-  # finch's socket `receive_timeout` is the idle timeout: it bounds the header
-  # wait and reports a silent body first. The stream loop's own timer sits
-  # just behind it as a backstop for a wedged socket process.
+  # finch's socket `receive_timeout` sits one grace period behind the stream
+  # loop's own timer: the `after` clause is the detector (ADR 0004), finch is
+  # the backstop for a wedged socket process, and its 15 s default can never
+  # cut a healthy stream first.
   @timeout_grace 1_000
 
   @doc """
@@ -34,7 +35,7 @@ defmodule DashFloat.LLM.ChatStream do
       when is_pid(ui) and is_binary(prompt) do
     idle_timeout = Keyword.get(opts, :idle_timeout, @default_idle_timeout)
 
-    # `Req.post` raises for a bad base_url (no scheme, stray space) — a config
+    # `Req.post` raises on a bad base_url (no scheme, stray space) — a config
     # typo must still degrade to a chat entry, never a crashed producer.
     try do
       post(provider, prompt, idle_timeout)
@@ -48,7 +49,8 @@ defmodule DashFloat.LLM.ChatStream do
     if cancelled?() do
       terminal(ui, "[cancelled]")
     else
-      fail(ui, "[llm: connection failed: " <> scrub(exception, provider) <> "]")
+      message = Exception.message(exception)
+      fail(ui, "[llm: connection failed: " <> scrub(message, provider.api_key) <> "]")
     end
   end
 
@@ -57,8 +59,8 @@ defmodule DashFloat.LLM.ChatStream do
     if cancelled?(), do: cancel(ui, resp), else: stream(ui, resp, idle_timeout, SSE.new())
   end
 
-  defp handle_response({:ok, %Req.Response{status: status} = resp}, ui, _provider, _timeout) do
-    drain(ui, resp, status, "")
+  defp handle_response({:ok, %Req.Response{status: status} = resp}, ui, provider, _timeout) do
+    drain(ui, resp, status, "", provider.api_key)
   end
 
   # Esc may arrive while the request is still waiting for headers; nothing
@@ -71,17 +73,25 @@ defmodule DashFloat.LLM.ChatStream do
     end
   end
 
-  # Connection-failure text can quote the offending header value; the key
-  # never reaches the chat log (ADR 0004). Config guarantees a non-blank key.
-  defp scrub(exception, provider) do
-    String.replace(Exception.message(exception), provider.api_key, "[redacted]")
+  # Failure text and provider-supplied error bodies can quote the offending
+  # header value; the key never reaches the chat log (ADR 0004). Mint renders
+  # header values with inspect, so the escaped form is redacted too.
+  defp scrub(message, key) do
+    needles =
+      [key, key |> inspect() |> String.slice(1..-2//1)]
+      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.uniq()
+
+    Enum.reduce(needles, message, fn needle, acc ->
+      String.replace(acc, needle, "[redacted]")
+    end)
   end
 
   # A streaming completions POST is not resumable: `retry: false` and no
   # redirect following — either one could duplicate generation and billing.
-  # `receive_timeout` shares the stream's idle timeout: finch's 15 s default
-  # would otherwise cut a healthy but slow stream early, and both timers must
-  # agree so a quiet stream is reported as a timeout, not a lost connection.
+  # `receive_timeout` bounds the header wait and outlives the stream loop's
+  # own timer, so the ADR's `after` is always the detector of a silent
+  # stream and finch's 15 s default can never cut a healthy one first.
   defp post(provider, prompt, idle_timeout) do
     Req.post(
       String.trim_trailing(provider.base_url, "/") <> "/chat/completions",
@@ -97,7 +107,7 @@ defmodule DashFloat.LLM.ChatStream do
       into: :self,
       retry: false,
       redirect: false,
-      receive_timeout: idle_timeout
+      receive_timeout: idle_timeout + @timeout_grace
     )
   end
 
@@ -123,9 +133,9 @@ defmodule DashFloat.LLM.ChatStream do
     end
   end
 
-  # finch reports its idle `receive_timeout` as a socket error; that IS "no
-  # data for :idle_timeout" (ADR 0004), so it reads as a timeout, not a lost
-  # connection.
+  # finch reports its idle `receive_timeout` (one grace period behind the
+  # stream loop's `after`) as a socket error; that is still "no data for
+  # :idle_timeout" (ADR 0004), so it reads as a timeout, not a lost connection.
   defp stream_error(%{reason: :timeout}), do: "[llm: timed out waiting for stream data]"
   defp stream_error(_reason), do: "[llm: connection lost mid-stream]"
 
@@ -187,11 +197,11 @@ defmodule DashFloat.LLM.ChatStream do
   # Both bounds are absolute from the moment the drain starts: a server that
   # trickles bytes cannot extend it (@drain_timeout total, @drain_limit bytes).
 
-  defp drain(ui, resp, status, acc) do
-    drain(ui, resp, status, acc, deadline())
+  defp drain(ui, resp, status, acc, key) do
+    drain(ui, resp, status, acc, deadline(), key)
   end
 
-  defp drain(ui, resp, status, acc, deadline) do
+  defp drain(ui, resp, status, acc, deadline, key) do
     receive do
       :cancel ->
         cancel(ui, resp)
@@ -199,22 +209,22 @@ defmodule DashFloat.LLM.ChatStream do
       message ->
         case Req.parse_message(resp, message) do
           {:ok, [data: bytes]} ->
-            drain(ui, resp, status, append_bounded(acc, bytes), deadline)
+            drain(ui, resp, status, append_bounded(acc, bytes), deadline, key)
 
           {:ok, [trailers: _trailers]} ->
-            drain(ui, resp, status, acc, deadline)
+            drain(ui, resp, status, acc, deadline, key)
 
           {:ok, [:done]} ->
-            finish_drain(ui, resp, status, acc)
+            finish_drain(ui, resp, status, acc, key)
 
           {:error, _reason} ->
-            finish_drain(ui, resp, status, acc)
+            finish_drain(ui, resp, status, acc, key)
 
           :unknown ->
-            drain(ui, resp, status, acc, deadline)
+            drain(ui, resp, status, acc, deadline, key)
         end
     after
-      remaining(deadline) -> finish_drain(ui, resp, status, acc)
+      remaining(deadline) -> finish_drain(ui, resp, status, acc, key)
     end
   end
 
@@ -234,12 +244,12 @@ defmodule DashFloat.LLM.ChatStream do
     end
   end
 
-  defp finish_drain(ui, resp, status, body) do
+  defp finish_drain(ui, resp, status, body, key) do
     Req.cancel_async_response(resp)
 
     case Jason.decode(body) do
       {:ok, %{"error" => %{"message" => message}}} when is_binary(message) ->
-        fail(ui, "[llm: HTTP #{status} — #{message}]")
+        fail(ui, "[llm: HTTP #{status} — #{scrub(message, key)}]")
 
       _other ->
         fail(ui, "[llm: HTTP #{status}]")
