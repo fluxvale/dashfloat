@@ -13,8 +13,10 @@ defmodule DashFloat.TUI do
   @behaviour ExRatatui.App
 
   alias DashFloat.SyntheticStream
-  alias DashFloat.TUI.{State, View}
+  alias DashFloat.TUI.State
+  alias DashFloat.TUI.View
 
+  @spec child_spec(term()) :: Supervisor.child_spec()
   def child_spec(opts) do
     %{
       id: __MODULE__,
@@ -25,19 +27,22 @@ defmodule DashFloat.TUI do
   end
 
   @doc false
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) when is_list(opts) do
-    opts |> Keyword.put(:mod, __MODULE__) |> ExRatatui.App.dispatch_start()
+    opts
+    |> Keyword.put(:mod, __MODULE__)
+    |> ExRatatui.App.dispatch_start()
   end
 
-  @impl true
+  @impl ExRatatui.App
   def mount(opts) do
     {:ok, State.new(opts)}
   end
 
-  @impl true
+  @impl ExRatatui.App
   def render(state, frame), do: View.render(state, frame)
 
-  @impl true
+  @impl ExRatatui.App
   def handle_event(%ExRatatui.Event.Key{kind: kind} = key, state)
       when kind in ["press", "repeat"] do
     {state, action} = State.handle_key(state, key.code, key.modifiers)
@@ -65,28 +70,29 @@ defmodule DashFloat.TUI do
 
   def handle_event(_event, state), do: {:noreply, state}
 
-  @impl true
-  def handle_info({:entry, _, _} = msg, state),
+  @impl ExRatatui.App
+  def handle_info({:entry, _kind, _text} = msg, state),
     do: {:noreply, State.stream_message(state, msg)}
 
-  def handle_info({kind, _} = msg, state) when kind in [:token, :phase],
+  def handle_info({kind, _payload} = msg, state) when kind in [:token, :phase],
     do: {:noreply, State.stream_message(state, msg)}
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
-    {state, _} = State.task_down(state, ref, reason)
+    {state, _verdict} = State.task_down(state, ref, reason)
     {:noreply, state}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
 
-  @impl true
+  @impl ExRatatui.App
   def terminate(reason, state) do
     # Standalone runs (`mix run --no-halt`, future burrito binary) exit the VM
     # when the TUI quits so the shell prompt comes back. Only an explicit quit
     # is a success — a supervisor-driven or failing shutdown reports 1 (ADR
     # 0002). Test-mode instances own no real terminal and must not stop the
     # test VM.
-    if state.live?, do: System.stop(exit_code(reason))
+    code = exit_code(reason)
+    if state.live?, do: System.stop(code)
 
     :ok
   end
@@ -95,8 +101,9 @@ defmodule DashFloat.TUI do
   Exit status for a standalone run: `0` only for a user quit (`:normal`),
   `1` for anything else — supervisor shutdowns, crashes, failures.
   """
+  @spec exit_code(term()) :: 0 | 1
   def exit_code(:normal), do: 0
-  def exit_code(_), do: 1
+  def exit_code(_reason), do: 1
 
   defp start_stream(prompt, state) do
     ui = self()

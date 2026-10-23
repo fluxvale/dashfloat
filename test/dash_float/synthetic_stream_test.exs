@@ -24,7 +24,7 @@ defmodule DashFloat.SyntheticStreamTest do
 
     :ok = SyntheticStream.emit(collector, "ping", interval_ms: 0, sentences: 1)
 
-    msgs =
+    repeatedly =
       Stream.repeatedly(fn ->
         receive do
           msg -> msg
@@ -32,10 +32,11 @@ defmodule DashFloat.SyntheticStreamTest do
           200 -> :done
         end
       end)
-      |> Enum.take_while(&(&1 != :done))
+
+    msgs = Enum.take_while(repeatedly, &(&1 != :done))
 
     # Order: tokens → executing_tool → tool entry → streaming → tokens → idle.
-    tokens = Enum.filter(msgs, &match?({:token, _}, &1))
+    tokens = Enum.filter(msgs, &match?({:token, _text}, &1))
     assert tokens != []
     assert Enum.all?(tokens, fn {:token, t} -> is_binary(t) end)
     assert Enum.any?(tokens, fn {:token, t} -> String.contains?(t, "ping") end)
@@ -43,7 +44,7 @@ defmodule DashFloat.SyntheticStreamTest do
     assert Enum.find_index(msgs, &match?({:token, _}, &1)) <
              Enum.find_index(msgs, &match?({:phase, :executing_tool}, &1))
 
-    assert {:entry, :tool, text} = Enum.find(msgs, &match?({:entry, :tool, _}, &1))
+    assert {:entry, :tool, text} = Enum.find(msgs, &match?({:entry, :tool, _text}, &1))
     assert text =~ "[tool]"
 
     assert List.last(msgs) == {:phase, :idle}

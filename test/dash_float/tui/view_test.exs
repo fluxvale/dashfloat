@@ -2,10 +2,13 @@ defmodule DashFloat.TUI.ViewTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
-  alias DashFloat.TUI.{State, View}
+  alias DashFloat.TUI.State
+  alias DashFloat.TUI.View
 
   defp new_state(opts \\ []) do
-    State.new(Keyword.merge([test_mode: {80, 24}], opts))
+    [test_mode: {80, 24}]
+    |> Keyword.merge(opts)
+    |> State.new()
   end
 
   describe "regions/2" do
@@ -38,15 +41,20 @@ defmodule DashFloat.TUI.ViewTest do
       widgets = View.render(new_state(), %ExRatatui.Frame{width: 80, height: 24})
 
       assert [
-               {%ExRatatui.Widgets.Paragraph{}, _},
-               {%ExRatatui.Widgets.Paragraph{}, _},
-               {%ExRatatui.Widgets.Textarea{}, _}
+               {%ExRatatui.Widgets.Paragraph{}, _status_rect},
+               {%ExRatatui.Widgets.Paragraph{}, _log_rect},
+               {%ExRatatui.Widgets.Textarea{}, _input_rect}
              ] = widgets
     end
 
     test "status bar carries placeholders and the phase label" do
       line = hd(status_line(new_state()))
-      text = line |> spans() |> Enum.join()
+
+      text =
+        line
+        |> spans()
+        |> Enum.join()
+
       assert text =~ "DashFloat"
       assert text =~ "model: —"
       assert text =~ "ctx: —"
@@ -103,8 +111,8 @@ defmodule DashFloat.TUI.ViewTest do
           State.stream_message(acc, {:entry, :system, "line #{i}"})
         end)
 
-      {state, nil} = State.handle_key(state, "page_up", [])
-      widget = log_widget(state, 80, 24)
+      {paged, nil} = State.handle_key(state, "page_up", [])
+      widget = log_widget(paged, 80, 24)
       assert flatten(hd(widget.text)) =~ "line 61"
     end
 
@@ -124,24 +132,24 @@ defmodule DashFloat.TUI.ViewTest do
           State.stream_message(acc, {:entry, :system, "line #{i}"})
         end)
 
-      {state, nil} = State.handle_key(state, "page_up", [])
+      {paged, nil} = State.handle_key(state, "page_up", [])
       # 80x4: status(1) + log(0) + input(3); log height 0
-      text = status_text_at(state, 80, 4)
+      text = status_text_at(paged, 80, 4)
       refute Regex.match?(~r/L(\d+)-(\d+)/, text)
       assert text =~ "/30"
     end
 
     test "user entries are prefixed" do
-      state = new_state() |> State.stream_message({:entry, :system, "x"})
-      state = put_in(state.entries, [{:user, "hello"}])
-      [first | _] = log_lines(state)
+      state = State.stream_message(new_state(), {:entry, :system, "x"})
+      with_user = put_in(state.entries, [{:user, "hello"}])
+      [first | _rest] = log_lines(with_user)
       assert flatten(first) =~ "❯ hello"
     end
 
     test "very long entries do not break rendering" do
       long = String.duplicate("x", 5_000)
-      state = new_state() |> State.stream_message({:entry, :system, long})
-      assert [_] = log_lines(state)
+      state = State.stream_message(new_state(), {:entry, :system, long})
+      assert [_only] = log_lines(state)
     end
 
     test "a tiny frame renders without raising" do
@@ -181,7 +189,8 @@ defmodule DashFloat.TUI.ViewTest do
       |> List.first()
 
     [line] = widget.text
-    spans(line) |> Enum.join()
+    parts = spans(line)
+    Enum.join(parts)
   end
 
   defp status_line(state) do
@@ -211,5 +220,10 @@ defmodule DashFloat.TUI.ViewTest do
   end
 
   defp spans(%ExRatatui.Text.Line{spans: spans}), do: Enum.map(spans, & &1.content)
-  defp flatten(line), do: line |> spans() |> Enum.join()
+
+  defp flatten(line) do
+    line
+    |> spans()
+    |> Enum.join()
+  end
 end

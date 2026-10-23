@@ -3,7 +3,7 @@ defmodule DashFloat.Application do
 
   use Application
 
-  @impl true
+  @impl Application
   def start(_type, _args) do
     children = [
       {Task.Supervisor, name: DashFloat.StreamSupervisor}

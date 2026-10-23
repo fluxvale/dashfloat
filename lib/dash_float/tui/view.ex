@@ -8,8 +8,11 @@ defmodule DashFloat.TUI.View do
   alias DashFloat.TUI.State
   alias ExRatatui.Layout.Rect
   alias ExRatatui.Style
-  alias ExRatatui.Text.{Line, Span}
-  alias ExRatatui.Widgets.{Block, Paragraph, Textarea}
+  alias ExRatatui.Text.Line
+  alias ExRatatui.Text.Span
+  alias ExRatatui.Widgets.Block
+  alias ExRatatui.Widgets.Paragraph
+  alias ExRatatui.Widgets.Textarea
 
   @phases %{
     idle: {"Idle", :dark_gray},
@@ -21,6 +24,11 @@ defmodule DashFloat.TUI.View do
   Splits `width` x `height` into status (1 row), log (rest), and input
   (`2 + input_lines` rows, clamped to a third of the frame).
   """
+  @spec regions({integer(), integer()}, integer()) :: %{
+          status: Rect.t(),
+          log: Rect.t(),
+          input: Rect.t()
+        }
   def regions({width, height}, input_lines)
       when is_integer(width) and is_integer(height) and is_integer(input_lines) do
     area = %Rect{x: 0, y: 0, width: max(width, 0), height: max(height, 0)}
@@ -36,12 +44,18 @@ defmodule DashFloat.TUI.View do
   end
 
   @doc "Input region height: borders plus draft lines, capped at a third of the frame."
+  @spec input_height(integer(), integer()) :: pos_integer()
   def input_height(input_lines, height) do
     max_third = max(div(height, 3), 3)
-    input_lines |> Kernel.+(2) |> min(max_third) |> max(3)
+
+    input_lines
+    |> Kernel.+(2)
+    |> min(max_third)
+    |> max(3)
   end
 
   @doc "Renders the three regions. Pure; never raises on odd sizes."
+  @spec render(State.t(), ExRatatui.Frame.t()) :: [{ExRatatui.widget(), Rect.t()}]
   def render(%State{} = state, %ExRatatui.Frame{width: width, height: height}) do
     regions = regions({width, height}, State.input_line_count(state))
 
@@ -116,7 +130,7 @@ defmodule DashFloat.TUI.View do
 
     # Walk entries counting display lines; build Lines only for entries that
     # intersect [offset, offset + height).
-    {_, acc} =
+    {_total, acc} =
       Enum.reduce_while(pairs, {0, []}, fn {_kind, text} = pair, {skipped, acc} ->
         n = line_count(text)
 
@@ -156,7 +170,7 @@ defmodule DashFloat.TUI.View do
     |> Enum.with_index(1)
     |> Enum.map(fn
       {line, 1} -> Line.new([Span.new("❯ ", style: %Style{modifiers: [:bold]}), Span.new(line)])
-      {line, _} -> Line.new([Span.new("  " <> line)])
+      {line, _idx} -> Line.new([Span.new("  " <> line)])
     end)
   end
 
@@ -167,7 +181,9 @@ defmodule DashFloat.TUI.View do
   end
 
   defp entry_lines({:assistant, text}) do
-    text |> String.split("\n") |> Enum.map(&Line.new([Span.new(&1)]))
+    text
+    |> String.split("\n")
+    |> Enum.map(&Line.new([Span.new(&1)]))
   end
 
   ## Input

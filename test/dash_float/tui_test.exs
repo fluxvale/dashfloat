@@ -28,7 +28,7 @@ defmodule DashFloat.TUITest do
     Process.unlink(sup)
     on_exit(fn -> if Process.alive?(sup), do: Supervisor.stop(sup) end)
 
-    [{TUI, pid, :worker, _}] = Supervisor.which_children(sup)
+    [{TUI, pid, :worker, _args}] = Supervisor.which_children(sup)
     {:ok, pid}
   end
 
@@ -41,12 +41,15 @@ defmodule DashFloat.TUITest do
   end
 
   defp type(pid, text) do
-    Enum.each(String.codepoints(text), &press(pid, &1))
+    text
+    |> String.codepoints()
+    |> Enum.each(&press(pid, &1))
   end
 
   # The runtime's own state carries our user_state; no test backdoor needed.
   defp get_state(pid) do
-    :sys.get_state(pid) |> Map.get(:user_state)
+    runtime_state = :sys.get_state(pid)
+    Map.get(runtime_state, :user_state)
   end
 
   defp eventually(pid, fun, tries \\ 200) do
@@ -66,7 +69,8 @@ defmodule DashFloat.TUITest do
     assert Runtime.snapshot(pid).render_count >= 1
 
     type(pid, "hello tui")
-    assert State.input_text(get_state(pid)) == "hello tui"
+    typed = get_state(pid)
+    assert State.input_text(typed) == "hello tui"
 
     press(pid, "enter")
 
@@ -101,7 +105,7 @@ defmodule DashFloat.TUITest do
 
     # {:phase, :bogus} violates the stream contract; State.stream_message/2 has
     # no clause for it, so the callback raises like any real bug would.
-    bogus = String.to_atom("bogus")
+    bogus = :bogus
     send(pid, {:phase, bogus})
 
     assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 1_000
@@ -122,12 +126,15 @@ defmodule DashFloat.TUITest do
     eventually(pid, &(&1.phase == :idle))
 
     press(pid, "up")
-    assert State.input_text(get_state(pid)) == "second"
+    latest = get_state(pid)
+    assert State.input_text(latest) == "second"
     press(pid, "up")
-    assert State.input_text(get_state(pid)) == "first"
+    oldest = get_state(pid)
+    assert State.input_text(oldest) == "first"
     press(pid, "down")
     press(pid, "down")
-    assert State.input_text(get_state(pid)) == ""
+    restored = get_state(pid)
+    assert State.input_text(restored) == ""
   end
 
   test "a dead producer degrades to idle instead of bricking input" do
@@ -233,10 +240,11 @@ defmodule DashFloat.TUITest do
   end
 
   test "the TUI is absent from the application supervision tree in test env" do
-    children = Supervisor.which_children(DashFloat.Supervisor) |> Enum.map(&elem(&1, 0))
+    children = Supervisor.which_children(DashFloat.Supervisor)
+    child_ids = Enum.map(children, &elem(&1, 0))
     # the stream supervisor is up; the TUI is gated out of :test
-    assert DashFloat.StreamSupervisor in children
-    refute TUI in children
+    assert DashFloat.StreamSupervisor in child_ids
+    refute TUI in child_ids
   end
 
   defp attach_disconnect_listener do
