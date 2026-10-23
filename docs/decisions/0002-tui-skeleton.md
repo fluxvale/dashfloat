@@ -199,6 +199,10 @@ safety net, not the reporter of record.
 
 ### Synthetic-update demo path
 
+Superseded by [ADR 0005](0005-llm-streaming-engine.md): the demo module is
+deleted and the real SSE producer takes its place. The description below is
+kept as the record of what Phase 1 shipped.
+
 `DashFloat.SyntheticStream.emit(ui_pid, prompt, opts)` runs under
 `DashFloat.StreamSupervisor` as a Task (started by the TUI on submit) and
 drives the full contract on a canned reply: ~60 word-tokens at ~25 ms

@@ -12,22 +12,41 @@ isolated subprocess execution — with an
 
 ## Status
 
-**Pre-alpha — Phase 1.** The TUI skeleton is in ([ADR 0002](docs/decisions/0002-tui-skeleton.md)):
-status bar, scrollable log, multi-line input with history, and a synthetic
-streaming demo. Next up per the [ADR 0001](docs/decisions/0001-founding-stack-and-architecture.md)
-roadmap: LLM streaming engine, tool call execution, context management &
-history persistence.
+**Pre-alpha — Phase 2.** The LLM streaming engine is in
+([ADR 0005](docs/decisions/0005-llm-streaming-engine.md)): an OpenAI-compatible
+SSE client streams tokens into the existing TUI
+([ADR 0002](docs/decisions/0002-tui-skeleton.md)). Next up per the
+[ADR 0001](docs/decisions/0001-founding-stack-and-architecture.md) roadmap: tool
+call execution, context management & history persistence.
 
 ## Run it
+
+Configure your provider — any OpenAI-compatible endpoint — in
+`~/.config/dashfloat/config.json`:
+
+```json
+{"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini", "api_key": "..."}
+```
+
+`DASHFLOAT_BASE_URL`, `DASHFLOAT_MODEL`, and `DASHFLOAT_API_KEY` override the
+file per field. Put your provider's own base URL in `base_url`; DashFloat
+appends `/chat/completions`. Then:
 
 ```sh
 mix run --no-halt
 ```
 
-Type a message and press Enter; a synthetic reply streams in. Shift+Enter
+Type a prompt and press Enter: tokens stream into the log and the status bar
+flips Streaming → Idle when the reply completes. Press Esc mid-stream to cancel
+— the partial reply is kept and a gray `[cancelled]` line marks it. Shift+Enter
 inserts a newline on terminals that report enhanced key events (kitty
 protocol, modifyOtherKeys) — on others, use Alt+Enter. Up/Down walk input
 history, PageUp/PageDown scroll the log, Ctrl+Q (or Ctrl+C) quits.
+
+Without a provider configured the TUI still starts; submitting logs the setup
+instructions instead of a reply. This live-key run is the manual smoke step —
+the test suite is offline and deterministic (recorded SSE fixtures plus a
+loopback server).
 
 ## Stack
 
@@ -50,7 +69,8 @@ format, compile with warnings as errors, `credo --strict`, `dialyzer`, and the
 test suite under ExCoveralls with a coverage floor (`coveralls.json`). It
 fetches any missing deps itself — there is deliberately no separate
 `mix deps.get` first, as it would silently repair a stale lock before the gate
-could catch it.
+could catch it. Coverage counts shipped code only: the test harness
+(`test/`) is excluded via `skip_files`, so the floor guards `lib/`.
 
 CI runs it on every pull request and every push to `main`, uploads the HTML
 coverage report as an artifact, and sends the JSON report to Codecov. The

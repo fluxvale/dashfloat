@@ -7,6 +7,7 @@ defmodule DashFloat.MixProject do
       version: "0.0.0",
       elixir: "~> 1.20.0",
       start_permanent: Mix.env() == :prod,
+      elixirc_paths: elixirc_paths(Mix.env()),
       aliases: aliases(),
       deps: deps(),
       # coveralls.multiple writes cover/excoveralls.json (Codecov) and
@@ -74,4 +75,8 @@ defmodule DashFloat.MixProject do
       ]
     ]
   end
+
+  # Test support modules (the loopback SSE server) compile only under :test.
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_env), do: ["lib"]
 end

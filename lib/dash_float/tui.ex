@@ -2,7 +2,8 @@ defmodule DashFloat.TUI do
   @moduledoc """
   The DashFloat terminal UI: a thin `ExRatatui.App` whose state logic lives in
   `DashFloat.TUI.State` and rendering in `DashFloat.TUI.View`. Process shape,
-  key bindings, and teardown guarantees are settled in ADR 0002.
+  key bindings, and teardown guarantees are settled in ADR 0002; the producer
+  started on submit is the SSE adapter from ADR 0005.
 
   Run with `mix run --no-halt`. Quit with Ctrl+Q or Ctrl+C.
   """
@@ -12,9 +13,13 @@ defmodule DashFloat.TUI do
   # back blank (ADR 0002). The behaviour form is documented as equivalent.
   @behaviour ExRatatui.App
 
-  alias DashFloat.SyntheticStream
+  alias DashFloat.LLM.ChatStream
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
+
+  @no_provider "[llm: no provider configured — set base_url/model/api_key in " <>
+                 "~/.config/dashfloat/config.json or " <>
+                 "DASHFLOAT_BASE_URL/DASHFLOAT_MODEL/DASHFLOAT_API_KEY]"
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -48,14 +53,10 @@ defmodule DashFloat.TUI do
     {state, action} = State.handle_key(state, key.code, key.modifiers)
 
     case action do
-      :quit ->
-        {:stop, state}
-
-      {:submit, prompt} ->
-        {:noreply, start_stream(prompt, state)}
-
-      nil ->
-        {:noreply, state}
+      :quit -> {:stop, state}
+      {:submit, prompt} -> {:noreply, start_stream(prompt, state)}
+      :cancel -> {:noreply, cancel_stream(state)}
+      nil -> {:noreply, state}
     end
   end
 
@@ -105,20 +106,26 @@ defmodule DashFloat.TUI do
   def exit_code(:normal), do: 0
   def exit_code(_reason), do: 1
 
-  defp start_stream(prompt, state) do
+  defp start_stream(prompt, %{provider: {:ok, provider}} = state) do
     ui = self()
-    opts = state.demo_stream_opts
 
     case Task.Supervisor.start_child(
            DashFloat.StreamSupervisor,
-           fn -> SyntheticStream.emit(ui, prompt, opts) end,
+           fn -> ChatStream.run(ui, provider, prompt) end,
            restart: :temporary
          ) do
-      {:ok, pid} ->
-        State.claim_task(state, Process.monitor(pid))
-
-      {:error, reason} ->
-        State.stream_failed(state, reason)
+      {:ok, pid} -> State.claim_task(state, pid, Process.monitor(pid))
+      {:error, reason} -> State.stream_failed(state, reason)
     end
+  end
+
+  # Spec-mandated: both "no config at all" and "config unreadable" degrade to
+  # the setup instructions; the Config error text is deliberately not surfaced
+  # (values are never echoed either way).
+  defp start_stream(_prompt, state), do: State.stream_failed(state, @no_provider)
+
+  defp cancel_stream(state) do
+    if is_pid(state.task_pid), do: send(state.task_pid, :cancel)
+    state
   end
 end

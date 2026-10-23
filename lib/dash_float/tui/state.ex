@@ -5,15 +5,15 @@ defmodule DashFloat.TUI.State do
   All logic here is deterministic: no processes, no terminal, no timers. The
   input draft lives in the textarea's Rust-side state, reached through its
   synchronous in-memory API. Transitions return `{state, action}` where
-  `action` is `:quit`, `{:submit, prompt}`, or `nil`; the TUI interprets
-  actions. See ADR 0002 for the event flow.
+  `action` is `:quit`, `{:submit, prompt}`, `:cancel`, or `nil`; the TUI
+  interprets actions. See ADR 0002 for the event flow.
   """
 
   alias DashFloat.TUI.View
 
   @type phase :: :idle | :streaming | :executing_tool
   @type entry_kind :: :user | :assistant | :tool | :system
-  @type action :: :quit | {:submit, String.t()} | nil
+  @type action :: :quit | {:submit, String.t()} | :cancel | nil
 
   @max_history 500
   @default_size {80, 24}
@@ -21,7 +21,7 @@ defmodule DashFloat.TUI.State do
   @enforce_keys [:input]
   defstruct [
     :input,
-    :demo_stream_opts,
+    :provider,
     phase: :idle,
     entries: [],
     in_flight: nil,
@@ -32,12 +32,13 @@ defmodule DashFloat.TUI.State do
     draft: "",
     size: @default_size,
     live?: false,
-    task_ref: nil
+    task_ref: nil,
+    task_pid: nil
   ]
 
   @type t :: %__MODULE__{
           input: reference(),
-          demo_stream_opts: keyword(),
+          provider: {:ok, DashFloat.Config.t()} | {:error, String.t()} | nil,
           phase: phase(),
           entries: [{entry_kind(), String.t()}],
           in_flight: String.t() | nil,
@@ -48,7 +49,8 @@ defmodule DashFloat.TUI.State do
           draft: String.t(),
           size: {pos_integer(), pos_integer()},
           live?: boolean(),
-          task_ref: reference() | nil
+          task_ref: reference() | nil,
+          task_pid: pid() | nil
         }
 
   @typedoc """
@@ -65,17 +67,24 @@ defmodule DashFloat.TUI.State do
   @doc """
   Builds the initial state from the App's mount opts. Under `test_mode: {w, h}`
   the size comes from the opts; live, it is read from the terminal (falling
-  back to 80x24 without a TTY) and kept fresh by later Resize events.
+  back to 80x24 without a TTY) and kept fresh by later Resize events. The
+  provider is loaded once by the Application and handed in as `:provider`
+  (ADR 0005).
   """
   @spec new(keyword()) :: t()
   def new(opts) do
     %__MODULE__{
       input: ExRatatui.textarea_new(),
-      demo_stream_opts: Keyword.get(opts, :demo_stream_opts, []),
+      provider: Keyword.get(opts, :provider),
       size: initial_size(opts),
       live?: is_nil(Keyword.get(opts, :test_mode))
     }
   end
+
+  @doc "The configured model name for the status bar, or nil when unusable."
+  @spec provider_model(t()) :: String.t() | nil
+  def provider_model(%__MODULE__{provider: {:ok, %{model: model}}}), do: model
+  def provider_model(%__MODULE__{}), do: nil
 
   defp initial_size(opts) do
     case Keyword.get(opts, :test_mode) do
@@ -124,6 +133,13 @@ defmodule DashFloat.TUI.State do
   def handle_key(state, "enter", mods) when mods in [[], ["ctrl"]], do: submit(state)
   def handle_key(state, "enter", ["shift"]), do: forward(state, "enter", [])
   def handle_key(state, "enter", ["alt"]), do: forward(state, "enter", [])
+
+  # Esc cancels a running stream; a no-op otherwise (ADR 0005).
+  def handle_key(%{phase: :streaming, task_pid: pid} = state, "esc", _modifiers)
+      when is_pid(pid),
+      do: {state, :cancel}
+
+  def handle_key(state, "esc", _modifiers), do: {state, nil}
 
   # Log scrolling.
   def handle_key(state, "page_up", _modifiers), do: {page_up(state), nil}
@@ -259,9 +275,10 @@ defmodule DashFloat.TUI.State do
 
   ## Producer-task monitoring
 
-  @doc "Records the monitor ref of the producer Task started for this stream."
-  @spec claim_task(t(), reference()) :: t()
-  def claim_task(state, ref) when is_reference(ref), do: %{state | task_ref: ref}
+  @doc "Records the pid and monitor ref of the producer Task started for this stream."
+  @spec claim_task(t(), pid(), reference()) :: t()
+  def claim_task(state, pid, ref) when is_pid(pid) and is_reference(ref),
+    do: %{state | task_pid: pid, task_ref: ref}
 
   @doc """
   Applies a producer-task `{:DOWN, ref, :process, _pid, reason}`. Normal exits
@@ -269,16 +286,15 @@ defmodule DashFloat.TUI.State do
   `:noproc` — the monitor attaching after an already-finished task — is
   treated the same, because a producer that exits between `start_child/2`
   returning and `Process.monitor/1` attaching cannot be distinguished from a
-  successful one after the fact (the fast demo cadence hits this window).
-  Other exits finalize the stream, log a `:system` entry explaining what
-  happened, and return to `:idle` so input keeps working — a dead producer
-  must never brick the UI (ADR 0001: failures degrade to chat messages).
-  Returns `{state, :handled}` when the ref was ours, `{state, :ignored}`
-  otherwise.
+  successful one after the fact. Other exits finalize the stream, log a
+  `:system` entry explaining what happened, and return to `:idle` so input
+  keeps working — a dead producer must never brick the UI (ADR 0001: failures
+  degrade to chat messages). Returns `{state, :handled}` when the ref was ours,
+  `{state, :ignored}` otherwise.
   """
   @spec task_down(t(), reference(), term()) :: {t(), :handled | :ignored}
   def task_down(%{task_ref: ref} = state, ref, reason) do
-    cleared = %{state | task_ref: nil}
+    cleared = %{state | task_ref: nil, task_pid: nil}
 
     state =
       if reason in [:normal, :noproc] do
@@ -292,19 +308,20 @@ defmodule DashFloat.TUI.State do
 
   def task_down(state, _other_ref, _reason), do: {state, :ignored}
 
-  @doc "Degrades to `:idle` with a `:system` entry explaining the failure."
+  @doc """
+  Degrades to `:idle` with a `:system` entry explaining the failure. A binary
+  reason is already user-facing text and is logged verbatim; anything else is
+  inspected.
+  """
   @spec stream_failed(t(), term()) :: t()
   def stream_failed(state, reason) do
     state
-    |> stream_message({:entry, :system, "[stream failed: #{format_reason(reason)}]"})
+    |> stream_message({:entry, :system, format_reason(reason)})
     |> stream_message({:phase, :idle})
   end
 
-  defp format_reason(reason) do
-    reason
-    |> inspect()
-    |> String.slice(0, 120)
-  end
+  defp format_reason(reason) when is_binary(reason), do: reason
+  defp format_reason(reason), do: "[stream failed: #{String.slice(inspect(reason), 0, 120)}]"
 
   ## History navigation
 
