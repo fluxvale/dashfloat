@@ -15,7 +15,7 @@ Each ADR uses a lightweight Nygard-style format:
 
 ## Numbering
 
-Files are prefixed with a 4-digit padded, zero-based sequence number (`0001-...`).
+Files are prefixed with a 4-digit padded sequence number starting at `0001`.
 Numbers are never reused. Superseded ADRs keep their number and gain a link to
 their replacement.
 

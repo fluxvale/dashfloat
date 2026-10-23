@@ -7,11 +7,11 @@
 
 DashFloat replaces Octofriend as our CLI AI coding harness: a fast, robust,
 responsive terminal application that streams LLM responses, executes structured
-tool calls, and manages coding sessions. The founding spec — goal, feature
-subsystems, and phases — is recorded in
-[issue #1](https://github.com/fluxvale/dashfloat/issues/1); this ADR pins the
-decisions that outlive it. All dependency versions were verified on hex.pm on
-2026-10-23 (`mix hex.info`).
+tool calls, and manages coding sessions. The founding spec settled the goal,
+stack, and shape; this ADR is its durable record — the decisions that outlive
+the bootstrap task that created this repository
+([issue #1](https://github.com/fluxvale/dashfloat/issues/1)). All dependency
+versions were verified on hex.pm on 2026-10-23 (`mix hex.info`).
 
 ## Decision
 
@@ -49,6 +49,25 @@ Guideline: all I/O — network, filesystem, shell commands — lives off the UI
 process, inside dedicated Tasks or GenServers, so the render loop stays fast and
 non-blocking. Failed subprocesses report back to the chat stream gracefully
 rather than crashing the BEAM node.
+
+### Key subsystems
+
+The TUI is three regions: a header/status bar (model info, context-size
+indicator, execution state — idle / streaming / executing tool), a scrollable
+main log view (markdown-formatted model messages, tool calls, shell outputs),
+and a multi-line input box with history navigation.
+
+The core toolset is fixed and structured (JSON function calls):
+
+- `read_file(path, offset, limit)`
+- `write_file(path, content)`
+- `edit_file(path, search_block, replace_block)`
+- `execute_command(command, cwd)`
+- `list_directory(path)`
+
+File mutation uses explicit, structured search-and-replace blocks — no
+line-number or best-guess edits. Destructive changes are previewed in the TUI
+before being applied whenever user confirmation is required.
 
 ### Roadmap
 
