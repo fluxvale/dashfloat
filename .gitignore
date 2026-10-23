@@ -10,6 +10,9 @@
 # Where third-party dependencies like ExDoc output generated docs.
 /doc/
 
+# Dialyzer PLTs — binary-tied to the exact OTP patch, rebuilt locally/CI-cached.
+/priv/plts/
+
 # Temporary files, for example, from tests.
 /tmp/
 
