@@ -117,7 +117,7 @@ UI process (ExRatatui)      DashFloat.Agent (GenServer)         Tasks under Dash
   are two `send/2`s on one node.
 - **`DashFloat.Tools.Runner`** executes one validated call inside a `restart: :temporary`
   Task: `read_file`/`write_file`/`edit_file`/`list_directory` via the `File` module,
-  `execute_command` via `DashFloat.Tools.Exec` (a `Port.open({:spawn, command}, …)` with
+  `execute_command` via `DashFloat.Tools.Exec` (a `Port.open({:spawn, …}, …)` with
   `:use_stdio`, `:stderr_to_stdout`, `:exit_status`, `cd:` the resolved cwd). Every
   failure — bad args, denied path, timeout, non-zero exit — is a normal result map
   returned to the agent. The runner never raises into the tree: anticipated errors are
@@ -125,6 +125,26 @@ UI process (ExRatatui)      DashFloat.Agent (GenServer)         Tasks under Dash
   `{:tool_result, id, {:crashed, reason}}` result.
 - **`DashFloat.TaskSupervisor`** replaces `DashFloat.StreamSupervisor` (renamed: it now
   hosts tool-runner tasks as well as stream tasks — the old name would lie).
+
+**Exec reality, verified against the runtime (not the docs):** `Port.open({:spawn,
+command}, …)` prepends `exec` — a single command, no shell; `;`-chained tails are
+silently dropped and builtins rejected. `Exec` therefore wraps every command in a
+POSIX-quoted `/bin/sh -c` so the model's command lines mean what they say.
+And `Port.close/1` closes the port but **never kills the port program**: a
+busy-looping or backgrounded child would outlive it. Every exec completion path
+(exit, timeout, cancel-kill) therefore also SIGKILLs the command's whole process
+group (`setsid`-spawned under its own group) — no leaked grandchildren. What a
+`setsid`-escaping child does beyond that is out of scope: a process sandbox is a
+recorded future hardening option, not this slice. One accepted consequence: a
+grandchild that inherits stdio and outlives the command holds the pipe open, so
+`exit_status` may wait until the timeout — bounded, visible, honest.
+
+**Write hardening:** `write_file`/`edit_file` write through an exclusive temp file
+(`O_EXCL`, cryptographically random name, created in the target's own directory) and
+`rename/2` into place — an attacker cannot pre-place a symlink at the temp name
+between resolve and write, and an existing file's mode is preserved (no widening).
+The residual parent-directory race (swapping a *directory* component between
+realpath and open) remains accepted per §3's standing judgment.
 
 Boundaries: exec output is head-capped at **32 KiB** with a trailing marker naming the
 total byte count; `read_file` caps at 2 000 lines *and* 64 KiB (marker reports both
@@ -146,6 +166,10 @@ runs before any file operation:
    `realpath(root)`; the not-yet-existing lexical remainder cannot be a symlink. A
    symlink inside the tree pointing outside is therefore rejected — as is a `..` chain,
    an absolute outside path, or an escape via a symlinked intermediate directory.
+   (`:file.realpath/1` does not exist on this OTP; the resolution is implemented once,
+   in `PathPolicy`, on top of `:file.read_link_info/1`.) Mutations additionally write
+   through an exclusive temp + atomic rename (§2), closing the check-then-open window
+   at the file itself.
 
 Residual risk, accepted and recorded: check-then-open is a TOCTOU window against an
 attacker who can mutate the tree between resolve and open — an attacker who already has
