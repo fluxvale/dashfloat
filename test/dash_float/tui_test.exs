@@ -455,6 +455,38 @@ defmodule DashFloat.TUITest do
     assert get_state(pid).tick_ref == nil
   end
 
+  test "a stale tick is dropped: no double-step, no orphan timer" do
+    # A tick with no timer pending (its timer was cancelled after firing, or the
+    # message is a leftover) must not step the spinner nor arm anything.
+    idle = State.new(test_mode: {80, 24})
+    assert {:noreply, ^idle} = TUI.handle_info(:dashfloat_tick, idle)
+
+    # A tick whose tracked timer has not fired yet is stale too, and the live
+    # timer is left alone.
+    ref = Process.send_after(self(), :never, 10_000)
+    active = %{idle | phase: :streaming, tick_ref: ref}
+
+    assert {:noreply, ^active} = TUI.handle_info(:dashfloat_tick, active)
+    assert is_integer(Process.read_timer(ref))
+
+    Process.cancel_timer(ref)
+  end
+
+  test "a tick that finds idle halts and clears the timer (last-resort net)" do
+    # schedule/1 cancels on any idle transition, so this state should be
+    # unreachable; if it ever happens, the tick must still die here.
+    idle = State.new(test_mode: {80, 24})
+    ref = Process.send_after(self(), :never, 10_000)
+    # A fired timer: read_timer returns false, so the tick is not stale.
+    Process.cancel_timer(ref)
+    Process.sleep(5)
+
+    leaked = %{idle | tick_ref: ref}
+    assert {:noreply, cleared} = TUI.handle_info(:dashfloat_tick, leaked)
+    assert cleared.tick_ref == nil
+    assert cleared.phase == :idle
+  end
+
   test "a stray tick while idle halts without rescheduling" do
     {:ok, pid} = start_tui()
     Process.sleep(50)
@@ -486,7 +518,7 @@ defmodule DashFloat.TUITest do
     submit(pid, "animate")
 
     # While active there is always a tick pending and the frame counter climbs.
-    active = eventually(pid, fn s -> State.needs_tick?(s) or s.phase != :idle end)
+    eventually(pid, fn s -> s.phase == :streaming and s.tick_ref != nil end)
     during = Runtime.snapshot(pid).render_count
     Process.sleep(250)
     assert Runtime.snapshot(pid).render_count > during
@@ -497,7 +529,6 @@ defmodule DashFloat.TUITest do
 
     state = eventually(pid, fn s -> s.phase == :idle and s.tick_ref == nil end)
     assert state.tick_ref == nil
-    assert active.phase in [:streaming, :executing_tool, :idle]
 
     # ...and the timer is gone: another quiet window changes nothing.
     frozen = Runtime.snapshot(pid).render_count

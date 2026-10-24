@@ -71,9 +71,7 @@ defmodule DashFloat.TUI.ViewTest do
       text = status_text(new_state())
 
       assert text =~ "❯ ~/"
-      assert text =~ "—"
-      assert text =~ "ctx —"
-      assert text =~ "● Idle"
+      assert text =~ " · ctx — · ● Idle · "
     end
 
     test "the configured model replaces the placeholder" do
@@ -118,6 +116,17 @@ defmodule DashFloat.TUI.ViewTest do
     test "empty log shows a placeholder" do
       [line] = log_lines(new_state())
       assert flatten(line) =~ "(log is empty"
+    end
+
+    test "the first tokens are never announced as an empty log" do
+      state =
+        new_state()
+        |> State.stream_message({:token, "hello"}, 1_000)
+        |> Map.put(:phase, :streaming)
+
+      # Before the first tick the lines are not rendered yet, but the log
+      # must not claim to be empty.
+      assert log_lines(state) == []
     end
 
     test "log entries render from their stored lines, separators included" do

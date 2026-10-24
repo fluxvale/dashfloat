@@ -147,7 +147,12 @@ defmodule DashFloat.TUI.View do
     }
   end
 
-  defp log_lines(%State{entries: [], in_flight_lines: nil}, _offset, _height) do
+  defp log_lines(
+         %State{entries: [], in_flight: in_flight, in_flight_lines: nil},
+         _offset,
+         _height
+       )
+       when in_flight in [nil, ""] do
     [Line.new([Span.new("(log is empty — say something)", style: Theme.style(:dim))])]
   end
 

@@ -388,6 +388,9 @@ defmodule DashFloat.TUI.State do
       state.stats
       | prompt_tokens: prompt,
         completion_tokens: completion,
+        # The usage frame is the authoritative count: the per-delta estimate is
+        # reconciled here, so the frozen rate is computed from real tokens.
+        tokens: completion,
         context_total: state.stats.context_total + total
     }
 
@@ -442,9 +445,9 @@ defmodule DashFloat.TUI.State do
 
   defp rate(_tokens, _first_token_at, _now), do: nil
 
+  # `text` stays verbatim (ADR 0006: it is the persistence truth); the render
+  # path splits on "\n" and tolerates trailing blanks.
   defp append_entry(state, kind, text) do
-    text = String.trim_trailing(text, "\n")
-
     %{
       state
       | entries:

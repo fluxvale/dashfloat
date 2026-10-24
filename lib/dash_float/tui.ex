@@ -78,12 +78,16 @@ defmodule DashFloat.TUI do
 
   @impl ExRatatui.App
   def handle_info(@tick, state) do
-    {ticked, verdict} = State.tick(state, System.monotonic_time(:millisecond))
-    cleared = %{ticked | tick_ref: nil}
+    if stale_tick?(state) do
+      {:noreply, state}
+    else
+      {ticked, verdict} = State.tick(state, System.monotonic_time(:millisecond))
+      cleared = %{ticked | tick_ref: nil}
 
-    case verdict do
-      :cont -> schedule(cleared)
-      :halt -> {:noreply, cleared}
+      case verdict do
+        :cont -> schedule(cleared)
+        :halt -> {:noreply, cleared}
+      end
     end
   end
 
@@ -99,6 +103,14 @@ defmodule DashFloat.TUI do
   end
 
   def handle_info(_msg, state), do: schedule(state)
+
+  # A tick is stale when no timer of ours is pending (a timer cancelled after
+  # its message was already queued) or when the tracked timer has not fired yet
+  # (a message left over from an earlier timer). Dropping it keeps the invariant
+  # at exactly one pending timer and keeps a stale tick from rendering at idle
+  # (ADR 0006).
+  defp stale_tick?(%{tick_ref: nil}), do: true
+  defp stale_tick?(%{tick_ref: ref}), do: Process.read_timer(ref) != false
 
   # The single tick choke point (ADR 0006): any active phase keeps exactly one
   # timer pending; idle always cancels it. Idle => no timers => no renders.

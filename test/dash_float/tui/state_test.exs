@@ -411,6 +411,13 @@ defmodule DashFloat.TUI.StateTest do
       assert pairs(state) == [{:tool, "[tool] ran"}, {:system, "reconnected"}]
     end
 
+    test "entry text is kept verbatim, trailing newlines included" do
+      state = State.stream_message(new_state(), {:entry, :system, "note\n\n"})
+      [entry] = state.entries
+      assert entry.text == "note\n\n"
+      assert Enum.map(entry.lines, &flatten/1) == ["", "note", "", ""]
+    end
+
     test "entries carry their rendered lines, blank separator first" do
       state = State.stream_message(new_state(), {:entry, :system, "a\nb"})
       [entry] = state.entries
@@ -459,6 +466,8 @@ defmodule DashFloat.TUI.StateTest do
       assert state.stats.prompt_tokens == 120
       assert state.stats.completion_tokens == 42
       assert state.stats.context_total == 162
+      # The estimate is reconciled to the provider's authoritative count.
+      assert state.stats.tokens == 42
       assert state.phase == :streaming
     end
 

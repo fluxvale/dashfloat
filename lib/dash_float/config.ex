@@ -75,12 +75,12 @@ defmodule DashFloat.Config do
     trimmed = String.trim(raw)
 
     case Integer.parse(trimmed) do
-      {n, ""} when n > 0 -> n
+      {n, ""} when n in 1..1_000_000_000_000 -> n
       _other -> nil
     end
   end
 
-  defp positive_int(raw) when is_integer(raw) and raw > 0, do: raw
+  defp positive_int(raw) when is_integer(raw) and raw in 1..1_000_000_000_000, do: raw
   defp positive_int(_raw), do: nil
 
   defp build(values, context_tokens) do
