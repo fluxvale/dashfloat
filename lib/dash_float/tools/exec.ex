@@ -52,17 +52,24 @@ defmodule DashFloat.Tools.Exec do
             [:binary, :stream, :use_stdio, :stderr_to_stdout, :exit_status, {:cd, cwd}]
           )
 
-        # Captured at birth: once the program exits, Port.info returns nil and
-        # the group id (== the program's pid) would be unfindable.
-        {:os_pid, os_pid} = Port.info(port, :os_pid)
-
-        loop(port, os_pid, deadline, timeout_ms, cap_bytes, "", 0, false)
+        loop(port, birth_pid(port), deadline, timeout_ms, cap_bytes, "", 0, false)
 
       {:ok, _stat} ->
         %{ok: false, exit: nil, error: "spawn failed: not a directory: " <> cwd}
 
       {:error, reason} ->
         %{ok: false, exit: nil, error: "spawn failed: " <> to_string(:file.format_error(reason))}
+    end
+  end
+
+  # Captured at birth: once the program exits, Port.info returns nil and the
+  # group id (== the program's pid) would be unfindable. A program that dies
+  # within the Port.open window (echo) can already be gone here — nothing to
+  # signal, the exit_status still arrives.
+  defp birth_pid(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} -> pid
+      _already_gone -> nil
     end
   end
 
@@ -173,6 +180,12 @@ defmodule DashFloat.Tools.Exec do
   # (wrapping pid_max takes far longer than the run of a command). The
   # killer's stderr is silenced: after a clean exit the group is usually
   # already gone and kill(1) would otherwise complain on the BEAM's stderr.
+  # Belt for the instant-death window between Port.open and Port.info: only
+  # observed under scheduler load (a coverage-instrumented run), never
+  # deterministic in a test.
+  # coveralls-ignore-next-line
+  defp signal_group(nil), do: :ok
+
   defp signal_group(os_pid) do
     group = Integer.to_string(-os_pid)
 
