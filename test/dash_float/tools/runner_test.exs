@@ -1,0 +1,414 @@
+defmodule DashFloat.Tools.RunnerTest do
+  @moduledoc false
+  use ExUnit.Case, async: true
+
+  alias DashFloat.Tools
+
+  setup do
+    tmp = System.tmp_dir!()
+    root = Path.join(tmp, "df-run-#{System.unique_integer([:positive])}")
+    src = Path.join(root, "src")
+    docs = Path.join(root, "docs")
+    readme = Path.join(root, "readme.md")
+    a_ex = Path.join(src, "a.ex")
+
+    File.mkdir_p!(src)
+    File.mkdir_p!(docs)
+    File.write!(readme, "one\ntwo\nthree\nfour\nfive\n")
+    File.write!(a_ex, "defmodule A do\nend\n")
+    File.ln_s!(src, Path.join(root, "srclink"))
+    on_exit(fn -> File.rm_rf(root) end)
+
+    %{root: root, src: src, docs: docs, readme: readme}
+  end
+
+  defp validate!(name, args), do: elem(Tools.validate(name, args), 1)
+
+  defp run(name, args, root, opts \\ []),
+    do: Tools.Runner.run(name, validate!(name, args), root, opts)
+
+  ## read_file
+
+  test "read_file returns the whole small file", %{root: root} do
+    assert run("read_file", %{"path" => "readme.md"}, root) == %{
+             ok: true,
+             path: "readme.md",
+             content: "one\ntwo\nthree\nfour\nfive",
+             lines: 5,
+             total_lines: 5,
+             total_bytes: 24,
+             truncated: false
+           }
+  end
+
+  test "read_file windows by offset and limit, marking the tail truncated", %{root: root} do
+    result = run("read_file", %{"path" => "readme.md", "offset" => 2, "limit" => 2}, root)
+
+    assert result.content == "two\nthree\n… [truncated: showing 2 of 5 lines]"
+    assert result.lines == 2
+    assert result.truncated == true
+    assert result.total_lines == 5
+  end
+
+  test "read_file to the end of the file is not truncated", %{root: root} do
+    result = run("read_file", %{"path" => "readme.md", "offset" => 3}, root)
+
+    assert result.content == "three\nfour\nfive"
+    assert result.truncated == false
+  end
+
+  test "read_file past the end returns an empty window without a marker", %{root: root} do
+    result = run("read_file", %{"path" => "readme.md", "offset" => 9, "limit" => 5}, root)
+
+    assert result.content == ""
+    assert result.lines == 0
+    assert result.truncated == false
+  end
+
+  test "read_file byte-caps whole lines and reports the marker", %{root: root} do
+    long = Enum.map_join(1..100, &(String.duplicate("x", 1_500) <> Integer.to_string(&1) <> "\n"))
+
+    root
+    |> Path.join("big.txt")
+    |> File.write!(long)
+
+    result = run("read_file", %{"path" => "big.txt"}, root)
+
+    assert result.truncated == true
+    assert result.lines < 100
+    assert result.lines > 0
+    assert result.content =~ "… [truncated: showing #{result.lines} of 100 lines]"
+
+    marker = "\n… [truncated: showing #{result.lines} of 100 lines]"
+    shown = String.replace_suffix(result.content, marker, "")
+    assert byte_size(shown) <= 64 * 1024
+  end
+
+  test "read_file on a missing file", %{root: root} do
+    assert run("read_file", %{"path" => "nope.txt"}, root) == %{
+             ok: false,
+             path: "nope.txt",
+             error: "file not found"
+           }
+  end
+
+  test "read_file on a directory degrades to an error, not a raise", %{root: root} do
+    result = run("read_file", %{"path" => "src"}, root)
+
+    assert result.ok == false
+    assert result.error =~ "could not read file"
+  end
+
+  test "read_file through a sandboxed symlink resolves to the real file", %{root: root} do
+    result = run("read_file", %{"path" => "srclink/a.ex"}, root)
+
+    assert result.ok == true
+    assert result.content == "defmodule A do\nend"
+  end
+
+  test "a path escaping the working directory is rejected with the given path", %{root: root} do
+    assert run("read_file", %{"path" => "../../etc/passwd"}, root) == %{
+             ok: false,
+             path: "../../etc/passwd",
+             error: "path escapes the working directory: ../../etc/passwd"
+           }
+
+    assert run("read_file", %{"path" => "/etc/passwd"}, root) == %{
+             ok: false,
+             path: "/etc/passwd",
+             error: "path is outside the working directory: /etc/passwd"
+           }
+
+    assert run("write_file", %{"path" => "../escape.txt", "content" => "x"}, root) == %{
+             ok: false,
+             path: "../escape.txt",
+             error: "path escapes the working directory: ../escape.txt"
+           }
+
+    assert run("list_directory", %{"path" => "../"}, root) == %{
+             ok: false,
+             path: "../",
+             error: "path escapes the working directory: ../"
+           }
+
+    edit_args = %{"path" => "/etc/hosts", "search_block" => "a", "replace_block" => "b"}
+
+    assert run("edit_file", edit_args, root) == %{
+             ok: false,
+             path: "/etc/hosts",
+             error: "path is outside the working directory: /etc/hosts"
+           }
+  end
+
+  ## write_file
+
+  test "write_file creates parent directories", %{root: root} do
+    result = run("write_file", %{"path" => "lib/deep/new.ex", "content" => ":ok"}, root)
+
+    assert result == %{ok: true, path: "lib/deep/new.ex", bytes: 3, created: true}
+
+    written =
+      root
+      |> Path.join("lib/deep/new.ex")
+      |> File.read!()
+
+    assert written == ":ok"
+  end
+
+  test "write_file over an existing file reports created: false", %{root: root} do
+    run("write_file", %{"path" => "a.txt", "content" => "one"}, root)
+    result = run("write_file", %{"path" => "a.txt", "content" => "longer"}, root)
+
+    assert result == %{ok: true, path: "a.txt", bytes: 6, created: false}
+
+    written =
+      root
+      |> Path.join("a.txt")
+      |> File.read!()
+
+    assert written == "longer"
+  end
+
+  test "write_file into a path blocked by a file fails cleanly", %{root: root} do
+    root
+    |> Path.join("blocked")
+    |> File.write!("file")
+
+    result = run("write_file", %{"path" => "blocked/sub.txt", "content" => "x"}, root)
+
+    assert result.ok == false
+    assert result.error =~ "could not create directory"
+  end
+
+  test "write_file onto a directory path fails cleanly", %{root: root} do
+    result = run("write_file", %{"path" => "src", "content" => "x"}, root)
+
+    assert result.ok == false
+    assert result.error =~ "could not write file"
+  end
+
+  ## edit_file
+
+  test "edit_file replaces a unique block exactly once", %{root: root} do
+    args = %{
+      "path" => "readme.md",
+      "search_block" => "two\nthree",
+      "replace_block" => "TWO\nTHREE"
+    }
+
+    result = run("edit_file", args, root)
+
+    assert result == %{ok: true, path: "readme.md", replaced: 1}
+
+    written =
+      root
+      |> Path.join("readme.md")
+      |> File.read!()
+
+    assert written == "one\nTWO\nTHREE\nfour\nfive\n"
+  end
+
+  test "edit_file rejects a block that does not match", %{root: root} do
+    args = %{"path" => "readme.md", "search_block" => "absent", "replace_block" => "x"}
+    result = run("edit_file", args, root)
+
+    assert result == %{ok: false, path: "readme.md", error: "search block not found"}
+  end
+
+  test "edit_file rejects an ambiguous block with its match count", %{root: root} do
+    root
+    |> Path.join("dup.txt")
+    |> File.write!("same\nsame\n")
+
+    args = %{"path" => "dup.txt", "search_block" => "same", "replace_block" => "x"}
+    result = run("edit_file", args, root)
+
+    assert result == %{
+             ok: false,
+             path: "dup.txt",
+             error: "search block matches 2 times; make it unique"
+           }
+
+    unchanged =
+      root
+      |> Path.join("dup.txt")
+      |> File.read!()
+
+    assert unchanged == "same\nsame\n"
+  end
+
+  test "edit_file rejects an empty search block", %{root: root} do
+    args = %{"path" => "readme.md", "search_block" => "", "replace_block" => "x"}
+    result = run("edit_file", args, root)
+
+    assert result == %{ok: false, path: "readme.md", error: "search block is empty"}
+  end
+
+  test "edit_file rejects identical search and replace blocks", %{root: root} do
+    args = %{"path" => "readme.md", "search_block" => "two", "replace_block" => "two"}
+    result = run("edit_file", args, root)
+
+    assert result == %{
+             ok: false,
+             path: "readme.md",
+             error: "search and replace blocks are identical"
+           }
+
+    unchanged =
+      root
+      |> Path.join("readme.md")
+      |> File.read!()
+
+    assert unchanged == "one\ntwo\nthree\nfour\nfive\n"
+  end
+
+  test "edit_file on a missing file", %{root: root} do
+    args = %{"path" => "nope.txt", "search_block" => "a", "replace_block" => "b"}
+    result = run("edit_file", args, root)
+
+    assert result == %{ok: false, path: "nope.txt", error: "file not found"}
+  end
+
+  test "edit_file refuses files over the 8 MiB cap", %{root: root} do
+    root
+    |> Path.join("huge.txt")
+    |> File.write!(String.duplicate("a", 8 * 1024 * 1024 + 1))
+
+    args = %{"path" => "huge.txt", "search_block" => "a", "replace_block" => "b"}
+    result = run("edit_file", args, root)
+
+    assert result == %{ok: false, path: "huge.txt", error: "file too large to edit"}
+  end
+
+  test "edit_file reports a write failure cleanly", %{root: root} do
+    locked = Path.join(root, "locked.txt")
+    File.write!(locked, "target\n")
+    File.chmod!(locked, 0o444)
+    on_exit(fn -> File.chmod(locked, 0o644) end)
+
+    args = %{"path" => "locked.txt", "search_block" => "target", "replace_block" => "new"}
+    result = run("edit_file", args, root)
+
+    assert result.ok == false
+    assert result.error =~ "could not write file"
+  end
+
+  ## execute_command
+
+  test "execute_command runs in the resolved cwd", %{root: root, src: src} do
+    result = run("execute_command", %{"command" => "pwd", "cwd" => "src"}, root)
+
+    assert result.ok == true
+    assert result.exit == 0
+    assert result.output == src <> "\n"
+  end
+
+  test "execute_command defaults cwd to the working directory", %{root: root} do
+    result = run("execute_command", %{"command" => "basename $(pwd)"}, root)
+
+    assert result.ok == true
+    assert result.output == Path.basename(root) <> "\n"
+  end
+
+  test "execute_command reports nonzero exit, timeout, and cwd escape", %{root: root} do
+    failed = run("execute_command", %{"command" => "sh -c 'exit 4'"}, root)
+    assert failed.ok == false
+    assert failed.exit == 4
+
+    timed = run("execute_command", %{"command" => "sleep 5"}, root, exec_timeout: 100)
+    assert timed.ok == false
+    assert timed.error == "timed out after 100ms"
+
+    escaped = run("execute_command", %{"command" => "pwd", "cwd" => "../elsewhere"}, root)
+
+    assert escaped == %{
+             ok: false,
+             path: "../elsewhere",
+             error: "path escapes the working directory: ../elsewhere"
+           }
+  end
+
+  ## list_directory
+
+  test "list_directory orders directories first, then files and symlinks, alphabetically", %{
+    root: root
+  } do
+    root
+    |> Path.join("zeta.txt")
+    |> File.write!("")
+
+    root
+    |> Path.join("alpha.txt")
+    |> File.write!("")
+
+    root
+    |> Path.join("zed")
+    |> File.mkdir_p!()
+
+    alpha = Path.join(root, "alpha.txt")
+    mlink = Path.join(root, "mlink")
+    File.ln_s!(alpha, mlink)
+
+    result = run("list_directory", %{"path" => "."}, root)
+
+    assert Enum.take(result.entries, 3) == ["d docs/", "d src/", "d zed/"]
+
+    assert Enum.drop(result.entries, 3) == [
+             "- alpha.txt",
+             "@ mlink",
+             "- readme.md",
+             "@ srclink",
+             "- zeta.txt"
+           ]
+
+    assert result.count == 8
+    assert result.truncated == false
+  end
+
+  test "list_directory caps at 500 entries with truncated: true", %{root: root} do
+    dir = Path.join(root, "many")
+    File.mkdir_p!(dir)
+
+    Enum.each(1..501, fn i ->
+      digits = Integer.to_string(i)
+      padded = String.pad_leading(digits, 4, "0")
+      File.write!(Path.join(dir, "f" <> padded), "x")
+    end)
+
+    result = run("list_directory", %{"path" => "many"}, root)
+
+    assert length(result.entries) == 500
+    assert result.count == 501
+    assert result.truncated == true
+    assert List.first(result.entries) == "- f0001"
+  end
+
+  test "list_directory on a missing directory", %{root: root} do
+    assert run("list_directory", %{"path" => "nope"}, root) == %{
+             ok: false,
+             path: "nope",
+             error: "directory not found"
+           }
+  end
+
+  test "list_directory on a file degrades to an error", %{root: root} do
+    result = run("list_directory", %{"path" => "readme.md"}, root)
+
+    assert result.ok == false
+    assert result.error =~ "could not list directory"
+  end
+
+  ## the rescue belt
+
+  test "a broken call degrades to tool crashed, never a raise", %{root: root} do
+    broken = %{"path" => nil, "offset" => 1, "limit" => 2_000}
+    result = Tools.Runner.run("read_file", broken, root)
+
+    assert result.ok == false
+    assert result.error =~ "tool crashed"
+
+    unknown = Tools.Runner.run("not_a_tool", %{}, root)
+    assert unknown.ok == false
+    assert unknown.error =~ "tool crashed"
+  end
+end
