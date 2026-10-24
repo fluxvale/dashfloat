@@ -155,27 +155,46 @@ defmodule DashFloat.Tools.Runner do
   defp write_atomic(resolved, content, mode) do
     tmp = temp_path(resolved)
 
-    with {:ok, device} <- File.open(tmp, [:write, :exclusive]),
-         :ok <- fill(device, tmp, content, mode),
-         :ok <- File.rename(tmp, resolved) do
-      :ok
-    else
-      {:error, reason} ->
-        File.rm(tmp)
-        {:error, reason}
+    result =
+      try do
+        with {:ok, device} <- File.open(tmp, [:write, :exclusive]),
+             :ok <- fill(device, tmp, content, mode),
+             :ok <- File.rename(tmp, resolved) do
+          :ok
+        else
+          {:error, reason} -> {:error, reason}
+        end
+      rescue
+        # A mid-write I/O failure raises (ENOSPC, dead device): the write is
+        # over either way — report it through the same error door.
+        exception -> {:error, Exception.message(exception)}
+      end
+
+    case result do
+      :ok -> :ok
+      {:error, reason} -> discard_tmp(tmp, reason)
     end
+  end
+
+  defp discard_tmp(tmp, reason) do
+    File.rm(tmp)
+    {:error, reason}
   end
 
   # `mode` is nil for fresh files; over an existing entry the old
   # permissions carry over — a rename alone would reset them to 0644.
   defp fill(device, tmp, content, mode) do
-    :ok = IO.binwrite(device, content)
-    File.close(device)
+    result =
+      try do
+        :ok = IO.binwrite(device, content)
+        :ok
+      after
+        File.close(device)
+      end
 
-    if is_nil(mode) do
-      :ok
-    else
-      File.chmod(tmp, mode)
+    case result do
+      :ok when is_nil(mode) -> :ok
+      :ok -> File.chmod(tmp, mode)
     end
   end
 
