@@ -6,7 +6,7 @@ defmodule DashFloat.Config do
   overlays per-field environment variables, so a value can be overridden
   without editing the file. Loading happens once in `DashFloat.Application`
   and rides into the TUI as a mount opt — the UI process performs no file I/O.
-  See ADR 0005.
+  See ADR 0005; `context_tokens` is ADR 0006's optional window denominator.
   """
 
   @fields [
@@ -15,15 +15,19 @@ defmodule DashFloat.Config do
     api_key: "DASHFLOAT_API_KEY"
   ]
 
+  @context "context_tokens"
+  @context_var "DASHFLOAT_CONTEXT_TOKENS"
+
   # The provider rides in the TUI state, and a UI crash logs that state: never
   # let the key into a log line (ADR 0005).
   @derive {Inspect, except: [:api_key]}
-  defstruct [:base_url, :model, :api_key]
+  defstruct [:base_url, :model, :api_key, :context_tokens]
 
   @type t :: %__MODULE__{
           base_url: String.t(),
           model: String.t(),
-          api_key: String.t()
+          api_key: String.t(),
+          context_tokens: pos_integer() | nil
         }
 
   @doc "Loads the config from the default path, overlaid with the environment."
@@ -41,11 +45,14 @@ defmodule DashFloat.Config do
   Testable core: reads `path` (missing file = empty) and overlays `env`
   (a map of variable names to values). Blank fields after the merge yield an
   error naming only the missing field names — values are never echoed.
+  `context_tokens` is optional: env wins over the file, and anything that is
+  not a positive integer is nil — never an error, never a startup failure
+  (ADR 0006).
   """
   @spec load(String.t(), map()) :: {:ok, t()} | {:error, String.t()}
   def load(path, env) when is_binary(path) and is_map(env) do
     with {:ok, file} <- read_file(path) do
-      build(merge(file, env))
+      build(merge(file, env), context(env, file))
     end
   end
 
@@ -55,10 +62,32 @@ defmodule DashFloat.Config do
     end)
   end
 
-  defp build(values) do
+  # Env wins over the file; a blank env var counts as absent (like every other
+  # field), but a value present and unusable is simply nil (ADR 0006).
+  defp context(env, file) do
+    case env_value(env, @context_var) do
+      nil -> positive_int(file[@context])
+      raw -> positive_int(raw)
+    end
+  end
+
+  defp positive_int(raw) when is_binary(raw) do
+    trimmed = String.trim(raw)
+
+    case Integer.parse(trimmed) do
+      {n, ""} when n in 1..1_000_000_000_000 -> n
+      _other -> nil
+    end
+  end
+
+  defp positive_int(raw) when is_integer(raw) and raw in 1..1_000_000_000_000, do: raw
+  defp positive_int(_raw), do: nil
+
+  defp build(values, context_tokens) do
     case Enum.reject(@fields, fn {field, _var} -> value(values[field]) end) do
       [] ->
-        {:ok, struct!(__MODULE__, Map.new(values, fn {field, raw} -> {field, value(raw)} end))}
+        config = struct!(__MODULE__, Map.new(values, fn {field, raw} -> {field, value(raw)} end))
+        {:ok, %{config | context_tokens: context_tokens}}
 
       missing ->
         {:error, "missing provider config: " <> field_names(missing)}

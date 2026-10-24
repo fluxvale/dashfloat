@@ -2,12 +2,13 @@ defmodule DashFloat.TUI.View do
   @moduledoc """
   Pure rendering: `render/2` maps state + frame to `{widget, rect}` tuples.
   Also owns the shared region split used by both rendering and
-  `DashFloat.TUI.State`'s scroll arithmetic. See ADR 0002.
+  `DashFloat.TUI.State`'s scroll arithmetic. See ADR 0002; the status,
+  activity, and entry styling are ADR 0006's.
   """
 
   alias DashFloat.TUI.State
+  alias DashFloat.TUI.Theme
   alias ExRatatui.Layout.Rect
-  alias ExRatatui.Style
   alias ExRatatui.Text.Line
   alias ExRatatui.Text.Span
   alias ExRatatui.Widgets.Block
@@ -15,32 +16,36 @@ defmodule DashFloat.TUI.View do
   alias ExRatatui.Widgets.Textarea
 
   @phases %{
-    idle: {"Idle", :dark_gray},
-    streaming: {"Streaming", :yellow},
-    executing_tool: {"Executing Tool", :cyan}
+    idle: {"Idle", :status_idle},
+    streaming: {"Streaming", :status_busy},
+    executing_tool: {"Running tool", :status_tool}
   }
 
   @doc """
-  Splits `width` x `height` into status (1 row), log (rest), and input
-  (`2 + input_lines` rows, clamped to a third of the frame).
+  Splits `width` x `height` into status (1 row), log (rest), activity
+  (1 row while active, else 0), and input (`2 + input_lines` rows, clamped to
+  a third of the frame).
   """
-  @spec regions({integer(), integer()}, integer()) :: %{
+  @spec regions({integer(), integer()}, integer(), boolean()) :: %{
           status: Rect.t(),
           log: Rect.t(),
+          activity: Rect.t(),
           input: Rect.t()
         }
-  def regions({width, height}, input_lines)
-      when is_integer(width) and is_integer(height) and is_integer(input_lines) do
+  def regions({width, height}, input_lines, active?)
+      when is_integer(width) and is_integer(height) and is_integer(input_lines) and
+             is_boolean(active?) do
     area = %Rect{x: 0, y: 0, width: max(width, 0), height: max(height, 0)}
 
-    [status, log, input] =
+    [status, log, activity, input] =
       ExRatatui.Layout.split(area, :vertical, [
         {:length, 1},
         {:min, 0},
+        {:length, if(active?, do: 1, else: 0)},
         {:length, input_height(input_lines, height)}
       ])
 
-    %{status: status, log: log, input: input}
+    %{status: status, log: log, activity: activity, input: input}
   end
 
   @doc "Input region height: borders plus draft lines, capped at a third of the frame."
@@ -54,14 +59,16 @@ defmodule DashFloat.TUI.View do
     |> max(3)
   end
 
-  @doc "Renders the three regions. Pure; never raises on odd sizes."
+  @doc "Renders the four regions. Pure; never raises on odd sizes."
   @spec render(State.t(), ExRatatui.Frame.t()) :: [{ExRatatui.widget(), Rect.t()}]
   def render(%State{} = state, %ExRatatui.Frame{width: width, height: height}) do
-    regions = regions({width, height}, State.input_line_count(state))
+    active? = state.phase != :idle
+    regions = regions({width, height}, State.input_line_count(state), active?)
 
     [
       {status_widget(state, regions.log.height), regions.status},
       {log_widget(state, regions.log.height), regions.log},
+      {activity_widget(state), regions.activity},
       {input_widget(state), regions.input}
     ]
   end
@@ -69,22 +76,43 @@ defmodule DashFloat.TUI.View do
   ## Status bar
 
   defp status_widget(state, log_height) do
-    {label, color} = Map.fetch!(@phases, state.phase)
+    {label, role} = Map.fetch!(@phases, state.phase)
 
     %Paragraph{
       text: [
-        Line.new([
-          Span.new("DashFloat", style: %Style{modifiers: [:bold]}),
-          Span.new("  model: #{model(state)}  ctx: —", style: %Style{fg: :dark_gray}),
-          Span.new("  ● ", style: %Style{fg: color}),
-          Span.new(label, style: %Style{fg: color}),
-          Span.new("  #{position(state, log_height)}", style: %Style{fg: :dark_gray})
-        ])
+        Line.new(
+          [
+            Span.new("❯ ", style: Theme.style(:accent)),
+            Span.new(State.cwd_label(state), style: Theme.style(:dim)),
+            Span.new(" · ", style: Theme.style(:hint)),
+            Span.new(State.provider_model(state) || "—", style: Theme.style(:assistant)),
+            Span.new(" · ctx ", style: Theme.style(:hint)),
+            Span.new(State.context_label(state), style: Theme.style(:dim))
+          ] ++ rate_spans(state) ++ phase_spans(label, role) ++ position_spans(state, log_height)
+        )
       ]
     }
   end
 
-  defp model(state), do: State.provider_model(state) || "—"
+  defp rate_spans(state) do
+    case State.rate_label(state) do
+      nil -> []
+      rate -> [Span.new(" · #{rate} tok/s", style: Theme.style(:dim))]
+    end
+  end
+
+  defp phase_spans(label, role) do
+    [
+      Span.new(" · ", style: Theme.style(:hint)),
+      Span.new("● ", style: Theme.style(role)),
+      Span.new(label, style: Theme.style(role))
+    ]
+  end
+
+  defp position_spans(state, log_height) do
+    position = position(state, log_height)
+    [Span.new(" · ", style: Theme.style(:hint)), Span.new(position, style: Theme.style(:dim))]
+  end
 
   defp position(state, log_height) do
     total = State.log_line_count(state)
@@ -110,7 +138,8 @@ defmodule DashFloat.TUI.View do
 
   # Only the visible window is built and encoded per frame: per-frame cost is
   # O(viewport), not O(total log) — the full log stays in memory until Phase 4
-  # persistence (ADR 0002).
+  # persistence (ADR 0002). Stored rendered lines are sliced; nothing renders
+  # here (ADR 0006).
   defp log_widget(state, height) do
     %Paragraph{
       text: log_lines(state, State.effective_scroll(state, height), height),
@@ -118,78 +147,80 @@ defmodule DashFloat.TUI.View do
     }
   end
 
-  defp log_lines(%State{entries: [], in_flight: in_flight}, _offset, _height)
+  defp log_lines(
+         %State{entries: [], in_flight: in_flight, in_flight_lines: nil},
+         _offset,
+         _height
+       )
        when in_flight in [nil, ""] do
-    [Line.new([Span.new("(log is empty — say something)", style: %Style{fg: :dark_gray})])]
+    [Line.new([Span.new("(log is empty — say something)", style: Theme.style(:dim))])]
   end
 
   defp log_lines(state, offset, height) do
-    pairs =
-      case state.in_flight do
-        in_flight when in_flight in [nil, ""] -> state.entries
-        in_flight -> state.entries ++ [{:assistant, in_flight}]
-      end
-
-    # Walk entries counting display lines; build Lines only for entries that
-    # intersect [offset, offset + height).
-    {_total, acc} =
-      Enum.reduce_while(pairs, {0, []}, fn {_kind, text} = pair, {skipped, acc} ->
-        n = line_count(text)
-
-        if skipped + n <= offset do
-          {:cont, {skipped + n, acc}}
-        else
-          take_window(pair, skipped, n, acc, offset, height)
-        end
-      end)
+    # Walk blocks counting display lines; slice only those that intersect
+    # [offset, offset + height), so per-frame building stays O(viewport).
+    {_skipped, acc} =
+      state
+      |> blocks()
+      |> Enum.reduce_while({0, []}, &take_block(&1, &2, offset, height))
 
     acc
   end
 
-  # Windowing step of log_lines/3: build Lines for the first entry that
-  # intersects [offset, offset + height) and report whether the walk is done.
-  defp take_window(pair, skipped, n, acc, offset, height) do
-    taken =
-      pair
-      |> entry_lines()
-      |> Enum.drop(max(offset - skipped, 0))
-      |> Enum.take(height - length(acc))
+  defp blocks(%State{in_flight_lines: nil} = state), do: Enum.map(state.entries, & &1.lines)
 
-    acc = acc ++ taken
+  defp blocks(%State{in_flight_lines: lines} = state),
+    do: Enum.map(state.entries, & &1.lines) ++ [lines]
 
-    if length(acc) >= height do
-      {:halt, {skipped, acc}}
-    else
+  defp take_block(lines, {skipped, acc}, offset, height) do
+    n = length(lines)
+
+    if skipped + n <= offset do
       {:cont, {skipped + n, acc}}
+    else
+      taken =
+        lines
+        |> Enum.drop(max(offset - skipped, 0))
+        |> Enum.take(height - length(acc))
+
+      acc = acc ++ taken
+
+      if length(acc) >= height, do: {:halt, {skipped, acc}}, else: {:cont, {skipped + n, acc}}
     end
   end
 
-  defp line_count(text), do: length(:binary.matches(text, "\n")) + 1
+  ## Activity line
 
-  defp entry_lines({:user, text}) do
-    text
-    |> String.split("\n")
-    |> Enum.with_index(1)
-    |> Enum.map(fn
-      {line, 1} -> Line.new([Span.new("❯ ", style: %Style{modifiers: [:bold]}), Span.new(line)])
-      {line, _idx} -> Line.new([Span.new("  " <> line)])
-    end)
+  defp activity_widget(%{phase: :idle}) do
+    %Paragraph{text: [], scroll: {0, 0}}
   end
 
-  defp entry_lines({kind, text}) when kind in [:tool, :system] do
-    text
-    |> String.split("\n")
-    |> Enum.map(&Line.new([Span.new(&1, style: %Style{fg: :dark_gray})]))
+  defp activity_widget(state) do
+    %Paragraph{
+      text: [
+        Line.new([
+          Span.new(spinner_frame(state), style: Theme.style(:accent)),
+          Span.new(" "),
+          Span.new(activity_label(state), style: Theme.style(:accent)),
+          Span.new("  esc interrupt", style: Theme.style(:hint))
+        ])
+      ],
+      scroll: {0, 0}
+    }
   end
 
-  defp entry_lines({:assistant, text}) do
-    text
-    |> String.split("\n")
-    |> Enum.map(&Line.new([Span.new(&1)]))
+  defp spinner_frame(state) do
+    frames = Theme.spinner_frames()
+    Enum.at(frames, rem(state.anim_step, length(frames)))
   end
+
+  defp activity_label(%{phase: :executing_tool}), do: "Running tool…"
+  defp activity_label(%{stats: %{tokens: 0}}), do: "Thinking…"
+  defp activity_label(_state), do: "Streaming…"
 
   ## Input
 
+  # Unchanged by this slice: worker 2 restyles the input (wrap mode, glyph).
   defp input_widget(state) do
     %Textarea{
       state: state.input,
@@ -200,7 +231,7 @@ defmodule DashFloat.TUI.View do
       },
       placeholder:
         "ask anything — Enter send · Shift+Enter newline · PgUp/PgDn scroll · Ctrl+Q quit",
-      placeholder_style: %Style{fg: :dark_gray}
+      placeholder_style: Theme.style(:dim)
     }
   end
 end
