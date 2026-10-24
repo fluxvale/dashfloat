@@ -67,13 +67,41 @@ defmodule DashFloat.TUI.ViewTest do
              ] = widgets
     end
 
-    test "status bar carries the cwd, model, context, and phase truth" do
+    test "status bar carries the cwd, model, and phase truth, omitting token fields" do
       text = status_text(new_state())
 
       assert text =~ "❯ ~/"
       assert text =~ "—"
-      assert text =~ "ctx —"
+      refute text =~ "ctx"
+      refute text =~ "tok/s"
       assert text =~ "● Idle"
+    end
+
+    test "token fields appear only once something has streamed, in ADR order" do
+      base = new_state(provider: provider(128_000))
+
+      state =
+        base
+        |> State.stream_message({:token, "a"}, 1_000)
+        |> State.stream_message({:token, "b"}, 1_000)
+        |> State.stream_message(
+          {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 4_100}}
+        )
+        |> State.stream_message({:phase, :idle}, 2_000)
+
+      text = status_text(state)
+
+      assert text =~ ~r/model · ctx 4\.1k\/128k · 2\.0 tok\/s · ● Idle · /
+      assert text =~ "test-model"
+    end
+
+    test "the status bar is one line of styled spans, dim separators between" do
+      [line] = status_line(new_state())
+      assert length(line.spans) > 4
+
+      separators = Enum.filter(line.spans, &(&1.content == " · "))
+      assert separators != []
+      assert Enum.all?(separators, &(&1.style.fg == :dark_gray))
     end
 
     test "the configured model replaces the placeholder" do
@@ -251,6 +279,22 @@ defmodule DashFloat.TUI.ViewTest do
       assert activity_text(%{new_state() | phase: :streaming, anim_step: 10}) =~
                Enum.at(frames, 0)
     end
+
+    test "spinner and label are accent; the interrupt hint is dim" do
+      {widget, _rect} = activity(%{new_state() | phase: :streaming})
+      [spinner, _space, label, hint] = hd(widget.text).spans
+
+      assert spinner.style == Theme.style(:accent)
+      assert label.style == Theme.style(:accent)
+      assert label.content == "Thinking…"
+      assert hint.content == "  esc interrupt"
+      assert hint.style == Theme.style(:dim)
+    end
+
+    test "the activity row has height zero while idle and one while active" do
+      assert View.regions({80, 24}, 1, false).activity.height == 0
+      assert View.regions({80, 24}, 1, true).activity.height == 1
+    end
   end
 
   describe "render/2 against a test terminal buffer" do
@@ -268,8 +312,25 @@ defmodule DashFloat.TUI.ViewTest do
       assert buffer =~ "❯"
       assert buffer =~ "Idle"
       assert buffer =~ "hello log"
-      assert buffer =~ "Input"
+      assert buffer =~ "ask anything"
       assert buffer =~ "Enter send"
+    end
+  end
+
+  describe "input box" do
+    test "rounded dim border, an accent prompt title, dim placeholder, word-or-glyph wrap" do
+      {widget, _rect} = input(new_state())
+      assert widget.wrap_mode == :word_or_glyph
+
+      assert widget.placeholder ==
+               "ask anything — Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit"
+
+      assert widget.placeholder_style == Theme.style(:dim)
+      assert widget.block.border_type == :rounded
+      assert widget.block.borders == [:all]
+      assert widget.block.border_style == Theme.style(:dim)
+      assert %ExRatatui.Text.Span{content: "❯ ", style: style} = widget.block.title
+      assert style == Theme.style(:accent)
     end
   end
 
@@ -279,16 +340,29 @@ defmodule DashFloat.TUI.ViewTest do
     [%{kind: :user, text: text, lines: Render.entry_lines(:user, text)}]
   end
 
+  defp provider(context_tokens) do
+    {:ok,
+     %DashFloat.Config{
+       base_url: "http://x",
+       model: "test-model",
+       api_key: "k",
+       context_tokens: context_tokens
+     }}
+  end
+
   defp status_text(state), do: status_text_at(state, 80, 24)
 
   defp status_text_at(state, w, h) do
+    [line] = status_line_at(state, w, h)
+    Enum.map_join(line.spans, "", & &1.content)
+  end
+
+  defp status_line(state), do: status_line_at(state, 80, 24)
+
+  defp status_line_at(state, w, h) do
     widgets = View.render(state, %ExRatatui.Frame{width: w, height: h})
     {widget, _rect} = List.first(widgets)
-    [line] = widget.text
-
-    line
-    |> spans()
-    |> Enum.join()
+    widget.text
   end
 
   defp activity(state) do
@@ -300,6 +374,12 @@ defmodule DashFloat.TUI.ViewTest do
   defp activity_text(state) do
     {widget, _rect} = activity(state)
     Enum.map_join(widget.text, "", &flatten/1)
+  end
+
+  defp input(state) do
+    state
+    |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+    |> Enum.at(3)
   end
 
   defp log_widget(state, w, h) do

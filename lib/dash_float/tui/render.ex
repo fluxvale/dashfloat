@@ -2,10 +2,11 @@ defmodule DashFloat.TUI.Render do
   @moduledoc """
   The one pure seam between entry truth and the log view:
   `entry_lines/2` turns an entry's raw text into styled lines. Every entry
-  starts with one blank separator line. The markdown mapper replaces the
-  `:assistant` path later (ADR 0006); the seam itself stays this function.
+  starts with one blank separator line. Assistant text goes through the
+  markdown mapper; the seam itself stays this function (ADR 0006).
   """
 
+  alias DashFloat.TUI.Markdown
   alias DashFloat.TUI.Theme
   alias ExRatatui.Style
   alias ExRatatui.Text.Line
@@ -35,8 +36,8 @@ defmodule DashFloat.TUI.Render do
     end)
   end
 
-  # Plain default-foreground lines; the markdown mapper takes over this path.
-  defp body_lines(:assistant, text), do: lines(text, Theme.style(:assistant))
+  # Assistant output is markdown; the mapper owns every style in it.
+  defp body_lines(:assistant, text), do: Markdown.render(text)
 
   defp body_lines(:tool, text), do: lines(text, Theme.style(:tool))
   defp body_lines(:system, text), do: lines(text, Theme.style(:dim_italic))

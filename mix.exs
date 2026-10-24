@@ -49,6 +49,7 @@ defmodule DashFloat.MixProject do
   defp deps do
     [
       {:burrito, "~> 1.6"},
+      {:earmark_parser, "~> 1.4"},
       {:ex_ratatui, "~> 0.17.1"},
       {:jason, "~> 1.4"},
       {:req, "~> 0.7.5"},

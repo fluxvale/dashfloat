@@ -75,35 +75,44 @@ defmodule DashFloat.TUI.View do
 
   ## Status bar
 
+  # One left-flowing line, ADR order: cwd, model, context, rate, phase, log
+  # position. Token fields are omitted entirely until something streamed.
   defp status_widget(state, log_height) do
     {label, role} = Map.fetch!(@phases, state.phase)
 
     %Paragraph{
       text: [
         Line.new(
-          [
-            Span.new("❯ ", style: Theme.style(:accent)),
-            Span.new(State.cwd_label(state), style: Theme.style(:dim)),
-            Span.new(" · ", style: Theme.style(:hint)),
-            Span.new(State.provider_model(state) || "—", style: Theme.style(:assistant)),
-            Span.new(" · ctx ", style: Theme.style(:hint)),
-            Span.new(State.context_label(state), style: Theme.style(:dim))
-          ] ++ rate_spans(state) ++ phase_spans(label, role) ++ position_spans(state, log_height)
+          [Span.new("❯ " <> State.cwd_label(state), style: Theme.style(:dim))] ++
+            model_spans(state) ++
+            context_spans(state) ++
+            rate_spans(state) ++
+            phase_spans(label, role) ++ position_spans(state, log_height)
         )
       ]
     }
   end
 
+  defp model_spans(state) do
+    [separator(), Span.new(State.provider_model(state) || "—", style: Theme.style(:assistant))]
+  end
+
+  defp context_spans(%{stats: %{context_total: 0}}), do: []
+
+  defp context_spans(state) do
+    [separator(), Span.new("ctx " <> State.context_label(state), style: Theme.style(:dim))]
+  end
+
   defp rate_spans(state) do
     case State.rate_label(state) do
       nil -> []
-      rate -> [Span.new(" · #{rate} tok/s", style: Theme.style(:dim))]
+      rate -> [separator(), Span.new("#{rate} tok/s", style: Theme.style(:dim))]
     end
   end
 
   defp phase_spans(label, role) do
     [
-      Span.new(" · ", style: Theme.style(:hint)),
+      separator(),
       Span.new("● ", style: Theme.style(role)),
       Span.new(label, style: Theme.style(role))
     ]
@@ -111,8 +120,10 @@ defmodule DashFloat.TUI.View do
 
   defp position_spans(state, log_height) do
     position = position(state, log_height)
-    [Span.new(" · ", style: Theme.style(:hint)), Span.new(position, style: Theme.style(:dim))]
+    [separator(), Span.new(position, style: Theme.style(:dim))]
   end
+
+  defp separator, do: Span.new(" · ", style: Theme.style(:hint))
 
   defp position(state, log_height) do
     total = State.log_line_count(state)
@@ -215,18 +226,19 @@ defmodule DashFloat.TUI.View do
 
   ## Input
 
-  # Unchanged by this slice: worker 2 restyles the input (wrap mode, glyph).
   defp input_widget(state) do
     %Textarea{
       state: state.input,
       block: %Block{
-        title: "Input",
+        title: Span.new("❯ ", style: Theme.style(:accent)),
         borders: [:all],
-        border_type: :rounded
+        border_type: :rounded,
+        border_style: Theme.style(:dim)
       },
       placeholder:
-        "ask anything — Enter send · Shift+Enter newline · PgUp/PgDn scroll · Ctrl+Q quit",
-      placeholder_style: Theme.style(:dim)
+        "ask anything — Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit",
+      placeholder_style: Theme.style(:dim),
+      wrap_mode: :word_or_glyph
     }
   end
 end
