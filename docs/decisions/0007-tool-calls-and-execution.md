@@ -154,7 +154,11 @@ total byte count; `read_file` caps at 2 000 lines *and* 64 KiB (marker reports b
 totals) — and reads are bounded, not just output: files above 256 KiB stream only the
 requested line window (the exact line total is traded away; `truncated` is learned
 from a one-line probe past the window); `edit_file` refuses files over 8 MiB by
-stat, before reading; `list_directory` stats at most 501 entries; the episode's own
+stat, before reading; `list_directory` stats at most 501 entries (the alphabetical head of the sorted
+names — a listing beyond the cap hides later-named entries, disclosed by
+`truncated`; on this runtime `File.ls` silently skips non-UTF-8 names); edit
+previews are window-capped at 50 lines with a marker, write previews likewise;
+the episode's own
 accumulations (content plus tool-argument fragments) abort the stream at **4 MiB** —
 a trickling endpoint that never trips the idle timeout or the frame cap still cannot
 grow memory without bound. Exec timeout default **30 s** (agent opt `:exec_timeout`,
@@ -325,7 +329,9 @@ tests own their agents.
   confirmation order and result ordering for no user-visible gain at five tools;
   sequential-in-call-order is deterministic and testable. A Phase-4+ concern if ever.
 - **Line-number edits / fuzzy matching** — the founding spec fixed the search-block
-  protocol; fuzzy would break the "approved diff == landed diff" guarantee.
+  protocol; fuzzy would break the "approved diff == landed diff" guarantee (the
+  preview may be window-capped at 50 lines with a disclosed marker — what it
+  SHOWS is exactly what lands).
 - **Esc no-op during tool execution** — would leave the `esc interrupt` hint lying and a
   30 s timeout unskippable; cancellation is message-based and reaps the process group.
   Interrupt implemented.
