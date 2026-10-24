@@ -118,8 +118,10 @@ page-scroll arithmetic — one source of truth.
 ### Scrollback model
 
 - The log is a list of entries; each entry renders as one or more display
-  lines (no wrapping: long lines truncate at the right edge, so display-line
-  count == logical-line count and scroll math is exact).
+  lines. *(Amended by [ADR 0006](0006-ui-truth-and-rendering.md): long lines
+  word-wrap; the display-line count is the stored wrapped count, so scroll
+  math is exact. Originally: no wrapping — long lines truncated at the right
+  edge, so display-line count == logical-line count.)*
 - State holds `scroll` (lines from top — the *intent*) and `follow?`
   (auto-scroll pin). `View` computes the *effective* offset by clamping
   `scroll` to `max(0, total_lines − view_height)` — stale intents after a
@@ -258,6 +260,8 @@ logged, loop continues).
   selection; keyboard scrolling suffices for Phase 1.
 - **Wrapped log lines** — scroll offsets would count rendered lines and jump
   on resize/reflow; truncation keeps the math exact and the view stable.
+  *(Reversed by [ADR 0006's wrap amendment](0006-ui-truth-and-rendering.md):
+  the log word-wraps and the math counts stored wrapped display lines.)*
 - **`List` widget for the log** — `Paragraph.scroll` gives the same with less
   state; no selection behavior needed.
 - **Spinner animation via subscriptions** — not required to demonstrate the

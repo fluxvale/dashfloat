@@ -15,10 +15,17 @@ defmodule DashFloat.TUI.State do
 
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.View
+  alias DashFloat.TUI.Wrap
 
   @type phase :: :idle | :streaming | :executing_tool | :confirming
   @type entry_kind :: :user | :assistant | :tool | :system
-  @type entry :: %{kind: entry_kind(), text: String.t(), lines: [ExRatatui.Text.Line.t()]}
+
+  @type entry :: %{
+          kind: entry_kind(),
+          text: String.t(),
+          logical: [ExRatatui.Text.Line.t()],
+          lines: [ExRatatui.Text.Line.t()]
+        }
   @type confirm :: %{ref: term(), id: term(), name: String.t()}
   @type action ::
           :quit | {:submit, String.t()} | {:confirm, :approved | :rejected} | :cancel | nil
@@ -546,15 +553,25 @@ defmodule DashFloat.TUI.State do
 
   defp rate(_tokens, _first_token_at, _now), do: nil
 
-  # `text` stays verbatim (ADR 0006: it is the persistence truth); the render
-  # path splits on "\n" and tolerates trailing blanks. Tool-contract entries
-  # carry their own styled lines from the Render builders.
+  # `text` stays verbatim (ADR 0006: it is the persistence truth); `logical`
+  # is the width-free render truth, `lines` its wrap at the current width —
+  # what the view renders and the scroll math counts. Tool-contract entries
+  # carry their styled logical lines from the Render builders.
   defp append_entry(state, kind, text),
     do: put_entry(state, kind, text, Render.entry_lines(kind, text))
 
-  defp put_entry(state, kind, text, lines) do
-    %{state | entries: state.entries ++ [%{kind: kind, text: text, lines: lines}]}
+  defp put_entry(state, kind, text, logical) do
+    entry = %{
+      kind: kind,
+      text: text,
+      logical: logical,
+      lines: Wrap.wrap(logical, log_width(state))
+    }
+
+    %{state | entries: state.entries ++ [entry]}
   end
+
+  defp log_width(%__MODULE__{size: {width, _height}}), do: width
 
   ## Animation tick
 
@@ -585,11 +602,8 @@ defmodule DashFloat.TUI.State do
 
   defp refresh_in_flight(%{in_flight: in_flight} = state)
        when byte_size(in_flight) <= @in_flight_cap do
-    %{
-      state
-      | in_flight_lines: Render.entry_lines(:assistant, in_flight),
-        in_flight_dirty: false
-    }
+    width = log_width(state)
+    %{state | in_flight_lines: wrapped_assistant(in_flight, width), in_flight_dirty: false}
   end
 
   # Above the cap the live view keeps its last render; finalize still parses
@@ -777,8 +791,53 @@ defmodule DashFloat.TUI.State do
 
   ## Resize
 
-  @doc "Records the new terminal size; scroll intents stay and are clamped at render."
+  @doc """
+  Records the new terminal size and, when the width changed, re-wraps the log
+  to it: stored entries re-wrap from their logical lines (no re-parse), and
+  the in-flight reply re-renders from its text under the same 64 KiB live
+  cap. Above the cap no fresh render is possible until finalize, and a
+  stale-width render would truncate at the new edge, so the live view
+  clears until the reply finalizes (ADR 0006, amended). Scroll intents stay
+  and are clamped at render.
+  """
   @spec resize(t(), integer(), integer()) :: t()
-  def resize(state, width, height) when is_integer(width) and is_integer(height),
-    do: %{state | size: {max(width, 1), max(height, 1)}}
+  def resize(state, width, height) when is_integer(width) and is_integer(height) do
+    width = max(width, 1)
+    height = max(height, 1)
+
+    case state.size do
+      {^width, ^height} ->
+        state
+
+      {old_width, _old_height} when old_width == width ->
+        %{state | size: {width, height}}
+
+      _old_size ->
+        %{
+          state
+          | size: {width, height},
+            entries: Enum.map(state.entries, &rewrap_entry(&1, width)),
+            in_flight_lines: rewrap_in_flight(state, width)
+        }
+    end
+  end
+
+  # Hand-built entries (tests, older state) may lack :logical; re-wrapping
+  # from their stored lines is the best available truth there.
+  defp rewrap_entry(entry, width) do
+    logical = Map.get(entry, :logical, entry.lines)
+    %{entry | lines: Wrap.wrap(logical, width)}
+  end
+
+  defp rewrap_in_flight(%{in_flight: in_flight} = _state, width)
+       when is_binary(in_flight) and in_flight != "" and byte_size(in_flight) <= @in_flight_cap,
+       do: wrapped_assistant(in_flight, width)
+
+  defp rewrap_in_flight(_state, _width), do: nil
+
+  defp wrapped_assistant(text, width) do
+    :assistant
+    |> Render.entry_lines(text)
+    |> Wrap.wrap(width)
+  end
 end
