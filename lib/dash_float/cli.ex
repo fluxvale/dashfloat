@@ -42,9 +42,21 @@ defmodule DashFloat.CLI do
         do_parse(rest, put_new(acc, Map.fetch!(@keys, flag), value))
 
       _other ->
-        Logger.warning("unrecognized argument #{inspect(arg)} — ignored")
+        warn_ignored(arg)
         do_parse(rest, acc)
     end
+  end
+
+  # The flag name only — a value like `--api-key=<secret>` must never reach a
+  # log (the whole argv is user input, and secret-shaped mistakes are the
+  # natural typo next to DASHFLOAT_API_KEY).
+  defp warn_ignored(arg) do
+    flag =
+      arg
+      |> String.split("=", parts: 2)
+      |> hd()
+
+    Logger.warning("unrecognized argument #{inspect(flag)} — ignored")
   end
 
   # The first occurrence wins; later repeats warn.

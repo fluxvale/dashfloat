@@ -43,13 +43,17 @@ defmodule DashFloat.CLITest do
     assert model_logs =~ "--model given without a value"
   end
 
-  test "unrecognized arguments warn and are ignored" do
+  test "unrecognized arguments warn by flag name only — values are never logged" do
     logs =
       capture_log(fn ->
-        assert CLI.parse(["--bogus", "x", "plain"]) == []
+        assert CLI.parse(["--api-key=PLACEHOLDER-SECRET", "--token=PLACEHOLDER-TOKEN", "plain"]) ==
+                 []
       end)
 
-    assert logs =~ "unrecognized argument"
+    assert logs =~ ~s(unrecognized argument "--api-key")
+    assert logs =~ ~s(unrecognized argument "--token")
+    assert logs =~ ~s(unrecognized argument "plain")
+    refute logs =~ "PLACEHOLDER"
   end
 
   test "a repeated switch keeps the first value and warns" do

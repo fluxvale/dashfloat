@@ -20,7 +20,7 @@ defmodule DashFloat.Agent do
   @display_lines 30
 
   @no_provider "[llm: no provider configured — set up profiles in " <>
-                 "~/.config/dashfloat/dashfloat.json5 or " <>
+                 "~/.config/dashfloat/settings.json5 or " <>
                  "DASHFLOAT_BASE_URL/DASHFLOAT_MODEL/DASHFLOAT_API_KEY]"
 
   @enforce_keys [:provider, :cwd, :supervisor]

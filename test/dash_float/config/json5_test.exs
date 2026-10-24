@@ -61,19 +61,17 @@ defmodule DashFloat.Config.JSON5Test do
     end
   end
 
-  test "encode round-trips through decode (keys come back as strings)" do
-    term = %{configVersion: 1, profiles: [%{name: "default", baseUrl: "https://file.example/v1"}]}
+  test "unrepresentable number literals are errors, not crashes (hostile-review P1)" do
+    # decimal raises Decimal.Error (whose message quotes the literal) for
+    # exponents it cannot represent — the wrapper must degrade that to the
+    # fixed error string so the literal never reaches a log and startup
+    # survives a hand-edited typo.
+    for input <- ["{ context: 1e10000 }", "{ context: 1e-10000 }", "{ context: 1.5e-400 }"] do
+      assert {:error, "invalid JSON5"} = JSON5.decode(input)
+    end
+  end
 
-    decoded =
-      term
-      |> JSON5.encode()
-      |> JSON5.decode()
-
-    assert {:ok,
-            %{
-              "configVersion" => 1,
-              "profiles" => [%{"name" => "default", "baseUrl" => "https://file.example/v1"}]
-            }} =
-             decoded
+  test "values with one quote kind parse fine raw (the other style delimits)" do
+    assert JSON5.decode(~s({ a: "k'x", b: 'y"z' })) == {:ok, %{"a" => "k'x", "b" => "y\"z"}}
   end
 end

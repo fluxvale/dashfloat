@@ -1,7 +1,7 @@
 defmodule DashFloat.Config.MigrationTest do
   @moduledoc false
   # ADR 0008 migration semantics: legacy config.json becomes the default
-  # profile inside dashfloat.json5 (0600, secrets inline), the old file
+  # profile inside settings.json5 (0600, secrets inline), the old file
   # survives as a backup, and re-runs are no-ops. Placeholders only — never a
   # real key.
   use ExUnit.Case, async: true
@@ -37,7 +37,7 @@ defmodule DashFloat.Config.MigrationTest do
 
   defp paths(dir) do
     %{
-      main: Path.join(dir, "dashfloat.json5"),
+      main: Path.join(dir, "settings.json5"),
       legacy: Path.join(dir, "config.json"),
       backup: Path.join(dir, "config.json.bak")
     }
@@ -73,7 +73,7 @@ defmodule DashFloat.Config.MigrationTest do
              |> JSON5.decode()
   end
 
-  test "dashfloat.json5 is created 0600 and the legacy file is backed up by rename" do
+  test "settings.json5 is created 0600 and the legacy file is backed up by rename" do
     dir = tmp_dir()
     legacy_contents = Jason.encode!(full_legacy())
     legacy = Path.join(dir, "config.json")
@@ -86,6 +86,128 @@ defmodule DashFloat.Config.MigrationTest do
     assert Bitwise.band(mode, 0o777) == 0o600
     refute File.exists?(legacy)
     assert File.read!(backup) == legacy_contents
+  end
+
+  test "the backup is tightened to 0600 and no temp debris is left behind" do
+    dir = write_legacy!(tmp_dir(), full_legacy())
+
+    assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+    %{backup: backup} = paths(dir)
+
+    # The backup still holds the credential — it is 0600 too (hostile-review
+    # finding), and the tmp+rename write leaves nothing behind.
+    assert {:ok, %File.Stat{mode: backup_mode}} = File.stat(backup)
+    assert Bitwise.band(backup_mode, 0o777) == 0o600
+
+    files = File.ls!(dir)
+    refute Enum.any?(files, &String.ends_with?(&1, ".tmp"))
+  end
+
+  test "credentials containing one quote kind survive the round trip" do
+    # The Combine decoder processes no escapes, so the migration renders its
+    # fixed document by hand: single-quoted values, double-quoted when the
+    # value holds a single quote. A quote in a credential is preserved
+    # exactly (hostile-review P1 — the json5 encoder corrupted these).
+    dir =
+      write_legacy!(
+        tmp_dir(),
+        %{
+          "base_url" => "https://leg'acy.example/v1",
+          "model" => "mo\"del",
+          "api_key" => "PLACEHOLDER-mo'dern-key"
+        }
+      )
+
+    assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+    %{main: main} = paths(dir)
+
+    assert {:ok,
+            %{
+              "profiles" => [
+                %{
+                  "baseUrl" => "https://leg'acy.example/v1",
+                  "apiKey" => "PLACEHOLDER-mo'dern-key",
+                  "models" => [%{"model" => "mo\"del", "nickname" => "mo\"del"}]
+                }
+              ]
+            }} =
+             main
+             |> File.read!()
+             |> JSON5.decode()
+  end
+
+  test "a value with both quote kinds or a backslash fails the migration by field name" do
+    for bad <- ["both'kinds\"", "back\\slash"] do
+      base = tmp_dir()
+      dir = write_legacy!(base, Map.put(full_legacy(), "api_key", bad))
+
+      logs =
+        capture_log(fn ->
+          assert {:error, message} = @migration.maybe_migrate(dir)
+          assert message =~ "api_key"
+          assert message =~ "cannot represent"
+          refute message =~ "PLACEHOLDER"
+        end)
+
+      assert logs == ""
+
+      %{main: main, legacy: legacy} = paths(dir)
+      refute File.exists?(main)
+      assert File.exists?(legacy)
+    end
+  end
+
+  test "an empty settings.json5 (crash debris) is not a marker; migration proceeds" do
+    dir = write_legacy!(tmp_dir(), full_legacy())
+    main = Path.join(dir, "settings.json5")
+    File.write!(main, "")
+
+    assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+    decoded =
+      main
+      |> File.read!()
+      |> JSON5.decode()
+
+    assert {:ok, %{"profiles" => [%{"name" => "default"}]}} = decoded
+
+    backup = Path.join(dir, "config.json.bak")
+    assert File.exists?(backup)
+  end
+
+  test "an unwritable directory is a load error, not a crash" do
+    dir = write_legacy!(tmp_dir(), full_legacy())
+    on_exit(fn -> File.chmod!(dir, 0o700) end)
+    File.chmod!(dir, 0o500)
+
+    logs =
+      capture_log(fn ->
+        assert {:error, message} = @migration.maybe_migrate(dir)
+        assert message =~ "cannot write"
+        assert message =~ "settings.json5"
+      end)
+
+    refute logs =~ "PLACEHOLDER"
+
+    # The legacy file is untouched — nothing was renamed over it.
+    legacy = Path.join(dir, "config.json")
+    assert File.exists?(legacy)
+  end
+
+  test "a legacy string context_tokens (v1-accepted shape) survives the migration" do
+    dir = write_legacy!(tmp_dir(), Map.put(full_legacy(), "context_tokens", "128000"))
+
+    assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+    %{main: main} = paths(dir)
+
+    decoded =
+      main
+      |> File.read!()
+      |> JSON5.decode()
+
+    assert {:ok, %{"profiles" => [%{"models" => [%{"context" => 128_000}]}]}} = decoded
   end
 
   test "re-running is a no-op: the marker file exists, nothing is rewritten" do
@@ -210,6 +332,9 @@ defmodule DashFloat.Config.MigrationTest do
     assert File.read!(backup) =~ "older.example"
     # The legacy file was NOT renamed over the user's backup…
     assert File.exists?(legacy)
+    # …but it still holds the credential, so it is tightened to 0600.
+    assert {:ok, %File.Stat{mode: legacy_mode}} = File.stat(legacy)
+    assert Bitwise.band(legacy_mode, 0o777) == 0o600
     # …and the layout is complete and loadable regardless.
     %{main: main} = paths(dir)
     assert File.exists?(main)

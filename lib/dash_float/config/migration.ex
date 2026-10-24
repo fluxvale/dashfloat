@@ -4,46 +4,58 @@ defmodule DashFloat.Config.Migration do
   profile layout ([ADR 0008](../decisions/0008-config-layout-profiles-json5.md)).
 
   Runs as the first step of every `DashFloat.Config.load/2,3`. Migrates only
-  when `dashfloat.json5` is absent and the legacy file exists;
-  `dashfloat.json5`'s existence is the migration marker, which makes re-runs
-  no-ops. The legacy file is renamed to a backup, never deleted, and a
-  pre-existing backup is never clobbered. Malformed or incomplete legacy
-  input fails with field names only — nothing is written, no value is ever
-  echoed.
+  when a non-empty `settings.json5` is absent and the legacy file exists; a
+  non-empty `settings.json5` is the migration marker, which makes re-runs
+  no-ops. The new file is written to a private temp path and renamed into
+  place, so a crash can never leave a torn or half-written marker. The legacy
+  file is renamed to a backup, never deleted, both are tightened to 0600
+  (each still holds the credential), and a pre-existing backup is never
+  clobbered. Malformed or incomplete legacy input fails with field names
+  only — nothing is written, no value is ever echoed.
   """
-
-  alias DashFloat.Config.JSON5
 
   require Logger
 
   @legacy_file "config.json"
   @backup_file "config.json.bak"
-  @main_file "dashfloat.json5"
+  @main_file "settings.json5"
+  @tmp_suffix ".tmp"
   @default_profile "default"
   @main_version 1
   @secret_mode 0o600
 
   @doc """
   `{:ok, :migrated}` after a migration, `{:ok, :not_needed}` when there is
-  nothing to do, `{:error, message}` when the legacy file is unusable.
+  nothing to do, `{:error, message}` when the legacy file is unusable or the
+  new one cannot be written.
   """
   @spec maybe_migrate(Path.t()) :: {:ok, :migrated | :not_needed} | {:error, String.t()}
   def maybe_migrate(dir) do
     main = Path.join(dir, @main_file)
     legacy = Path.join(dir, @legacy_file)
 
-    if File.exists?(main) or not File.exists?(legacy) do
+    # An EMPTY settings.json5 is not a marker: it can only be crash debris
+    # (writes are tmp+rename atomic) or an empty user file — neither carries
+    # data, so migration proceeds over it.
+    if marker?(main) or not File.exists?(legacy) do
       {:ok, :not_needed}
     else
       migrate(dir, legacy, main)
     end
   end
 
-  defp migrate(dir, legacy, main) do
+  defp marker?(main) do
+    case File.stat(main) do
+      {:ok, %File.Stat{size: size}} when size > 0 -> true
+      _other -> false
+    end
+  end
+
+  defp migrate(_dir, legacy, main) do
     with {:ok, map} <- read_legacy(legacy),
-         {:ok, fields} <- legacy_fields(legacy, map) do
-      File.mkdir_p!(dir)
-      write_main(main, fields)
+         {:ok, fields} <- legacy_fields(legacy, map),
+         {:ok, contents} <- render_main(fields),
+         :ok <- write_main(main, contents) do
       backup_legacy(legacy)
       {:ok, :migrated}
     end
@@ -84,33 +96,98 @@ defmodule DashFloat.Config.Migration do
     end
   end
 
-  defp write_main(path, fields) do
-    base = %{nickname: fields.model, model: fields.model}
-    entry = maybe_put(base, :context, fields.context_tokens)
+  # Written tmp-then-rename (atomic on POSIX): no crash can leave a torn or
+  # zero-byte marker. The tmp file is created empty under 0600 before any
+  # content lands in it (ADR 0008 security posture).
+  defp write_main(path, contents) do
+    tmp = path <> @tmp_suffix
 
-    main = %{
-      configVersion: @main_version,
-      profiles: [
-        %{
-          name: @default_profile,
-          baseUrl: fields.base_url,
-          apiKey: fields.api_key,
-          models: [entry]
-        }
-      ]
-    }
+    with :ok <- File.touch(tmp),
+         :ok <- File.chmod(tmp, @secret_mode),
+         :ok <- File.write(tmp, contents <> "\n"),
+         :ok <- File.rename(tmp, path) do
+      :ok
+    else
+      {:error, reason} when is_atom(reason) ->
+        File.rm(tmp)
+        {:error, "cannot write #{path}: #{:file.format_error(reason)}"}
+    end
+  end
 
-    # Content must never land in a world-readable file: create it empty under
-    # 0600 first, then write (ADR 0008 security posture).
-    File.touch!(path)
-    File.chmod!(path, @secret_mode)
-    File.write!(path, JSON5.encode(main) <> "\n")
+  # The one place DashFloat WRITES json5: a fixed document shape rendered by
+  # hand with octofriend-style quoting. Values are single-quoted, or
+  # double-quoted when they contain a single quote; the Combine decoder
+  # cannot process escapes (hostile-review P1: the json5 encoder corrupts
+  # quote-containing values), so a value holding a backslash or BOTH quote
+  # kinds is unrepresentable — the migration fails naming the field instead
+  # of writing a file that cannot be read back.
+  defp render_main(fields) do
+    with {:ok, name} <- field_value("name", @default_profile),
+         {:ok, base_url} <- field_value("base_url", fields.base_url),
+         {:ok, api_key} <- field_value("api_key", fields.api_key),
+         {:ok, model} <- field_value("model", fields.model) do
+      context =
+        case fields.context_tokens do
+          nil -> ""
+          tokens -> ",\n            context: #{tokens}"
+        end
+
+      contents = """
+      {
+        configVersion: #{@main_version},
+        profiles: [
+          {
+            name: #{name},
+            baseUrl: #{base_url},
+            apiKey: #{api_key},
+            models: [
+              {
+                nickname: #{model},
+                model: #{model}#{context},
+              },
+            ],
+          },
+        ],
+      }
+      """
+
+      {:ok, contents}
+    else
+      {:unrepresentable, field} ->
+        {:error,
+         "legacy config.json: #{field} contains characters the settings.json5 dialect cannot " <>
+           "represent (a backslash or both quote kinds) — migrate it by hand"}
+    end
+  end
+
+  defp field_value(field, value) do
+    case quote_value(value) do
+      {:ok, _quoted} = ok -> ok
+      {:error, :unrepresentable} -> {:unrepresentable, field}
+    end
+  end
+
+  defp quote_value(value) do
+    cond do
+      String.contains?(value, "\\") ->
+        {:error, :unrepresentable}
+
+      String.contains?(value, "'") and String.contains?(value, "\"") ->
+        {:error, :unrepresentable}
+
+      String.contains?(value, "'") ->
+        {:ok, ~s("#{value}")}
+
+      true ->
+        {:ok, "'#{value}'"}
+    end
   end
 
   # The rename is last: until it happens, a crash leaves the new layout
   # partial and the legacy file intact, so a re-run converges. An existing
-  # backup is never clobbered — the legacy file then simply stays (inert once
-  # dashfloat.json5 exists).
+  # backup is never clobbered — the legacy file then simply stays (inert
+  # once settings.json5 exists). Either way both files are tightened to 0600:
+  # each holds the credential, and secrets are 0600 wherever they live.
   defp backup_legacy(legacy) do
     backup =
       legacy
@@ -119,16 +196,22 @@ defmodule DashFloat.Config.Migration do
 
     if File.exists?(backup) do
       Logger.warning("#{backup} already exists — leaving the legacy config in place")
+      tighten(legacy)
     else
       case File.rename(legacy, backup) do
         :ok ->
-          :ok
+          tighten(backup)
 
         {:error, _reason} ->
           Logger.warning("cannot back up the legacy config — leaving it in place")
+          tighten(legacy)
       end
     end
   end
+
+  # Best effort, failures ignored: the file is inert after migration, this
+  # only keeps its secret private.
+  defp tighten(path), do: File.chmod(path, @secret_mode)
 
   defp blank_to_nil(value) when is_binary(value) do
     case String.trim_trailing(value) do
@@ -139,11 +222,20 @@ defmodule DashFloat.Config.Migration do
 
   defp blank_to_nil(_other), do: nil
 
+  # v1 accepted a decimal STRING in context_tokens (its loader parsed both
+  # shapes); the migration accepts what v1 accepted, so the context window
+  # survives the boundary instead of silently disappearing.
+  defp positive_int(raw) when is_binary(raw) do
+    trimmed = String.trim(raw)
+
+    case Integer.parse(trimmed) do
+      {n, ""} when n in 1..1_000_000_000_000 -> n
+      _other -> nil
+    end
+  end
+
   defp positive_int(raw) when is_integer(raw) and raw in 1..1_000_000_000_000, do: raw
   defp positive_int(_other), do: nil
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp names(fields), do: Enum.map_join(fields, ", ", fn {field, _v} -> Atom.to_string(field) end)
 end

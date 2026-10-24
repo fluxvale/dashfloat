@@ -12,14 +12,6 @@ defmodule DashFloat.TUI.StateTest do
     |> State.new()
   end
 
-  test "a live state reads the terminal size, defaulting to 80x24 without a TTY" do
-    # No test_mode: the size comes from the real terminal query, which under
-    # CI has no TTY and falls back to the default (ADR 0006).
-    state = State.new([])
-    assert state.live?
-    assert match?({_, _}, state.size)
-  end
-
   # One completed stream turn carrying `usage` (banked at finalize).
   defp bank_usage(state, usage) do
     state

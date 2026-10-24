@@ -31,18 +31,20 @@ structure only; no values were copied). Two layout iterations on this ADR
 landed on the consolidated shape below: **one config file**, chosen over a
 keys/main file pair because profiles (not files) are the organizing concept —
 a credential is an attribute of a subscription, so it lives inside its
-profile. `dashfloat.json5` mirrors `octofriend.json5`'s name and dialect.
+profile. The file is `settings.json5` (Terence's call over mirroring
+`octofriend.json5`'s filename); the dialect is octofriend's JSON5.
 
 ## Decision
 
 ### File layout
 
-One file: `~/.config/dashfloat/dashfloat.json5` (`XDG_CONFIG_HOME` honored via
+One file: `~/.config/dashfloat/settings.json5` (`XDG_CONFIG_HOME` honored via
 `:filename.basedir/1`) — everything in it, including credentials, so **the
 file is created 0600 and repaired to 0600 on load**. No `keys.json5`, no
 `oauth.json5`: OAuth storage returns *if* an OAuth flow is ever built
 (footgun-free, because the loader described here never reads such a file).
-JSON5 throughout; hand-editing is the primary workflow.
+JSON5 throughout; hand-editing is the primary workflow (a leading UTF-8 BOM is
+stripped before decoding — editors add one silently).
 
 ### JSON5 parsing (verify-first outcome)
 
@@ -55,8 +57,11 @@ literals are rejected and **escape sequences (`\n`, `\u0041`) are not
 translated** — both fine: the schema's values (URLs, ids, nicknames, keys) are
 plain strings and octofriend files use no escapes. Decode errors return
 `{:error, reason}` whose text never contains input content — safe next to
-secrets. The README's "slow" warning is irrelevant here: config decodes once
-at startup.
+secrets. A number literal the library cannot represent (e.g. `1e10000`)
+raises `Decimal.Error` **whose message quotes the literal**; the wrapper
+rescues it into the same fixed error string, so neither the crash nor the
+leak can reach startup. The README's "slow" warning is irrelevant here:
+config decodes once at startup.
 
 **Number caveat:** the library returns every number as `Decimal` for
 precision. `DashFloat.Config.JSON5` (thin wrapper) normalizes `Decimal` to
@@ -80,7 +85,7 @@ parser is strictly better); Jason (no JSON5 support — the whole point).
 
 ### Schema
 
-`dashfloat.json5` (placeholder values shown):
+`settings.json5` (placeholder values shown):
 
 ```json5
 {
@@ -132,18 +137,25 @@ status-bar vocabulary. Selection at startup:
 
 1. **Active profile** = `--profile <name>` CLI flag, else `DASHFLOAT_PROFILE`
    env (non-blank), else the first `profiles` entry. A flag/env profile that
-   matches no defined profile warns and is used anyway — the effective fields
-   can still be completed by other env vars.
+   matches no defined profile — including when no profiles exist at all —
+   warns and is used anyway: the effective fields can still be completed by
+   other env vars. Duplicate profile names warn and the **first definition
+   wins**.
 2. **Model menu** = the active profile's `models`, in file order.
-3. **Selected model** = the entry named by `--model <nickname>` (matched by
-   `nickname`, then by `model` id), else the profile's `settings.defaultModel`
-   (same matching), else the **first menu entry**. A miss at either named step
-   warns and falls back to the profile default — a typo leaves the profile on
-   its own default, the least surprising outcome.
+3. **Selected model** = the entry named by `--model <nickname>`, else the
+   profile's `settings.defaultModel`, else the **first menu entry**. Named
+   lookup is **two-pass — nickname first, then model id** — so when entry A's
+   id collides with entry B's nickname, B wins (nicknames are the
+   user-facing address). A miss at either named step warns and falls back to
+   the profile default; a present-but-unusable `defaultModel` (a number, a
+   blank) warns too; a `--model` against a model-less profile warns that the
+   flag was discarded.
 
 `DashFloat.CLI.parse/1` turns argv into `[profile: name, model: name]` —
 `--profile work`, `--profile=work`, `--model Sol`, `--model=Sol`; a switch
-without a value or an unrecognized argument warns and is ignored. The
+without a value or an unrecognized argument warns and is ignored, and the
+warning carries the argument's **name only** — `--api-key=<secret>` is exactly
+the typo this parser sits next to, and values never reach logs. The
 Application parses argv once at startup and hands the result to
 `DashFloat.Config.load/1`; the UI and agent remain untouched by argv.
 
@@ -175,8 +187,12 @@ without an `apiKey` therefore surfaces as `api_key` in that message.
 
 - The one file holds the secrets, so it is **0600**: migration creates it with
   mode 0600 from the moment content can land in it, and **load repairs a
-  too-permissive file back to 0600 with a warning** (best effort; repair
-  failure warns again and load proceeds — the read is already done).
+  too-permissive file back to 0600 with a warning** — before parsing, so a
+  hand-made file that is both malformed and too permissive (the most likely
+  first-write shape) is still repaired. Repair is best effort; a repair
+  failure warns again and load proceeds. A **symlinked** config warns and is
+  loaded as-is — chmod must never follow a link out of the config directory
+  onto a file the loader does not own.
 - `@derive {Inspect, except: [:api_key]}` stays, so a UI crash logging state
   still cannot print the key.
 - Error and warning messages carry paths, field names, and profile *names* —
@@ -187,25 +203,35 @@ without an `apiKey` therefore surfaces as `api_key` in that message.
 
 `Migration.maybe_migrate/1` runs as the first step of every load:
 
-- **Trigger:** migrates only when `dashfloat.json5` is absent AND legacy
-  `config.json` is present. `dashfloat.json5`'s existence is the migration
-  marker.
+- **Trigger:** migrates only when a **non-empty** `settings.json5` is absent
+  AND legacy `config.json` is present. A non-empty `settings.json5` is the
+  migration marker; an empty one (crash debris or an empty user file —
+  writes are atomic, so this version cannot produce it) carries no data and
+  is migrated over.
 - **Product:** the legacy triple becomes the **default profile** —
-  `dashfloat.json5` = `configVersion: 1`, `profiles: [{ name: 'default',
+  `settings.json5` = `configVersion: 1`, `profiles: [{ name: 'default',
   baseUrl: <base_url>, apiKey: <api_key>, models: [{ nickname: <model>,
   model: <model>, context: <context_tokens>? }] }]` (the legacy model id
   doubles as the nickname; `context` written only when the legacy file had a
-  usable one). Pretty JSON5 via the same library, created under 0600.
+  usable one — in the integer or decimal-string shape v1 accepted). The file
+  is **pretty JSON via Jason** — a strict JSON5 subset — because the json5
+  library's encoder does not escape string values, and a quote inside a
+  credential must not corrupt the generated file.
+- **Atomic write:** content is written to a private `settings.json5.tmp`
+  (created empty under 0600) and *renamed* into place — no crash can leave a
+  torn or zero-byte marker; a failed write removes the tmp and returns
+  `{:error, "cannot write …"}` (paths only), never a raise.
 - **Backup:** after the new file is written, `config.json` is *renamed* to
   `config.json.bak` — never deleted. An existing `.bak` is never clobbered;
   the legacy file is then simply left in place (inert — the loader ignores it
-  once `dashfloat.json5` exists) with a warning.
+  once `settings.json5` exists) with a warning. Whichever of the two holds
+  the legacy credential is **tightened to 0600** (best effort): secrets are
+  0600 wherever they live, not just in their primary home.
 - **Failure safety:** malformed or incomplete legacy JSON → `{:error, …}`
-  naming the problem (field names only) with **nothing written**; the write
-  order (write → rename) means any mid-migration crash leaves either no new
-  file (re-run migrates cleanly) or a complete one with the legacy file still
-  on disk.
-- **Idempotent:** the second run sees `dashfloat.json5` and is a no-op.
+  naming the problem (field names only) with **nothing written**; any
+  filesystem failure during the write is an `{:error, _}`, not a crash —
+  startup must always reach its config-error path.
+- **Idempotent:** the second run sees the marker and is a no-op.
 
 ### Status-bar label contract
 

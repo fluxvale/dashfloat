@@ -18,8 +18,8 @@ defmodule DashFloat.ConfigTest do
   end
 
   defp write!(dir, contents) do
-    # dashfloat.json5 carries secrets: every fixture starts 0600 (ADR 0008).
-    path = Path.join(dir, "dashfloat.json5")
+    # settings.json5 carries secrets: every fixture starts 0600 (ADR 0008).
+    path = Path.join(dir, "settings.json5")
     File.write!(path, contents)
     File.chmod!(path, 0o600)
     path
@@ -381,13 +381,141 @@ defmodule DashFloat.ConfigTest do
     end
   end
 
+  describe "profile and model addressing edge cases (hostile review)" do
+    test "duplicate profile names warn and the first definition wins" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          profiles: [
+            { name: 'work', baseUrl: 'https://first.example/v1',
+              apiKey: 'PLACEHOLDER-first', models: [{ model: 'm1' }] },
+            { name: 'work', baseUrl: 'https://second.example/v1',
+              apiKey: 'PLACEHOLDER-second', models: [{ model: 'm2' }] },
+          ],
+        }
+        """
+      )
+
+      logs =
+        capture_log(fn ->
+          assert {:ok,
+                  %Config{
+                    base_url: "https://first.example/v1",
+                    api_key: "PLACEHOLDER-first",
+                    model: "m1"
+                  }} =
+                   Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ ~s(duplicate profile "work" — keeping the first)
+      refute logs =~ "PLACEHOLDER"
+    end
+
+    test "--model resolves nickname-then-id when they collide across entries" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          profiles: [{
+            name: 'work',
+            baseUrl: 'https://provider.example/v1',
+            apiKey: 'PLACEHOLDER-work-key',
+            models: [
+              { nickname: 'alpha', model: 'beta' },
+              { nickname: 'beta', model: 'gamma' },
+            ],
+          }],
+        }
+        """
+      )
+
+      # "beta" is BOTH entry one's model id and entry two's nickname: the
+      # nickname is the user-facing address and wins.
+      assert {:ok, %Config{model: "gamma", nickname: "beta"}} =
+               Config.load(dir, %{}, model: "beta")
+    end
+
+    test "a flag/env profile matching nothing warns even with no profiles defined" do
+      dir = tmp_dir()
+
+      logs =
+        capture_log(fn ->
+          env = %{
+            "DASHFLOAT_PROFILE" => "ghost",
+            "DASHFLOAT_BASE_URL" => "https://env.example/v1",
+            "DASHFLOAT_MODEL" => "env-model",
+            "DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"
+          }
+
+          assert {:ok, %Config{profile: "ghost"}} = Config.load(dir, env, [])
+        end)
+
+      assert logs =~ "profile \"ghost\" (flag or DASHFLOAT_PROFILE) matches no profile"
+    end
+
+    test "a --model flag on a profile with no models warns it was discarded" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          profiles: [{
+            name: 'work',
+            baseUrl: 'https://provider.example/v1',
+            apiKey: 'PLACEHOLDER-work-key',
+          }],
+        }
+        """
+      )
+
+      logs =
+        capture_log(fn ->
+          assert {:error, "missing provider config: model"} = Config.load(dir, %{}, model: "Sol")
+        end)
+
+      assert logs =~ ~s(--model "Sol" has no models to select from)
+    end
+
+    test "a present-but-unusable defaultModel warns and uses the first entry" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          profiles: [{
+            name: 'work',
+            baseUrl: 'https://provider.example/v1',
+            apiKey: 'PLACEHOLDER-work-key',
+            settings: { defaultModel: 3 },
+            models: [{ nickname: 'Sol', model: 'glm-5.3' }, { nickname: 'Flash', model: 'glm-5.3-flash' }],
+          }],
+        }
+        """
+      )
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{nickname: "Sol"}} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ "defaultModel is not a usable nickname"
+    end
+  end
+
   describe "malformed and unusual files" do
     test "invalid JSON5 is reported without echoing the file contents" do
       dir = tmp_dir()
       write!(dir, ~s({"apiKey": "PLACEHOLDER-secret",))
 
       assert {:error, message} = Config.load(dir, %{}, [])
-      assert message == "invalid JSON5 in #{Path.join(dir, "dashfloat.json5")}"
+      assert message == "invalid JSON5 in #{Path.join(dir, "settings.json5")}"
       refute message =~ "PLACEHOLDER"
     end
 
@@ -562,9 +690,51 @@ defmodule DashFloat.ConfigTest do
   end
 
   describe "security posture" do
-    test "a too-permissive dashfloat.json5 is repaired to 0600 with a warning" do
+    test "repair happens even when the too-permissive file is also malformed" do
+      # The hand-made-file path is exactly this: 0644 with a typo in it. The
+      # repair must not depend on the file also being valid JSON5
+      # (hostile-review P1).
+      dir = tmp_dir()
+      main = Path.join(dir, "settings.json5")
+      File.write!(main, "{ broken")
+      File.chmod!(main, 0o644)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "invalid JSON5"
+
+      assert {:ok, %File.Stat{mode: mode}} = File.stat(main)
+      assert Bitwise.band(mode, 0o777) == 0o600
+    end
+
+    test "a symlinked settings.json5 warns and never chmods the target" do
+      dir = tmp_dir()
+      target = Path.join(dir, "real-config")
+      File.write!(target, fleet_file())
+      File.chmod!(target, 0o644)
+      File.ln_s!(target, Path.join(dir, "settings.json5"))
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ "is a symlink"
+
+      # The loader does not own the target file — its mode is untouched.
+      assert {:ok, %File.Stat{mode: mode}} = File.stat(target)
+      assert Bitwise.band(mode, 0o777) == 0o644
+    end
+
+    test "a UTF-8 BOM is stripped before decoding" do
+      dir = tmp_dir()
+      write!(dir, "\xEF\xBB\xBF" <> fleet_file())
+
+      assert {:ok, %Config{nickname: "Flash", profile: "work"}} = Config.load(dir, %{}, [])
+    end
+
+    test "a too-permissive settings.json5 is repaired to 0600 with a warning" do
       dir = fleet_dir()
-      main = Path.join(dir, "dashfloat.json5")
+      main = Path.join(dir, "settings.json5")
       File.chmod!(main, 0o644)
 
       logs =
@@ -671,7 +841,7 @@ defmodule DashFloat.ConfigTest do
       backup = Path.join(dir, "config.json.bak")
       assert File.exists?(backup)
 
-      main = Path.join(dir, "dashfloat.json5")
+      main = Path.join(dir, "settings.json5")
       assert {:ok, %File.Stat{mode: mode}} = File.stat(main)
       assert Bitwise.band(mode, 0o777) == 0o600
 

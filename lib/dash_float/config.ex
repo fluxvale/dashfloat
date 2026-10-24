@@ -4,7 +4,7 @@ defmodule DashFloat.Config do
   profiles, and per-field env overrides
   ([ADR 0008](../decisions/0008-config-layout-profiles-json5.md)).
 
-  Reads `~/.config/dashfloat/dashfloat.json5` (`XDG_CONFIG_HOME` respected) —
+  Reads `~/.config/dashfloat/settings.json5` (`XDG_CONFIG_HOME` respected) —
   profiles with their endpoint, credential, optional open settings map, and
   model menu; the file contains secrets, so it is repaired to 0600 on load. A
   legacy `config.json` is migrated once, automatically, with a backup.
@@ -33,7 +33,7 @@ defmodule DashFloat.Config do
   @context_var "DASHFLOAT_CONTEXT_TOKENS"
   @profile_var "DASHFLOAT_PROFILE"
 
-  @main_file "dashfloat.json5"
+  @main_file "settings.json5"
   @secret_mode 0o600
   @main_version 1
   # The one settings key selection reads today; everything else is tolerated
@@ -70,7 +70,7 @@ defmodule DashFloat.Config do
   end
 
   @doc """
-  Testable core: loads `dashfloat.json5` in `dir` (missing file = empty),
+  Testable core: loads `settings.json5` in `dir` (missing file = empty),
   overlaid with `env` (a map of variable names to values) and `cli` (the
   `profile:`/`model:` keywords from `DashFloat.CLI.parse/1`; flag beats env,
   env beats file). Blank fields after the merge yield an error naming only
@@ -82,10 +82,13 @@ defmodule DashFloat.Config do
   def load(dir, env, cli) when is_binary(dir) and is_map(env) and is_list(cli) do
     main_path = Path.join(dir, @main_file)
 
+    # Repair runs BEFORE the parse: a hand-made file is most likely both
+    # malformed and too permissive, and the security posture must not depend
+    # on the file also being valid JSON5 (hostile-review finding).
     with {:ok, _migration} <- Migration.maybe_migrate(dir),
+         :ok <- repair_perms(main_path),
          {:ok, main} <- read_map(main_path) do
       check_version(main)
-      repair_perms(main_path)
 
       main
       |> parse_profiles()
@@ -163,7 +166,7 @@ defmodule DashFloat.Config do
   defp warn_unknown_profile(active, profiles, env, cli) do
     chosen = cli_value(cli, :profile) || env_value(env, @profile_var)
 
-    if is_binary(chosen) and chosen == active and profiles != [] and
+    if is_binary(chosen) and chosen == active and
          not Enum.any?(profiles, fn profile -> profile.name == chosen end) do
       Logger.warning(
         "profile \"#{chosen}\" (flag or DASHFLOAT_PROFILE) matches no profile in #{@main_file}"
@@ -171,7 +174,10 @@ defmodule DashFloat.Config do
     end
   end
 
-  defp select_entry([], _settings, _cli), do: nil
+  defp select_entry([], _settings, cli) do
+    warn_dropped_model(cli)
+    nil
+  end
 
   defp select_entry(menu, settings, cli) do
     case cli_value(cli, :model) do
@@ -186,15 +192,43 @@ defmodule DashFloat.Config do
     end
   end
 
+  # A discarded --model deserves a diagnostic, not a bare "model is missing".
+  defp warn_dropped_model(cli) do
+    case cli_value(cli, :model) do
+      nil ->
+        :ok
+
+      wanted ->
+        Logger.warning(~s(--model "#{wanted}" has no models to select from — ignored))
+    end
+  end
+
   defp default_entry(menu, settings) do
-    case settings && value(settings["defaultModel"]) do
+    case settings && default_model(settings) do
       nil -> hd(menu)
       wanted -> named_entry(menu, "defaultModel", wanted, fn -> hd(menu) end)
     end
   end
 
+  # A present-but-unusable defaultModel (a number, a blank) warns: the key is
+  # documented to be honored, and silently falling back hides the mistake.
+  defp default_model(settings) do
+    wanted = value(settings["defaultModel"])
+
+    if is_nil(wanted) and Map.has_key?(settings, "defaultModel") do
+      Logger.warning("defaultModel is not a usable nickname — using the first entry")
+    end
+
+    wanted
+  end
+
+  # Two passes — nickname first, then model id — so a collision (entry A's
+  # id equals entry B's nickname) resolves to B: the nickname is the
+  # user-facing address (ADR 0008).
   defp named_entry(menu, via, wanted, fallback) do
-    Enum.find(menu, fn model -> model.nickname == wanted || model.model == wanted end) ||
+    by_nickname = Enum.find(menu, fn model -> model.nickname == wanted end)
+
+    by_nickname || Enum.find(menu, fn model -> model.model == wanted end) ||
       miss(via, wanted, fallback)
   end
 
@@ -217,11 +251,31 @@ defmodule DashFloat.Config do
         entries
         |> Enum.map(&parse_profile/1)
         |> Enum.reject(&is_nil/1)
+        |> drop_duplicate_names()
 
       _other ->
         Logger.warning("#{@main_file}: profiles must be a list — ignored")
         []
     end
+  end
+
+  # Profile names are the addressing vocabulary: a duplicate warns and the
+  # later definition is dropped — the first block wins (ADR 0008).
+  defp drop_duplicate_names(parsed) do
+    {kept_reversed, _seen} =
+      Enum.reduce(parsed, {[], MapSet.new()}, fn profile, {acc, seen} ->
+        if MapSet.member?(seen, profile.name) do
+          Logger.warning(
+            ~s(#{@main_file}: duplicate profile "#{profile.name}" — keeping the first)
+          )
+
+          {acc, seen}
+        else
+          {[profile | acc], MapSet.put(seen, profile.name)}
+        end
+      end)
+
+    Enum.reverse(kept_reversed)
   end
 
   defp parse_profile(entry) when is_map(entry) do
@@ -310,7 +364,9 @@ defmodule DashFloat.Config do
   defp read_map(path) do
     case File.read(path) do
       {:ok, contents} ->
-        case JSON5.decode(contents) do
+        stripped = strip_bom(contents)
+
+        case JSON5.decode(stripped) do
           {:ok, map} when is_map(map) -> {:ok, map}
           {:ok, _other} -> {:error, "invalid JSON5 in #{path}: expected an object"}
           {:error, message} -> {:error, "#{message} in #{path}"}
@@ -323,6 +379,11 @@ defmodule DashFloat.Config do
         {:error, "cannot read #{path}: #{:file.format_error(reason)}"}
     end
   end
+
+  # Several editors prepend a UTF-8 BOM on save; the parser rejects it with
+  # an opaque error, and hand-editing is the primary workflow.
+  defp strip_bom("\xEF\xBB\xBF" <> rest), do: rest
+  defp strip_bom(contents), do: contents
 
   defp check_version(main) do
     case main["configVersion"] do
@@ -337,11 +398,25 @@ defmodule DashFloat.Config do
   end
 
   # The file holds secrets (ADR 0008): it is created 0600 by migration;
-  # repair a hand-made or tool-mangled one back to 0600 (best effort — the
-  # read is already done).
+  # repair a hand-made or tool-mangled one back to 0600 (best effort — a
+  # repair failure warns, and load proceeds). lstat, not stat: chmod must
+  # never follow a symlink out of the config directory onto a file the
+  # loader does not own — a symlinked config warns and is loaded as-is.
   defp repair_perms(path) do
-    with {:ok, stat} <- File.stat(path),
-         true <- Bitwise.band(stat.mode, 0o077) != 0 do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :symlink}} ->
+        Logger.warning("#{@main_file} is a symlink — not repairing permissions")
+
+      {:ok, %File.Stat{mode: mode}} ->
+        tighten(path, mode)
+
+      _missing ->
+        :ok
+    end
+  end
+
+  defp tighten(path, mode) do
+    if Bitwise.band(mode, 0o077) != 0 do
       Logger.warning("#{@main_file} is too permissive — repairing to 0600")
 
       case File.chmod(path, @secret_mode) do
@@ -349,7 +424,7 @@ defmodule DashFloat.Config do
         {:error, reason} -> Logger.warning("cannot repair #{path}: #{:file.format_error(reason)}")
       end
     else
-      _ok_or_missing -> :ok
+      :ok
     end
   end
 
