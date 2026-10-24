@@ -69,6 +69,8 @@ defmodule DashFloat.Tools.Exec do
   defp birth_pid(port) do
     case Port.info(port, :os_pid) do
       {:os_pid, pid} -> pid
+      # Belt: same race window as signal_group/2's nil clause.
+      # coveralls-ignore-next-line
       _already_gone -> nil
     end
   end
@@ -186,7 +188,7 @@ defmodule DashFloat.Tools.Exec do
   # deterministic in a test. A nil birth pid may just mean the handshake was
   # slow — re-query while the program lives; only a truly dead program (or a
   # fast one whose children already died with it) yields nil again.
-  # coveralls-ignore-next-line
+  # coveralls-ignore-start
   defp signal_group(port, nil) do
     case Port.info(port, :os_pid) do
       {:os_pid, os_pid} -> kill_group(os_pid)
@@ -194,6 +196,7 @@ defmodule DashFloat.Tools.Exec do
     end
   end
 
+  # coveralls-ignore-stop
   defp signal_group(_port, os_pid), do: kill_group(os_pid)
 
   defp kill_group(os_pid) do
