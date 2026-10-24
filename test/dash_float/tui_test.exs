@@ -89,6 +89,8 @@ defmodule DashFloat.TUITest do
     Map.get(runtime_state, :user_state)
   end
 
+  defp cursor(pid), do: ExRatatui.textarea_cursor(get_state(pid).input)
+
   defp eventually(pid, fun, tries \\ 200) do
     state = get_state(pid)
 
@@ -211,7 +213,8 @@ defmodule DashFloat.TUITest do
 
     assert entry?(state, :user, "hello")
     assert State.provider_model(state) == nil
-    assert status_text(state) =~ "ctx —"
+    # Token fields are omitted entirely until something has streamed.
+    refute status_text(state) =~ "ctx"
 
     type(pid, "again")
     typed_again = get_state(pid)
@@ -440,6 +443,76 @@ defmodule DashFloat.TUITest do
     send(pid, :stray_message)
     after_stray = get_state(pid)
     assert State.input_text(after_stray) == "pasted text"
+  end
+
+  # ADR 0006 paste hardening: CRLF/lone-CR normalize to LF, insertion at the
+  # cursor, and wrap stays visual (the draft keeps one logical line).
+  test "a multi-line bracketed paste with CRLF normalizes to LF at the cursor" do
+    {:ok, pid} = start_tui()
+
+    type(pid, "ab")
+    press(pid, "left")
+
+    inject(pid, %ExRatatui.Event.Paste{content: "line one\r\nline two\r\rline three"})
+    state = get_state(pid)
+
+    assert State.input_text(state) == "aline one\nline two\n\nline threeb"
+    assert State.input_line_count(state) == 4
+  end
+
+  test "a very long unbroken paste stays one logical line and does not grow the box" do
+    {:ok, pid} = start_tui()
+    long = "https://example.com/" <> String.duplicate("segment-", 200)
+
+    inject(pid, %ExRatatui.Event.Paste{content: long})
+    state = get_state(pid)
+
+    # Wrap is visual: one logical line, so the input box keeps its idle height.
+    assert State.input_text(state) == long
+    assert State.input_line_count(state) == 1
+
+    widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+    {widget, rect} = Enum.at(widgets, 3)
+
+    assert widget.wrap_mode == :word_or_glyph
+    assert rect.height == View.input_height(1, 24)
+  end
+
+  test "cursor movement within a pasted multi-line draft is row-aware" do
+    {:ok, pid} = start_tui()
+    submit(pid, "seed")
+    eventually(pid, &(&1.phase == :idle))
+
+    inject(pid, %ExRatatui.Event.Paste{content: "row one\nrow two\nrow three"})
+
+    # The cursor lands at the end of the pasted draft (last row).
+    assert cursor(pid) == {2, 9}
+
+    # Not on a boundary row: Up/Down move between rows.
+    press(pid, "up")
+    assert cursor(pid) == {1, 7}
+    row_state = get_state(pid)
+    assert State.input_text(row_state) == "row one\nrow two\nrow three"
+    assert row_state.history_index == nil
+
+    # Left/right move within the row.
+    press(pid, "left")
+    assert cursor(pid) == {1, 6}
+    press(pid, "right")
+    assert cursor(pid) == {1, 7}
+
+    # Vertical moves clamp to the target row's length, not a sticky column.
+    press(pid, "down")
+    assert cursor(pid) == {2, 7}
+    press(pid, "up")
+    press(pid, "up")
+    assert cursor(pid) == {0, 7}
+
+    # On the first row, Up navigates history instead of moving the cursor.
+    press(pid, "up")
+    state = get_state(pid)
+    assert State.input_text(state) == "seed"
+    assert state.history_index == 0
   end
 
   # The animation-discipline proof (ADR 0006): idle => no timers => no renders.
