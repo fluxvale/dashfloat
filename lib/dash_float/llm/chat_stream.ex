@@ -149,9 +149,10 @@ defmodule DashFloat.LLM.ChatStream do
   defp handle_response(
          {:ok, %Req.Response{status: status} = resp},
          agent,
-         {:ok, provider},
+         provider,
          _timeout
-       ) do
+       )
+       when status not in 200..299 do
     drain(agent, provider, resp, status, "")
   end
 
@@ -238,16 +239,24 @@ defmodule DashFloat.LLM.ChatStream do
       fail(agent, "[llm: SSE frame exceeded 1 MiB — stream aborted]", acc.content)
     else
       case emit_frames(agent, provider, resp, frames, acc) do
-        {:cont, acc} -> stream(agent, provider, resp, timeout, acc)
-        :done -> :ok
-        {:error, message} -> fail(agent, message, acc.content)
+        {:cont, acc} ->
+          stream(agent, provider, resp, timeout, acc)
+
+        :done ->
+          :ok
+
+        {:error, message, acc} ->
+          Req.cancel_async_response(resp)
+          fail(agent, message, acc.content)
       end
     end
   end
 
   # [DONE] is the ONLY happy terminal — it closes the connection so no pool
   # slot lingers. Frames after it are ignored.
-  defp emit_frames(agent, _provider, _resp, [%{data: "[DONE]"} | _rest], acc) do
+  defp emit_frames(agent, _provider, resp, [%{data: "[DONE]"} | _rest], acc) do
+    Req.cancel_async_response(resp)
+
     send(
       agent,
       {:stream_done,
@@ -267,7 +276,7 @@ defmodule DashFloat.LLM.ChatStream do
 
       # A data frame that is not JSON is a broken stream, not a keepalive.
       {:error, _error} ->
-        {:error, "[llm: malformed SSE data frame — stream aborted]"}
+        {:error, "[llm: malformed SSE data frame — stream aborted]", acc}
     end
   end
 

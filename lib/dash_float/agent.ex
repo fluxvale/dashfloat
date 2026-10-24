@@ -11,7 +11,6 @@ defmodule DashFloat.Agent do
   use GenServer
 
   alias DashFloat.LLM.ChatStream
-  alias DashFloat.LLM.ToolCalls
   alias DashFloat.Tools
   alias DashFloat.Tools.Preview
   alias DashFloat.Tools.Runner
@@ -196,7 +195,7 @@ defmodule DashFloat.Agent do
   # Our own cancel kill of a runner task: the announced call gets a cancelled
   # result and the whole batch aborts (ADR 0007 §4).
   def handle_info(
-        {:DOWN, ref, :process, _pid, :killed},
+        {:DOWN, ref, :process, _down_pid, :killed},
         %__MODULE__{tool_slot: {:running, ref, _pid, call}} = state
       ) do
     state = %{state | tool_slot: :none}
@@ -204,7 +203,7 @@ defmodule DashFloat.Agent do
   end
 
   def handle_info(
-        {:DOWN, ref, :process, _pid, reason},
+        {:DOWN, ref, :process, _down_pid, reason},
         %__MODULE__{tool_slot: {:running, ref, _pid, call}} = state
       ) do
     # A runner crash is a result, never a node crash (ADR 0001).
@@ -215,19 +214,16 @@ defmodule DashFloat.Agent do
   end
 
   # A stream task going down while still streaming: the producer-of-record rule
-  # from ADR 0002 moves here — finalize the partial content, explain, idle.
+  # from ADR 0002 moves here — finalize the partial content, explain, idle. A
+  # :normal DOWN can only mean the contract was broken (a reporting task
+  # clears stream_ref first); it gets the same degradation.
   def handle_info(
         {:DOWN, ref, :process, _pid, reason},
         %__MODULE__{status: :streaming, stream_ref: ref} = state
       ) do
     state = state |> finalize_episode(state.episode_content) |> reset_turn()
 
-    explanation =
-      if reason == :normal,
-        do: "[stream ended without a report]",
-        else: "[stream failed: #{inspect_slice(reason)}]"
-
-    display(state.ui, {:entry, :system, explanation})
+    display(state.ui, {:entry, :system, "[stream failed: #{inspect_slice(reason)}]"})
     display(state.ui, {:phase, :idle})
     {:noreply, state}
   end

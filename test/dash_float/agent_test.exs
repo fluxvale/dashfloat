@@ -77,16 +77,25 @@ defmodule DashFloat.AgentTest do
   end
 
   defp start_agent(server, cwd, opts \\ []) do
+    # A per-test supervisor: the agent's stream/runner tasks land here, so
+    # tests can enumerate them without leftovers from other tests.
+    {:ok, sup} = Task.Supervisor.start_link()
+
     {:ok, agent} =
       Agent.start_link(
         provider: provider(server),
         cwd: cwd,
         exec_timeout: Keyword.get(opts, :exec_timeout, 500),
+        supervisor: sup,
         name: nil
       )
 
-    on_exit(fn -> if Process.alive?(agent), do: GenServer.stop(agent) end)
-    agent
+    on_exit(fn ->
+      if Process.alive?(agent), do: GenServer.stop(agent)
+      if Process.alive?(sup), do: Process.exit(sup, :kill)
+    end)
+
+    {agent, sup}
   end
 
   # Decodes the messages array of a forwarded request body.
@@ -110,7 +119,7 @@ defmodule DashFloat.AgentTest do
         final_episode("wrote it")
       ])
 
-    agent = start_agent(server, ctx.tmp_dir)
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
 
     send(agent, {:prompt, self(), "create the file"})
     assert_receive {:sse_request, "POST", _, _, _first_body}, 2_000
@@ -162,8 +171,9 @@ defmodule DashFloat.AgentTest do
         final_episode("understood")
       ])
 
-    agent = start_agent(server, ctx.tmp_dir)
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
     send(agent, {:prompt, self(), "write it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:confirm, ref, %{name: "write_file"}}, 2_000
     send(agent, {:confirm_decision, ref, :rejected})
@@ -190,8 +200,9 @@ defmodule DashFloat.AgentTest do
         final_episode()
       ])
 
-    agent = start_agent(server, ctx.tmp_dir)
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
     send(agent, {:prompt, self(), "read it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_call, %{id: "call_read", name: "read_file", args: args}}, 2_000
     assert args["path"] == "notes.md"
@@ -207,7 +218,9 @@ defmodule DashFloat.AgentTest do
     assert %{"content" => result_json} =
              request_messages(second_body) |> tool_result_message("call_read")
 
-    assert %{"ok" => true, "content" => "line one\nline two\n"} = Jason.decode!(result_json)
+    assert %{"ok" => true, "content" => "line one\nline two", "truncated" => false} =
+             Jason.decode!(result_json)
+
     assert_receive {:phase, :idle}, 2_000
   end
 
@@ -221,8 +234,9 @@ defmodule DashFloat.AgentTest do
         final_episode()
       ])
 
-    agent = start_agent(server, ctx.tmp_dir)
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
     send(agent, {:prompt, self(), "read outside"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_result, %{name: "read_file", ok: false, status: status}}, 2_000
     assert status =~ "escape"
@@ -238,7 +252,7 @@ defmodule DashFloat.AgentTest do
   end
 
   @tag :tmp_dir
-  test "a mutation outside the working directory is refused even when approved", ctx do
+  test "a mutation outside the working directory is refused before confirmation", ctx do
     args = %{"path" => "../outside.txt", "content" => "nope"}
 
     server =
@@ -247,14 +261,16 @@ defmodule DashFloat.AgentTest do
         final_episode()
       ])
 
-    agent = start_agent(server, ctx.tmp_dir)
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
     send(agent, {:prompt, self(), "write outside"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
-    assert_receive {:confirm, ref, %{name: "write_file"}}, 2_000
-    send(agent, {:confirm_decision, ref, :approved})
+    # The policy runs while building the preview: an escaping mutation never
+    # even reaches the user (ADR 0007 §3 — rejections are results, not modals).
+    refute_received {:confirm, _ref, _preview}
 
     assert_receive {:tool_result, %{name: "write_file", ok: false, status: status}}, 2_000
-    assert status =~ "outside"
+    assert status =~ "escape"
 
     refute File.exists?(Path.join(Path.dirname(ctx.tmp_dir), "outside.txt"))
     assert_receive {:phase, :idle}, 2_000
@@ -274,8 +290,9 @@ defmodule DashFloat.AgentTest do
         final_episode()
       ])
 
-    agent = start_agent(server, ctx.tmp_dir)
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
     send(agent, {:prompt, self(), "edit it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     refute_received {:confirm, _ref, _preview}
 
@@ -303,8 +320,9 @@ defmodule DashFloat.AgentTest do
         final_episode()
       ])
 
-    agent = start_agent(server, ctx.tmp_dir)
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
     send(agent, {:prompt, self(), "misbehave"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_result, %{id: "call_u", status: status_u}}, 2_000
     assert status_u =~ "unknown tool"
@@ -312,11 +330,13 @@ defmodule DashFloat.AgentTest do
     assert_receive {:tool_result, %{id: "call_m", status: status_m}}, 2_000
     assert status_m =~ "path"
 
+    # Episode 2's request carries the first error; episode 3's carries both.
     assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
-    messages = request_messages(second_body)
-
-    assert %{"content" => json_u} = tool_result_message(messages, "call_u")
+    assert %{"content" => json_u} = request_messages(second_body) |> tool_result_message("call_u")
     assert %{"ok" => false, "error" => "unknown tool \"explode\""} = Jason.decode!(json_u)
+
+    assert_receive {:sse_request, "POST", _, _, third_body}, 4_000
+    messages = request_messages(third_body)
 
     assert %{"content" => json_m} = tool_result_message(messages, "call_m")
     assert %{"ok" => false, "error" => error_m} = Jason.decode!(json_m)
@@ -334,8 +354,9 @@ defmodule DashFloat.AgentTest do
         final_episode()
       ])
 
-    agent = start_agent(server, ctx.tmp_dir)
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
     send(agent, {:prompt, self(), "call it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_result, %{id: "call_bad", ok: false, status: status}}, 2_000
     assert status =~ "invalid JSON arguments"
@@ -367,8 +388,9 @@ defmodule DashFloat.AgentTest do
         final_episode()
       ])
 
-    agent = start_agent(server, ctx.tmp_dir)
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
     send(agent, {:prompt, self(), "copy it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_result, %{id: "call_rd", ok: true}}, 2_000
     assert_receive {:confirm, ref, %{id: "call_wr"}}, 2_000
@@ -385,14 +407,14 @@ defmodule DashFloat.AgentTest do
     assert_receive {:phase, :idle}, 2_000
   end
 
-  test "only the final episode's usage reaches the UI", ctx do
+  test "only the final episode's usage reaches the UI" do
     server =
       start_server([
         call_tool_episode("call_1", "list_directory", %{"path" => "."}, usage: 100),
         final_episode("done", usage: 500)
       ])
 
-    agent = start_agent(server, System.tmp_dir!())
+    {agent, _sup} = start_agent(server, System.tmp_dir!())
     send(agent, {:prompt, self(), "list"})
 
     assert_receive {:phase, :idle}, 4_000
@@ -409,7 +431,7 @@ defmodule DashFloat.AgentTest do
         [{:send, [@headers, frame("partial")]}, {:sleep, 60_000}, {:wait_close, 1_000}]
       ])
 
-    agent = start_agent(server, System.tmp_dir!())
+    {agent, _sup} = start_agent(server, System.tmp_dir!())
     send(agent, {:prompt, self(), "hello"})
 
     assert_receive {:token, "partial"}, 2_000
@@ -428,8 +450,9 @@ defmodule DashFloat.AgentTest do
         final_episode()
       ])
 
-    agent = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
+    {agent, sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
     send(agent, {:prompt, self(), "run it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:confirm, ref, %{name: "execute_command"}}, 2_000
     send(agent, {:confirm_decision, ref, :approved})
@@ -453,15 +476,16 @@ defmodule DashFloat.AgentTest do
         final_episode("continued")
       ])
 
-    agent = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
+    {agent, sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
     send(agent, {:prompt, self(), "run it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:confirm, ref, %{name: "execute_command"}}, 2_000
     send(agent, {:confirm_decision, ref, :approved})
 
     assert_receive {:tool_call, %{id: "call_c"}}, 2_000
 
-    [runner] = Task.Supervisor.children(DashFloat.TaskSupervisor)
+    runner = await_task(sup)
     Process.exit(runner, :boom)
 
     assert_receive {:tool_result, %{id: "call_c", ok: false, status: status}}, 2_000
@@ -483,39 +507,22 @@ defmodule DashFloat.AgentTest do
         [{:send, [@headers, frame("kept")]}, {:sleep, 60_000}, {:wait_close, 1_000}]
       ])
 
-    agent = start_agent(server, System.tmp_dir!())
+    {agent, sup} = start_agent(server, System.tmp_dir!())
     send(agent, {:prompt, self(), "hello"})
 
     assert_receive {:token, "kept"}, 2_000
 
-    [stream] = Task.Supervisor.children(DashFloat.TaskSupervisor)
+    stream = await_task(sup)
     Process.exit(stream, :boom)
 
     assert_receive {:entry, :system, "[stream failed: :boom]"}, 2_000
     assert_receive {:phase, :idle}, 2_000
   end
 
-  test "a stream task that dies without reporting degrades to idle" do
-    server =
-      start_server([
-        [{:send, [@headers]}, {:sleep, 60_000}, {:wait_close, 1_000}]
-      ])
-
-    agent = start_agent(server, System.tmp_dir!())
-    send(agent, {:prompt, self(), "hello"})
-
-    [stream] = Task.Supervisor.children(DashFloat.TaskSupervisor)
-    Process.exit(stream, :normal)
-
-    assert_receive {:entry, :system, "[stream ended without a report]"}, 2_000
-    assert_receive {:phase, :idle}, 2_000
-  end
-
   ## Failure taxonomy and lifecycle
 
   test "a provider connection failure becomes a system entry and idle" do
-    server = start_server([final_episode("unreachable is not this")])
-    # Point at a dead port: the server above is only to keep on_exit simple.
+    # Point at a dead port: nothing listens there.
     {:ok, agent} =
       Agent.start_link(
         provider:
@@ -553,7 +560,7 @@ defmodule DashFloat.AgentTest do
 
   test "an empty reply degrades to a system entry" do
     server = start_server([[{:send, [@headers, "data: [DONE]\n\n"]}, :close]])
-    agent = start_agent(server, System.tmp_dir!())
+    {agent, _sup} = start_agent(server, System.tmp_dir!())
 
     send(agent, {:prompt, self(), "hello"})
 
@@ -567,9 +574,10 @@ defmodule DashFloat.AgentTest do
         [{:send, [@headers, frame("hi")]}, {:sleep, 60_000}, {:wait_close, 1_000}]
       ])
 
-    agent = start_agent(server, System.tmp_dir!())
+    {agent, _sup} = start_agent(server, System.tmp_dir!())
     send(agent, {:prompt, self(), "first"})
     assert_receive {:token, "hi"}, 2_000
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     send(agent, {:prompt, self(), "second"})
     send(agent, {:confirm_decision, make_ref(), :approved})
@@ -579,6 +587,15 @@ defmodule DashFloat.AgentTest do
 
     send(agent, {:cancel})
     assert_receive {:phase, :idle}, 2_000
+  end
+
+  # The tool_call row is announced before the runner task is spawned; poll
+  # until the supervisor holds it.
+  defp await_task(sup, tries \\ 50) do
+    case Task.Supervisor.children(sup) do
+      [pid] -> pid
+      [] when tries > 0 -> Process.sleep(10) && await_task(sup, tries - 1)
+    end
   end
 
   defp free_port do

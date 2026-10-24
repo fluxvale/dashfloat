@@ -53,7 +53,7 @@ defmodule DashFloat.SSEServer do
       :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true, ip: ip])
 
     {:ok, port} = :inet.port(listen)
-    {:ok, conn} = :counters.new(1, [])
+    conn = :counters.new(1, [])
     spawn(fn -> accept_forever(listen, scripts, owner, conn) end)
 
     {:ok, %{listen: listen, port: port}}

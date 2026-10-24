@@ -77,10 +77,12 @@ defmodule DashFloat.LLM.ChatStreamTest do
     for {:token, text} <- messages, into: "", do: text
   end
 
+  # `in` demands exact equality; partial-key reports need pattern matching.
+  defp reported?(messages, fun) when is_function(fun, 1), do: Enum.any?(messages, fun)
+
   defp failures(messages), do: for({:stream_failed, text, _partial} <- messages, do: text)
 
-  defp done(messages),
-    do: Enum.find_value(messages, &match?({:stream_done, report} when report, &1))
+  defp done(messages), do: Enum.find(messages, &match?({:stream_done, _report}, &1))
 
   # A pre-flight rejection can finish before the monitor attaches, so the DOWN
   # arrives as :noproc — the same race the agent's DOWN handling documents.
@@ -238,10 +240,17 @@ defmodule DashFloat.LLM.ChatStreamTest do
     server = start_server(script)
     {pid, ref} = start_stream(SSEServer.base_url(server))
 
-    assert_receive {:token, _any}, 1_000
+    # No content frames: sync on the request, then give the fragments time to
+    # land before cancelling.
+    assert_receive {:sse_request, "POST", _, _, _body}, 1_000
+    Process.sleep(100)
     send(pid, :cancel)
 
-    assert {:stream_done, %{tool_calls: [], cancelled: true}} in collect()
+    assert reported?(collect(), fn
+             {:stream_done, %{tool_calls: [], cancelled: true}} -> true
+             _other -> false
+           end)
+
     await_exit(ref)
   end
 
@@ -258,7 +267,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
     {_pid, ref} = start_stream(SSEServer.base_url(server))
     messages = collect()
 
-    assert failures(messages) == ["[llm: HTTP 401 — invalid api key"]
+    assert failures(messages) == ["[llm: HTTP 401 — invalid api key]"]
     await_exit(ref)
 
     server2 = start_server([{:send, json_response(502, "bad gateway")}, :close])
@@ -283,7 +292,12 @@ defmodule DashFloat.LLM.ChatStreamTest do
     send(pid, :cancel)
 
     messages = collect()
-    assert {:stream_done, %{cancelled: true}} in messages
+
+    assert reported?(messages, fn
+             {:stream_done, %{cancelled: true}} -> true
+             _other -> false
+           end)
+
     await_exit(ref)
   end
 
@@ -300,7 +314,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
     assert_receive {:token, "kept"}, 500
     send(pid, {:unrelated, :junk})
-    assert {:stream_done, _report} in collect()
+    assert match?({:stream_done, _report}, Enum.find(collect(), &match?({:stream_done, _}, &1)))
     await_exit(ref)
   end
 
@@ -434,7 +448,12 @@ defmodule DashFloat.LLM.ChatStreamTest do
     send(pid, :cancel)
 
     messages = collect()
-    assert {:stream_done, %{cancelled: true}} in messages
+
+    assert reported?(messages, fn
+             {:stream_done, %{cancelled: true}} -> true
+             _other -> false
+           end)
+
     await_exit(ref)
   end
 
@@ -493,13 +512,13 @@ defmodule DashFloat.LLM.ChatStreamTest do
     assert headers["authorization"] == "Bearer test-key-123"
     assert headers["accept"] == "text/event-stream"
 
-    assert %{
-             "model" => "test-model",
-             "stream" => true,
-             "stream_options" => %{"include_usage" => true},
-             "messages" => ^messages,
-             "tools" => ^tools
-           } = Jason.decode!(body)
+    decoded = Jason.decode!(body)
+
+    assert decoded["model"] == "test-model"
+    assert decoded["stream"] == true
+    assert decoded["stream_options"] == %{"include_usage" => true}
+    assert decoded["messages"] == Jason.decode!(Jason.encode!(messages))
+    assert decoded["tools"] == Jason.decode!(Jason.encode!(tools))
 
     await_exit(ref)
   end
@@ -513,7 +532,12 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
     assert [message] = failures(messages)
     assert message =~ "[llm: connection failed: "
-    assert {:stream_failed, ^message, ""} in messages
+
+    assert Enum.any?(messages, fn
+             {:stream_failed, ^message, ""} -> true
+             _other -> false
+           end)
+
     await_exit(ref)
   end
 
@@ -704,7 +728,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
       refute Enum.any?(messages, &match?({:usage, _}, &1))
       assert failures(messages) == []
-      assert {:stream_done, _report} in messages
+      assert Enum.any?(messages, &match?({:stream_done, _report}, &1))
       await_exit(ref)
     end
   end
@@ -779,8 +803,14 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
     assert failures(messages) == []
 
-    assert {:stream_done,
-            %{tool_calls: [%{id: "call_1", args: nil, error: "invalid JSON arguments"}]}} in messages
+    assert reported?(messages, fn
+             {:stream_done,
+              %{tool_calls: [%{id: "call_1", args: nil, error: "invalid JSON arguments"}]}} ->
+               true
+
+             _other ->
+               false
+           end)
 
     await_exit(ref)
   end
