@@ -2,10 +2,11 @@ defmodule DashFloat.TUI do
   @moduledoc """
   The DashFloat terminal UI: a thin `ExRatatui.App` whose state logic lives in
   `DashFloat.TUI.State` and rendering in `DashFloat.TUI.View`. Process shape,
-  key bindings, and teardown guarantees are settled in ADR 0002; the producer
-  started on submit is the SSE adapter from ADR 0005. The activity tick
-  (ADR 0006) is the one timer this process owns — scheduled only while work is
-  in flight.
+  key bindings, and teardown guarantees are settled in ADR 0002. Submits,
+  cancels, and confirmation decisions are plain sends to the agent (ADR 0007)
+  — the agent is the single voice streaming back into the UI, and this
+  process starts no tasks. The activity tick (ADR 0006) is the one timer this
+  process owns — scheduled only while work is in flight.
 
   Run with `mix run --no-halt`. Quit with Ctrl+Q or Ctrl+C.
   """
@@ -15,16 +16,11 @@ defmodule DashFloat.TUI do
   # back blank (ADR 0002). The behaviour form is documented as equivalent.
   @behaviour ExRatatui.App
 
-  alias DashFloat.LLM.ChatStream
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
 
   @tick :dashfloat_tick
   @tick_ms 125
-
-  @no_provider "[llm: no provider configured — set base_url/model/api_key in " <>
-                 "~/.config/dashfloat/config.json or " <>
-                 "DASHFLOAT_BASE_URL/DASHFLOAT_MODEL/DASHFLOAT_API_KEY]"
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -46,7 +42,10 @@ defmodule DashFloat.TUI do
 
   @impl ExRatatui.App
   def mount(opts) do
-    {:ok, State.new(opts)}
+    # The agent monitor lives in this process, not State.new/1 — State stays
+    # free of side effects (ADR 0007).
+    state = State.new(opts)
+    {:ok, State.claim_agent(state)}
   end
 
   @impl ExRatatui.App
@@ -59,14 +58,20 @@ defmodule DashFloat.TUI do
 
     case action do
       :quit -> {:stop, state}
-      {:submit, prompt} -> schedule(start_stream(prompt, state))
-      :cancel -> schedule(cancel_stream(state))
+      {:submit, prompt} -> schedule(prompt_agent(prompt, state))
+      {:confirm, decision} -> schedule(confirm_decision(decision, state))
+      :cancel -> schedule(cancel_agent(state))
       nil -> schedule(state)
     end
   end
 
   # kitty-protocol terminals also report key releases; ignore them.
   def handle_event(%ExRatatui.Event.Key{}, state), do: schedule(state)
+
+  # Confirmation mode swallows pastes too — nothing may reach the draft
+  # mid-decision (ADR 0007).
+  def handle_event(%ExRatatui.Event.Paste{}, %{confirm: pending} = state) when pending != nil,
+    do: schedule(state)
 
   def handle_event(%ExRatatui.Event.Paste{content: content}, state),
     do: schedule(State.paste(state, content))
@@ -99,11 +104,15 @@ defmodule DashFloat.TUI do
   def handle_info({:entry, _kind, _text} = msg, state),
     do: schedule(State.stream_message(state, msg))
 
-  def handle_info({kind, _payload} = msg, state) when kind in [:token, :phase, :usage],
+  def handle_info({kind, _payload} = msg, state)
+      when kind in [:token, :phase, :usage, :tool_call, :tool_result],
+      do: schedule(State.stream_message(state, msg))
+
+  def handle_info({:confirm, _ref, _payload} = msg, state),
     do: schedule(State.stream_message(state, msg))
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
-    {state, _verdict} = State.task_down(state, ref, reason)
+    {state, _verdict} = State.agent_down(state, ref, reason)
     schedule(state)
   end
 
@@ -157,26 +166,20 @@ defmodule DashFloat.TUI do
   def exit_code(:normal), do: 0
   def exit_code(_reason), do: 1
 
-  defp start_stream(prompt, %{provider: {:ok, provider}} = state) do
-    ui = self()
-
-    case Task.Supervisor.start_child(
-           DashFloat.StreamSupervisor,
-           fn -> ChatStream.run(ui, provider, prompt) end,
-           restart: :temporary
-         ) do
-      {:ok, pid} -> State.claim_task(state, pid, Process.monitor(pid))
-      {:error, reason} -> State.stream_failed(state, reason)
-    end
+  # The agent seam (ADR 0007): plain sends, both directions — fake agents in
+  # tests are plain processes receiving these.
+  defp prompt_agent(prompt, state) do
+    send(state.agent, {:prompt, self(), prompt})
+    state
   end
 
-  # Spec-mandated: both "no config at all" and "config unreadable" degrade to
-  # the setup instructions; the Config error text is deliberately not surfaced
-  # (values are never echoed either way).
-  defp start_stream(_prompt, state), do: State.stream_failed(state, @no_provider)
-
-  defp cancel_stream(state) do
-    if is_pid(state.task_pid), do: send(state.task_pid, :cancel)
+  defp cancel_agent(state) do
+    send(state.agent, {:cancel})
     state
+  end
+
+  defp confirm_decision(decision, %{confirm: %{ref: ref}} = state) do
+    send(state.agent, {:confirm_decision, ref, decision})
+    State.confirm_decided(state)
   end
 end

@@ -19,10 +19,22 @@ defmodule DashFloat.SSEServer do
           | :reset
           | {:wait_close, non_neg_integer()}
 
-  @doc "Starts a server that replays `script` for every connection."
+  @doc """
+  Starts a server that replays `script` for every connection (ADR 0005 shape).
+  """
   @spec start_link([step()]) :: GenServer.on_start()
   def start_link(script) when is_list(script) do
-    GenServer.start_link(__MODULE__, {script, self()})
+    GenServer.start_link(__MODULE__, {{:every, script}, self()})
+  end
+
+  @doc """
+  Starts a server where connection `i` replays `scripts[i]` — one scripted
+  episode per request (the agent loop's tool round trip, ADR 0007). A
+  connection beyond the last script is closed immediately.
+  """
+  @spec start_link(:per_connection, [[step()]]) :: GenServer.on_start()
+  def start_link(:per_connection, scripts) when is_list(scripts) do
+    GenServer.start_link(__MODULE__, {{:per_connection, scripts}, self()})
   end
 
   @doc "The ephemeral port the server listens on."
@@ -34,14 +46,15 @@ defmodule DashFloat.SSEServer do
   def base_url(server), do: "http://127.0.0.1:#{port(server)}"
 
   @impl GenServer
-  def init({script, owner}) do
+  def init({scripts, owner}) do
     ip = {127, 0, 0, 1}
 
     {:ok, listen} =
       :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true, ip: ip])
 
     {:ok, port} = :inet.port(listen)
-    spawn(fn -> accept_forever(listen, script, owner) end)
+    conn = :counters.new(1, [])
+    spawn(fn -> accept_forever(listen, scripts, owner, conn) end)
 
     {:ok, %{listen: listen, port: port}}
   end
@@ -54,14 +67,25 @@ defmodule DashFloat.SSEServer do
   # The listen socket is owned by the GenServer, so it closes when the server
   # dies (a test's on_exit, or the owner test process dying and taking its
   # linked server with it); accept/1 then errors out and this process exits.
-  defp accept_forever(listen, script, owner) do
+  defp accept_forever(listen, scripts, owner, conn) do
     case :gen_tcp.accept(listen) do
       {:ok, socket} ->
-        serve(socket, script, owner)
-        accept_forever(listen, script, owner)
+        index = :counters.get(conn, 1)
+        :counters.add(conn, 1, 1)
+        serve(socket, script_for(scripts, index), owner)
+        accept_forever(listen, scripts, owner, conn)
 
       {:error, _reason} ->
         :ok
+    end
+  end
+
+  defp script_for({:every, script}, _index), do: script
+
+  defp script_for({:per_connection, scripts}, index) do
+    case Enum.at(scripts, index) do
+      nil -> [:close]
+      script -> script
     end
   end
 

@@ -29,3 +29,4 @@ their replacement.
 | [0004](0004-credo-fleet-ruleset.md) | Credo ruleset pinned to the FluxVale fleet config | Accepted |
 | [0005](0005-llm-streaming-engine.md) | LLM streaming engine: SSE adapter process architecture | Accepted |
 | [0006](0006-ui-truth-and-rendering.md) | UI truth & rendering: markdown log, live status, activity line, input hardening | Accepted |
+| [0007](0007-tool-calls-and-execution.md) | Tool calls & execution: agent loop, five tools, path policy, confirmations | Accepted |

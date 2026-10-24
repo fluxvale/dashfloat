@@ -118,6 +118,7 @@ defmodule DashFloat.TUI.ViewTest do
       for {phase, label} <- [
             streaming: "Streaming",
             executing_tool: "Running tool",
+            confirming: "Confirm",
             idle: "Idle"
           ] do
         state = %{new_state() | phase: phase}
@@ -284,6 +285,12 @@ defmodule DashFloat.TUI.ViewTest do
       assert activity_text(%{new_state() | phase: :executing_tool}) =~ "Running tool…"
     end
 
+    test "says Approve this change? while confirming, with the decision hint" do
+      state = %{new_state() | phase: :confirming}
+      assert activity_text(state) =~ "Approve this change?"
+      refute activity_text(state) =~ "esc interrupt"
+    end
+
     test "steps through the braille spinner in anim_step order" do
       frames = Theme.spinner_frames()
       assert length(frames) == 10
@@ -309,9 +316,77 @@ defmodule DashFloat.TUI.ViewTest do
       assert hint.style == Theme.style(:dim)
     end
 
+    test "the confirming hint offers approve/reject instead of interrupt" do
+      {widget, _rect} = activity(%{new_state() | phase: :confirming})
+      [spinner, _space, label, hint] = hd(widget.text).spans
+
+      assert spinner.style == Theme.style(:accent)
+      assert label.content == "Approve this change?"
+      assert label.style == Theme.style(:accent)
+      assert hint.content == "  ⏎ approve · esc reject"
+      assert hint.style == Theme.style(:dim)
+    end
+
     test "the activity row has height zero while idle and one while active" do
       assert View.regions({80, 24}, 1, false).activity.height == 0
       assert View.regions({80, 24}, 1, true).activity.height == 1
+    end
+  end
+
+  describe "tool entries (ADR 0007)" do
+    test "a tool call row is an accent gear with a dim remainder" do
+      {_text, [blank, line]} = Render.tool_call("read_file", %{"path" => "lib/foo.ex"})
+
+      assert flatten(blank) == ""
+
+      [gear, rest] = line.spans
+      assert gear.content == "⚙ "
+      assert gear.style == Theme.style(:accent)
+      assert rest.content == "read_file lib/foo.ex"
+      assert rest.style == Theme.style(:dim)
+    end
+
+    test "tool result output indents two spaces, dim, verbatim" do
+      {_text, [_blank, first | output]} = Render.tool_result("read_file", "ok", "one\ntwo")
+
+      assert [gear, rest] = first.spans
+      assert gear.content == "⚙ "
+      assert rest.content == "read_file → ok"
+
+      assert Enum.map(output, &flatten/1) == ["  one", "  two"]
+      assert Enum.map(output, &hd(&1.spans).style) == [dim(), dim()]
+    end
+
+    test "the confirm preview styles additions and commands as inline code, rest dim" do
+      lines = ["@@ -1 +1 @@", "- gone", "+ new", "$ mix format", "plain"]
+      {_text, [_blank | styled]} = Render.confirm_preview(lines)
+
+      assert Enum.map(styled, &flatten/1) == lines
+      assert Enum.map(styled, &hd(&1.spans).style) == [dim(), dim(), code(), code(), dim()]
+    end
+
+    test "tool entries flow into the log view from their stored lines" do
+      state =
+        new_state()
+        |> State.stream_message(
+          {:tool_call, %{id: "t1", name: "read_file", args: %{"path" => "lib/foo.ex"}}}
+        )
+        |> State.stream_message(
+          {:tool_result, %{id: "t1", name: "read_file", ok: true, status: "ok", output: "body"}}
+        )
+
+      texts =
+        state
+        |> log_lines()
+        |> Enum.map(&flatten/1)
+
+      assert texts == [
+               "",
+               "⚙ read_file lib/foo.ex",
+               "",
+               "⚙ read_file → ok",
+               "  body"
+             ]
     end
   end
 
@@ -357,6 +432,9 @@ defmodule DashFloat.TUI.ViewTest do
   defp user_entry(text) do
     [%{kind: :user, text: text, lines: Render.entry_lines(:user, text)}]
   end
+
+  defp dim, do: Theme.style(:dim)
+  defp code, do: Theme.style(:inline_code)
 
   defp provider(context_tokens) do
     {:ok,

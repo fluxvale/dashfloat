@@ -2,22 +2,26 @@ defmodule DashFloat.TUI.State do
   @moduledoc """
   Pure UI state and every state transition for `DashFloat.TUI`.
 
-  All logic here is deterministic: no processes, no terminal, no timers. The
-  input draft lives in the textarea's Rust-side state, reached through its
-  synchronous in-memory API. Transitions return `{state, action}` where
-  `action` is `:quit`, `{:submit, prompt}`, `:cancel`, or `nil`; the TUI
+  All logic here is deterministic: no processes, no terminal, no timers (the
+  one side-effecting exception is `claim_agent/1`, called from the TUI process
+  at mount so the monitor lives there). The input draft lives in the
+  textarea's Rust-side state, reached through its synchronous in-memory API.
+  Transitions return `{state, action}` where `action` is `:quit`,
+  `{:submit, prompt}`, `{:confirm, decision}`, `:cancel`, or `nil`; the TUI
   interprets actions. The one clock is injectable (`now` arguments, defaulting
   to the monotonic clock) so the animation tick and rate math stay pure.
-  See ADRs 0002 and 0006.
+  See ADRs 0002, 0006, and 0007.
   """
 
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.View
 
-  @type phase :: :idle | :streaming | :executing_tool
+  @type phase :: :idle | :streaming | :executing_tool | :confirming
   @type entry_kind :: :user | :assistant | :tool | :system
   @type entry :: %{kind: entry_kind(), text: String.t(), lines: [ExRatatui.Text.Line.t()]}
-  @type action :: :quit | {:submit, String.t()} | :cancel | nil
+  @type confirm :: %{ref: term(), id: term(), name: String.t()}
+  @type action ::
+          :quit | {:submit, String.t()} | {:confirm, :approved | :rejected} | :cancel | nil
 
   @type stats :: %{
           tokens: non_neg_integer(),
@@ -40,6 +44,8 @@ defmodule DashFloat.TUI.State do
     :input,
     :provider,
     :cwd,
+    :agent,
+    :confirm,
     phase: :idle,
     entries: [],
     in_flight: nil,
@@ -63,14 +69,14 @@ defmodule DashFloat.TUI.State do
     draft: "",
     size: @default_size,
     live?: false,
-    task_ref: nil,
-    task_pid: nil
+    agent_ref: nil
   ]
 
   @type t :: %__MODULE__{
           input: reference(),
           provider: {:ok, DashFloat.Config.t()} | {:error, String.t()} | nil,
           cwd: String.t(),
+          agent: pid() | atom(),
           phase: phase(),
           entries: [entry()],
           in_flight: String.t() | nil,
@@ -86,13 +92,13 @@ defmodule DashFloat.TUI.State do
           draft: String.t(),
           size: {pos_integer(), pos_integer()},
           live?: boolean(),
-          task_ref: reference() | nil,
-          task_pid: pid() | nil
+          agent_ref: reference() | nil,
+          confirm: confirm() | nil
         }
 
   @typedoc """
   One message of the stream contract (see `stream_message/2` and ADR 0002 /
-  ADR 0006).
+  0006 / 0007). The agent is the single voice; the tool messages are ADR 0007.
   """
   @type stream_msg ::
           {:token, String.t()}
@@ -104,7 +110,22 @@ defmodule DashFloat.TUI.State do
              }}
           | {:phase, :streaming}
           | {:phase, :executing_tool | :idle}
+          | {:tool_call, tool_call_msg()}
+          | {:tool_result, tool_result_msg()}
+          | {:confirm, term(), confirm_msg()}
           | {:entry, :tool | :system, String.t()}
+
+  @typep tool_call_msg :: %{id: term(), name: String.t(), args: map()}
+
+  @typep tool_result_msg :: %{
+           id: term(),
+           name: String.t(),
+           ok: boolean(),
+           status: String.t(),
+           output: String.t() | nil
+         }
+
+  @typep confirm_msg :: %{id: term(), name: String.t(), args: map(), lines: [String.t()]}
 
   ## Construction
 
@@ -113,14 +134,17 @@ defmodule DashFloat.TUI.State do
   the size comes from the opts; live, it is read from the terminal (falling
   back to 80x24 without a TTY) and kept fresh by later Resize events. The
   provider is loaded once by the Application and handed in as `:provider`
-  (ADR 0005). The `cwd` label is computed here, once — status truth, not I/O
-  per frame (ADR 0006).
+  (ADR 0005); the agent the UI talks to as `:agent` (pid or name, default
+  `DashFloat.Agent` — ADR 0007). The `cwd` label is computed here, once —
+  status truth, not I/O per frame (ADR 0006).
   """
   @spec new(keyword()) :: t()
   def new(opts) do
     %__MODULE__{
       input: ExRatatui.textarea_new(),
       provider: Keyword.get(opts, :provider),
+      agent: Keyword.get(opts, :agent, DashFloat.Agent),
+      confirm: nil,
       cwd: cwd_label(),
       size: initial_size(opts),
       live?: is_nil(Keyword.get(opts, :test_mode))
@@ -245,18 +269,34 @@ defmodule DashFloat.TUI.State do
   @spec handle_key(t(), String.t(), [String.t()]) :: {t(), action()}
   def handle_key(state, code, modifiers)
 
-  # Quit (raw mode turns Ctrl+C into a key event, not SIGINT).
+  # Quit (raw mode turns Ctrl+C into a key event, not SIGINT) — even
+  # mid-decision.
   def handle_key(state, "c", ["ctrl"]), do: {state, :quit}
   def handle_key(state, "q", ["ctrl"]), do: {state, :quit}
+
+  # Confirmation mode (a pending confirm from the agent, ADR 0007): Enter
+  # approves, Esc rejects, and every other key is swallowed — typing
+  # mid-decision must not reach the textarea nor become an accidental
+  # approve.
+  def handle_key(%{confirm: pending} = state, "enter", mods)
+      when pending != nil and mods in [[], ["ctrl"]],
+      do: {state, {:confirm, :approved}}
+
+  def handle_key(%{confirm: pending} = state, "esc", _modifiers) when pending != nil,
+    do: {state, {:confirm, :rejected}}
+
+  def handle_key(%{confirm: pending} = state, _code, _modifiers) when pending != nil,
+    do: {state, nil}
 
   # Enter / Ctrl+Enter submit; Shift+Enter / Alt+Enter insert a newline.
   def handle_key(state, "enter", mods) when mods in [[], ["ctrl"]], do: submit(state)
   def handle_key(state, "enter", ["shift"]), do: forward(state, "enter", [])
   def handle_key(state, "enter", ["alt"]), do: forward(state, "enter", [])
 
-  # Esc cancels a running stream; a no-op otherwise (ADR 0005).
-  def handle_key(%{phase: :streaming, task_pid: pid} = state, "esc", _modifiers)
-      when is_pid(pid),
+  # Esc interrupts a streaming reply or a running tool (ADR 0005/0007); a
+  # no-op otherwise (including the post-decision confirming gap).
+  def handle_key(%{phase: phase} = state, "esc", _modifiers)
+      when phase in [:streaming, :executing_tool],
       do: {state, :cancel}
 
   def handle_key(state, "esc", _modifiers), do: {state, nil}
@@ -360,6 +400,12 @@ defmodule DashFloat.TUI.State do
       fragment its reply)
     * `{:phase, :executing_tool | :idle}` — set the phase and finalize the
       in-flight entry, freezing the rate
+    * `{:tool_call, call}` — append the gear row built by `Render.tool_call/2`
+    * `{:tool_result, result}` — append the status row and dim output built by
+      `Render.tool_result/3`
+    * `{:confirm, ref, request}` — append the preview entry built by
+      `Render.confirm_preview/1`, then arm `state.confirm` and flip to the
+      `:confirming` phase (ADR 0007)
     * `{:entry, kind, text}` — append a complete entry
 
   `now` is monotonic milliseconds (injectable so the rate math is testable).
@@ -411,17 +457,49 @@ defmodule DashFloat.TUI.State do
     %{state | stats: stats}
   end
 
-  def stream_message(state, {:phase, :streaming}, _now), do: %{state | phase: :streaming}
+  # Any phase message supersedes a pending confirm: the agent is the single
+  # voice, and a confirm the UI never decided must not outlive the turn it
+  # belonged to (agent death included — agent_down routes through here).
+  def stream_message(state, {:phase, :streaming}, _now),
+    do: %{state | phase: :streaming, confirm: nil}
 
   def stream_message(state, {:phase, phase}, now) when phase in [:executing_tool, :idle] do
     state
     |> finalize_in_flight(now)
     |> Map.put(:phase, phase)
+    |> Map.put(:confirm, nil)
   end
 
   def stream_message(state, {:entry, kind, text}, _now)
       when kind in [:tool, :system] and is_binary(text),
       do: append_entry(state, kind, text)
+
+  def stream_message(state, {:tool_call, %{id: _id, name: name, args: args}}, _now) do
+    {text, lines} = Render.tool_call(name, args)
+    put_entry(state, :tool, text, lines)
+  end
+
+  def stream_message(
+        state,
+        {:tool_result, %{id: _id, name: name, ok: _ok, status: status, output: output}},
+        _now
+      ) do
+    {text, lines} = Render.tool_result(name, status, output)
+    put_entry(state, :tool, text, lines)
+  end
+
+  def stream_message(
+        state,
+        {:confirm, ref, %{id: id, name: name, args: _args, lines: lines}},
+        _now
+      ) do
+    {text, entry_lines} = Render.confirm_preview(lines)
+
+    state
+    |> put_entry(:tool, text, entry_lines)
+    |> Map.put(:confirm, %{ref: ref, id: id, name: name})
+    |> Map.put(:phase, :confirming)
+  end
 
   # Finalizing renders the reply once and freezes the cumulative rate; the
   # streaming counters reset for the next turn, the frozen rate and context
@@ -469,13 +547,13 @@ defmodule DashFloat.TUI.State do
   defp rate(_tokens, _first_token_at, _now), do: nil
 
   # `text` stays verbatim (ADR 0006: it is the persistence truth); the render
-  # path splits on "\n" and tolerates trailing blanks.
-  defp append_entry(state, kind, text) do
-    %{
-      state
-      | entries:
-          state.entries ++ [%{kind: kind, text: text, lines: Render.entry_lines(kind, text)}]
-    }
+  # path splits on "\n" and tolerates trailing blanks. Tool-contract entries
+  # carry their own styled lines from the Render builders.
+  defp append_entry(state, kind, text),
+    do: put_entry(state, kind, text, Render.entry_lines(kind, text))
+
+  defp put_entry(state, kind, text, lines) do
+    %{state | entries: state.entries ++ [%{kind: kind, text: text, lines: lines}]}
   end
 
   ## Animation tick
@@ -524,40 +602,51 @@ defmodule DashFloat.TUI.State do
   def needs_tick?(%__MODULE__{tick_ref: nil}), do: true
   def needs_tick?(%__MODULE__{}), do: false
 
-  ## Producer-task monitoring
-
-  @doc "Records the pid and monitor ref of the producer Task started for this stream."
-  @spec claim_task(t(), pid(), reference()) :: t()
-  def claim_task(state, pid, ref) when is_pid(pid) and is_reference(ref),
-    do: %{state | task_pid: pid, task_ref: ref}
+  ## Agent monitoring
 
   @doc """
-  Applies a producer-task `{:DOWN, ref, :process, _pid, reason}`. Normal exits
-  only ensure the phase is `:idle` (finalizing any partial reply);
-  `:noproc` — the monitor attaching after an already-finished task — is
-  treated the same, because a producer that exits between `start_child/2`
-  returning and `Process.monitor/1` attaching cannot be distinguished from a
-  successful one after the fact. Other exits finalize the stream, log a
-  `:system` entry explaining what happened, and return to `:idle` so input
-  keeps working — a dead producer must never brick the UI (ADR 0001: failures
-  degrade to chat messages). Returns `{state, :handled}` when the ref was ours,
-  `{state, :ignored}` otherwise.
+  Monitors the agent (`state.agent`, a pid or registered name) so its death
+  degrades the UI instead of bricking input. A side effect on purpose — the
+  only one in this module — called from the TUI process at mount so the
+  monitor lives there, not in `new/1` (ADR 0007).
   """
-  @spec task_down(t(), reference(), term()) :: {t(), :handled | :ignored}
-  def task_down(%{task_ref: ref} = state, ref, reason) do
-    cleared = %{state | task_ref: nil, task_pid: nil}
+  @spec claim_agent(t()) :: t()
+  def claim_agent(%__MODULE__{} = state) do
+    %{state | agent_ref: Process.monitor(state.agent)}
+  end
+
+  @doc """
+  Applies an agent `{:DOWN, ref, :process, _pid, reason}`. Normal exits (and
+  `:noproc` — the monitor attaching after an already-dead name) only ensure
+  the phase is `:idle` (finalizing any partial reply); anything else
+  finalizes the stream, logs a `:system` entry explaining what happened, and
+  returns to `:idle` so input keeps working — a dead agent must never brick
+  the UI (ADR 0001: failures degrade to chat messages). Returns
+  `{state, :handled}` when the ref was ours, `{state, :ignored}` otherwise.
+  """
+  @spec agent_down(t(), reference(), term()) :: {t(), :handled | :ignored}
+  def agent_down(%{agent_ref: ref} = state, ref, reason) do
+    cleared = %{state | agent_ref: nil}
 
     state =
       if reason in [:normal, :noproc] do
         stream_message(cleared, {:phase, :idle})
       else
-        stream_failed(cleared, reason)
+        stream_failed(cleared, "[agent failed: #{String.slice(inspect(reason), 0, 120)}]")
       end
 
     {state, :handled}
   end
 
-  def task_down(state, _other_ref, _reason), do: {state, :ignored}
+  def agent_down(state, _other_ref, _reason), do: {state, :ignored}
+
+  @doc """
+  Clears the pending confirmation once the decision has been sent to the
+  agent. The phase stays `:confirming` until the agent's next phase message
+  arrives — the gap is one mailbox hop, invisible under render coalescing.
+  """
+  @spec confirm_decided(t()) :: t()
+  def confirm_decided(%__MODULE__{} = state), do: %{state | confirm: nil}
 
   @doc """
   Degrades to `:idle` with a `:system` entry explaining the failure. A binary
