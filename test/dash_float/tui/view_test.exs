@@ -2,7 +2,9 @@ defmodule DashFloat.TUI.ViewTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  alias DashFloat.TUI.Render
   alias DashFloat.TUI.State
+  alias DashFloat.TUI.Theme
   alias DashFloat.TUI.View
 
   defp new_state(opts \\ []) do
@@ -11,18 +13,27 @@ defmodule DashFloat.TUI.ViewTest do
     |> State.new()
   end
 
-  describe "regions/2" do
-    test "status 1 row, log the rest, input borders + draft lines" do
-      %{status: status, log: log, input: input} = View.regions({80, 24}, 1)
-      assert {status.height, log.height, input.height} == {1, 20, 3}
-      assert status.y == 0 and log.y == 1 and input.y == 21
-      assert Enum.map([status, log, input], & &1.width) == [80, 80, 80]
+  describe "regions/3" do
+    test "status 1 row, log the rest, no activity row when idle, input borders + draft" do
+      %{status: status, log: log, activity: activity, input: input} =
+        View.regions({80, 24}, 1, false)
+
+      assert {status.height, log.height, activity.height, input.height} == {1, 20, 0, 3}
+      assert status.y == 0 and log.y == 1 and activity.y == 21 and input.y == 21
+      assert Enum.map([status, log, activity, input], & &1.width) == [80, 80, 80, 80]
+    end
+
+    test "an active phase claims one activity row between log and input" do
+      %{log: log, activity: activity, input: input} = View.regions({80, 24}, 1, true)
+      assert activity.height == 1
+      assert log.height == 19
+      assert activity.y == 20 and input.y == 21
     end
 
     test "the input grows with the draft" do
-      %{log: log, input: input} = View.regions({80, 24}, 5)
+      %{log: log, activity: activity, input: input} = View.regions({80, 24}, 5, true)
       assert input.height == 7
-      assert log.height == 24 - 1 - 7
+      assert_region_sum({80, 24}, [log, activity, input])
     end
 
     test "the input never exceeds a third of the frame" do
@@ -31,48 +42,82 @@ defmodule DashFloat.TUI.ViewTest do
     end
 
     test "degenerate frames collapse regions without raising" do
-      %{status: status, log: log, input: input} = View.regions({1, 1}, 1)
-      assert status.height == 0 and log.height == 0 and input.height == 1
+      %{status: status, log: log, activity: activity, input: input} =
+        View.regions({1, 1}, 1, true)
+
+      assert status.height == 0 and log.height == 0
+      assert activity.height + input.height <= 1
+    end
+
+    defp assert_region_sum({_w, h}, regions) do
+      heights = Enum.map(regions, & &1.height)
+      assert Enum.sum(heights) <= h
     end
   end
 
   describe "render/2" do
-    test "produces the three widgets" do
+    test "produces the four widgets" do
       widgets = View.render(new_state(), %ExRatatui.Frame{width: 80, height: 24})
 
       assert [
                {%ExRatatui.Widgets.Paragraph{}, _status_rect},
                {%ExRatatui.Widgets.Paragraph{}, _log_rect},
+               {%ExRatatui.Widgets.Paragraph{}, _activity_rect},
                {%ExRatatui.Widgets.Textarea{}, _input_rect}
              ] = widgets
     end
 
-    test "status bar carries the model and context placeholders plus the phase label" do
-      line = hd(status_line(new_state()))
+    test "status bar carries the cwd, model, and phase truth, omitting token fields" do
+      text = status_text(new_state())
 
-      text =
-        line
-        |> spans()
-        |> Enum.join()
-
-      assert text =~ "DashFloat"
-      assert text =~ "model: —"
-      assert text =~ "ctx: —"
-      assert text =~ "Idle"
+      assert text =~ "❯ ~/"
+      assert text =~ "—"
+      refute text =~ "ctx"
+      refute text =~ "tok/s"
+      assert text =~ "● Idle"
     end
 
-    test "the configured model replaces the status bar placeholder" do
+    test "token fields appear only once something has streamed, in ADR order" do
+      base = new_state(provider: provider(128_000))
+
+      state =
+        base
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "a"}, 1_000)
+        |> State.stream_message({:token, "b"}, 1_000)
+        |> State.stream_message(
+          {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 4_100}},
+          1_500
+        )
+        |> State.stream_message({:phase, :idle}, 2_000)
+
+      text = status_text(state)
+
+      # The usage frame reconciles the count (2 deltas batched 5 tokens), so
+      # the frozen rate uses the authoritative 5 tokens over the 1 s window.
+      assert text =~ ~r/model · ctx 4\.1k\/128k · 5\.0 tok\/s · ● Idle · /
+      assert text =~ "test-model"
+    end
+
+    test "the status bar is one line of styled spans, dim separators between" do
+      [line] = status_line(new_state())
+      assert length(line.spans) > 4
+
+      separators = Enum.filter(line.spans, &(&1.content == " · "))
+      assert separators != []
+      assert Enum.all?(separators, &(&1.style.fg == :dark_gray))
+    end
+
+    test "the configured model replaces the placeholder" do
       provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "gpt-test", api_key: "k"}}
       text = status_text(new_state(provider: provider))
-      assert text =~ "model: gpt-test"
-      assert text =~ "model: gpt-test  ctx: —"
-      refute text =~ "model: —"
+      assert text =~ "gpt-test"
     end
 
     test "each phase maps to its status label" do
       for {phase, label} <- [
             streaming: "Streaming",
-            executing_tool: "Executing Tool",
+            executing_tool: "Running tool",
             idle: "Idle"
           ] do
         state = %{new_state() | phase: phase}
@@ -80,22 +125,59 @@ defmodule DashFloat.TUI.ViewTest do
       end
     end
 
+    test "the rate shows only once one exists" do
+      refute status_text(new_state()) =~ "tok/s"
+
+      state =
+        new_state()
+        |> State.stream_message({:token, "a"}, 1_000)
+        |> State.stream_message({:token, "b"}, 1_000)
+        |> State.stream_message({:phase, :idle}, 2_000)
+
+      assert status_text(state) =~ "2.0 tok/s"
+    end
+
+    test "the context label shows the accumulated usage" do
+      state =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message(
+          {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 4_100}},
+          1_000
+        )
+        |> State.stream_message({:phase, :idle}, 2_000)
+
+      assert status_text(state) =~ "ctx 4.1k"
+    end
+
     test "empty log shows a placeholder" do
-      state = new_state()
-      [line] = log_lines(state)
+      [line] = log_lines(new_state())
       assert flatten(line) =~ "(log is empty"
     end
 
-    test "log entries render with kind styling and prefixes" do
+    test "the first tokens are never announced as an empty log" do
+      state =
+        new_state()
+        |> State.stream_message({:token, "hello"}, 1_000)
+        |> Map.put(:phase, :streaming)
+
+      # Before the first tick the lines are not rendered yet, but the log
+      # must not claim to be empty.
+      assert log_lines(state) == []
+    end
+
+    test "log entries render from their stored lines, separators included" do
       state =
         new_state()
         |> State.stream_message({:entry, :system, "a system line"})
         |> State.stream_message({:token, "streaming "})
         |> State.stream_message({:token, "through"})
+        |> Map.put(:phase, :streaming)
 
-      lines = log_lines(state)
-      assert flatten(hd(lines)) =~ "a system line"
-      assert length(lines) == 2
+      {ticked, :cont} = State.tick(state, 1_000)
+
+      lines = log_lines(ticked)
+      assert Enum.map(lines, &flatten/1) == ["", "a system line", "", "streaming through"]
     end
 
     test "only the visible window is built — log text is bounded by the viewport" do
@@ -107,7 +189,6 @@ defmodule DashFloat.TUI.ViewTest do
       widget = log_widget(state, 80, 24)
       lines = widget.text
       assert length(lines) == 20
-      assert flatten(hd(lines)) =~ "line 81"
       assert flatten(List.last(lines)) =~ "line 100"
       # the window is pre-scrolled; the paragraph itself does no scrolling
       assert widget.scroll == {0, 0}
@@ -121,7 +202,9 @@ defmodule DashFloat.TUI.ViewTest do
 
       {paged, nil} = State.handle_key(state, "page_up", [])
       widget = log_widget(paged, 80, 24)
-      assert flatten(hd(widget.text)) =~ "line 61"
+      texts = Enum.map(widget.text, &flatten/1)
+      refute Enum.any?(texts, &(&1 =~ "line 100"))
+      assert Enum.any?(texts, &(&1 =~ "line 81"))
     end
 
     test "huge logs keep the widget text at viewport size" do
@@ -141,36 +224,94 @@ defmodule DashFloat.TUI.ViewTest do
         end)
 
       {paged, nil} = State.handle_key(state, "page_up", [])
-      # 80x4: status(1) + log(0) + input(3); log height 0
+      # 80x4: status(1) + log(0) + activity(0) + input(3); log height 0
       text = status_text_at(paged, 80, 4)
       refute Regex.match?(~r/L(\d+)-(\d+)/, text)
-      assert text =~ "/30"
+      assert text =~ "/60"
     end
 
-    test "user entries are prefixed" do
+    test "user entries are prefixed and continuation lines indented" do
       state = State.stream_message(new_state(), {:entry, :system, "x"})
-      with_user = put_in(state.entries, [{:user, "hello"}])
-      [first | _rest] = log_lines(with_user)
-      assert flatten(first) =~ "❯ hello"
-    end
+      with_user = %{state | entries: user_entry("line one\nline two")}
 
-    test "multi-line user entries prefix the first line and indent continuations" do
-      state = State.stream_message(new_state(), {:entry, :system, "x"})
-      with_user = put_in(state.entries, [{:user, "line one\nline two"}])
-      [first, second | _rest] = log_lines(with_user)
+      [_sep, first, second] = log_lines(with_user)
       assert flatten(first) =~ "❯ line one"
-      assert flatten(second) =~ "  line two"
+      assert flatten(second) == "  line two"
+    end
+
+    test "system rows are dim italic" do
+      state = State.stream_message(new_state(), {:entry, :system, "note"})
+      [_sep, line] = log_lines(state)
+      [span] = line.spans
+      assert span.style.fg == :dark_gray
+      assert :italic in span.style.modifiers
     end
 
     test "very long entries do not break rendering" do
       long = String.duplicate("x", 5_000)
       state = State.stream_message(new_state(), {:entry, :system, long})
-      assert [_only] = log_lines(state)
+      assert [_separator, _text] = log_lines(state)
     end
 
     test "a tiny frame renders without raising" do
       widgets = View.render(new_state(), %ExRatatui.Frame{width: 1, height: 1})
-      assert length(widgets) == 3
+      assert length(widgets) == 4
+    end
+  end
+
+  describe "activity line" do
+    test "is empty while idle" do
+      {widget, _rect} = activity(new_state())
+      assert widget.text == []
+    end
+
+    test "says Thinking… before any token" do
+      text = activity_text(%{new_state() | phase: :streaming})
+      assert text =~ "Thinking…"
+      assert text =~ "esc interrupt"
+    end
+
+    test "says Streaming… once tokens arrived" do
+      state =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "hi"}, 1_000)
+
+      assert activity_text(state) =~ "Streaming…"
+    end
+
+    test "says Running tool… while executing a tool" do
+      assert activity_text(%{new_state() | phase: :executing_tool}) =~ "Running tool…"
+    end
+
+    test "steps through the braille spinner in anim_step order" do
+      frames = Theme.spinner_frames()
+      assert length(frames) == 10
+
+      for step <- 0..9 do
+        text = activity_text(%{new_state() | phase: :streaming, anim_step: step})
+        assert String.starts_with?(text, Enum.at(frames, step))
+      end
+
+      # It wraps.
+      assert activity_text(%{new_state() | phase: :streaming, anim_step: 10}) =~
+               Enum.at(frames, 0)
+    end
+
+    test "spinner and label are accent; the interrupt hint is dim" do
+      {widget, _rect} = activity(%{new_state() | phase: :streaming})
+      [spinner, _space, label, hint] = hd(widget.text).spans
+
+      assert spinner.style == Theme.style(:accent)
+      assert label.style == Theme.style(:accent)
+      assert label.content == "Thinking…"
+      assert hint.content == "  esc interrupt"
+      assert hint.style == Theme.style(:dim)
+    end
+
+    test "the activity row has height zero while idle and one while active" do
+      assert View.regions({80, 24}, 1, false).activity.height == 0
+      assert View.regions({80, 24}, 1, true).activity.height == 1
     end
   end
 
@@ -186,38 +327,77 @@ defmodule DashFloat.TUI.ViewTest do
       assert :ok = ExRatatui.draw(term, widgets)
 
       buffer = ExRatatui.get_buffer_content(term)
-      assert buffer =~ "DashFloat"
+      assert buffer =~ "❯"
       assert buffer =~ "Idle"
       assert buffer =~ "hello log"
-      assert buffer =~ "Input"
+      assert buffer =~ "ask anything"
       assert buffer =~ "Enter send"
+    end
+  end
+
+  describe "input box" do
+    test "rounded dim border, an accent prompt title, dim placeholder, word-or-glyph wrap" do
+      {widget, _rect} = input(new_state())
+      assert widget.wrap_mode == :word_or_glyph
+
+      assert widget.placeholder ==
+               "ask anything — Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit"
+
+      assert widget.placeholder_style == Theme.style(:dim)
+      assert widget.block.border_type == :rounded
+      assert widget.block.borders == [:all]
+      assert widget.block.border_style == Theme.style(:dim)
+      assert %ExRatatui.Text.Span{content: "❯ ", style: style} = widget.block.title
+      assert style == Theme.style(:accent)
     end
   end
 
   ## helpers
 
+  defp user_entry(text) do
+    [%{kind: :user, text: text, lines: Render.entry_lines(:user, text)}]
+  end
+
+  defp provider(context_tokens) do
+    {:ok,
+     %DashFloat.Config{
+       base_url: "http://x",
+       model: "test-model",
+       api_key: "k",
+       context_tokens: context_tokens
+     }}
+  end
+
   defp status_text(state), do: status_text_at(state, 80, 24)
 
   defp status_text_at(state, w, h) do
-    {widget, _rect} =
-      state
-      |> View.render(%ExRatatui.Frame{width: w, height: h})
-      |> List.first()
-
-    [line] = widget.text
-    parts = spans(line)
-    Enum.join(parts)
+    [line] = status_line_at(state, w, h)
+    Enum.map_join(line.spans, "", & &1.content)
   end
 
-  defp status_line(state) do
-    {widget, _rect} =
-      state
-      |> View.render(%ExRatatui.Frame{width: 80, height: 24})
-      |> List.first()
+  defp status_line(state), do: status_line_at(state, 80, 24)
 
-    case widget.text do
-      lines when is_list(lines) -> lines
-    end
+  defp status_line_at(state, w, h) do
+    widgets = View.render(state, %ExRatatui.Frame{width: w, height: h})
+    {widget, _rect} = List.first(widgets)
+    widget.text
+  end
+
+  defp activity(state) do
+    state
+    |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+    |> Enum.at(2)
+  end
+
+  defp activity_text(state) do
+    {widget, _rect} = activity(state)
+    Enum.map_join(widget.text, "", &flatten/1)
+  end
+
+  defp input(state) do
+    state
+    |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+    |> Enum.at(3)
   end
 
   defp log_widget(state, w, h) do

@@ -89,6 +89,8 @@ defmodule DashFloat.TUITest do
     Map.get(runtime_state, :user_state)
   end
 
+  defp cursor(pid), do: ExRatatui.textarea_cursor(get_state(pid).input)
+
   defp eventually(pid, fun, tries \\ 200) do
     state = get_state(pid)
 
@@ -101,7 +103,10 @@ defmodule DashFloat.TUITest do
     end
   end
 
-  defp system_entries(state), do: for({:system, text} <- state.entries, do: text)
+  defp system_entries(state), do: for(%{kind: :system, text: text} <- state.entries, do: text)
+
+  defp entry?(state, kind, text),
+    do: Enum.any?(state.entries, &(&1.kind == kind and &1.text == text))
 
   test "supervised start renders, typed input accumulates, and a real stream lands" do
     server =
@@ -127,21 +132,22 @@ defmodule DashFloat.TUITest do
     # finalized until the idle phase.
     streaming = eventually(pid, fn s -> s.in_flight == "Hello" end)
     assert streaming.phase == :streaming
-    assert {:user, "hello tui"} in streaming.entries
+    assert entry?(streaming, :user, "hello tui")
 
     grown = eventually(pid, fn s -> s.in_flight == "Hello from the engine" end)
     assert grown.phase == :streaming
 
     state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
 
-    assert {:assistant, "Hello from the engine"} in state.entries
+    assert entry?(state, :assistant, "Hello from the engine")
     assert state.history == ["hello tui"]
     assert system_entries(state) == []
     assert state.task_ref == nil
 
-    # The status bar names the configured model (ADR 0005).
+    # The status bar names the configured model and reports phase truth.
     assert State.provider_model(state) == "test-model"
-    assert status_text(state) =~ "model: test-model"
+    assert status_text(state) =~ "test-model"
+    assert status_text(state) =~ "Idle"
   end
 
   test "Esc cancels mid-stream: partial reply kept, [cancelled] logged, input usable" do
@@ -165,8 +171,8 @@ defmodule DashFloat.TUITest do
         s.phase == :idle and "[cancelled]" in system_entries(s)
       end)
 
-    assert {:assistant, "partial"} in state.entries
-    refute Enum.any?(state.entries, fn {_kind, text} -> text =~ "late" end)
+    assert entry?(state, :assistant, "partial")
+    refute Enum.any?(state.entries, &(&1.text =~ "late"))
 
     # Input is usable again.
     submit(pid, "again")
@@ -185,7 +191,7 @@ defmodule DashFloat.TUITest do
           "[llm: stream ended without completion]" in system_entries(s)
       end)
 
-    assert {:assistant, "partial"} in state.entries
+    assert entry?(state, :assistant, "partial")
 
     # Still typeable.
     type(pid, "next")
@@ -205,9 +211,10 @@ defmodule DashFloat.TUITest do
           Enum.any?(entries, &String.contains?(&1, "[llm: no provider configured"))
       end)
 
-    assert {:user, "hello"} in state.entries
+    assert entry?(state, :user, "hello")
     assert State.provider_model(state) == nil
-    assert status_text(state) =~ "model: —"
+    # Token fields are omitted entirely until something has streamed.
+    refute status_text(state) =~ "ctx"
 
     type(pid, "again")
     typed_again = get_state(pid)
@@ -290,7 +297,7 @@ defmodule DashFloat.TUITest do
 
     assert state.task_ref == nil
     assert state.task_pid == nil
-    assert {:user, "hello"} in state.entries
+    assert entry?(state, :user, "hello")
 
     # Input is usable again: submit works (the server replays its script).
     submit(pid, "again")
@@ -310,8 +317,8 @@ defmodule DashFloat.TUITest do
     state = get_state(pid)
     assert state.task_ref == nil
 
-    refute Enum.any?(state.entries, fn {kind, text} ->
-             kind == :system and String.contains?(text, "stream failed")
+    refute Enum.any?(state.entries, fn entry ->
+             entry.kind == :system and String.contains?(entry.text, "stream failed")
            end)
   end
 
@@ -319,9 +326,10 @@ defmodule DashFloat.TUITest do
   test "the UI stays responsive while a stream lands at cadence into a large log" do
     {:ok, pid} = start_tui()
 
-    # Preload a log far beyond the viewport (400 lines).
+    # Preload a log far beyond the viewport (400 entries = 800 rendered lines
+    # including their blank separators).
     Enum.each(1..400, fn i -> send(pid, {:entry, :system, "warm #{i}"}) end)
-    eventually(pid, &(State.log_line_count(&1) == 400))
+    eventually(pid, &(State.log_line_count(&1) == 800))
 
     # Burst coalescing with a big log: hundreds of messages, few frames.
     burst = Enum.map(1..300, &"b#{&1} ")
@@ -393,7 +401,7 @@ defmodule DashFloat.TUITest do
     state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
 
     expected = Enum.map_join(1..40, "", &"t#{&1} ")
-    assert {:assistant, expected} in state.entries
+    assert entry?(state, :assistant, expected)
     assert State.input_text(state) == "zzzzz"
   end
 
@@ -435,6 +443,276 @@ defmodule DashFloat.TUITest do
     send(pid, :stray_message)
     after_stray = get_state(pid)
     assert State.input_text(after_stray) == "pasted text"
+  end
+
+  # ADR 0006 paste hardening: CRLF/lone-CR normalize to LF, insertion at the
+  # cursor, and wrap stays visual (the draft keeps one logical line).
+  test "a multi-line bracketed paste with CRLF normalizes to LF at the cursor" do
+    {:ok, pid} = start_tui()
+
+    type(pid, "ab")
+    press(pid, "left")
+
+    inject(pid, %ExRatatui.Event.Paste{content: "line one\r\nline two\r\rline three"})
+    state = get_state(pid)
+
+    assert State.input_text(state) == "aline one\nline two\n\nline threeb"
+    assert State.input_line_count(state) == 4
+  end
+
+  test "a very long unbroken paste stays one logical line and does not grow the box" do
+    {:ok, pid} = start_tui()
+    long = "https://example.com/" <> String.duplicate("segment-", 200)
+
+    inject(pid, %ExRatatui.Event.Paste{content: long})
+    state = get_state(pid)
+
+    # Wrap is visual: one logical line, so the input box keeps its idle height.
+    assert State.input_text(state) == long
+    assert State.input_line_count(state) == 1
+
+    widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+    {widget, rect} = Enum.at(widgets, 3)
+
+    assert widget.wrap_mode == :word_or_glyph
+    assert rect.height == View.input_height(1, 24)
+  end
+
+  test "cursor movement within a pasted multi-line draft is row-aware" do
+    {:ok, pid} = start_tui()
+    submit(pid, "seed")
+    eventually(pid, &(&1.phase == :idle))
+
+    inject(pid, %ExRatatui.Event.Paste{content: "row one\nrow two\nrow three"})
+
+    # The cursor lands at the end of the pasted draft (last row).
+    assert cursor(pid) == {2, 9}
+
+    # Not on a boundary row: Up/Down move between rows.
+    press(pid, "up")
+    assert cursor(pid) == {1, 7}
+    row_state = get_state(pid)
+    assert State.input_text(row_state) == "row one\nrow two\nrow three"
+    assert row_state.history_index == nil
+
+    # Left/right move within the row.
+    press(pid, "left")
+    assert cursor(pid) == {1, 6}
+    press(pid, "right")
+    assert cursor(pid) == {1, 7}
+
+    # Vertical moves clamp to the target row's length, not a sticky column.
+    press(pid, "down")
+    assert cursor(pid) == {2, 7}
+    press(pid, "up")
+    press(pid, "up")
+    assert cursor(pid) == {0, 7}
+
+    # On the first row, Up navigates history instead of moving the cursor.
+    press(pid, "up")
+    state = get_state(pid)
+    assert State.input_text(state) == "seed"
+    assert state.history_index == 0
+  end
+
+  # The animation-discipline proof (ADR 0006): idle => no timers => no renders.
+  test "an idle app renders nothing on a timer" do
+    {:ok, pid} = start_tui()
+    # Let mount's first frame land, then observe a quiet window.
+    Process.sleep(50)
+    before = Runtime.snapshot(pid).render_count
+
+    Process.sleep(300)
+
+    assert Runtime.snapshot(pid).render_count == before
+    assert get_state(pid).tick_ref == nil
+  end
+
+  test "a stale tick is dropped: no double-step, no orphan timer, no frame" do
+    # A tick with no timer pending (its timer was cancelled after firing, or the
+    # message is a leftover) must not step the spinner, arm anything, or draw.
+    idle = State.new(test_mode: {80, 24})
+    assert {:noreply, ^idle, %{render?: false}} = TUI.handle_info(:dashfloat_tick, idle)
+
+    # A tick whose tracked timer has not fired yet is stale too, and the live
+    # timer is left alone.
+    ref = Process.send_after(self(), :never, 10_000)
+    active = %{idle | phase: :streaming, tick_ref: ref}
+
+    assert {:noreply, ^active, %{render?: false}} = TUI.handle_info(:dashfloat_tick, active)
+    assert is_integer(Process.read_timer(ref))
+
+    Process.cancel_timer(ref)
+  end
+
+  test "a tick that finds idle halts and clears the timer (last-resort net)" do
+    # schedule/1 cancels on any idle transition, so this state should be
+    # unreachable; if it ever happens, the tick must still die here — and draw
+    # nothing, since idle renders on no timer (ADR 0006).
+    idle = State.new(test_mode: {80, 24})
+    ref = Process.send_after(self(), :never, 10_000)
+    # A fired timer: read_timer returns false, so the tick is not stale.
+    Process.cancel_timer(ref)
+    Process.sleep(5)
+
+    leaked = %{idle | tick_ref: ref}
+    assert {:noreply, cleared, %{render?: false}} = TUI.handle_info(:dashfloat_tick, leaked)
+    assert cleared.tick_ref == nil
+    assert cleared.phase == :idle
+  end
+
+  test "a stray tick while idle halts without rescheduling" do
+    {:ok, pid} = start_tui()
+    Process.sleep(50)
+
+    send(pid, :dashfloat_tick)
+
+    state = get_state(pid)
+    assert state.phase == :idle
+    assert state.tick_ref == nil
+    assert state.anim_step == 0
+
+    # The timer is not re-armed, so no further frames arrive.
+    Process.sleep(50)
+    settled = Runtime.snapshot(pid).render_count
+    Process.sleep(300)
+    assert Runtime.snapshot(pid).render_count == settled
+  end
+
+  test "a stale tick draining at idle draws no frame (render-suppressed)" do
+    # The race this pins: a tick timer fires just as the terminal idle
+    # message queues behind a backlog; cancel_timer cannot stop the already-
+    # queued tick, so it drains at idle. Its callback has no state change —
+    # and must draw no frame either (ADR 0006: idle renders nothing on a
+    # timer). The render counter is the metric of record.
+    {:ok, pid} = start_tui()
+    :ok = Runtime.enable_trace(pid, limit: 200)
+    Process.sleep(50)
+    before_count = Runtime.snapshot(pid).render_count
+
+    send(pid, :dashfloat_tick)
+
+    # Wait until the server has processed the tick (it appears in the trace)…
+    await_trace(pid, fn events ->
+      Enum.any?(events, &tick_message?/1)
+    end)
+
+    # …then confirm the processed tick drew nothing. An unsuppressed return
+    # would render immediately here: the mailbox is empty at idle.
+    traced = Runtime.trace_events(pid)
+    assert Enum.any?(traced, &tick_message?/1)
+    assert Runtime.snapshot(pid).render_count == before_count
+  end
+
+  defp tick_message?(%{kind: :message, details: %{source: :info, payload: :dashfloat_tick}}),
+    do: true
+
+  defp tick_message?(_other), do: false
+
+  defp await_trace(pid, predicate, tries \\ 100) do
+    traced = Runtime.trace_events(pid)
+
+    if predicate.(traced) or tries == 0 do
+      :ok
+    else
+      Process.sleep(10)
+      await_trace(pid, predicate, tries - 1)
+    end
+  end
+
+  test "renders increase while a stream is live and freeze again after :idle" do
+    script =
+      [{:send, @headers}] ++
+        Enum.flat_map(1..10, fn i -> [{:sleep, 60}, {:send, frame("t#{i} ")}] end) ++
+        [{:send, "data: [DONE]\n\n"}, :close]
+
+    server = start_server(script)
+    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+
+    submit(pid, "animate")
+
+    # While active there is always a tick pending and the frame counter climbs.
+    eventually(pid, fn s -> s.phase == :streaming and s.tick_ref != nil end)
+    during = Runtime.snapshot(pid).render_count
+    Process.sleep(250)
+    assert Runtime.snapshot(pid).render_count > during
+
+    # The tick stepped the spinner while the stream was running.
+    stepped = eventually(pid, fn s -> s.anim_step > 0 end)
+    assert stepped.anim_step > 0
+
+    state = eventually(pid, fn s -> s.phase == :idle and s.tick_ref == nil end)
+    assert state.tick_ref == nil
+
+    # ...and the timer is gone: another quiet window changes nothing.
+    frozen = Runtime.snapshot(pid).render_count
+    Process.sleep(300)
+    assert Runtime.snapshot(pid).render_count == frozen
+  end
+
+  test "the render counter is the metric of record: it ticks during activity only" do
+    script = [
+      {:send, [@headers, frame("one")]},
+      {:sleep, 600},
+      {:send, frame(" two")},
+      {:send, "data: [DONE]\n\n"},
+      :close
+    ]
+
+    server = start_server(script)
+    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+
+    idle_before = Runtime.snapshot(pid).render_count
+    submit(pid, "rate")
+    eventually(pid, fn s -> s.phase == :streaming end)
+
+    # Sample across the slow gap: the activity tick alone drives renders.
+    start_count = Runtime.snapshot(pid).render_count
+    Process.sleep(400)
+    active_delta = Runtime.snapshot(pid).render_count - start_count
+    assert active_delta >= 2, "expected tick-driven renders, saw #{active_delta}"
+
+    eventually(pid, fn s -> s.phase == :idle and s.tick_ref == nil end)
+    idle_after = Runtime.snapshot(pid).render_count
+    Process.sleep(300)
+    assert Runtime.snapshot(pid).render_count == idle_after
+    assert idle_after > idle_before
+  end
+
+  test "a usage frame reconciles token counts before the terminal idle phase" do
+    usage =
+      ~s(data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":42,"total_tokens":162}}\n\n)
+
+    server =
+      start_server([
+        {:send, [@headers, frame("Hello")]},
+        {:send, usage},
+        {:send, "data: [DONE]\n\n"},
+        :close
+      ])
+
+    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+    :ok = Runtime.enable_trace(pid, limit: 500)
+
+    submit(pid, "count me")
+
+    state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
+
+    assert state.stats.prompt_tokens == 120
+    assert state.stats.completion_tokens == 42
+    assert state.stats.context_total == 162
+    assert entry?(state, :assistant, "Hello")
+
+    # Ordering proof: the usage message is handled before the idle phase.
+    traced = Runtime.trace_events(pid)
+    payloads = for(%{kind: :message, details: %{payload: payload}} <- traced, do: payload)
+
+    usage_at = Enum.find_index(payloads, &match?({:usage, _usage}, &1))
+    idle_at = Enum.find_index(payloads, &(&1 == {:phase, :idle}))
+    assert usage_at != nil and idle_at != nil
+    assert usage_at < idle_at
+
+    assert status_text(state) =~ "ctx 162"
   end
 
   test "child_spec/1 is temporary and a worker" do

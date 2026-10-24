@@ -2,7 +2,8 @@ defmodule DashFloat.LLM.ChatStream do
   @moduledoc """
   The Phase 2 producer: streams an OpenAI-compatible chat completion into the
   UI over the ADR-0002 message contract (`{:token, _}`, `{:phase, _}`,
-  `{:entry, _, _}`).
+  `{:entry, _, _}`), plus the ADR-0006 `{:usage, map}` accounting message.
+
 
   `run/4` is a Task body started by the TUI on submit under
   `DashFloat.StreamSupervisor`. It performs all network I/O — the UI process
@@ -93,6 +94,7 @@ defmodule DashFloat.LLM.ChatStream do
       json: %{
         model: provider.model,
         stream: true,
+        stream_options: %{include_usage: true},
         messages: [%{role: "user", content: prompt}]
       },
       headers: [
@@ -220,6 +222,7 @@ defmodule DashFloat.LLM.ChatStream do
     case Jason.decode(data) do
       {:ok, decoded} ->
         emit_content(ui, decoded)
+        emit_usage(ui, decoded)
         emit_frames(ui, resp, rest)
 
       # A data frame that is not JSON is a broken stream, not a keepalive.
@@ -230,8 +233,28 @@ defmodule DashFloat.LLM.ChatStream do
 
   defp emit_frames(_ui, _resp, []), do: :cont
 
-  # Role-only frames, empty choices, and usage frames are shape misses: skip
-  # them silently (ADR 0005).
+  # Usage arrives in the stream's final chunk (often with empty choices):
+  # forward it as data; a malformed usage object is ignored, never an error.
+  defp emit_usage(ui, %{"usage" => usage}) when is_map(usage) do
+    case usage do
+      %{"prompt_tokens" => prompt, "completion_tokens" => completion, "total_tokens" => total}
+      when is_integer(prompt) and is_integer(completion) and is_integer(total) and
+             prompt >= 0 and completion >= 0 and total >= 0 ->
+        send(
+          ui,
+          {:usage, %{prompt_tokens: prompt, completion_tokens: completion, total_tokens: total}}
+        )
+
+      # Non-integer or negative counts are a broken frame, not accounting data.
+      _other ->
+        :ok
+    end
+  end
+
+  defp emit_usage(_ui, _decoded), do: :ok
+
+  # Role-only frames, empty choices, and other shape misses are skipped
+  # silently (ADR 0005).
   defp emit_content(ui, %{"choices" => [%{"delta" => %{"content" => content}} | _rest]})
        when is_binary(content) and content != "" do
     send(ui, {:token, content})

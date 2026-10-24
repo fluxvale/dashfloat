@@ -6,25 +6,56 @@ defmodule DashFloat.TUI.State do
   input draft lives in the textarea's Rust-side state, reached through its
   synchronous in-memory API. Transitions return `{state, action}` where
   `action` is `:quit`, `{:submit, prompt}`, `:cancel`, or `nil`; the TUI
-  interprets actions. See ADR 0002 for the event flow.
+  interprets actions. The one clock is injectable (`now` arguments, defaulting
+  to the monotonic clock) so the animation tick and rate math stay pure.
+  See ADRs 0002 and 0006.
   """
 
+  alias DashFloat.TUI.Render
   alias DashFloat.TUI.View
 
   @type phase :: :idle | :streaming | :executing_tool
   @type entry_kind :: :user | :assistant | :tool | :system
+  @type entry :: %{kind: entry_kind(), text: String.t(), lines: [ExRatatui.Text.Line.t()]}
   @type action :: :quit | {:submit, String.t()} | :cancel | nil
+
+  @type stats :: %{
+          tokens: non_neg_integer(),
+          first_token_at: integer() | nil,
+          rate: float() | nil,
+          prompt_tokens: non_neg_integer() | nil,
+          completion_tokens: non_neg_integer() | nil,
+          context_total: non_neg_integer(),
+          turn_total: non_neg_integer() | nil
+        }
 
   @max_history 500
   @default_size {80, 24}
+  # Live re-renders of the in-flight reply stop above this; finalize still
+  # parses once at the end (ADR 0006).
+  @in_flight_cap 64 * 1024
 
   @enforce_keys [:input]
   defstruct [
     :input,
     :provider,
+    :cwd,
     phase: :idle,
     entries: [],
     in_flight: nil,
+    in_flight_lines: nil,
+    in_flight_dirty: false,
+    anim_step: 0,
+    tick_ref: nil,
+    stats: %{
+      tokens: 0,
+      first_token_at: nil,
+      rate: nil,
+      prompt_tokens: nil,
+      completion_tokens: nil,
+      context_total: 0,
+      turn_total: nil
+    },
     scroll: 0,
     follow?: true,
     history: [],
@@ -39,9 +70,15 @@ defmodule DashFloat.TUI.State do
   @type t :: %__MODULE__{
           input: reference(),
           provider: {:ok, DashFloat.Config.t()} | {:error, String.t()} | nil,
+          cwd: String.t(),
           phase: phase(),
-          entries: [{entry_kind(), String.t()}],
+          entries: [entry()],
           in_flight: String.t() | nil,
+          in_flight_lines: [ExRatatui.Text.Line.t()] | nil,
+          in_flight_dirty: boolean(),
+          anim_step: non_neg_integer(),
+          tick_ref: reference() | nil,
+          stats: stats(),
           scroll: non_neg_integer(),
           follow?: boolean(),
           history: [String.t()],
@@ -54,10 +91,17 @@ defmodule DashFloat.TUI.State do
         }
 
   @typedoc """
-  One message of the stream contract (see `stream_message/2` and ADR 0002).
+  One message of the stream contract (see `stream_message/2` and ADR 0002 /
+  ADR 0006).
   """
   @type stream_msg ::
           {:token, String.t()}
+          | {:usage,
+             %{
+               prompt_tokens: non_neg_integer(),
+               completion_tokens: non_neg_integer(),
+               total_tokens: non_neg_integer()
+             }}
           | {:phase, :streaming}
           | {:phase, :executing_tool | :idle}
           | {:entry, :tool | :system, String.t()}
@@ -69,13 +113,15 @@ defmodule DashFloat.TUI.State do
   the size comes from the opts; live, it is read from the terminal (falling
   back to 80x24 without a TTY) and kept fresh by later Resize events. The
   provider is loaded once by the Application and handed in as `:provider`
-  (ADR 0005).
+  (ADR 0005). The `cwd` label is computed here, once — status truth, not I/O
+  per frame (ADR 0006).
   """
   @spec new(keyword()) :: t()
   def new(opts) do
     %__MODULE__{
       input: ExRatatui.textarea_new(),
       provider: Keyword.get(opts, :provider),
+      cwd: cwd_label(),
       size: initial_size(opts),
       live?: is_nil(Keyword.get(opts, :test_mode))
     }
@@ -85,6 +131,37 @@ defmodule DashFloat.TUI.State do
   @spec provider_model(t()) :: String.t() | nil
   def provider_model(%__MODULE__{provider: {:ok, %{model: model}}}), do: model
   def provider_model(%__MODULE__{}), do: nil
+
+  @doc "The provider's context window, or nil when it was not configured."
+  @spec provider_context_tokens(t()) :: pos_integer() | nil
+  def provider_context_tokens(%__MODULE__{provider: {:ok, %{context_tokens: n}}})
+      when is_integer(n) and n > 0,
+      do: n
+
+  def provider_context_tokens(%__MODULE__{}), do: nil
+
+  @doc "The status bar's cwd label (`~/<last two segments>`, computed at new/1)."
+  @spec cwd_label(t()) :: String.t()
+  def cwd_label(%__MODULE__{cwd: cwd}), do: cwd
+
+  defp cwd_label do
+    case File.cwd() do
+      {:ok, path} -> format_cwd(path)
+      {:error, _reason} -> "~"
+    end
+  end
+
+  defp format_cwd(path) do
+    segments =
+      path
+      |> Path.split()
+      |> Enum.reject(&(&1 == "/"))
+
+    case Enum.take(segments, -2) do
+      [] -> "~"
+      tail -> "~/" <> Path.join(tail)
+    end
+  end
 
   defp initial_size(opts) do
     case Keyword.get(opts, :test_mode) do
@@ -99,6 +176,43 @@ defmodule DashFloat.TUI.State do
     end
   end
 
+  ## Status labels
+
+  @doc "The live tok/s rate as one decimal, or nil before any rate exists."
+  @spec rate_label(t()) :: String.t() | nil
+  def rate_label(%__MODULE__{stats: %{rate: nil}}), do: nil
+
+  def rate_label(%__MODULE__{stats: %{rate: rate}}),
+    do: :erlang.float_to_binary(rate, decimals: 1)
+
+  @doc """
+  Context usage, `4.1k` or `4.1k/128k` when a provider window is configured;
+  `—` until something has streamed.
+  """
+  @spec context_label(t()) :: String.t()
+  def context_label(%__MODULE__{stats: %{context_total: 0}}), do: "—"
+
+  def context_label(%__MODULE__{stats: %{context_total: total}} = state) do
+    case provider_context_tokens(state) do
+      nil -> humanize(total)
+      window -> humanize(total) <> "/" <> humanize(window)
+    end
+  end
+
+  # 999_999 reads "1.0m", not "1000k": a value that rounds up to the next
+  # unit's thousand boundary uses that unit.
+  defp humanize(n) when n < 1_000, do: Integer.to_string(n)
+  defp humanize(n) when n < 999_950, do: trim_zero(n / 1_000) <> "k"
+  defp humanize(n) when n < 999_950_000, do: trim_zero(n / 1_000_000) <> "m"
+  defp humanize(n), do: trim_zero(n / 1_000_000_000) <> "b"
+
+  defp trim_zero(x) do
+    x
+    |> Float.round(1)
+    |> :erlang.float_to_binary(decimals: 1)
+    |> String.trim_trailing(".0")
+  end
+
   ## Input draft
 
   @doc "Current draft text (lines joined with `\\n`)."
@@ -109,11 +223,17 @@ defmodule DashFloat.TUI.State do
   @spec input_line_count(t()) :: non_neg_integer()
   def input_line_count(%__MODULE__{input: input}), do: ExRatatui.textarea_line_count(input)
 
-  @doc "Inserts pasted text at the cursor (bracketed paste)."
+  @doc "Inserts pasted text at the cursor (bracketed paste), normalizing CRLF and CR."
   @spec paste(t(), String.t()) :: t()
   def paste(%__MODULE__{input: input} = state, content) when is_binary(content) do
-    ExRatatui.textarea_insert_str(input, content)
+    ExRatatui.textarea_insert_str(input, normalize_newlines(content))
     leave_history(state)
+  end
+
+  defp normalize_newlines(content) do
+    content
+    |> String.replace("\r\n", "\n")
+    |> String.replace("\r", "\n")
   end
 
   ## Key routing
@@ -231,47 +351,178 @@ defmodule DashFloat.TUI.State do
   @doc """
   Applies one stream-contract message:
 
-    * `{:token, text}` — append to the in-flight entry
+    * `{:token, text}` — append to the in-flight entry verbatim, count it, start
+      the rate clock on the first token, mark the live lines stale
+    * `{:usage, map}` — reconcile prompt/completion tokens, add the frame's
+      total to the context accumulator; no phase change
     * `{:phase, :streaming}` — set the phase only; re-announcing streaming
       never finalizes (a producer resuming after a tool interlude must not
       fragment its reply)
     * `{:phase, :executing_tool | :idle}` — set the phase and finalize the
-      in-flight entry
+      in-flight entry, freezing the rate
     * `{:entry, kind, text}` — append a complete entry
 
+  `now` is monotonic milliseconds (injectable so the rate math is testable).
   Messages that violate the contract have no matching clause and crash —
   contract violations are bugs.
   """
-  @spec stream_message(t(), stream_msg()) :: t()
-  def stream_message(state, {:token, text}) when is_binary(text) do
-    %{state | in_flight: (state.in_flight || "") <> text}
+  @spec stream_message(t(), stream_msg(), integer()) :: t()
+  def stream_message(state, msg, now \\ System.monotonic_time(:millisecond))
+
+  def stream_message(state, {:token, text}, now) when is_binary(text) do
+    %{
+      state
+      | in_flight: (state.in_flight || "") <> text,
+        stats: %{
+          state.stats
+          | tokens: state.stats.tokens + 1,
+            first_token_at: state.stats.first_token_at || now
+        },
+        in_flight_dirty: true
+    }
   end
 
-  def stream_message(state, {:phase, :streaming}), do: %{state | phase: :streaming}
+  # A usage frame arriving after the turn finalized belongs to a turn that is
+  # already over: applying it would poison the next turn's rate math (its
+  # completion count is not this turn's). Ignored.
+  def stream_message(%{phase: :idle} = state, {:usage, _usage}, _now), do: state
 
-  def stream_message(state, {:phase, phase}) when phase in [:executing_tool, :idle] do
+  def stream_message(state, {:usage, usage}, _now) when is_map(usage) do
+    %{
+      prompt_tokens: prompt,
+      completion_tokens: completion,
+      total_tokens: total
+    } = usage
+
+    # Usage frames carry the turn's running total — single-frame providers
+    # send it once, per-chunk reporters on every frame. The turn's truth is
+    # the LAST frame, banked once at finalize (ADR 0006); summing every frame
+    # would inflate the context on per-chunk providers.
+    stats = %{
+      state.stats
+      | prompt_tokens: prompt,
+        completion_tokens: completion,
+        # The usage frame is the authoritative count: the per-delta estimate is
+        # reconciled here, so the frozen rate is computed from real tokens.
+        tokens: completion,
+        turn_total: total
+    }
+
+    %{state | stats: stats}
+  end
+
+  def stream_message(state, {:phase, :streaming}, _now), do: %{state | phase: :streaming}
+
+  def stream_message(state, {:phase, phase}, now) when phase in [:executing_tool, :idle] do
     state
-    |> finalize_in_flight()
+    |> finalize_in_flight(now)
     |> Map.put(:phase, phase)
   end
 
-  def stream_message(state, {:entry, kind, text})
+  def stream_message(state, {:entry, kind, text}, _now)
       when kind in [:tool, :system] and is_binary(text),
       do: append_entry(state, kind, text)
 
-  defp finalize_in_flight(%{in_flight: in_flight} = state) when in_flight in [nil, ""],
-    do: %{state | in_flight: nil}
+  # Finalizing renders the reply once and freezes the cumulative rate; the
+  # streaming counters reset for the next turn, the frozen rate and context
+  # accumulator stay visible.
+  defp finalize_in_flight(%{in_flight: in_flight} = state, now) when in_flight in [nil, ""] do
+    %{
+      state
+      | in_flight: nil,
+        in_flight_lines: nil,
+        in_flight_dirty: false,
+        stats: frozen(state, now)
+    }
+  end
 
-  defp finalize_in_flight(%{in_flight: in_flight} = state) do
+  defp finalize_in_flight(%{in_flight: in_flight} = state, now) do
     state
     |> append_entry(:assistant, in_flight)
-    |> Map.put(:in_flight, nil)
+    |> Map.merge(%{in_flight: nil, in_flight_lines: nil, in_flight_dirty: false})
+    |> Map.put(:stats, frozen(state, now))
   end
 
-  defp append_entry(state, kind, text) do
-    text = String.trim_trailing(text, "\n")
-    %{state | entries: state.entries ++ [{kind, text}]}
+  # The turn's banked usage total joins the conversation accumulator exactly
+  # once, here (ADR 0006). Phase 3 caveat: a producer that emits the tool
+  # transition before flushing usage would fold that episode's total into the
+  # next episode's banking slot — producers must send usage before each phase
+  # change (the in-contract order).
+  defp frozen(%{stats: stats}, now) do
+    %{
+      stats
+      | rate: rate(stats.tokens, stats.first_token_at, now) || stats.rate,
+        tokens: 0,
+        first_token_at: nil,
+        # The turn's banked usage total joins the conversation accumulator
+        # exactly once, here (ADR 0006).
+        context_total: stats.context_total + (stats.turn_total || 0),
+        turn_total: nil
+    }
   end
+
+  defp rate(tokens, first_token_at, now)
+       when is_integer(first_token_at) and is_integer(now) and tokens > 0 and now > first_token_at do
+    tokens * 1000 / (now - first_token_at)
+  end
+
+  defp rate(_tokens, _first_token_at, _now), do: nil
+
+  # `text` stays verbatim (ADR 0006: it is the persistence truth); the render
+  # path splits on "\n" and tolerates trailing blanks.
+  defp append_entry(state, kind, text) do
+    %{
+      state
+      | entries:
+          state.entries ++ [%{kind: kind, text: text, lines: Render.entry_lines(kind, text)}]
+    }
+  end
+
+  ## Animation tick
+
+  @doc """
+  Steps the spinner and refreshes the live in-flight render. Returns
+  `{state, :halt}` immediately when idle — an idle UI must never keep a timer
+  alive (ADR 0006). `now` is monotonic milliseconds.
+  """
+  @spec tick(t(), integer()) :: {t(), :cont | :halt}
+  def tick(%__MODULE__{phase: :idle} = state, _now), do: {state, :halt}
+
+  def tick(%__MODULE__{} = state, now) do
+    stats = state.stats
+
+    state =
+      state
+      |> Map.put(:anim_step, state.anim_step + 1)
+      |> Map.put(:stats, %{
+        stats
+        | rate: rate(stats.tokens, stats.first_token_at, now) || stats.rate
+      })
+      |> refresh_in_flight()
+
+    {state, :cont}
+  end
+
+  defp refresh_in_flight(%{in_flight_dirty: false} = state), do: state
+
+  defp refresh_in_flight(%{in_flight: in_flight} = state)
+       when byte_size(in_flight) <= @in_flight_cap do
+    %{
+      state
+      | in_flight_lines: Render.entry_lines(:assistant, in_flight),
+        in_flight_dirty: false
+    }
+  end
+
+  # Above the cap the live view keeps its last render; finalize still parses
+  # once at the end (ADR 0006).
+  defp refresh_in_flight(state), do: state
+
+  @doc "True when an active phase has no tick scheduled yet."
+  @spec needs_tick?(t()) :: boolean()
+  def needs_tick?(%__MODULE__{phase: :idle}), do: false
+  def needs_tick?(%__MODULE__{tick_ref: nil}), do: true
+  def needs_tick?(%__MODULE__{}), do: false
 
   ## Producer-task monitoring
 
@@ -385,21 +636,12 @@ defmodule DashFloat.TUI.State do
 
   ## Scrolling
 
-  @doc "Total display lines in the log (entries plus any in-flight entry)."
+  @doc "Total display lines in the log (stored entry lines plus any in-flight lines)."
   @spec log_line_count(t()) :: non_neg_integer()
-  def log_line_count(%{entries: entries, in_flight: in_flight}) do
-    # Count via :binary.matches — avoids String.split's per-line list building
-    # on the hot render path.
-    count = Enum.reduce(entries, 0, fn {_kind, text}, acc -> acc + line_count(text) end)
-
-    if in_flight in [nil, ""] do
-      count
-    else
-      count + line_count(in_flight)
-    end
+  def log_line_count(%{entries: entries, in_flight_lines: in_flight_lines}) do
+    count = Enum.reduce(entries, 0, fn %{lines: lines}, acc -> acc + length(lines) end)
+    count + length(in_flight_lines || [])
   end
-
-  defp line_count(text), do: length(:binary.matches(text, "\n")) + 1
 
   @doc """
   Effective scroll offset for a viewport of `height` lines: the intent
@@ -440,7 +682,7 @@ defmodule DashFloat.TUI.State do
   end
 
   defp log_height(state) do
-    %{log: log} = View.regions(state.size, input_line_count(state))
+    %{log: log} = View.regions(state.size, input_line_count(state), state.phase != :idle)
     log.height
   end
 

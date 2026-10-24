@@ -49,6 +49,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
   defp collect(acc \\ []) do
     receive do
       {:token, _text} = msg -> collect([msg | acc])
+      {:usage, _map} = msg -> collect([msg | acc])
       {:entry, _kind, _text} = msg -> collect([msg | acc])
       {:phase, :idle} = msg -> Enum.reverse([msg | acc])
       {:phase, _phase} = msg -> collect([msg | acc])
@@ -436,6 +437,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
     assert Jason.decode!(body) == %{
              "model" => "test-model",
              "stream" => true,
+             "stream_options" => %{"include_usage" => true},
              "messages" => [%{"role" => "user", "content" => "hello"}]
            }
 
@@ -565,6 +567,78 @@ defmodule DashFloat.LLM.ChatStreamTest do
     assert tokens(messages) == ""
     assert_receive {:sse_closed}, 3_000
     await_exit(ref)
+  end
+
+  test "a final usage frame becomes a {:usage, map} message before idle" do
+    usage =
+      ~s(data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":42,"total_tokens":162}}\n\n)
+
+    server =
+      start_server([
+        {:send, [@headers, frame("Hello")]},
+        {:send, usage},
+        {:send, "data: [DONE]\n\n"},
+        :close
+      ])
+
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+    messages = collect()
+
+    assert tokens(messages) == "Hello"
+
+    assert {:usage, %{prompt_tokens: 120, completion_tokens: 42, total_tokens: 162}} in messages
+    assert {:phase, :idle} == List.last(messages)
+
+    usage_index = Enum.find_index(messages, &match?({:usage, _usage}, &1))
+    idle_index = Enum.find_index(messages, &(&1 == {:phase, :idle}))
+    assert usage_index < idle_index
+    await_exit(ref)
+  end
+
+  test "a usage frame carrying choices emits both the token and the usage" do
+    both =
+      ~s(data: {"choices":[{"index":0,"delta":{"content":"tail"}}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}\n\n)
+
+    server =
+      start_server([
+        {:send, [@headers, both]},
+        {:send, "data: [DONE]\n\n"},
+        :close
+      ])
+
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+    messages = collect()
+
+    assert tokens(messages) == "tail"
+    assert {:usage, %{prompt_tokens: 5, completion_tokens: 1, total_tokens: 6}} in messages
+    await_exit(ref)
+  end
+
+  test "a malformed usage object is ignored, not an error" do
+    for bad <- [
+          ~s({"choices":[],"usage":{"prompt_tokens":"a","completion_tokens":1,"total_tokens":2}}),
+          ~s({"choices":[],"usage":{"prompt_tokens":1,"total_tokens":2}}),
+          ~s({"choices":[],"usage":"none"}),
+          ~s({"choices":[],"usage":null}),
+          # Hostile/buggy counts are not accounting data either.
+          ~s({"choices":[],"usage":{"prompt_tokens":-1,"completion_tokens":1,"total_tokens":2}}),
+          ~s({"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":-2}})
+        ] do
+      server =
+        start_server([
+          {:send, [@headers, "data: " <> bad <> "\n\n"]},
+          {:send, "data: [DONE]\n\n"},
+          :close
+        ])
+
+      {_pid, ref} = start_stream(SSEServer.base_url(server))
+      messages = collect()
+
+      refute Enum.any?(messages, &match?({:usage, _}, &1))
+      assert system_entries(messages) == []
+      assert {:phase, :idle} == List.last(messages)
+      await_exit(ref)
+    end
   end
 
   defp json_response(status, body) do
