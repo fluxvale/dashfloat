@@ -101,7 +101,10 @@ defmodule DashFloat.TUITest do
     end
   end
 
-  defp system_entries(state), do: for({:system, text} <- state.entries, do: text)
+  defp system_entries(state), do: for(%{kind: :system, text: text} <- state.entries, do: text)
+
+  defp entry?(state, kind, text),
+    do: Enum.any?(state.entries, &(&1.kind == kind and &1.text == text))
 
   test "supervised start renders, typed input accumulates, and a real stream lands" do
     server =
@@ -127,21 +130,22 @@ defmodule DashFloat.TUITest do
     # finalized until the idle phase.
     streaming = eventually(pid, fn s -> s.in_flight == "Hello" end)
     assert streaming.phase == :streaming
-    assert {:user, "hello tui"} in streaming.entries
+    assert entry?(streaming, :user, "hello tui")
 
     grown = eventually(pid, fn s -> s.in_flight == "Hello from the engine" end)
     assert grown.phase == :streaming
 
     state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
 
-    assert {:assistant, "Hello from the engine"} in state.entries
+    assert entry?(state, :assistant, "Hello from the engine")
     assert state.history == ["hello tui"]
     assert system_entries(state) == []
     assert state.task_ref == nil
 
-    # The status bar names the configured model (ADR 0005).
+    # The status bar names the configured model and reports phase truth.
     assert State.provider_model(state) == "test-model"
-    assert status_text(state) =~ "model: test-model"
+    assert status_text(state) =~ "test-model"
+    assert status_text(state) =~ "Idle"
   end
 
   test "Esc cancels mid-stream: partial reply kept, [cancelled] logged, input usable" do
@@ -165,8 +169,8 @@ defmodule DashFloat.TUITest do
         s.phase == :idle and "[cancelled]" in system_entries(s)
       end)
 
-    assert {:assistant, "partial"} in state.entries
-    refute Enum.any?(state.entries, fn {_kind, text} -> text =~ "late" end)
+    assert entry?(state, :assistant, "partial")
+    refute Enum.any?(state.entries, &(&1.text =~ "late"))
 
     # Input is usable again.
     submit(pid, "again")
@@ -185,7 +189,7 @@ defmodule DashFloat.TUITest do
           "[llm: stream ended without completion]" in system_entries(s)
       end)
 
-    assert {:assistant, "partial"} in state.entries
+    assert entry?(state, :assistant, "partial")
 
     # Still typeable.
     type(pid, "next")
@@ -205,9 +209,9 @@ defmodule DashFloat.TUITest do
           Enum.any?(entries, &String.contains?(&1, "[llm: no provider configured"))
       end)
 
-    assert {:user, "hello"} in state.entries
+    assert entry?(state, :user, "hello")
     assert State.provider_model(state) == nil
-    assert status_text(state) =~ "model: —"
+    assert status_text(state) =~ "ctx —"
 
     type(pid, "again")
     typed_again = get_state(pid)
@@ -290,7 +294,7 @@ defmodule DashFloat.TUITest do
 
     assert state.task_ref == nil
     assert state.task_pid == nil
-    assert {:user, "hello"} in state.entries
+    assert entry?(state, :user, "hello")
 
     # Input is usable again: submit works (the server replays its script).
     submit(pid, "again")
@@ -310,8 +314,8 @@ defmodule DashFloat.TUITest do
     state = get_state(pid)
     assert state.task_ref == nil
 
-    refute Enum.any?(state.entries, fn {kind, text} ->
-             kind == :system and String.contains?(text, "stream failed")
+    refute Enum.any?(state.entries, fn entry ->
+             entry.kind == :system and String.contains?(entry.text, "stream failed")
            end)
   end
 
@@ -319,9 +323,10 @@ defmodule DashFloat.TUITest do
   test "the UI stays responsive while a stream lands at cadence into a large log" do
     {:ok, pid} = start_tui()
 
-    # Preload a log far beyond the viewport (400 lines).
+    # Preload a log far beyond the viewport (400 entries = 800 rendered lines
+    # including their blank separators).
     Enum.each(1..400, fn i -> send(pid, {:entry, :system, "warm #{i}"}) end)
-    eventually(pid, &(State.log_line_count(&1) == 400))
+    eventually(pid, &(State.log_line_count(&1) == 800))
 
     # Burst coalescing with a big log: hundreds of messages, few frames.
     burst = Enum.map(1..300, &"b#{&1} ")
@@ -393,7 +398,7 @@ defmodule DashFloat.TUITest do
     state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
 
     expected = Enum.map_join(1..40, "", &"t#{&1} ")
-    assert {:assistant, expected} in state.entries
+    assert entry?(state, :assistant, expected)
     assert State.input_text(state) == "zzzzz"
   end
 
@@ -435,6 +440,134 @@ defmodule DashFloat.TUITest do
     send(pid, :stray_message)
     after_stray = get_state(pid)
     assert State.input_text(after_stray) == "pasted text"
+  end
+
+  # The animation-discipline proof (ADR 0006): idle => no timers => no renders.
+  test "an idle app renders nothing on a timer" do
+    {:ok, pid} = start_tui()
+    # Let mount's first frame land, then observe a quiet window.
+    Process.sleep(50)
+    before = Runtime.snapshot(pid).render_count
+
+    Process.sleep(300)
+
+    assert Runtime.snapshot(pid).render_count == before
+    assert get_state(pid).tick_ref == nil
+  end
+
+  test "a stray tick while idle halts without rescheduling" do
+    {:ok, pid} = start_tui()
+    Process.sleep(50)
+
+    send(pid, :dashfloat_tick)
+
+    state = get_state(pid)
+    assert state.phase == :idle
+    assert state.tick_ref == nil
+    assert state.anim_step == 0
+
+    # The runtime draws the frame that carried the message, then nothing:
+    # the timer is not re-armed, so no further frames arrive.
+    Process.sleep(50)
+    settled = Runtime.snapshot(pid).render_count
+    Process.sleep(300)
+    assert Runtime.snapshot(pid).render_count == settled
+  end
+
+  test "renders increase while a stream is live and freeze again after :idle" do
+    script =
+      [{:send, @headers}] ++
+        Enum.flat_map(1..10, fn i -> [{:sleep, 60}, {:send, frame("t#{i} ")}] end) ++
+        [{:send, "data: [DONE]\n\n"}, :close]
+
+    server = start_server(script)
+    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+
+    submit(pid, "animate")
+
+    # While active there is always a tick pending and the frame counter climbs.
+    active = eventually(pid, fn s -> State.needs_tick?(s) or s.phase != :idle end)
+    during = Runtime.snapshot(pid).render_count
+    Process.sleep(250)
+    assert Runtime.snapshot(pid).render_count > during
+
+    # The tick stepped the spinner while the stream was running.
+    stepped = eventually(pid, fn s -> s.anim_step > 0 end)
+    assert stepped.anim_step > 0
+
+    state = eventually(pid, fn s -> s.phase == :idle and s.tick_ref == nil end)
+    assert state.tick_ref == nil
+    assert active.phase in [:streaming, :executing_tool, :idle]
+
+    # ...and the timer is gone: another quiet window changes nothing.
+    frozen = Runtime.snapshot(pid).render_count
+    Process.sleep(300)
+    assert Runtime.snapshot(pid).render_count == frozen
+  end
+
+  test "the render counter is the metric of record: it ticks during activity only" do
+    script = [
+      {:send, [@headers, frame("one")]},
+      {:sleep, 600},
+      {:send, frame(" two")},
+      {:send, "data: [DONE]\n\n"},
+      :close
+    ]
+
+    server = start_server(script)
+    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+
+    idle_before = Runtime.snapshot(pid).render_count
+    submit(pid, "rate")
+    eventually(pid, fn s -> s.phase == :streaming end)
+
+    # Sample across the slow gap: the activity tick alone drives renders.
+    start_count = Runtime.snapshot(pid).render_count
+    Process.sleep(400)
+    active_delta = Runtime.snapshot(pid).render_count - start_count
+    assert active_delta >= 2, "expected tick-driven renders, saw #{active_delta}"
+
+    eventually(pid, fn s -> s.phase == :idle and s.tick_ref == nil end)
+    idle_after = Runtime.snapshot(pid).render_count
+    Process.sleep(300)
+    assert Runtime.snapshot(pid).render_count == idle_after
+    assert idle_after > idle_before
+  end
+
+  test "a usage frame reconciles token counts before the terminal idle phase" do
+    usage =
+      ~s(data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":42,"total_tokens":162}}\n\n)
+
+    server =
+      start_server([
+        {:send, [@headers, frame("Hello")]},
+        {:send, usage},
+        {:send, "data: [DONE]\n\n"},
+        :close
+      ])
+
+    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+    :ok = Runtime.enable_trace(pid, limit: 500)
+
+    submit(pid, "count me")
+
+    state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
+
+    assert state.stats.prompt_tokens == 120
+    assert state.stats.completion_tokens == 42
+    assert state.stats.context_total == 162
+    assert entry?(state, :assistant, "Hello")
+
+    # Ordering proof: the usage message is handled before the idle phase.
+    traced = Runtime.trace_events(pid)
+    payloads = for(%{kind: :message, details: %{payload: payload}} <- traced, do: payload)
+
+    usage_at = Enum.find_index(payloads, &match?({:usage, _usage}, &1))
+    idle_at = Enum.find_index(payloads, &(&1 == {:phase, :idle}))
+    assert usage_at != nil and idle_at != nil
+    assert usage_at < idle_at
+
+    assert status_text(state) =~ "ctx 162"
   end
 
   test "child_spec/1 is temporary and a worker" do

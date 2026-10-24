@@ -3,7 +3,9 @@ defmodule DashFloat.TUI do
   The DashFloat terminal UI: a thin `ExRatatui.App` whose state logic lives in
   `DashFloat.TUI.State` and rendering in `DashFloat.TUI.View`. Process shape,
   key bindings, and teardown guarantees are settled in ADR 0002; the producer
-  started on submit is the SSE adapter from ADR 0005.
+  started on submit is the SSE adapter from ADR 0005. The activity tick
+  (ADR 0006) is the one timer this process owns — scheduled only while work is
+  in flight.
 
   Run with `mix run --no-halt`. Quit with Ctrl+Q or Ctrl+C.
   """
@@ -16,6 +18,9 @@ defmodule DashFloat.TUI do
   alias DashFloat.LLM.ChatStream
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
+
+  @tick :dashfloat_tick
+  @tick_ms 125
 
   @no_provider "[llm: no provider configured — set base_url/model/api_key in " <>
                  "~/.config/dashfloat/config.json or " <>
@@ -54,36 +59,65 @@ defmodule DashFloat.TUI do
 
     case action do
       :quit -> {:stop, state}
-      {:submit, prompt} -> {:noreply, start_stream(prompt, state)}
-      :cancel -> {:noreply, cancel_stream(state)}
-      nil -> {:noreply, state}
+      {:submit, prompt} -> schedule(start_stream(prompt, state))
+      :cancel -> schedule(cancel_stream(state))
+      nil -> schedule(state)
     end
   end
 
   # kitty-protocol terminals also report key releases; ignore them.
-  def handle_event(%ExRatatui.Event.Key{}, state), do: {:noreply, state}
+  def handle_event(%ExRatatui.Event.Key{}, state), do: schedule(state)
 
   def handle_event(%ExRatatui.Event.Paste{content: content}, state),
-    do: {:noreply, State.paste(state, content)}
+    do: schedule(State.paste(state, content))
 
   def handle_event(%ExRatatui.Event.Resize{width: w, height: h}, state),
-    do: {:noreply, State.resize(state, w, h)}
+    do: schedule(State.resize(state, w, h))
 
-  def handle_event(_event, state), do: {:noreply, state}
+  def handle_event(_event, state), do: schedule(state)
 
   @impl ExRatatui.App
-  def handle_info({:entry, _kind, _text} = msg, state),
-    do: {:noreply, State.stream_message(state, msg)}
+  def handle_info(@tick, state) do
+    {ticked, verdict} = State.tick(state, System.monotonic_time(:millisecond))
+    cleared = %{ticked | tick_ref: nil}
 
-  def handle_info({kind, _payload} = msg, state) when kind in [:token, :phase],
-    do: {:noreply, State.stream_message(state, msg)}
+    case verdict do
+      :cont -> schedule(cleared)
+      :halt -> {:noreply, cleared}
+    end
+  end
+
+  def handle_info({:entry, _kind, _text} = msg, state),
+    do: schedule(State.stream_message(state, msg))
+
+  def handle_info({kind, _payload} = msg, state) when kind in [:token, :phase, :usage],
+    do: schedule(State.stream_message(state, msg))
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     {state, _verdict} = State.task_down(state, ref, reason)
-    {:noreply, state}
+    schedule(state)
   end
 
-  def handle_info(_msg, state), do: {:noreply, state}
+  def handle_info(_msg, state), do: schedule(state)
+
+  # The single tick choke point (ADR 0006): any active phase keeps exactly one
+  # timer pending; idle always cancels it. Idle => no timers => no renders.
+  defp schedule(state) do
+    state =
+      cond do
+        State.needs_tick?(state) ->
+          %{state | tick_ref: Process.send_after(self(), @tick, @tick_ms)}
+
+        state.phase == :idle and state.tick_ref != nil ->
+          Process.cancel_timer(state.tick_ref)
+          %{state | tick_ref: nil}
+
+        true ->
+          state
+      end
+
+    {:noreply, state}
+  end
 
   @impl ExRatatui.App
   def terminate(reason, state) do

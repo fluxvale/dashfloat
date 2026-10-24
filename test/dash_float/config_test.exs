@@ -126,19 +126,75 @@ defmodule DashFloat.ConfigTest do
     refute inspect(%{provider: {:ok, config}}) =~ "test-key-123"
   end
 
+  test "context_tokens comes from the file when present" do
+    path = write!(tmp_path(), Map.put(full_file(), "context_tokens", 128_000))
+
+    assert {:ok, %Config{context_tokens: 128_000}} = Config.load(path, %{})
+  end
+
+  test "context_tokens comes from the environment, overriding the file" do
+    path = write!(tmp_path(), Map.put(full_file(), "context_tokens", 8_000))
+    env = %{"DASHFLOAT_CONTEXT_TOKENS" => "200000"}
+
+    assert {:ok, %Config{context_tokens: 200_000}} = Config.load(path, env)
+  end
+
+  test "absent context_tokens is nil, never an error" do
+    path = write!(tmp_path(), full_file())
+    assert {:ok, %Config{context_tokens: nil, model: "file-model"}} = Config.load(path, %{})
+  end
+
+  test "invalid context_tokens values are nil, never an error" do
+    for bad <- ["0", "-5", "abc", "12abc", "1.5", "", "  ", true, [1], 1.5, %{"n" => 1}] do
+      path = write!(tmp_path(), Map.put(full_file(), "context_tokens", bad))
+      assert {:ok, %Config{context_tokens: nil}} = Config.load(path, %{})
+    end
+
+    path = write!(tmp_path(), full_file())
+
+    for bad <- ["0", "-5", "abc", ""] do
+      assert {:ok, %Config{context_tokens: nil}} =
+               Config.load(path, %{"DASHFLOAT_CONTEXT_TOKENS" => bad})
+    end
+  end
+
+  test "a blank env value falls back to the file; an unusable one is nil" do
+    path = write!(tmp_path(), Map.put(full_file(), "context_tokens", 4_096))
+
+    for blank <- ["", "   "] do
+      assert {:ok, %Config{context_tokens: 4_096}} =
+               Config.load(path, %{"DASHFLOAT_CONTEXT_TOKENS" => blank})
+    end
+
+    assert {:ok, %Config{context_tokens: nil}} =
+             Config.load(path, %{"DASHFLOAT_CONTEXT_TOKENS" => "nope"})
+  end
+
   test "load/0 uses the default path and the real environment" do
     # Point the user-config dir at an empty temp dir, so a real config on the
     # developer's machine cannot make this test pass or fail by accident.
     dir = Path.join(@tmp_dir, "xdg-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
 
-    vars = ["XDG_CONFIG_HOME", "DASHFLOAT_BASE_URL", "DASHFLOAT_MODEL", "DASHFLOAT_API_KEY"]
+    vars = [
+      "XDG_CONFIG_HOME",
+      "DASHFLOAT_BASE_URL",
+      "DASHFLOAT_MODEL",
+      "DASHFLOAT_API_KEY",
+      "DASHFLOAT_CONTEXT_TOKENS"
+    ]
+
     saved = Map.new(vars, &{&1, System.get_env(&1)})
     on_exit(fn -> Enum.each(saved, fn {var, value} -> restore(var, value) end) end)
 
     System.put_env("XDG_CONFIG_HOME", dir)
 
-    for var <- ["DASHFLOAT_BASE_URL", "DASHFLOAT_MODEL", "DASHFLOAT_API_KEY"] do
+    for var <- [
+          "DASHFLOAT_BASE_URL",
+          "DASHFLOAT_MODEL",
+          "DASHFLOAT_API_KEY",
+          "DASHFLOAT_CONTEXT_TOKENS"
+        ] do
       System.delete_env(var)
     end
 
