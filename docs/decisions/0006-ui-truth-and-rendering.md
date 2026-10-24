@@ -297,21 +297,30 @@ What was decided, amending this ADR (and ADR 0002's truncation clause):
   (`:word_or_glyph`, same semantics as the input textarea). Styles travel
   with the text; a line that fits is rebuilt span-for-span (its own
   style/alignment ride along); a blank line wraps to a blank line
-  (separators keep the rhythm). A line's leading whitespace becomes the
-  indent its wrapped continuation rows re-carry (tool output, user echo);
-  a whitespace run that would overflow a row is dropped *and closes the
-  row*, so a wrap point can never fuse the words it separated.
+  (separators keep the rhythm). A line's leading whitespace plus an optional
+  short symbolic marker (`• `, `│ `, `❯ `, `⚙ `) is its hanging indent: the
+  first row keeps the prefix verbatim, continuation rows hang by its width —
+  prose never matches (a leading word must be purely symbolic to count as a
+  marker), and an indent wider than half the row is dropped rather than
+  guttering the text. A whitespace run that would overflow a row is dropped
+  *and closes the row*, so a wrap point can never fuse the words it
+  separated.
 - **Width accounting matches the Rust renderer** (`unicode-width`), measured
   against it during review: East Asian Wide/Fullwidth and emoji count two
   columns, combining marks and format characters zero, everything else one.
   Grapheme clusters carrying a variation selector (emoji presentation:
-  ⚠️, ❤️, keycaps) or an emoji-led ZWJ sequence count two — the renderer's
-  cluster width, where a per-codepoint sum would undercount and let the
-  Paragraph clip the row tail (the exact #20 symptom, reproduced in review
-  and pinned by a buffer-level regression test). The width tables are
-  compile-time-checked sorted (the binary search depends on it), provenance
-  documented in the module; residual table drift is deliberately
-  over-count-only (wraps a column early, never truncates).
+  ⚠️, ❤️, keycaps), a skin tone, or an emoji-led ZWJ sequence count two —
+  the renderer's cluster width, where a per-codepoint sum would undercount
+  and let the Paragraph clip the row tail (the exact #20 symptom, reproduced
+  in review and pinned by buffer-level regression tests). The width tables
+  are compile-time-checked sorted *and disjoint* (zero is consulted before
+  wide, so an overlap would silently re-classify wide codepoints as
+  zero-width — that exact bug shipped in an intermediate cut and was caught
+  in review), and a renderer-agreement property test walks every table
+  entry and the emoji families through the real cell renderer asserting
+  `Wrap.width >= rendered advance`: measured zero under-counts across the
+  review's 16,927-codepoint differential, the residual drift over-count
+  only (wraps a column early, never truncates).
 - **Entries carry both truths**: `logical` (the width-free render, the parse
   cache — still built once at append by `Render.entry_lines/2`) and `lines`
   (its wrap at the current width — what the view renders and the scroll math
@@ -326,9 +335,16 @@ What was decided, amending this ADR (and ADR 0002's truncation clause):
   stored wrapped lines. The wrap itself is single-pass over graphemes with
   binary-searched width tables — measured at 35 ms for a 48 KB
   space-free CJK reply (was 1.6 s in the first cut, quadratic; a
-  wall-clock regression test guards the tick budget) and ~21 ms per 1000
-  entries on resize — user-paced, O(session), the same cost class as the
-  accepted scroll-time accounting scans.
+  wall-clock regression test guards the tick budget).
+- **Resize re-wrap cost is O(session) and known** — ~21 ms per 1000 entries
+  for short lines, up to ~0.7 s for a 5000-entry log of 200-char prose
+  (measured in review): resize is the one eager full-log pass, and unlike
+  scroll-time accounting (which walks entry lists, not their lines) it
+  touches every row, so a drag-resize on a huge log stalls the UI process
+  per event. Accepted for now — resize is user-paced and rare; deferring
+  the re-wrap (lazy per-entry re-wrap in the windowed slice, memoised per
+  `{entry, width}`) is tracked follow-up work for when logs grow with
+  Phase 4 persistence.
 - **Scroll math counts display lines** — the invariant moved from
   "display == logical (no wrapping)" to "accounting and rendering read the
   same stored wrapped lines". `log_line_count/1`, `effective_scroll/2`, the

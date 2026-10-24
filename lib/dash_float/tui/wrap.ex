@@ -27,6 +27,11 @@ defmodule DashFloat.TUI.Wrap do
   @run ~r/\s+|\S+/
   @vs16 "\u{FE0F}"
   @zwj "\u{200D}"
+  # Emoji skin-tone modifiers: a cluster carrying one renders as an emoji
+  # pair whatever its base (☝🏽 = 1+0 per codepoint, 2 cells in the
+  # renderer). Standalone they sit in the wide table.
+  @skin_tones for cp <- 0x1F3FB..0x1F3FF, do: <<cp::utf8>>
+  @alphanumeric ~r/[\p{L}\p{N}]/u
 
   # Width 2 ranges: East Asian Width W and F codepoints, plus codepoints the
   # bundled renderer (unicode-width 0.2.2, Unicode 15.1/16 data) measures as
@@ -50,6 +55,7 @@ defmodule DashFloat.TUI.Wrap do
     {0x2630, 0x2637},
     {0x2648, 0x2653},
     {0x267F, 0x267F},
+    {0x268A, 0x268F},
     {0x2693, 0x2693},
     {0x26A1, 0x26A1},
     {0x26AA, 0x26AB},
@@ -79,7 +85,8 @@ defmodule DashFloat.TUI.Wrap do
     {0x2E9B, 0x2EF3},
     {0x2F00, 0x2FD5},
     {0x2FF0, 0x2FFF},
-    {0x3000, 0x303E},
+    {0x3000, 0x3029},
+    {0x302E, 0x303E},
     {0x3041, 0x3096},
     {0x309B, 0x30FF},
     {0x3105, 0x312F},
@@ -267,7 +274,6 @@ defmodule DashFloat.TUI.Wrap do
     {0x2066, 0x206F},
     {0x20D0, 0x20F0},
     {0x2CEF, 0x2CF1},
-    {0x2D7F, 0x2D7F},
     {0x302A, 0x302D},
     {0x3099, 0x309A},
     {0xA66F, 0xA672},
@@ -282,7 +288,6 @@ defmodule DashFloat.TUI.Wrap do
     {0x1D173, 0x1D182},
     {0x1D185, 0x1D18B},
     {0x1D1AA, 0x1D1AD},
-    {0x1F3FB, 0x1F3FF},
     {0xE0100, 0xE01EF}
   ]
 
@@ -291,16 +296,36 @@ defmodule DashFloat.TUI.Wrap do
   @zero_ranges List.to_tuple(@zero)
   @zero_count tuple_size(@zero_ranges)
 
-  # The binary search in covers?/4 relies on both tables being sorted and
-  # disjoint; enforced at compile time so a future edit cannot silently
-  # unsort a table (a misplaced range once made a whole region of the zero
-  # table unreachable — found in the #20 hostile review).
+  # The binary search in covers?/4 relies on both tables being sorted, and
+  # cp_width/1 consults zero before wide, so a range overlapping across the
+  # tables silently re-classifies wide codepoints as zero-width (the
+  # skin-tone range, found in the #20 review). Both invariants are enforced
+  # at compile time.
   Enum.each([@wide, @zero], fn ranges ->
     true =
       ranges
       |> Enum.zip(tl(ranges))
       |> Enum.all?(fn {a, b} -> a < b end)
   end)
+
+  Enum.each(@zero, fn {zero_lo, zero_hi} ->
+    true =
+      Enum.all?(@wide, fn {wide_lo, wide_hi} ->
+        zero_hi < wide_lo or wide_hi < zero_lo
+      end)
+  end)
+
+  @doc false
+  # Width tables for the renderer-agreement property test: every entry, and
+  # the emoji-sequence families, must advance at least `width/1` columns in
+  # the real renderer (the no-undercount invariant — undercounting is what
+  # truncates rows at the pane edge).
+  @spec __tables__ ::
+          {[{non_neg_integer(), non_neg_integer()}],
+           [
+             {non_neg_integer(), non_neg_integer()}
+           ]}
+  def __tables__, do: {Enum.to_list(@wide), Enum.to_list(@zero)}
 
   @doc "Display width in terminal columns of a single-line string."
   @spec width(String.t()) :: non_neg_integer()
@@ -317,16 +342,17 @@ defmodule DashFloat.TUI.Wrap do
     end
   end
 
-  # A cluster carrying a variation selector (emoji presentation) or joining
-  # pictographics with a ZWJ renders as one emoji cell pair — the renderer's
-  # cluster width, which a per-codepoint sum would undercount (⚠️ = 1+0) or
-  # wildly overcount (family emoji = 2+0+2+0+2). A bare ZWJ between plain
-  # letters is its own zero-width grapheme and falls through to the sum.
+  # A cluster carrying a variation selector (emoji presentation), a skin
+  # tone, or joining pictographics with a ZWJ renders as one emoji cell pair
+  # — the renderer's cluster width, which a per-codepoint sum would
+  # undercount (⚠️ = 1+0, ☝🏽 = 1+0) or wildly overcount (family emoji =
+  # 2+0+2+0+2). A bare ZWJ between plain letters adds nothing.
   defp cluster_width(<<cp::utf8>>) when cp < 0x0300, do: 1
 
   defp cluster_width(grapheme) do
     cond do
       String.contains?(grapheme, @vs16) -> 2
+      String.contains?(grapheme, @skin_tones) -> 2
       joined_emoji?(grapheme) -> 2
       true -> cp_sum(grapheme)
     end
@@ -369,28 +395,70 @@ defmodule DashFloat.TUI.Wrap do
     indent = chunks_width(prefix)
 
     cond do
-      # A blank or whitespace-only line that fits is untouched.
+      # A blank or prefix-only line that fits is untouched.
       body == [] and indent <= width ->
         [line]
 
-      # An indent as wide as the row is degenerate; wrap without it.
-      indent == 0 or indent >= width ->
-        wrap_chunks(chunks, width, line)
+      # No hanging indent to carry, or one wider than half the row (deep
+      # nesting at a narrow terminal) — wrapping the body without it beats
+      # guttering the text down to a column or two.
+      indent == 0 or indent > div(width, 2) ->
+        wrap_chunks(body, width, line)
 
-      # Continuation rows re-carry the leading whitespace as their indent,
-      # so the body wraps into the columns the indent leaves behind.
+      # The first row keeps its prefix verbatim; continuation rows hang by
+      # the prefix's width, so wrapped bullets, quote bars, gear rows, and
+      # user echoes stay visually under their opener.
       true ->
-        indent_width = width - indent
-        indent_line = display_line(drop_kinds(prefix), line)
-        indent_spans = indent_line.spans
-
-        body
-        |> wrap_chunks(indent_width, line)
-        |> Enum.map(fn %Line{} = row -> %Line{row | spans: indent_spans ++ row.spans} end)
+        hanging_wrap(body, prefix, indent, width, line)
     end
   end
 
-  defp split_prefix(chunks), do: Enum.split_while(chunks, fn {_t, _s, kind} -> kind == :space end)
+  defp hanging_wrap(body, prefix, indent, width, line) do
+    chunks = drop_kinds(prefix)
+    reversed = Enum.reverse(chunks)
+    prefix_line = display_line(reversed, line)
+    spaces = String.duplicate(" ", indent)
+    hang = Span.new(spaces)
+
+    body
+    |> wrap_chunks(width - indent, line)
+    |> indent_rows(prefix_line.spans, hang)
+  end
+
+  defp indent_rows([%Line{} = first], prefix_spans, _hang),
+    do: [%Line{first | spans: prefix_spans ++ first.spans}]
+
+  defp indent_rows([%Line{} = first | rest], prefix_spans, hang) do
+    first = %Line{first | spans: prefix_spans ++ first.spans}
+
+    rest =
+      Enum.map(rest, fn %Line{} = row -> %Line{row | spans: [hang | row.spans]} end)
+
+    [first | rest]
+  end
+
+  # The prefix is the line's leading whitespace plus an optional marker run:
+  # a short symbolic word chunk (bullet "•", quote bar "│", prompt "❯",
+  # gear "⚙") followed by a single space. Prose never matches — a leading
+  # word must be purely symbolic to count as a marker, so "the quick brown
+  # fox" carries no hanging indent while "❯ anything" does.
+  defp split_prefix(chunks) do
+    {spaces, rest} = Enum.split_while(chunks, fn {_t, _s, kind} -> kind == :space end)
+
+    case rest do
+      [{text, style, :word}, {space, _space_style, :space} | tail] ->
+        if marker?(text) and width(space) == 1 do
+          {spaces ++ [{text, style, :word}, {space, style, :space}], tail}
+        else
+          {spaces, rest}
+        end
+
+      _other ->
+        {spaces, rest}
+    end
+  end
+
+  defp marker?(text), do: width(text) <= 4 and not Regex.match?(@alphanumeric, text)
 
   defp chunks_width(chunks),
     do: Enum.reduce(chunks, 0, fn {text, _s, _k}, acc -> acc + width(text) end)
@@ -411,13 +479,15 @@ defmodule DashFloat.TUI.Wrap do
   # never inherit leading spaces). A run that would overflow a full row is
   # dropped and the row marked full (col := width) — the run is gone, so the
   # next word must move to the next row rather than abut the last word on
-  # this one.
+  # this one. A run overflowing an EMPTY row is dropped outright: marking it
+  # full would manufacture a phantom blank row.
   defp step({text, style, :space}, width, {rev, cur, col, continued}) do
     w = width(text)
 
     cond do
-      col == 0 and continued -> {rev, cur, col, true}
       col + w <= width -> {rev, [{text, style} | cur], col + w, continued}
+      cur == [] -> {rev, cur, col, continued}
+      col == 0 and continued -> {rev, cur, col, true}
       true -> {rev, cur, width, continued}
     end
   end
@@ -542,7 +612,9 @@ defmodule DashFloat.TUI.Wrap do
   ## Column accounting
 
   # Codepoints below U+0300 (ASCII, Latin-1, Latin Extended) never touch the
-  # range tables: the common case is one comparison.
+  # range tables: the common case is one comparison. U+17D8 (Khmer sign
+  # BEYYAL) is the one codepoint the renderer advances three cells.
+  defp cp_width(0x17D8), do: 3
   defp cp_width(cp) when cp < 0x0300, do: 1
 
   defp cp_width(cp) do

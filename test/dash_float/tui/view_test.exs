@@ -491,6 +491,23 @@ defmodule DashFloat.TUI.ViewTest do
 
       assert ExRatatui.get_buffer_content(term) =~ "CRITICAL_TAIL"
     end
+
+    # Regression (review N1): skin-tone sequences on non-wide bases (☝🏽 ✍🏽)
+    # counted 1 per codepoint pair after the modifiers moved to the zero
+    # table; the renderer gives them two cells, so rows overflowed and the
+    # tail clipped. The cluster rule plus the renderer-agreement property
+    # test pin the class.
+    test "skin-tone emoji sequences wrap without truncating the tail" do
+      text = String.duplicate("☝🏽", 40) <> " TAIL_C"
+
+      state = State.stream_message(new_state(), {:entry, :system, text})
+
+      term = ExRatatui.init_test_terminal(80, 24)
+      widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+      assert :ok = ExRatatui.draw(term, widgets)
+
+      assert ExRatatui.get_buffer_content(term) =~ "TAIL_C"
+    end
   end
 
   describe "input box" do

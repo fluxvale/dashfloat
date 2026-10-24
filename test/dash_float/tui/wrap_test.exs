@@ -115,6 +115,44 @@ defmodule DashFloat.TUI.WrapTest do
       assert flat(Wrap.wrap([line("  one two")], 5)) == ["  one", "  two"]
     end
 
+    test "marker prefixes hang their continuations under the opener" do
+      # Bullets, quote bars, prompts, gear rows: continuation rows indent by
+      # the marker's width; the marker itself stays on the first row only
+      # (review N3 — flush-left continuations broke the visual structure).
+      bullet = line([{"• ", :assistant}, {"a list item that is long", :assistant}])
+
+      assert flat(Wrap.wrap([bullet], 12)) == ["• a list ", "  item that ", "  is long"]
+
+      quote_row = line([{"│ ", :quote}, {"a quoted paragraph that runs wide", :assistant}])
+
+      assert flat(Wrap.wrap([quote_row], 14)) == [
+               "│ a quoted ",
+               "  paragraph ",
+               "  that runs ",
+               "  wide"
+             ]
+
+      prompt = line([{"❯ ", :user}, {"the quick brown fox jumps", :user}])
+
+      assert flat(Wrap.wrap([prompt], 12)) == ["❯ the quick ", "  brown fox ", "  jumps"]
+    end
+
+    test "prose never hangs: a leading short word is not a marker" do
+      assert flat(Wrap.wrap([line("the quick brown fox jumps over")], 12)) == [
+               "the quick ",
+               "brown fox ",
+               "jumps over"
+             ]
+    end
+
+    test "an indent wider than half the row is dropped, not guttered" do
+      # Deep-nested output on a narrow terminal: wrapping at width beats a
+      # two-column budget (review N5/N6).
+      deep = line(String.duplicate(" ", 8) <> "return value here")
+
+      assert flat(Wrap.wrap([deep], 10)) == ["return ", "value here"]
+    end
+
     test "a whitespace run that overflows the row never fuses adjacent words" do
       # Regression (hostile review P1-2): the dropped run used to leave the
       # next word on the same row, deleting the gap — and the words' spacing
@@ -126,7 +164,7 @@ defmodule DashFloat.TUI.WrapTest do
 
       assert flat(Wrap.wrap([line("| a" <> String.duplicate(" ", 10) <> "| b |")], 12)) == [
                "| a",
-               "| b |"
+               "  | b |"
              ]
 
       tail = "xxxx" <> String.duplicate("x", 36) <> String.duplicate(" ", 50) <> "TAIL_VALUE"
@@ -216,6 +254,89 @@ defmodule DashFloat.TUI.WrapTest do
 
     test "a lone grapheme wider than the budget renders as its own row" do
       assert flat(Wrap.wrap([line("日")], 1)) == ["日"]
+    end
+  end
+
+  describe "renderer agreement (width never undercounts the renderer)" do
+    alias ExRatatui.CellSession
+    alias ExRatatui.Layout.Rect
+    alias ExRatatui.Text.Line
+    alias ExRatatui.Text.Span
+    alias ExRatatui.Widgets.Paragraph
+
+    # The width tables are asserted against the actual renderer, cell by
+    # cell: every table entry (boundaries and midpoint) and the
+    # emoji-sequence families we classify must advance exactly `Wrap.width/1`
+    # columns, or more (over-counts wrap early; under-counts truncate — the
+    # #20 bug). Technique: draw `X <> text <> Y` per row and read the column
+    # Y lands on (the #20 review's differential probe).
+    test "every table entry matches or over-counts the renderer's advance" do
+      {wide, zero} = Wrap.__tables__()
+
+      entries =
+        (wide ++ zero)
+        |> Enum.flat_map(fn {lo, hi} -> [lo, hi, div(lo + hi, 2)] end)
+        |> Enum.uniq()
+
+      entries
+      |> Enum.map(&<<&1::utf8>>)
+      |> advances()
+      |> Enum.zip(entries)
+      |> Enum.each(fn {rendered, cp} ->
+        measured = Wrap.width(<<cp::utf8>>)
+
+        assert is_integer(rendered) and measured >= rendered,
+               "U+#{Integer.to_string(cp, 16)} undercounts: wrap=#{measured} render=#{rendered}"
+      end)
+    end
+
+    test "emoji sequence families match the renderer's advance exactly" do
+      sequences = [
+        "⚠️",
+        "❤️",
+        "1️⃣",
+        "🏳️‍🌈",
+        "👨‍👩‍👧",
+        "👍🏽",
+        "☝🏽",
+        "✍🏽",
+        "e\u0301",
+        "日",
+        "ｆ",
+        "a\u200Db",
+        "TRL"
+      ]
+
+      sequences
+      |> advances()
+      |> Enum.zip(sequences)
+      |> Enum.each(fn {rendered, seq} ->
+        assert rendered == Wrap.width(seq),
+               "#{inspect(seq)} wrap=#{Wrap.width(seq)} render=#{rendered}"
+      end)
+    end
+
+    defp advances(texts) do
+      lines = Enum.map(texts, &Line.new([Span.new("X" <> &1 <> "Y")]))
+      height = length(lines)
+      session = CellSession.new(20, height)
+
+      :ok =
+        CellSession.draw(session, [
+          {%Paragraph{text: lines}, %Rect{x: 0, y: 0, width: 20, height: height}}
+        ])
+
+      y_cols =
+        session
+        |> CellSession.take_cells()
+        |> Map.get(:cells, [])
+        |> Enum.filter(&(&1.symbol == "Y"))
+        |> Enum.group_by(& &1.row, & &1.col)
+        |> Enum.into(%{}, fn {row, cols} -> {row, Enum.max(cols)} end)
+
+      CellSession.close(session)
+
+      Enum.with_index(texts, fn _text, i -> Map.get(y_cols, i, 0) - 1 end)
     end
   end
 

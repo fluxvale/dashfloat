@@ -1084,6 +1084,19 @@ defmodule DashFloat.TUI.StateTest do
       assert state.size == {1, 1}
     end
 
+    test "a whitespace run overflowing an empty row drops without a phantom blank" do
+      # Regression (review N2): marking an empty row full used to push a
+      # blank display row and inflate the log count.
+      base = new_state(test_mode: {10, 24})
+      text = String.duplicate(" ", 24) <> "x = 1"
+      state = State.stream_message(base, {:entry, :system, text})
+
+      [entry] = state.entries
+
+      assert Enum.map(entry.lines, &flatten/1) == ["", "x = 1"]
+      assert State.log_line_count(state) == 2
+    end
+
     test "entries re-wrap to the new width without losing text" do
       text = "the quick brown fox jumps over the lazy dog"
 
