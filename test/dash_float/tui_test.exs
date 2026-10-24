@@ -123,8 +123,9 @@ defmodule DashFloat.TUITest do
     assert state.history == ["hello tui"]
     assert system_entries(state) == []
 
-    # The status bar names the configured model and reports phase truth.
-    assert State.provider_model(state) == "test-model"
+    # The status bar names the configured model (label fallback chain) and
+    # reports phase truth.
+    assert State.provider_label(state) == "test-model"
     assert status_text(state) =~ "test-model"
     assert status_text(state) =~ "Idle"
   end

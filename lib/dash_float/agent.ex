@@ -19,8 +19,8 @@ defmodule DashFloat.Agent do
   # Display excerpt for tool-result rows; the model gets the bounded full result.
   @display_lines 30
 
-  @no_provider "[llm: no provider configured — set base_url/model/api_key in " <>
-                 "~/.config/dashfloat/config.json or " <>
+  @no_provider "[llm: no provider configured — set up profiles in " <>
+                 "~/.config/dashfloat/dashfloat.json5 or " <>
                  "DASHFLOAT_BASE_URL/DASHFLOAT_MODEL/DASHFLOAT_API_KEY]"
 
   @enforce_keys [:provider, :cwd, :supervisor]

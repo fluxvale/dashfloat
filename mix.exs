@@ -52,6 +52,12 @@ defmodule DashFloat.MixProject do
       {:earmark_parser, "~> 1.4"},
       {:ex_ratatui, "~> 0.17.1"},
       {:jason, "~> 1.4"},
+      # JSON5 config files (ADR 0008). json5 pins decimal ~2.0.0 — exactly
+      # 2.0.0, which carries two MEDIUM DoS advisories; override to the fixed
+      # 3.x line (verified: compiles and decodes identically). Drop the
+      # override when json5 bumps its pin.
+      {:json5, "~> 0.4"},
+      {:decimal, "~> 3.2", override: true},
       {:req, "~> 0.7.5"},
       # Dev/test-only analysis tools
       # Exact pin, matching the fleet reference — the enumerated .credo.exs

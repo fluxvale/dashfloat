@@ -145,6 +145,11 @@ usable provider the TUI still runs; submitting degrades to a system entry with
 setup instructions. The endpoint is one OpenAI-compatible URL:
 `base_url <> "/chat/completions"`, `stream: true`, `Authorization: Bearer`.
 
+*(This section's file layout and precedence are superseded by
+[ADR 0008](0008-config-layout-profiles-json5.md) — octofriend-style JSON5
+files with profiles. The load-once-in-Application contract, the mount-opt
+handoff, and the never-echo-values error rule stand, as restated there.)*
+
 ### Testing — recorded bytes and a loopback server
 
 The SSE parser is tested on recorded byte-stream fixtures (fed whole and

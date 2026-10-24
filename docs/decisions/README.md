@@ -30,3 +30,4 @@ their replacement.
 | [0005](0005-llm-streaming-engine.md) | LLM streaming engine: SSE adapter process architecture | Accepted |
 | [0006](0006-ui-truth-and-rendering.md) | UI truth & rendering: markdown log, live status, activity line, input hardening | Accepted |
 | [0007](0007-tool-calls-and-execution.md) | Tool calls & execution: agent loop, five tools, path policy, confirmations | Accepted |
+| [0008](0008-config-layout-profiles-json5.md) | Config layout v2: single-file JSON5 with profiles | Accepted |
