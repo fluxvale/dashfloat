@@ -14,6 +14,7 @@ defmodule DashFloat.Tools do
         name: "path",
         type: :string,
         required: true,
+        nonempty: true,
         description: "File path, relative to the working directory or absolute inside it.",
         minimum: nil,
         maximum: nil,
@@ -43,6 +44,7 @@ defmodule DashFloat.Tools do
         name: "path",
         type: :string,
         required: true,
+        nonempty: true,
         description: "File path to write. Parent directories are created.",
         minimum: nil,
         maximum: nil,
@@ -63,6 +65,7 @@ defmodule DashFloat.Tools do
         name: "path",
         type: :string,
         required: true,
+        nonempty: true,
         description: "File path to edit.",
         minimum: nil,
         maximum: nil,
@@ -92,6 +95,7 @@ defmodule DashFloat.Tools do
         name: "command",
         type: :string,
         required: true,
+        nonempty: true,
         description: "Shell command line to run.",
         minimum: nil,
         maximum: nil,
@@ -101,6 +105,7 @@ defmodule DashFloat.Tools do
         name: "cwd",
         type: :string,
         required: false,
+        nonempty: true,
         description: "Directory to run the command in, relative to the working directory.",
         minimum: nil,
         maximum: nil,
@@ -112,6 +117,7 @@ defmodule DashFloat.Tools do
         name: "path",
         type: :string,
         required: false,
+        nonempty: true,
         description: "Directory to list, relative to the working directory.",
         minimum: nil,
         maximum: nil,
@@ -215,6 +221,9 @@ defmodule DashFloat.Tools do
     end
   end
 
+  defp check_value(tool, %{type: :string, nonempty: true} = param, ""),
+    do: {:error, "#{tool}: #{param.name} must not be empty"}
+
   defp check_value(_tool, %{type: :string} = _param, value) when is_binary(value),
     do: {:ok, value}
 
@@ -223,12 +232,14 @@ defmodule DashFloat.Tools do
 
   defp property(param) do
     base = %{"type" => type_name(param.type), "description" => param.description}
+    min_length = if Map.get(param, :nonempty), do: 1, else: nil
 
     prop =
       base
       |> maybe_put("minimum", param.minimum)
       |> maybe_put("maximum", param.maximum)
       |> maybe_put("default", param.default)
+      |> maybe_put("minLength", min_length)
 
     {param.name, prop}
   end

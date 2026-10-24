@@ -1,7 +1,8 @@
 defmodule DashFloat.Tools.Edit do
   @moduledoc """
-  Shared exact-match locator for `edit_file`, plus the line splitting both
-  the runner and the preview hunk builder agree on.
+  Shared exact-match locator for `edit_file`, plus the line splitting and
+  UTF-8 scrubbing that the runner, the preview builder, and command execution
+  agree on.
 
   Matching is byte-exact substring matching (`:binary.matches`) — no
   normalization, no whitespace flexibility. `search_block == replace_block`
@@ -19,6 +20,30 @@ defmodule DashFloat.Tools.Edit do
       |> Enum.drop(-1)
     else
       String.split(content, "\n")
+    end
+  end
+
+  @doc """
+  Replaces invalid UTF-8 bytes with U+FFFD. Tool output returns to the model
+  as JSON and to the TUI as text — neither survives a raw binary tail, so
+  every byte boundary scrubs.
+  """
+  @spec sanitize(String.t()) :: String.t()
+  def sanitize(binary) when is_binary(binary) do
+    if String.valid?(binary) do
+      binary
+    else
+      binary
+      |> String.chunk(:valid)
+      |> Enum.map_join(&chunk_replacement/1)
+    end
+  end
+
+  defp chunk_replacement(chunk) do
+    if String.valid?(chunk) do
+      chunk
+    else
+      String.duplicate("�", byte_size(chunk))
     end
   end
 

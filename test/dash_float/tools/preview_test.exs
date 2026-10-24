@@ -176,6 +176,24 @@ defmodule DashFloat.Tools.PreviewTest do
     assert build("execute_command", args, root) == {:ok, %{lines: ["$ mix test", "cwd: " <> sub]}}
   end
 
+  test "every line of a multi-line command gets the $ marker", %{root: root} do
+    args = %{"command" => "echo safe\nrm -rf ~", "cwd" => "."}
+
+    assert build("execute_command", args, root) ==
+             {:ok, %{lines: ["$ echo safe", "$ rm -rf ~", "cwd: " <> root]}}
+  end
+
+  test "a broken preview degrades to an error result, never a raise", %{root: root} do
+    result = Tools.Preview.build("execute_command", %{"command" => "ls"}, root)
+
+    assert {:error, %{ok: false, error: message}} = result
+    assert message =~ "preview crashed"
+
+    partial = Tools.Preview.build("write_file", %{"content" => "x"}, root)
+
+    assert {:error, %{ok: false, error: "preview crashed" <> _rest}} = partial
+  end
+
   test "an execute_command cwd escaping the sandbox returns the runner-shaped error", %{
     root: root
   } do
