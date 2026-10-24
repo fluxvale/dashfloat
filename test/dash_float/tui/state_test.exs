@@ -3,6 +3,7 @@ defmodule DashFloat.TUI.StateTest do
   use ExUnit.Case, async: true
 
   alias DashFloat.TUI.State
+  alias DashFloat.TUI.View
 
   defp new_state(opts \\ []) do
     [test_mode: {80, 24}]
@@ -819,11 +820,12 @@ defmodule DashFloat.TUI.StateTest do
       assert over.in_flight_dirty
       assert over.in_flight == over_cap
 
-      # Finalize still renders the full text once.
+      # Finalize still renders the full text once — wrapped to the width.
       final = State.stream_message(over, {:phase, :idle}, 1_300)
       [entry] = final.entries
       assert entry.text == over_cap
-      assert length(entry.lines) == 2
+      # blank separator + 64 KiB + 1 of x's at 80 columns = 820 display rows
+      assert length(entry.lines) == 1 + div(64 * 1024, 80) + 1
     end
 
     test "needs_tick?/1 is true only while active and unscheduled" do
@@ -1063,6 +1065,147 @@ defmodule DashFloat.TUI.StateTest do
       state = State.resize(new_state(), 0, -3)
       assert state.size == {1, 1}
     end
+
+    test "entries re-wrap to the new width without losing text" do
+      text = "the quick brown fox jumps over the lazy dog"
+
+      state =
+        new_state()
+        |> State.stream_message({:entry, :system, text})
+        |> State.resize(20, 24)
+
+      [entry] = state.entries
+      assert entry.text == text
+
+      # One logical line becomes wrapped display rows, blank separator first;
+      # the pieces still carry the whole text.
+      pieces = Enum.map(entry.lines, &flatten/1)
+      assert hd(pieces) == ""
+
+      joined =
+        pieces
+        |> Enum.join("")
+        |> String.trim()
+
+      assert joined == text
+
+      pieces
+      |> tl()
+      |> Enum.all?(&(&1 == "" or String.length(&1) <= 20))
+    end
+
+    test "re-wrapping is exact in both directions" do
+      text = Enum.map_join(1..15, fn _i -> "word " end)
+
+      state =
+        new_state()
+        |> State.stream_message({:entry, :system, text})
+        |> State.resize(16, 24)
+
+      assert State.log_line_count(state) > 2
+
+      widened = State.resize(state, 80, 24)
+      [entry] = widened.entries
+
+      # Back at the original width the display is the logical render again.
+      assert State.log_line_count(widened) == 2
+      assert Enum.map_join(entry.lines, &flatten/1) == text
+    end
+
+    test "a same-size or height-only resize re-wraps nothing" do
+      state = State.stream_message(new_state(), {:entry, :system, "some long line here"})
+
+      assert State.resize(state, 80, 24) == state
+      assert State.resize(state, 80, 40).entries == state.entries
+    end
+
+    test "the in-flight reply re-renders to the new width immediately" do
+      text = "one two three four five six seven eight nine ten"
+
+      state =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, text}, 1_000)
+        |> tick_once()
+
+      narrow = State.resize(state, 15, 24)
+
+      refute narrow.in_flight_lines == state.in_flight_lines
+      assert State.log_line_count(narrow) > State.log_line_count(state)
+      joined = Enum.map_join(narrow.in_flight_lines, &flatten/1)
+      assert String.trim(joined) == text
+    end
+
+    test "an above-cap in-flight reply keeps its last render across resize" do
+      over_cap = String.duplicate("x", 64 * 1024) <> "y"
+
+      state =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, over_cap}, 1_000)
+        |> tick_once()
+
+      assert state.in_flight_lines == nil
+      assert State.resize(state, 40, 24).in_flight_lines == state.in_flight_lines
+    end
+
+    test "wrap accounting and the windowed view agree after resize (no drift)" do
+      # 40 entries, each long enough to wrap several times at width 18.
+      full =
+        Enum.reduce(1..40, new_state(), fn i, acc ->
+          State.stream_message(acc, {:entry, :system, "entry number #{i} with plenty of words"})
+        end)
+
+      state = State.resize(full, 18, 24)
+
+      # The view's own log height drives both the offset math and the slice.
+      log_height = View.regions(state.size, 1, false).log.height
+      total = State.log_line_count(state)
+      assert total > log_height
+
+      # Follow: the bottom of the window is the last display row.
+      {viewed, _widget} =
+        state
+        |> View.render(%ExRatatui.Frame{width: 18, height: 24})
+        |> Enum.at(1)
+
+      visible = Enum.map(viewed.text, &flatten/1)
+      assert length(visible) == log_height
+      assert State.effective_scroll(state, log_height) == total - log_height
+      assert Enum.all?(visible, &(&1 == "" or String.length(&1) <= 18))
+
+      # Paging up twice moves exactly two viewports up the display list, and
+      # the shown rows are the accounting's rows — no gaps, no repeats.
+      {paged, nil} = State.handle_key(state, "page_up", [])
+      {paged2, nil} = State.handle_key(paged, "page_up", [])
+
+      offset = State.effective_scroll(paged2, log_height)
+      all = Enum.flat_map(paged2.entries, & &1.lines)
+
+      {viewed2, _widget2} =
+        paged2
+        |> View.render(%ExRatatui.Frame{width: 18, height: 24})
+        |> Enum.at(1)
+
+      expected =
+        all
+        |> Enum.drop(offset)
+        |> Enum.take(log_height)
+        |> Enum.map(&flatten/1)
+
+      assert Enum.map(viewed2.text, &flatten/1) == expected
+    end
+
+    test "follow stays pinned to the re-wrapped bottom across resize" do
+      state =
+        Enum.reduce(1..20, new_state(), fn i, acc ->
+          State.stream_message(acc, {:entry, :system, "wrapped words number #{i} keep coming"})
+        end)
+
+      narrow = State.resize(state, 12, 24)
+      assert narrow.follow?
+      assert State.effective_scroll(narrow, 24) == State.log_line_count(narrow) - 24
+    end
   end
 
   describe "paste/2" do
@@ -1090,4 +1233,7 @@ defmodule DashFloat.TUI.StateTest do
   end
 
   defp flatten(%ExRatatui.Text.Line{spans: spans}), do: Enum.map_join(spans, "", & &1.content)
+
+  # Runs one animation tick (rendering dirty in-flight lines), keeping state.
+  defp tick_once(state), do: elem(State.tick(state, 1_100), 0)
 end

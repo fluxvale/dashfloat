@@ -325,6 +325,51 @@ defmodule DashFloat.TUITest do
     assert State.input_text(state) == "zzzzz"
   end
 
+  # Issue #20: a resize re-wraps the log to the new width live — no restart,
+  # no restart of the turn, and nothing lost at the pane edge.
+  test "a resize re-wraps the log live and follow stays pinned" do
+    {:ok, pid} = start_tui()
+    long = "the quick brown fox jumps over the lazy dog again and again"
+
+    send(pid, {:entry, :system, long})
+    state = eventually(pid, &(State.log_line_count(&1) == 2))
+    assert State.log_line_count(state) == 2
+
+    inject(pid, %ExRatatui.Event.Resize{width: 20, height: 24})
+    narrowed = eventually(pid, &(State.log_line_count(&1) > 2))
+
+    assert narrowed.size == {20, 24}
+    assert narrowed.follow?
+    # Content still fits the viewport at this size, so follow pins at 0; make
+    # it overflow and confirm the pin moves with the wrapped bottom.
+    Enum.each(1..20, fn i -> send(pid, {:entry, :system, "#{i} #{long}"}) end)
+
+    full = eventually(pid, &(State.log_line_count(&1) > 24))
+    assert State.effective_scroll(full, 20) == State.log_line_count(full) - 20
+
+    # Full text survives the re-wrap, every row fits the new width.
+    [entry] = narrowed.entries
+    rows = Enum.map(entry.lines, &Enum.map_join(&1.spans, "", fn s -> s.content end))
+
+    joined =
+      rows
+      |> Enum.join("")
+      |> String.trim()
+
+    assert joined == long
+    assert Enum.all?(rows, &(&1 == "" or String.length(&1) <= 20))
+
+    # And the drawn frame really carries the wrapped rows, not a truncation.
+    term = ExRatatui.init_test_terminal(20, 24)
+    widgets = View.render(narrowed, %ExRatatui.Frame{width: 20, height: 24})
+    assert :ok = ExRatatui.draw(term, widgets)
+    buffer = ExRatatui.get_buffer_content(term)
+
+    for word <- ~w(jumps over lazy dog again) do
+      assert buffer =~ word
+    end
+  end
+
   test "paste, resize, key releases, unknown events, and stray messages are handled" do
     {:ok, pid} = start_tui()
 
@@ -360,6 +405,38 @@ defmodule DashFloat.TUITest do
 
     assert State.input_text(state) == "aline one\nline two\n\nline threeb"
     assert State.input_line_count(state) == 4
+  end
+
+  # Input-box wrap re-check (issue #20): the textarea wraps the draft itself
+  # (Rust-side, per frame at the area width), so a resize re-wraps it with no
+  # help from us; the box height stays bound to LOGICAL lines by ADR 0002 —
+  # wrapped overflow scrolls inside the box rather than growing it.
+  test "a long draft renders and stays whole through a narrow resize" do
+    {:ok, pid} = start_tui()
+    long = "https://example.com/" <> String.duplicate("segment-", 40)
+
+    inject(pid, %ExRatatui.Event.Paste{content: long})
+    pasted = get_state(pid)
+    assert State.input_text(pasted) == long
+    assert State.input_line_count(pasted) == 1
+
+    inject(pid, %ExRatatui.Event.Resize{width: 30, height: 12})
+    state = eventually(pid, &(&1.size == {30, 12}))
+
+    # One logical line still: the box keeps its idle height, wrap is visual.
+    assert State.input_line_count(state) == 1
+    assert State.input_text(state) == long
+
+    widgets = View.render(state, %ExRatatui.Frame{width: 30, height: 12})
+    {input_widget, input_rect} = Enum.at(widgets, 3)
+    assert input_widget.wrap_mode == :word_or_glyph
+    assert input_rect.height == View.input_height(1, 12)
+
+    # The narrow frame draws whole without raising; the cursor row stays
+    # visible (the textarea scrolls its own wrapped overflow).
+    term = ExRatatui.init_test_terminal(30, 12)
+    assert :ok = ExRatatui.draw(term, widgets)
+    assert ExRatatui.get_buffer_content(term) =~ "❯"
   end
 
   test "a very long unbroken paste stays one logical line and does not grow the box" do

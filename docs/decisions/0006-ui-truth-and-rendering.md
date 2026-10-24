@@ -1,6 +1,8 @@
 # 0006 — UI truth & rendering: markdown log, live status, activity line, input hardening
 
-- **Status:** Accepted
+- **Status:** Accepted; **amended 2026-10-24** ([issue #20](https://github.com/fluxvale/dashfloat/issues/20) —
+  the log word-wraps to the current width; see
+  [Amendment: log word-wrap](#amendment-log-word-wrap-issue-20) below)
 - **Date:** 2026-10-24
 - **Implements:** [issue #16](https://github.com/fluxvale/dashfloat/issues/16) — Phase 2.5 of the
   [ADR 0001](0001-founding-stack-and-architecture.md) roadmap.
@@ -124,7 +126,9 @@ colors — no rainbow.
   block ends (the following blank separator restores rhythm). No borders to
   draw, no width math — one line in, one line out.
 - **Where parsing runs** — in the UI process, never in `render/2`, in
-  exactly two bounded places:
+  exactly two bounded places *(amended: a third bounded moment — resize —
+  re-wraps without parsing; see the
+  [wrap amendment](#amendment-log-word-wrap-issue-20))*:
   1. **Finalize** — an assistant entry is rendered once at append time and
      the lines are stored on the entry. The entry *is* the parse cache.
   2. **The animation tick** — while streaming, the tick (≤ 8 Hz) re-renders
@@ -136,7 +140,8 @@ colors — no rainbow.
 - **Line accounting follows rendered lines** — `log_line_count/1` sums the
   stored line lists (plus the in-flight rendered lines). Scroll semantics
   (intent, clamp, follow-pin) are unchanged from ADR 0002; a re-render that
-  changes the count just re-clamps.
+  changes the count just re-clamps. *(Amended by the wrap amendment below:
+  the stored lists are wrapped display lines.)*
 
 ### Entries carry rendered lines
 
@@ -144,6 +149,9 @@ Entries become maps `%{kind: :user | :assistant | :tool | :system, text:
 String.t(), lines: [Line.t()]}` (was `{kind, text}`). `text` is kept verbatim
 for persistence (Phase 4); `lines` is the render truth built once at append
 by `DashFloat.TUI.Render.entry_lines/2`. The raw text never re-renders.
+*(Amended: entries also carry `logical` — the width-free render truth — and
+`lines` is its wrap at the current width, re-wrapped on resize; see the
+[wrap amendment](#amendment-log-word-wrap-issue-20).)*
 
 ### Status-bar truth
 
@@ -216,8 +224,11 @@ Sent before the terminal `{:phase, :idle}` when the provider includes usage
 - **Bracketed paste** — `ExRatatui.Event.Paste` (already wired) → normalize
   `\r\n` and lone `\r` to `\n`, then insert at the cursor. No size cap:
   a huge paste costs one bounded NIF insert; documented acceptance.
-- **Word wrap** — input `wrap_mode: :word_or_glyph` (above). Log lines still
-  truncate (ADR 0002's scroll-math decision stands; re-litigation refused).
+- **Word wrap** — input `wrap_mode: :word_or_glyph` (above). ~~Log lines
+  still truncate~~ Log lines word-wrap to the current width —
+  [Amendment: log word-wrap](#amendment-log-word-wrap-issue-20) below
+  reverses this clause (and ADR 0002's corresponding rejection); scroll math
+  follows wrapped display lines.
 - **Cursor movement** — the textarea's existing key set (arrows, Home/End,
   Ctrl+A/E/K/W) with history-aware Up/Down at draft boundaries (ADR 0002,
   unchanged).
@@ -269,7 +280,60 @@ The exact seams implementers build against:
   hint differently. Custom spans.
 - **Right-aligned status cluster** — alignment is per-`Line`, not per-span;
   a two-line bar wastes a row. Single left-flow chosen.
-- **Wrapped log lines** — ADR 0002 rejected; scroll math stays exact.
+- **Wrapped log lines** — ADR 0002 rejected; ~~scroll math stays exact~~
+  reversed by the wrap amendment below (wrapped scroll math is exact because
+  accounting counts the stored wrapped lines).
+
+## Amendment: log word-wrap (issue #20)
+
+Live testing (#20) showed the shipped contract truncating long log lines at
+the pane edge — cut off, not soft-wrapped — exactly as ADR 0002 had decided
+and this ADR had retained. The product answer changed: **the log wraps.**
+What was decided, amending this ADR (and ADR 0002's truncation clause):
+
+- **`DashFloat.TUI.Wrap`** owns the transform: `wrap(lines, width)` folds
+  each logical styled line into display lines no wider than the log region —
+  word boundaries first, glyph boundaries for runs too long for a row
+  (`:word_or_glyph`, same semantics as the input textarea). Styles travel
+  with the text; a line that fits is rebuilt span-for-span; a blank line
+  wraps to a blank line (separators keep the rhythm).
+- **Width accounting matches the Rust renderer** (`unicode-width`): East
+  Asian Wide/Fullwidth and emoji count two columns, combining marks and
+  format characters zero, everything else one — CJK/emoji never misalign
+  after a wrap. Unknown codepoints default to one column: an over-count can
+  wrap early, never truncate.
+- **Entries carry both truths**: `logical` (the width-free render, the parse
+  cache — still built once at append by `Render.entry_lines/2`) and `lines`
+  (its wrap at the current width — what the view renders and the scroll math
+  counts). `text` stays the persistence truth.
+- **Where wrapping runs** — the same bounded places parsing always ran:
+  append (inside `put_entry`), the tick's in-flight refresh, and now resize
+  (width change only, re-wrapping every entry from `logical` — no re-parse;
+  the in-flight reply re-renders from its text under the same 64 KiB cap).
+  Never per frame: `render/2` stays `O(viewport)`, slicing stored wrapped
+  lines.
+- **Scroll math counts display lines** — the invariant moved from
+  "display == logical (no wrapping)" to "accounting and rendering read the
+  same stored wrapped lists". `log_line_count/1`, `effective_scroll/2`, the
+  windowed slice, and the status position all agree by construction.
+  Continuation rows of a wrapped entry carry no prefix (a wrap point never
+  inherits leading whitespace); scroll *intents* survive resize and re-clamp
+  against the new counts.
+- **Input box unchanged** — the textarea wraps its own draft Rust-side, per
+  frame, at the area width, so resize re-wraps it for free; the box height
+  stays bound to logical lines (ADR 0002's clamp), wrapped overflow scrolling
+  inside the box.
+- **Why the shipped tests missed the bug**: they asserted on stored logical
+  lines and widget configuration (`wrap_mode: :word_or_glyph`) — never on
+  what a narrow terminal buffer actually received. The regression test now
+  draws a long entry into a 20-column test terminal and requires every word
+  to reach the buffer.
+
+ADR 0002's scroll-math rationale ("wrapped log lines" rejected; truncation
+keeps the math exact) is reversed by this amendment: wrapping keeps the math
+exact *by storing the wrapped lines as the counted truth*, and the
+truncation it defended was the bug.
+
 
 ## Consequences
 

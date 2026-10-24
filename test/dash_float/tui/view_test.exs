@@ -6,6 +6,7 @@ defmodule DashFloat.TUI.ViewTest do
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Theme
   alias DashFloat.TUI.View
+  alias DashFloat.TUI.Wrap
 
   defp new_state(opts \\ []) do
     [test_mode: {80, 24}]
@@ -208,6 +209,44 @@ defmodule DashFloat.TUI.ViewTest do
       assert Enum.any?(texts, &(&1 =~ "line 81"))
     end
 
+    # The full markdown vocabulary wraps coherently: every display row fits
+    # the width, nothing is lost, and blank separators keep the rhythm.
+    test "markdown entries wrap coherently across the block vocabulary" do
+      doc = """
+      # A heading long enough to wrap at twenty columns
+      Some paragraph with **bold** and *italic* and `code` inside it.
+      - a list item that is fairly long
+      - another item
+      > a quoted line that also wraps when narrow
+      ```
+      fenced code with a long line inside the block
+      ```
+      """
+
+      base = %{new_state(test_mode: {20, 24}) | phase: :streaming}
+
+      state =
+        base
+        |> State.stream_message({:token, doc}, 1_000)
+        |> then(fn s -> elem(State.tick(s, 1_100), 0) end)
+        |> State.stream_message({:phase, :idle}, 1_200)
+
+      [entry] = state.entries
+      rows = Enum.map(entry.lines, &flatten/1)
+
+      assert Enum.all?(rows, &(Wrap.width(&1) <= 20))
+
+      # Every word of the source survives somewhere in the wrapped rows.
+      joined = Enum.join(rows, " ")
+
+      for word <- ~w(heading columns paragraph italic fenced inside) do
+        assert joined =~ word
+      end
+
+      assert Enum.any?(rows, &(&1 =~ "• "))
+      assert Enum.any?(rows, &(&1 =~ "│ "))
+    end
+
     test "huge logs keep the widget text at viewport size" do
       state =
         Enum.reduce(1..10_000, new_state(), fn i, acc ->
@@ -248,10 +287,21 @@ defmodule DashFloat.TUI.ViewTest do
       assert :italic in span.style.modifiers
     end
 
-    test "very long entries do not break rendering" do
+    test "very long entries wrap instead of breaking rendering or losing text" do
       long = String.duplicate("x", 5_000)
       state = State.stream_message(new_state(), {:entry, :system, long})
-      assert [_separator, _text] = log_lines(state)
+      [entry] = state.entries
+
+      # Blank separator + one 80-column row per 80 chars; the wrapped pieces
+      # join back to exactly the input.
+      assert length(entry.lines) == 1 + div(5_000, 80) + 1
+      assert Enum.map_join(entry.lines, &flatten/1) == long
+
+      # The windowed view agrees with the accounting: follow shows the last
+      # 20 display rows — 19 full rows plus the 40-char tail, nothing else.
+      visible = log_lines(state)
+      assert length(visible) == 20
+      assert Enum.map_join(visible, &flatten/1) == String.duplicate("x", 19 * 80 + 40)
     end
 
     test "a tiny frame renders without raising" do
@@ -408,6 +458,24 @@ defmodule DashFloat.TUI.ViewTest do
       assert buffer =~ "ask anything"
       assert buffer =~ "Enter send"
     end
+
+    # Issue #20 repro: at a narrow width every word of a long entry must still
+    # reach the buffer (wrapped onto following rows), not stop at the first
+    # row's right edge.
+    test "long log lines wrap to the terminal width instead of truncating" do
+      base = new_state(test_mode: {20, 24})
+      state = State.stream_message(base, {:entry, :system, fox_text()})
+
+      term = ExRatatui.init_test_terminal(20, 24)
+      widgets = View.render(state, %ExRatatui.Frame{width: 20, height: 24})
+      assert :ok = ExRatatui.draw(term, widgets)
+
+      buffer = ExRatatui.get_buffer_content(term)
+
+      for word <- ~w(quick brown fox jumps over lazy dog again) do
+        assert buffer =~ word, "expected #{inspect(word)} to survive the wrap"
+      end
+    end
   end
 
   describe "input box" do
@@ -471,6 +539,8 @@ defmodule DashFloat.TUI.ViewTest do
     {widget, _rect} = activity(state)
     Enum.map_join(widget.text, "", &flatten/1)
   end
+
+  defp fox_text, do: "the quick brown fox jumps over the lazy dog again and again"
 
   defp input(state) do
     state
