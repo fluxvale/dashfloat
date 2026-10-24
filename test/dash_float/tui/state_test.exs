@@ -72,6 +72,8 @@ defmodule DashFloat.TUI.StateTest do
       assert state.follow? == true
       assert state.size == {80, 24}
       assert state.live? == false
+      assert state.agent_ref == nil
+      assert state.confirm == nil
       assert State.input_text(state) == ""
     end
 
@@ -87,10 +89,12 @@ defmodule DashFloat.TUI.StateTest do
              }
     end
 
-    test "mount opts carry the provider" do
+    test "mount opts carry the provider; the agent defaults to the name" do
       provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "m", api_key: "k"}}
       assert new_state(provider: provider).provider == provider
       assert new_state().provider == nil
+      assert new_state().agent == DashFloat.Agent
+      assert new_state(agent: self()).agent == self()
     end
   end
 
@@ -280,6 +284,60 @@ defmodule DashFloat.TUI.StateTest do
     end
   end
 
+  describe "handle_key/3 — confirmation mode" do
+    defp confirming do
+      ref = make_ref()
+
+      {State.stream_message(new_state(), {:confirm, ref, confirm_request(["+ x"])}), ref}
+    end
+
+    test "Enter and Ctrl+Enter approve; Esc rejects — both carry no state change" do
+      {state, _ref} = confirming()
+
+      assert {^state, {:confirm, :approved}} = State.handle_key(state, "enter", [])
+      assert {^state, {:confirm, :approved}} = State.handle_key(state, "enter", ["ctrl"])
+      assert {^state, {:confirm, :rejected}} = State.handle_key(state, "esc", [])
+    end
+
+    test "quit keys still quit mid-decision" do
+      {state, _ref} = confirming()
+      assert {_state, :quit} = State.handle_key(state, "q", ["ctrl"])
+      assert {_state, :quit} = State.handle_key(state, "c", ["ctrl"])
+    end
+
+    test "every other key is swallowed — nothing reaches the textarea" do
+      {state, _ref} = confirming()
+
+      for {code, mods} <- [
+            {"x", []},
+            {"enter", ["shift"]},
+            {"enter", ["alt"]},
+            {"up", []},
+            {"page_up", []}
+          ] do
+        {^state, nil} = State.handle_key(state, code, mods)
+      end
+
+      assert State.input_text(state) == ""
+    end
+
+    test "confirm_decided clears the confirm; the phase waits for the agent" do
+      {state, _ref} = confirming()
+      decided = State.confirm_decided(state)
+
+      assert decided.confirm == nil
+      assert decided.phase == :confirming
+
+      # After the decision the keys route normally again (no swallowing,
+      # no cancel — the gap is one mailbox hop).
+      {gap, nil} = State.handle_key(decided, "esc", [])
+      assert gap == decided
+
+      {typed, nil} = State.handle_key(decided, "x", [])
+      assert State.input_text(typed) == "x"
+    end
+  end
+
   describe "handle_key/3 — history-aware Up/Down" do
     test "Up on the first row enters history; Down on the last row leaves it" do
       base =
@@ -430,6 +488,102 @@ defmodule DashFloat.TUI.StateTest do
 
       assert pairs(state) == [{:tool, "[tool] ran"}, {:system, "reconnected"}]
     end
+
+    test "tool_call appends a gear row summarizing the path argument" do
+      state =
+        State.stream_message(
+          new_state(),
+          {:tool_call, %{id: "t1", name: "read_file", args: %{"path" => "lib/foo.ex"}}}
+        )
+
+      [entry] = state.entries
+      assert entry.kind == :tool
+      assert entry.text == "⚙ read_file lib/foo.ex"
+      assert Enum.map(entry.lines, &flatten/1) == ["", "⚙ read_file lib/foo.ex"]
+    end
+
+    test "tool_call summarizes execute_command by its command; bare name without either" do
+      cmd =
+        State.stream_message(
+          new_state(),
+          {:tool_call, %{id: "t2", name: "execute_command", args: %{"command" => "mix test"}}}
+        )
+
+      assert pairs(cmd) == [{:tool, "⚙ execute_command mix test"}]
+
+      bare =
+        State.stream_message(new_state(), {:tool_call, %{id: "t3", name: "list_dir", args: %{}}})
+
+      assert pairs(bare) == [{:tool, "⚙ list_dir"}]
+    end
+
+    test "tool_result appends the status row with dim, indented, verbatim output" do
+      state =
+        State.stream_message(
+          new_state(),
+          {:tool_result,
+           %{id: "t1", name: "read_file", ok: true, status: "ok", output: "line one\nline two"}}
+        )
+
+      [entry] = state.entries
+      assert entry.kind == :tool
+      assert entry.text == "⚙ read_file → ok\nline one\nline two"
+
+      assert Enum.map(entry.lines, &flatten/1) == [
+               "",
+               "⚙ read_file → ok",
+               "  line one",
+               "  line two"
+             ]
+    end
+
+    test "tool_result without output is a single row" do
+      state =
+        State.stream_message(
+          new_state(),
+          {:tool_result,
+           %{id: "t1", name: "write_file", ok: false, status: "rejected", output: nil}}
+        )
+
+      [entry] = state.entries
+      assert entry.text == "⚙ write_file → rejected"
+      assert Enum.map(entry.lines, &flatten/1) == ["", "⚙ write_file → rejected"]
+    end
+
+    test "confirm appends the preview entry, arms the decision, flips to :confirming" do
+      ref = make_ref()
+
+      state =
+        State.stream_message(
+          new_state(),
+          {:confirm, ref,
+           %{
+             id: "c1",
+             name: "write_file",
+             args: %{"path" => "a.ex"},
+             lines: ["@@ -1 +1 @@", "- old", "+ new", "$ mix format"]
+           }}
+        )
+
+      [entry] = state.entries
+      assert entry.kind == :tool
+      assert entry.text == "@@ -1 +1 @@\n- old\n+ new\n$ mix format"
+      assert length(entry.lines) == 5
+      assert state.confirm == %{ref: ref, id: "c1", name: "write_file"}
+      assert state.phase == :confirming
+    end
+
+    test ":confirming is an active phase: it ticks and steps the spinner" do
+      state =
+        State.stream_message(new_state(), {:confirm, make_ref(), confirm_request(["+ x"])})
+
+      assert State.needs_tick?(state)
+
+      {ticked, :cont} = State.tick(state, 1_000)
+      assert ticked.anim_step == 1
+    end
+
+    defp confirm_request(lines), do: %{id: "c", name: "write_file", args: %{}, lines: lines}
 
     test "entry text is kept verbatim, trailing newlines included" do
       state = State.stream_message(new_state(), {:entry, :system, "note\n\n"})
@@ -677,6 +831,7 @@ defmodule DashFloat.TUI.StateTest do
 
       active = %{new_state() | phase: :streaming}
       assert State.needs_tick?(active)
+      assert State.needs_tick?(%{new_state() | phase: :confirming})
 
       assert State.needs_tick?(%{active | tick_ref: make_ref()}) == false
     end
@@ -777,88 +932,110 @@ defmodule DashFloat.TUI.StateTest do
     end
   end
 
-  describe "task monitoring" do
-    test "claim_task records the pid and monitor ref" do
-      pid = self()
-      ref = make_ref()
-      state = State.claim_task(new_state(), pid, ref)
-      assert state.task_pid == pid
-      assert state.task_ref == ref
+  describe "agent monitoring" do
+    test "claim_agent stores the monitor ref" do
+      base = new_state(agent: self())
+      state = State.claim_agent(base)
+      assert is_reference(state.agent_ref)
+      Process.demonitor(state.agent_ref)
     end
 
-    test "Esc cancels only while streaming with a live task" do
-      pid = spawn(fn -> Process.sleep(1_000) end)
-      state = State.claim_task(new_state(), pid, make_ref())
+    test "Esc cancels while streaming or executing a tool; a no-op otherwise" do
+      streaming = %{new_state() | phase: :streaming}
+      assert {^streaming, :cancel} = State.handle_key(streaming, "esc", [])
 
-      assert {%{phase: :streaming} = streaming, :cancel} =
-               State.handle_key(%{state | phase: :streaming}, "esc", [])
+      tool = %{new_state() | phase: :executing_tool}
+      assert {^tool, :cancel} = State.handle_key(tool, "esc", [])
 
-      assert streaming == %{state | phase: :streaming}
-
-      # Idle: no cancel, and the key does not reach the textarea.
-      assert {%{phase: :idle} = idle, nil} = State.handle_key(%{state | phase: :idle}, "esc", [])
+      # Idle (and the post-decision confirming gap): no cancel, and the key
+      # does not reach the textarea.
+      assert {%{phase: :idle} = idle, nil} = State.handle_key(new_state(), "esc", [])
       assert State.input_text(idle) == ""
 
-      # Streaming without a task pid (already released) is a no-op.
-      assert {%{task_pid: nil}, nil} =
-               State.handle_key(%{state | phase: :streaming, task_pid: nil}, "esc", [])
+      gap = %{new_state() | phase: :confirming}
+      assert {^gap, nil} = State.handle_key(gap, "esc", [])
     end
 
-    test "a normal task DOWN finalizes a partial reply, ensures idle, clears the pid" do
+    test "a normal agent DOWN finalizes a partial reply, ensures idle, clears the ref" do
       ref = make_ref()
 
       state =
         new_state()
-        |> State.claim_task(self(), ref)
+        |> Map.put(:agent_ref, ref)
         |> State.stream_message({:token, "partial"}, 1_000)
 
-      {after_down, handled} = State.task_down(state, ref, :normal)
+      {after_down, handled} = State.agent_down(state, ref, :normal)
       assert handled == :handled
       assert after_down.phase == :idle
-      assert after_down.task_ref == nil
-      assert after_down.task_pid == nil
+      assert after_down.agent_ref == nil
       assert after_down.in_flight == nil
       assert {:assistant, "partial"} in pairs(after_down)
     end
 
-    test "a :noproc DOWN (monitor attached after a fast exit) is a success" do
+    test "a :noproc DOWN (monitor attached to an already-dead name) is a success" do
       ref = make_ref()
+      state = %{new_state() | agent_ref: ref}
 
-      state =
-        new_state()
-        |> State.claim_task(self(), ref)
-        |> State.stream_message({:phase, :idle})
-
-      {after_down, handled} = State.task_down(state, ref, :noproc)
+      {after_down, handled} = State.agent_down(state, ref, :noproc)
       assert handled == :handled
       assert after_down.phase == :idle
       assert after_down.entries == []
-      assert after_down.task_ref == nil
+      assert after_down.agent_ref == nil
     end
 
-    test "an abnormal task DOWN degrades to idle with a system entry" do
+    test "an abnormal agent DOWN degrades to idle with an [agent failed] entry" do
       ref = make_ref()
 
       state =
         new_state()
-        |> State.claim_task(self(), ref)
+        |> Map.put(:agent_ref, ref)
         |> State.stream_message({:token, "partial reply"}, 1_000)
 
-      {after_down, handled} = State.task_down(state, ref, :killed)
+      {after_down, handled} = State.agent_down(state, ref, :killed)
       assert handled == :handled
-      assert after_down.task_ref == nil
+      assert after_down.agent_ref == nil
       assert after_down.phase == :idle
+
       # the partial reply is kept as an assistant entry, then explained
       assert {:assistant, "partial reply"} in pairs(after_down)
+      assert {:system, "[agent failed: :killed]"} in pairs(after_down)
+    end
 
-      assert Enum.any?(after_down.entries, fn entry ->
-               entry.kind == :system and entry.text =~ "stream failed"
-             end)
+    test "an agent DOWN mid-confirm disarms the modal so input keeps working" do
+      ref = make_ref()
+
+      state =
+        new_state()
+        |> Map.put(:agent_ref, ref)
+        |> State.stream_message({:confirm, make_ref(), confirm_request(["+ x"])})
+
+      assert state.confirm != nil
+
+      {after_down, :handled} = State.agent_down(state, ref, :killed)
+      assert after_down.confirm == nil
+      assert after_down.phase == :idle
+
+      # A phase transition alone (no agent death, no decision) disarms too.
+      armed = State.stream_message(new_state(), {:confirm, make_ref(), confirm_request(["+ y"])})
+      retired = State.stream_message(armed, {:phase, :idle})
+      assert retired.confirm == nil
+      assert retired.phase == :idle
+    end
+
+    test "the failure entry inspects the reason to a 120-char slice" do
+      reason = {:boom, String.duplicate("x", 300)}
+      state = %{new_state() | agent_ref: make_ref()}
+
+      {after_down, :handled} = State.agent_down(state, state.agent_ref, reason)
+
+      expected = "[agent failed: #{String.slice(inspect(reason), 0, 120)}]"
+      assert {:system, expected} in pairs(after_down)
+      assert String.length(expected) == 120 + String.length("[agent failed: ]")
     end
 
     test "a foreign DOWN ref is ignored" do
-      state = State.claim_task(new_state(), self(), make_ref())
-      {after_down, handled} = State.task_down(state, make_ref(), :killed)
+      state = %{new_state() | agent_ref: make_ref()}
+      {after_down, handled} = State.agent_down(state, make_ref(), :killed)
       assert handled == :ignored
       assert after_down.phase == :idle
       assert after_down.entries == []

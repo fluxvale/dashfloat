@@ -1,15 +1,17 @@
 defmodule DashFloat.TUITest do
   @moduledoc """
   App-level tests under `test_mode`: supervised lifecycle, teardown paths
-  (including crashes), the real streaming producer, and the responsiveness
-  proof. Not async: they measure timing, share telemetry handlers, and open
-  real loopback sockets.
+  (including crashes), the agent seam (fake agents are this test process or
+  plain spawned processes — the TUI only ever sends
+  `{:prompt, ui, text}` / `{:confirm_decision, ref, decision}` / `{:cancel}`
+  and receives the frozen stream contract, ADR 0007), and the responsiveness
+  proof. Not async: they measure timing, share telemetry handlers, and drive
+  one supervised TUI per test.
   """
 
   use ExUnit.Case, async: false
 
   alias DashFloat.Config
-  alias DashFloat.SSEServer
   alias DashFloat.TUI
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
@@ -17,10 +19,13 @@ defmodule DashFloat.TUITest do
 
   @opts [test_mode: {80, 24}, name: nil]
 
-  @headers "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
-
   defp start_tui(opts \\ []) do
-    opts = Keyword.merge(@opts, opts)
+    # The default fake agent is the test process: the TUI's sends land in
+    # this mailbox and each test answers with contract messages.
+    opts =
+      @opts
+      |> Keyword.merge(opts)
+      |> Keyword.put_new(:agent, self())
 
     # A real supervisor, mirroring the Application wiring (restart: :temporary).
     {:ok, sup} =
@@ -34,34 +39,12 @@ defmodule DashFloat.TUITest do
     Process.unlink(sup)
     on_exit(fn -> if Process.alive?(sup), do: Supervisor.stop(sup) end)
 
-    # A torn-down TUI can leave its producer running for a few ms; later tests
-    # assert on the app-wide supervisor's children, so drain before they run.
-    on_exit(fn -> await_no_tasks(200) end)
-
     [{TUI, pid, :worker, _modules}] = Supervisor.which_children(sup)
     {:ok, pid}
   end
 
-  defp await_no_tasks(tries) do
-    cond do
-      Task.Supervisor.children(DashFloat.StreamSupervisor) == [] -> :ok
-      tries > 0 -> Process.sleep(10) && await_no_tasks(tries - 1)
-      true -> :ok
-    end
-  end
-
-  defp provider(base_url) do
-    {:ok, %Config{base_url: base_url, model: "test-model", api_key: "test-key-123"}}
-  end
-
-  defp start_server(script) do
-    {:ok, server} = SSEServer.start_link(script)
-    on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
-    server
-  end
-
-  defp frame(content) do
-    ~s(data: {"choices":[{"index":0,"delta":{"content":"#{content}"}}]}\n\n)
+  defp provider do
+    {:ok, %Config{base_url: "http://localhost:1", model: "test-model", api_key: "test-key-123"}}
   end
 
   defp press(pid, code, modifiers \\ []) do
@@ -108,18 +91,8 @@ defmodule DashFloat.TUITest do
   defp entry?(state, kind, text),
     do: Enum.any?(state.entries, &(&1.kind == kind and &1.text == text))
 
-  test "supervised start renders, typed input accumulates, and a real stream lands" do
-    server =
-      start_server([
-        {:send, [@headers, frame("Hello")]},
-        {:sleep, 200},
-        {:send, frame(" from the engine")},
-        {:sleep, 200},
-        {:send, "data: [DONE]\n\n"},
-        :close
-      ])
-
-    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+  test "supervised start renders, typed input accumulates, and an agent stream lands" do
+    {:ok, pid} = start_tui(provider: provider())
     assert Runtime.snapshot(pid).render_count >= 1
 
     type(pid, "hello tui")
@@ -128,21 +101,27 @@ defmodule DashFloat.TUITest do
 
     press(pid, "enter")
 
-    # Mid-stream: the reply grows in flight (one token per frame) and is not
-    # finalized until the idle phase.
+    # Submit is a plain send to the agent with our pid as the reply address.
+    assert_receive {:prompt, ui_pid, "hello tui"}, 1_000
+    assert ui_pid == pid
+
+    # Mid-stream: the reply grows in flight (one token per message) and is
+    # not finalized until the idle phase.
+    send(ui_pid, {:token, "Hello"})
     streaming = eventually(pid, fn s -> s.in_flight == "Hello" end)
     assert streaming.phase == :streaming
     assert entry?(streaming, :user, "hello tui")
 
-    grown = eventually(pid, fn s -> s.in_flight == "Hello from the engine" end)
+    send(ui_pid, {:token, " from the agent"})
+    grown = eventually(pid, fn s -> s.in_flight == "Hello from the agent" end)
     assert grown.phase == :streaming
 
+    send(ui_pid, {:phase, :idle})
     state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
 
-    assert entry?(state, :assistant, "Hello from the engine")
+    assert entry?(state, :assistant, "Hello from the agent")
     assert state.history == ["hello tui"]
     assert system_entries(state) == []
-    assert state.task_ref == nil
 
     # The status bar names the configured model and reports phase truth.
     assert State.provider_model(state) == "test-model"
@@ -150,21 +129,20 @@ defmodule DashFloat.TUITest do
     assert status_text(state) =~ "Idle"
   end
 
-  test "Esc cancels mid-stream: partial reply kept, [cancelled] logged, input usable" do
-    server =
-      start_server([
-        {:send, [@headers, frame("partial")]},
-        {:sleep, 1_000},
-        {:send, frame(" late")},
-        {:sleep, 100},
-        {:wait_close, 3_000}
-      ])
-
-    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+  test "Esc during streaming sends {:cancel} to the agent and the agent's ack lands" do
+    {:ok, pid} = start_tui()
     submit(pid, "cancel me")
 
+    assert_receive {:prompt, ui_pid, "cancel me"}, 1_000
+    send(ui_pid, {:token, "partial"})
     eventually(pid, fn s -> s.in_flight == "partial" end)
+
     press(pid, "esc")
+    assert_receive {:cancel}, 1_000
+
+    # The agent's half of the cancel contract: explanation + idle.
+    send(ui_pid, {:entry, :system, "[cancelled]"})
+    send(ui_pid, {:phase, :idle})
 
     state =
       eventually(pid, fn s ->
@@ -172,53 +150,10 @@ defmodule DashFloat.TUITest do
       end)
 
     assert entry?(state, :assistant, "partial")
-    refute Enum.any?(state.entries, &(&1.text =~ "late"))
 
     # Input is usable again.
     submit(pid, "again")
-    eventually(pid, fn s -> s.phase == :streaming and State.input_text(s) == "" end)
-  end
-
-  test "a mid-stream server disconnect degrades to idle with an explanation" do
-    server = start_server([{:send, [@headers, frame("partial")]}, :close])
-    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
-
-    submit(pid, "drop")
-
-    state =
-      eventually(pid, fn s ->
-        s.phase == :idle and
-          "[llm: stream ended without completion]" in system_entries(s)
-      end)
-
-    assert entry?(state, :assistant, "partial")
-
-    # Still typeable.
-    type(pid, "next")
-    typed_again = get_state(pid)
-    assert State.input_text(typed_again) == "next"
-  end
-
-  test "without a provider, submit degrades to setup instructions and stays usable" do
-    {:ok, pid} = start_tui()
-    submit(pid, "hello")
-
-    state =
-      eventually(pid, fn s ->
-        entries = system_entries(s)
-
-        s.phase == :idle and
-          Enum.any?(entries, &String.contains?(&1, "[llm: no provider configured"))
-      end)
-
-    assert entry?(state, :user, "hello")
-    assert State.provider_model(state) == nil
-    # Token fields are omitted entirely until something has streamed.
-    refute status_text(state) =~ "ctx"
-
-    type(pid, "again")
-    typed_again = get_state(pid)
-    assert State.input_text(typed_again) == "again"
+    assert_receive {:prompt, ^ui_pid, "again"}, 1_000
   end
 
   test "quit keys stop the supervised app with reason :normal" do
@@ -254,9 +189,15 @@ defmodule DashFloat.TUITest do
 
   test "history is reachable through real key events" do
     {:ok, pid} = start_tui()
+
     submit(pid, "first")
+    assert_receive {:prompt, ui_pid, "first"}, 1_000
+    send(ui_pid, {:phase, :idle})
     eventually(pid, &(&1.phase == :idle))
+
     submit(pid, "second")
+    assert_receive {:prompt, ^ui_pid, "second"}, 1_000
+    send(ui_pid, {:phase, :idle})
     eventually(pid, &(&1.phase == :idle))
 
     press(pid, "up")
@@ -272,54 +213,65 @@ defmodule DashFloat.TUITest do
   end
 
   @tag :capture_log
-  test "a dead producer degrades to idle instead of bricking input" do
-    server =
-      start_server([
-        {:send, [@headers, frame("slow")]},
-        {:sleep, 1_000},
-        {:send, frame(" later")},
-        {:sleep, 100},
-        {:wait_close, 3_000}
-      ])
+  test "a dead agent degrades to idle with an explanation instead of bricking input" do
+    agent =
+      spawn(fn ->
+        receive do
+          {:prompt, ui, _text} -> send(ui, {:token, "slow"})
+        end
 
-    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+        # Park until the test kills this process.
+        :timer.sleep(:infinity)
+      end)
+
+    {:ok, pid} = start_tui(agent: agent)
     submit(pid, "hello")
 
     eventually(pid, fn s -> s.in_flight == "slow" end)
-    [task] = Task.Supervisor.children(DashFloat.StreamSupervisor)
-    Process.exit(task, :kill)
+    Process.exit(agent, :kill)
 
     state =
       eventually(pid, fn s ->
         entries = system_entries(s)
-        s.phase == :idle and Enum.any?(entries, &String.contains?(&1, "stream failed"))
+        s.phase == :idle and Enum.any?(entries, &String.contains?(&1, "agent failed"))
       end)
 
-    assert state.task_ref == nil
-    assert state.task_pid == nil
+    assert state.agent_ref == nil
     assert entry?(state, :user, "hello")
+    assert entry?(state, :assistant, "slow")
 
-    # Input is usable again: submit works (the server replays its script).
-    submit(pid, "again")
-    eventually(pid, fn s -> s.phase == :streaming and State.input_text(s) == "" end)
+    # Input is usable again: typing works and a fresh submit still flips to
+    # :streaming optimistically (the dead agent just never answers).
+    type(pid, "again")
+    typed = get_state(pid)
+    assert State.input_text(typed) == "again"
+
+    press(pid, "enter")
+    eventually(pid, &(&1.phase == :streaming))
   end
 
-  @tag :capture_log
-  test "a fast completed stream never logs spurious stream failures (noproc race)" do
-    server = start_server([{:send, [@headers, "data: [DONE]\n\n"]}, :close])
-    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+  test "a normally-exiting agent logs no failure (idle finalize only)" do
+    agent =
+      spawn(fn ->
+        receive do
+          {:prompt, ui, _text} ->
+            send(ui, {:token, "done"})
+            send(ui, {:phase, :idle})
+        end
+      end)
 
-    Enum.each(1..3, fn i ->
-      submit(pid, "q#{i}")
-      eventually(pid, fn s -> s.phase == :idle and s.task_ref == nil end)
-    end)
+    {:ok, pid} = start_tui(agent: agent)
+    submit(pid, "quick")
 
-    state = get_state(pid)
-    assert state.task_ref == nil
+    # The agent answers then exits :normal; the DOWN must not read as failure.
+    state =
+      eventually(pid, fn s ->
+        s.phase == :idle and s.agent_ref == nil and
+          Enum.any?(s.entries, &(&1.kind == :assistant))
+      end)
 
-    refute Enum.any?(state.entries, fn entry ->
-             entry.kind == :system and String.contains?(entry.text, "stream failed")
-           end)
+    assert entry?(state, :assistant, "done")
+    assert system_entries(state) == []
   end
 
   @tag :capture_log
@@ -371,56 +323,6 @@ defmodule DashFloat.TUITest do
 
     assert state.in_flight == expected
     assert State.input_text(state) == "zzzzz"
-  end
-
-  @tag :capture_log
-  test "keystroke round-trips stay fast while the real engine streams at cadence" do
-    frames = Enum.map(1..40, &frame("t#{&1} "))
-
-    script =
-      [{:send, @headers}] ++
-        Enum.flat_map(frames, &[{:send, &1}, {:sleep, 10}]) ++
-        [{:send, "data: [DONE]\n\n"}, :close]
-
-    server = start_server(script)
-    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
-
-    submit(pid, "drip")
-
-    eventually(pid, fn s -> s.in_flight != nil end)
-
-    timings_ms =
-      Enum.map(1..5, fn _i ->
-        {micros, :ok} = :timer.tc(fn -> press(pid, "z") end)
-        div(micros, 1000)
-      end)
-
-    assert Enum.max(timings_ms) < 100,
-           "input round-trips #{inspect(timings_ms)}ms while the engine streams"
-
-    state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
-
-    expected = Enum.map_join(1..40, "", &"t#{&1} ")
-    assert entry?(state, :assistant, expected)
-    assert State.input_text(state) == "zzzzz"
-  end
-
-  test "an unreadable or invalid config still degrades to the setup instructions" do
-    # {:error, _} and nil both land on the same guidance: the TUI stays usable
-    # and never echoes the file contents or values.
-    {:ok, pid} = start_tui(provider: {:error, "invalid JSON in /x/config.json"})
-    submit(pid, "hello")
-
-    state =
-      eventually(pid, fn s ->
-        entries = system_entries(s)
-
-        s.phase == :idle and
-          Enum.any?(entries, &String.contains?(&1, "[llm: no provider configured"))
-      end)
-
-    entries = system_entries(state)
-    refute Enum.any?(entries, &String.contains?(&1, "/x/config.json"))
   end
 
   test "paste, resize, key releases, unknown events, and stray messages are handled" do
@@ -480,7 +382,10 @@ defmodule DashFloat.TUITest do
 
   test "cursor movement within a pasted multi-line draft is row-aware" do
     {:ok, pid} = start_tui()
+
     submit(pid, "seed")
+    assert_receive {:prompt, ui_pid, "seed"}, 1_000
+    send(ui_pid, {:phase, :idle})
     eventually(pid, &(&1.phase == :idle))
 
     inject(pid, %ExRatatui.Event.Paste{content: "row one\nrow two\nrow three"})
@@ -526,6 +431,23 @@ defmodule DashFloat.TUITest do
 
     assert Runtime.snapshot(pid).render_count == before
     assert get_state(pid).tick_ref == nil
+  end
+
+  # ADR 0006 extension along ADR 0007: a confirm phase is active (it ticks),
+  # and the tick must die again the moment the agent ends the turn.
+  test "the tick dies again after a confirm phase resolves to idle" do
+    {:ok, pid} = start_tui()
+
+    send(pid, {:confirm, make_ref(), confirm_request(["+ x"])})
+    eventually(pid, fn s -> s.phase == :confirming and s.tick_ref != nil end)
+
+    send(pid, {:phase, :idle})
+    state = eventually(pid, fn s -> s.phase == :idle and s.tick_ref == nil end)
+    assert state.confirm == nil
+
+    before = Runtime.snapshot(pid).render_count
+    Process.sleep(300)
+    assert Runtime.snapshot(pid).render_count == before
   end
 
   test "a stale tick is dropped: no double-step, no orphan timer, no frame" do
@@ -620,16 +542,11 @@ defmodule DashFloat.TUITest do
     end
   end
 
-  test "renders increase while a stream is live and freeze again after :idle" do
-    script =
-      [{:send, @headers}] ++
-        Enum.flat_map(1..10, fn i -> [{:sleep, 60}, {:send, frame("t#{i} ")}] end) ++
-        [{:send, "data: [DONE]\n\n"}, :close]
-
-    server = start_server(script)
-    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+  test "renders increase while a turn is live and freeze again after :idle" do
+    {:ok, pid} = start_tui()
 
     submit(pid, "animate")
+    assert_receive {:prompt, ui_pid, "animate"}, 1_000
 
     # While active there is always a tick pending and the frame counter climbs.
     eventually(pid, fn s -> s.phase == :streaming and s.tick_ref != nil end)
@@ -637,10 +554,11 @@ defmodule DashFloat.TUITest do
     Process.sleep(250)
     assert Runtime.snapshot(pid).render_count > during
 
-    # The tick stepped the spinner while the stream was running.
+    # The tick stepped the spinner while the turn was open.
     stepped = eventually(pid, fn s -> s.anim_step > 0 end)
     assert stepped.anim_step > 0
 
+    send(ui_pid, {:phase, :idle})
     state = eventually(pid, fn s -> s.phase == :idle and s.tick_ref == nil end)
     assert state.tick_ref == nil
 
@@ -651,27 +569,20 @@ defmodule DashFloat.TUITest do
   end
 
   test "the render counter is the metric of record: it ticks during activity only" do
-    script = [
-      {:send, [@headers, frame("one")]},
-      {:sleep, 600},
-      {:send, frame(" two")},
-      {:send, "data: [DONE]\n\n"},
-      :close
-    ]
-
-    server = start_server(script)
-    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+    {:ok, pid} = start_tui()
 
     idle_before = Runtime.snapshot(pid).render_count
     submit(pid, "rate")
+    assert_receive {:prompt, ui_pid, "rate"}, 1_000
     eventually(pid, fn s -> s.phase == :streaming end)
 
-    # Sample across the slow gap: the activity tick alone drives renders.
+    # Sample across a quiet gap: the activity tick alone drives renders.
     start_count = Runtime.snapshot(pid).render_count
     Process.sleep(400)
     active_delta = Runtime.snapshot(pid).render_count - start_count
     assert active_delta >= 2, "expected tick-driven renders, saw #{active_delta}"
 
+    send(ui_pid, {:phase, :idle})
     eventually(pid, fn s -> s.phase == :idle and s.tick_ref == nil end)
     idle_after = Runtime.snapshot(pid).render_count
     Process.sleep(300)
@@ -680,21 +591,15 @@ defmodule DashFloat.TUITest do
   end
 
   test "a usage frame reconciles token counts before the terminal idle phase" do
-    usage =
-      ~s(data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":42,"total_tokens":162}}\n\n)
-
-    server =
-      start_server([
-        {:send, [@headers, frame("Hello")]},
-        {:send, usage},
-        {:send, "data: [DONE]\n\n"},
-        :close
-      ])
-
-    {:ok, pid} = start_tui(provider: provider(SSEServer.base_url(server)))
+    {:ok, pid} = start_tui()
     :ok = Runtime.enable_trace(pid, limit: 500)
 
     submit(pid, "count me")
+    assert_receive {:prompt, ui_pid, "count me"}, 1_000
+
+    send(ui_pid, {:token, "Hello"})
+    send(ui_pid, {:usage, %{prompt_tokens: 120, completion_tokens: 42, total_tokens: 162}})
+    send(ui_pid, {:phase, :idle})
 
     state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
 
@@ -713,6 +618,114 @@ defmodule DashFloat.TUITest do
     assert usage_at < idle_at
 
     assert status_text(state) =~ "ctx 162"
+  end
+
+  test "tool rows land in the log and the executing_tool phase names itself" do
+    {:ok, pid} = start_tui()
+
+    send(pid, {:tool_call, %{id: "t1", name: "read_file", args: %{"path" => "lib/foo.ex"}}})
+
+    state = eventually(pid, fn s -> s.entries != [] end)
+
+    assert [%{kind: :tool, text: "⚙ read_file lib/foo.ex", lines: lines}] = state.entries
+    assert flatten_lines(lines) == ["", "⚙ read_file lib/foo.ex"]
+
+    send(
+      pid,
+      {:tool_result, %{id: "t1", name: "read_file", ok: true, status: "ok", output: "one\ntwo"}}
+    )
+
+    eventually(pid, fn s -> length(s.entries) == 2 end)
+
+    send(pid, {:phase, :executing_tool})
+    tool_phase = eventually(pid, fn s -> s.phase == :executing_tool end)
+    assert status_text(tool_phase) =~ "Running tool"
+
+    send(pid, {:phase, :idle})
+    eventually(pid, &(&1.phase == :idle))
+  end
+
+  test "the full confirm round trip: preview, decision, and swallowed keys" do
+    {:ok, pid} = start_tui()
+    submit(pid, "edit that file")
+    assert_receive {:prompt, ui_pid, "edit that file"}, 1_000
+
+    ref = make_ref()
+
+    send(
+      ui_pid,
+      {:confirm, ref,
+       %{
+         id: "call_1",
+         name: "write_file",
+         args: %{"path" => "lib/foo.ex"},
+         lines: ["@@ -1,2 +1,3 @@", "- old line", "+ new line", "$ mix format lib/foo.ex"]
+       }}
+    )
+
+    state = eventually(pid, fn s -> s.phase == :confirming end)
+    assert state.confirm == %{ref: ref, id: "call_1", name: "write_file"}
+
+    # The preview landed as a tool entry (blank separator + 4 preview rows).
+    [preview] = for(%{kind: :tool} = entry <- state.entries, do: entry)
+    assert preview.text == "@@ -1,2 +1,3 @@\n- old line\n+ new line\n$ mix format lib/foo.ex"
+
+    assert flatten_lines(preview.lines) == [
+             "",
+             "@@ -1,2 +1,3 @@",
+             "- old line",
+             "+ new line",
+             "$ mix format lib/foo.ex"
+           ]
+
+    # The activity line prompts the decision instead of offering interrupt.
+    assert activity_text(state) =~ "Approve this change?"
+    assert activity_text(state) =~ "⏎ approve · esc reject"
+
+    # Everything but Enter/Esc is swallowed — keys and pastes alike, the
+    # draft stays untouched.
+    press(pid, "x")
+    press(pid, "enter", ["shift"])
+    inject(pid, %ExRatatui.Event.Paste{content: "pasted mid-decision"})
+    swallowed = get_state(pid)
+    assert State.input_text(swallowed) == ""
+
+    # Enter approves: the decision carries the confirm ref to the agent.
+    press(pid, "enter")
+    assert_receive {:confirm_decision, ^ref, :approved}, 1_000
+
+    decided = eventually(pid, fn s -> s.confirm == nil end)
+    assert decided.phase == :confirming
+
+    # The agent resumes — a tool result rows in, then the turn ends.
+    send(
+      ui_pid,
+      {:tool_result,
+       %{id: "call_1", name: "write_file", ok: true, status: "ok", output: "wrote 3 lines"}}
+    )
+
+    send(ui_pid, {:phase, :idle})
+    approved = eventually(pid, fn s -> s.phase == :idle end)
+    assert entry?(approved, :tool, "⚙ write_file → ok\nwrote 3 lines")
+
+    # Second round: Esc rejects.
+    ref2 = make_ref()
+    send(ui_pid, {:confirm, ref2, confirm_request(["+ again"])})
+    eventually(pid, fn s -> s.confirm != nil end)
+
+    press(pid, "esc")
+    assert_receive {:confirm_decision, ^ref2, :rejected}, 1_000
+
+    send(
+      ui_pid,
+      {:tool_result,
+       %{id: "call_2", name: "write_file", ok: false, status: "cancelled", output: nil}}
+    )
+
+    send(ui_pid, {:phase, :idle})
+    rejected = eventually(pid, fn s -> s.phase == :idle end)
+    assert entry?(rejected, :tool, "⚙ write_file → cancelled")
+    assert State.input_text(rejected) == ""
   end
 
   test "child_spec/1 is temporary and a worker" do
@@ -735,6 +748,8 @@ defmodule DashFloat.TUITest do
     refute TUI in child_ids
   end
 
+  defp confirm_request(lines), do: %{id: "c", name: "write_file", args: %{}, lines: lines}
+
   defp inject(pid, event) do
     GenServer.call(pid, {:ex_ratatui_runtime_inject_event, event})
   end
@@ -748,6 +763,19 @@ defmodule DashFloat.TUITest do
     [line] = widget.text
     Enum.map_join(line.spans, "", & &1.content)
   end
+
+  defp activity_text(state) do
+    {widget, _rect} =
+      state
+      |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+      |> Enum.at(2)
+
+    [line] = widget.text
+    Enum.map_join(line.spans, "", & &1.content)
+  end
+
+  defp flatten_lines(lines),
+    do: Enum.map(lines, &Enum.map_join(&1.spans, "", fn span -> span.content end))
 
   defp attach_disconnect_listener do
     handler_id = {:disconnect_test, make_ref()}
