@@ -760,7 +760,25 @@ defmodule DashFloat.TUI.State do
       else: min(state.scroll, max_offset)
   end
 
-  defp page_up(state) do
+  defp page_up(state), do: scroll(state, :up, log_height(state))
+  defp page_down(state), do: scroll(state, :down, log_height(state))
+
+  # One wheel notch scrolls three lines — the terminal convention for
+  # alternate-screen apps (issue #21; ADR 0006 amendment).
+  @wheel_lines 3
+
+  @doc """
+  Scrolls the log one wheel notch. Wheel routing is focus-free (ADR 0006
+  amendment): it always addresses the log view — never the input draft —
+  including mid-confirmation. Semantics mirror the page keys at line
+  granularity: up unfollows (with page_up's nothing-to-scroll guard), down
+  re-pins at the bottom.
+  """
+  @spec wheel_scroll(t(), :up | :down) :: t()
+  def wheel_scroll(state, :up), do: scroll(state, :up, @wheel_lines)
+  def wheel_scroll(state, :down), do: scroll(state, :down, @wheel_lines)
+
+  defp scroll(state, :up, step) do
     height = log_height(state)
 
     # Nothing to scroll (empty or viewport-sized log): stay pinned. Unfollowing
@@ -768,14 +786,14 @@ defmodule DashFloat.TUI.State do
     if log_line_count(state) - height <= 0 do
       state
     else
-      %{state | follow?: false, scroll: max(effective_scroll(state, height) - max(height, 1), 0)}
+      %{state | follow?: false, scroll: max(effective_scroll(state, height) - max(step, 1), 0)}
     end
   end
 
-  defp page_down(state) do
+  defp scroll(state, :down, step) do
     height = log_height(state)
     bottom = max(log_line_count(state) - height, 0)
-    target = effective_scroll(state, height) + max(height, 1)
+    target = effective_scroll(state, height) + max(step, 1)
 
     if target >= bottom do
       %{state | scroll: 0, follow?: true}

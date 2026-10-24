@@ -920,6 +920,50 @@ defmodule DashFloat.TUI.StateTest do
       assert State.effective_scroll(down_two, 20) == 180
     end
 
+    test "wheel_scroll: one notch is three lines; up unfollows, down re-pins at the bottom" do
+      base = full_state(100)
+      assert State.effective_scroll(base, 20) == 180
+
+      wheeled = State.wheel_scroll(base, :up)
+      refute wheeled.follow?
+      assert State.effective_scroll(wheeled, 20) == 177
+
+      again = State.wheel_scroll(wheeled, :up)
+      assert State.effective_scroll(again, 20) == 174
+
+      down = State.wheel_scroll(again, :down)
+      refute down.follow?
+      assert State.effective_scroll(down, 20) == 177
+
+      pinned = State.wheel_scroll(down, :down)
+      assert pinned.follow?
+      assert State.effective_scroll(pinned, 20) == 180
+    end
+
+    test "wheel up on a viewport-sized log is a no-op (stays pinned)" do
+      base = full_state(10)
+      assert State.log_line_count(base) == 20
+      assert State.wheel_scroll(base, :up) == base
+    end
+
+    test "wheel scrolling stays live while a confirm is pending (focus-free)" do
+      base = full_state(100)
+
+      state =
+        State.stream_message(
+          base,
+          {:confirm, make_ref(), %{id: "c", name: "w", args: %{}, lines: ["+ x"]}}
+        )
+
+      assert state.phase == :confirming
+
+      # The activity row is up while confirming: the log viewport is 19 rows.
+      bottom = State.effective_scroll(state, 19)
+      wheeled = State.wheel_scroll(state, :up)
+      refute wheeled.follow?
+      assert State.effective_scroll(wheeled, 19) == bottom - 3
+    end
+
     test "new content does not move an unfollowed view, but clamping still holds" do
       base = full_state(100)
       {paged, nil} = State.handle_key(base, "page_up", [])
