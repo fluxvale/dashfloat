@@ -564,7 +564,6 @@ defmodule DashFloat.AgentTest do
   end
 
   @tag :tmp_dir
-  @tag :tmp_dir
   test "an aborted batch never sends literal null tool results to the model", ctx do
     # Two calls: a long command (cancelled mid-run by message) and a queued
     # read that never runs. Every announced call must carry real JSON.

@@ -25,6 +25,24 @@ defmodule DashFloat.Tools.RunnerTest do
     %{root: root, src: src, docs: docs, readme: readme}
   end
 
+  # chmod-000 assertions are meaningless for root.
+  setup :skip_permission_test_for_root
+
+  defp skip_permission_test_for_root(context) do
+    if context[:skip_if_root] && root?() do
+      {:skip, "chmod-000 is not a permission barrier for root"}
+    else
+      :ok
+    end
+  end
+
+  defp root? do
+    case System.cmd("id", ["-u"]) do
+      {"0\n", 0} -> true
+      _other -> false
+    end
+  end
+
   defp validate!(name, args), do: elem(Tools.validate(name, args), 1)
 
   defp run(name, args, root, opts \\ []),
@@ -140,6 +158,37 @@ defmodule DashFloat.Tools.RunnerTest do
 
     assert result.ok == false
     assert result.error =~ "illegal operation on a directory"
+  end
+
+  @tag :skip_if_root
+  test "unreadable files degrade to permission errors on both read paths", %{root: root} do
+    big = Path.join(root, "big-secret.log")
+    File.write!(big, String.duplicate("x", 300 * 1024))
+    small = Path.join(root, "small-secret.txt")
+    File.write!(small, "x")
+    File.chmod!(big, 0)
+    File.chmod!(small, 0)
+
+    streamed = run("read_file", %{"path" => "big-secret.log"}, root)
+
+    assert streamed == %{
+             ok: false,
+             path: "big-secret.log",
+             error: "could not read file: permission denied"
+           }
+
+    buffered = run("read_file", %{"path" => "small-secret.txt"}, root)
+
+    assert buffered == %{
+             ok: false,
+             path: "small-secret.txt",
+             error: "could not read file: permission denied"
+           }
+  after
+    big = Path.join(root, "big-secret.log")
+    small = Path.join(root, "small-secret.txt")
+    File.chmod(big, 0o600)
+    File.chmod(small, 0o600)
   end
 
   test "read_file on a directory degrades to an error, not a raise", %{root: root} do

@@ -129,10 +129,19 @@ defmodule DashFloat.Tools.Runner do
           |> Enum.join("\n")
           |> Edit.sanitize()
 
+        # No stray leading newline when the cap cut every line (a single
+        # over-cap line shows zero lines; the marker must still read cleanly).
         content =
-          if truncated,
-            do: joined <> "\n… [truncated: showing #{length(shown)} lines]",
-            else: joined
+          cond do
+            truncated and joined == "" ->
+              "… [truncated: showing 0 of #{length(wanted)} lines — line exceeds the byte cap]"
+
+            truncated ->
+              joined <> "\n… [truncated: showing #{length(shown)} lines]"
+
+            true ->
+              joined
+          end
 
         %{
           ok: true,

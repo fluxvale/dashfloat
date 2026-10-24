@@ -29,8 +29,8 @@ defmodule DashFloat.LLM.ChatStream do
   # The episode's own accumulations (content + tool-call ids, names, and
   # argument fragments) are bounded too: a trickling endpoint that never trips
   # the idle timeout or the frame cap must not grow them without bound
-  # (ADR 0007 §2). The call COUNT is capped separately — a hostile stream of
-  # fresh-index id-only deltas grows the accumulator map, not its bytes.
+  # (ADR 0007 §2). The distinct-call COUNT is capped separately — a hostile
+  # stream of fresh indices grows the accumulator map, not its bytes.
   @episode_limit 4 * 1024 * 1024
   @max_tool_calls 64
   @drain_timeout 5_000
@@ -150,8 +150,7 @@ defmodule DashFloat.LLM.ChatStream do
           parser: SSE.new(),
           tool_calls: ToolCalls.new(),
           content: "",
-          tool_bytes: 0,
-          calls_opened: 0
+          tool_bytes: 0
         })
   end
 
@@ -283,7 +282,7 @@ defmodule DashFloat.LLM.ChatStream do
         emit_usage(agent, decoded, acc)
 
         cond do
-          acc.calls_opened > @max_tool_calls ->
+          ToolCalls.count(acc.tool_calls) > @max_tool_calls ->
             {:error, "[llm: more than #{@max_tool_calls} tool calls — stream aborted]", acc}
 
           episode_bytes(acc) > @episode_limit ->
@@ -340,25 +339,23 @@ defmodule DashFloat.LLM.ChatStream do
   defp emit_tool_calls(acc, %{"choices" => [%{"delta" => %{"tool_calls" => deltas}} | _rest]})
        when is_list(deltas) do
     # Bytes count id + name + argument fragments (all model-controlled
-    # growth), and each id-bearing delta opens a call (the count cap below).
-    {bytes, opened} =
-      Enum.reduce(deltas, {0, 0}, fn
-        %{"id" => id} = delta, {sum, opened} when is_binary(id) ->
-          {sum + byte_size(id) + name_bytes(delta) + args_bytes(delta), opened + 1}
-
-        delta, {sum, opened} ->
-          {sum + name_bytes(delta) + args_bytes(delta), opened}
+    # growth). The call-count cap counts DISTINCT indices via ToolCalls.
+    bytes =
+      Enum.reduce(deltas, 0, fn delta, sum ->
+        sum + id_bytes(delta) + name_bytes(delta) + args_bytes(delta)
       end)
 
     %{
       acc
       | tool_calls: ToolCalls.feed(acc.tool_calls, deltas),
-        tool_bytes: acc.tool_bytes + bytes,
-        calls_opened: acc.calls_opened + opened
+        tool_bytes: acc.tool_bytes + bytes
     }
   end
 
   defp emit_tool_calls(acc, _decoded), do: acc
+
+  defp id_bytes(%{"id" => id}) when is_binary(id), do: byte_size(id)
+  defp id_bytes(_delta), do: 0
 
   defp name_bytes(%{"function" => %{"name" => name}}) when is_binary(name), do: byte_size(name)
   defp name_bytes(_delta), do: 0

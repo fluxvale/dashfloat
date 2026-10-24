@@ -975,6 +975,54 @@ defmodule DashFloat.LLM.ChatStreamTest do
     await_exit(ref)
   end
 
+  test "an id-less fresh-index spray is capped too (entries, not ids, count)" do
+    bare_index = fn index ->
+      ~s(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":#{index}}]}}]}\n\n)
+    end
+
+    frames = Enum.map(0..64, bare_index)
+
+    server =
+      start_server([
+        {:send, [@headers | frames]},
+        {:send, "data: [DONE]\n\n"},
+        :close
+      ])
+
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    assert ["[llm: more than 64 tool calls — stream aborted]"] = failures(collect())
+    await_exit(ref)
+  end
+
+  test "one call split into many id-echoing fragments is NOT capped" do
+    # Compat servers echo id+name on every fragment; a large write_file splits
+    # into dozens of them. Distinct indices are what count — this must pass.
+    echo_fragment = fn fragment ->
+      ~s(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_big","type":"function","function":{"name":"write_file","arguments":#{Jason.encode!(fragment)}}}]}}]}\n\n)
+    end
+
+    pieces = for i <- 1..70, do: echo_fragment.("chunk#{i};")
+
+    server =
+      start_server([
+        {:send, [@headers | pieces]},
+        {:send, "data: [DONE]\n\n"},
+        :close
+      ])
+
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    messages = collect()
+
+    assert failures(messages) == []
+
+    assert {:stream_done, %{tool_calls: [%{id: "call_big", name: "write_file"}]}} =
+             done(messages)
+
+    await_exit(ref)
+  end
+
   defp json_response(status, body) do
     "HTTP/1.1 #{status} Error\r\ncontent-type: application/json\r\n" <>
       "content-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n" <> body

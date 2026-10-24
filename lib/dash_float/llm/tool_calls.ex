@@ -42,6 +42,13 @@ defmodule DashFloat.LLM.ToolCalls do
     |> Enum.map(&build_call/1)
   end
 
+  @doc """
+  Distinct indices accumulated so far — the caller's call-count cap counts
+  CALLS (an index's many fragments are one call), not deltas.
+  """
+  @spec count(t()) :: non_neg_integer()
+  def count(%__MODULE__{calls: calls}), do: map_size(calls)
+
   defp merge(delta, %__MODULE__{calls: calls} = acc) when is_map(delta) do
     case delta["index"] do
       index when is_integer(index) and index >= 0 ->
