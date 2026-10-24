@@ -740,12 +740,13 @@ defmodule DashFloat.TUITest do
     assert TUI.exit_code({:error, :boom}) == 1
   end
 
-  test "the TUI is absent from the application supervision tree in test env" do
+  test "the TUI and agent are absent from the application supervision tree in test env" do
     children = Supervisor.which_children(DashFloat.Supervisor)
     child_ids = Enum.map(children, &elem(&1, 0))
-    # the stream supervisor is up; the TUI is gated out of :test
-    assert DashFloat.StreamSupervisor in child_ids
+    # the task supervisor is up; the TUI and agent are gated out of :test
+    assert DashFloat.TaskSupervisor in child_ids
     refute TUI in child_ids
+    refute DashFloat.Agent in child_ids
   end
 
   defp confirm_request(lines), do: %{id: "c", name: "write_file", args: %{}, lines: lines}
