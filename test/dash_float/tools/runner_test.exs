@@ -7,6 +7,9 @@ defmodule DashFloat.Tools.RunnerTest do
   setup do
     tmp = System.tmp_dir!()
     root = Path.join(tmp, "df-run-#{System.unique_integer([:positive])}")
+    # A killed run can leave its sandbox behind and unique_integer can collide
+    # with it; start from a clean slate.
+    File.rm_rf(root)
     src = Path.join(root, "src")
     docs = Path.join(root, "docs")
     readme = Path.join(root, "readme.md")
@@ -110,6 +113,33 @@ defmodule DashFloat.Tools.RunnerTest do
     window = run("read_file", %{"path" => "big.log", "offset" => 2, "limit" => 2}, root)
     assert window.truncated == true
     assert window.content =~ "… [truncated: showing 2 lines]"
+  end
+
+  test "a streamed read cut by the byte cap reports truncated honestly", %{root: root} do
+    # 300 lines of ~1 KiB: the window asks for all of them, the 64 KiB cap
+    # keeps only ~64 — the result must say truncated, not claim completeness.
+    big = Enum.map_join(1..300, &(String.pad_trailing("line #{&1}", 1000) <> "\n"))
+    wide = Path.join(root, "wide.log")
+    File.write!(wide, big)
+
+    result = run("read_file", %{"path" => "wide.log", "offset" => 1, "limit" => 300}, root)
+
+    assert result.ok == true
+    assert result.truncated == true
+    assert result.lines < 300
+    assert result.content =~ "… [truncated: showing #{result.lines} lines]"
+  end
+
+  test "read_file on a large directory degrades to the read error, not a raise", %{root: root} do
+    dir = Path.join(root, "many")
+    File.mkdir_p!(dir)
+    # 30_000 entries push the directory's inode past the streamed-path floor.
+    Enum.each(1..30_000, &File.touch!(Path.join(dir, "f#{&1}")))
+
+    result = run("read_file", %{"path" => "many"}, root)
+
+    assert result.ok == false
+    assert result.error =~ "illegal operation on a directory"
   end
 
   test "read_file on a directory degrades to an error, not a raise", %{root: root} do
@@ -238,6 +268,26 @@ defmodule DashFloat.Tools.RunnerTest do
 
     assert result.ok == false
     assert result.error =~ "could not write file"
+  end
+
+  test "writes onto the working directory itself are refused before any temp", %{root: root} do
+    for {tool, extra} <- [
+          {"write_file", %{"content" => "x"}},
+          {"edit_file", %{"search_block" => "a", "replace_block" => "b"}}
+        ] do
+      result = run(tool, Map.merge(%{"path" => "."}, extra), root)
+
+      assert result == %{
+               ok: false,
+               path: ".",
+               error: "path is the working directory itself"
+             }
+    end
+
+    # The parent of the sandbox stays clean: no temp file ever crossed out.
+    parent = Path.dirname(root)
+    {:ok, siblings} = File.ls(parent)
+    refute Enum.any?(siblings, &String.contains?(&1, ".df-tmp-"))
   end
 
   ## edit_file
@@ -469,7 +519,9 @@ defmodule DashFloat.Tools.RunnerTest do
     dir = Path.join(root, "many")
     File.mkdir_p!(dir)
 
-    Enum.each(1..501, fn i ->
+    # Created in REVERSE so readdir order differs from alphabetical: the shown
+    # window must be the true alphabetical head, not creation order sorted.
+    Enum.each(501..1//-1, fn i ->
       digits = Integer.to_string(i)
       padded = String.pad_leading(digits, 4, "0")
       File.write!(Path.join(dir, "f" <> padded), "x")
@@ -481,6 +533,7 @@ defmodule DashFloat.Tools.RunnerTest do
     assert result.count == 501
     assert result.truncated == true
     assert List.first(result.entries) == "- f0001"
+    assert List.last(result.entries) == "- f0500"
   end
 
   test "list_directory on a missing directory", %{root: root} do

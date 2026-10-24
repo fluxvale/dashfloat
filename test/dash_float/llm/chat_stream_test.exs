@@ -951,6 +951,30 @@ defmodule DashFloat.LLM.ChatStreamTest do
     await_exit(ref)
   end
 
+  test "a flood of fresh-index id-only deltas is capped by call count" do
+    # Each delta opens a new index carrying a large id: bytes stay under the
+    # episode cap while the accumulator map grows — the count cap stops it.
+    id_only = fn index ->
+      ~s(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":#{index},"id":"#{String.duplicate("i", 1024)}-#{index}","type":"function","function":{"name":"read_file","arguments":""}}]}}]}\n\n)
+    end
+
+    frames = Enum.map(0..64, id_only)
+
+    server =
+      start_server([
+        {:send, [@headers | frames]},
+        {:send, "data: [DONE]\n\n"},
+        :close
+      ])
+
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    messages = collect()
+
+    assert ["[llm: more than 64 tool calls — stream aborted]"] = failures(messages)
+    await_exit(ref)
+  end
+
   defp json_response(status, body) do
     "HTTP/1.1 #{status} Error\r\ncontent-type: application/json\r\n" <>
       "content-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n" <> body

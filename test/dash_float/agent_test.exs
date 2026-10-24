@@ -141,8 +141,6 @@ defmodule DashFloat.AgentTest do
     Enum.find(messages, &match?(%{"role" => "tool", "tool_call_id" => ^id}, &1))
   end
 
-  defp sandbox_file(ctx, relative), do: Path.join(ctx.tmp_dir, relative)
-
   ## The end-to-end round trip
 
   @tag :tmp_dir
@@ -518,7 +516,7 @@ defmodule DashFloat.AgentTest do
         final_episode()
       ])
 
-    {agent, sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
     send(agent, {:prompt, self(), "run it"})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
@@ -563,6 +561,55 @@ defmodule DashFloat.AgentTest do
     assert_receive {:entry, :system, "[tool run cancelled]"}, 2_000
     assert_receive {:phase, :idle}, 2_000
     refute_receive {:sse_request, "POST", _, _, _second}, 300
+  end
+
+  @tag :tmp_dir
+  @tag :tmp_dir
+  test "an aborted batch never sends literal null tool results to the model", ctx do
+    # Two calls: a long command (cancelled mid-run by message) and a queued
+    # read that never runs. Every announced call must carry real JSON.
+    frames =
+      tool_frames("call_run", "execute_command", [~s({"command":"sleep 10"})]) ++
+        tool_frames_1("call_read", "read_file", [~s({"path":"never.txt"})])
+
+    server =
+      start_server([
+        [{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close]
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 30_000)
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:confirm, run_ref, %{id: "call_run"}}, 2_000
+    send(agent, {:confirm_decision, run_ref, :approved})
+    assert_receive {:phase, :executing_tool}, 1_000
+
+    # Cancel while the command runs: Exec reaps it and reports cancelled; the
+    # queued read is filled cancelled by the abort — never a dangling "null".
+    send(agent, {:cancel})
+
+    assert_receive {:tool_result, %{id: "call_run", status: "cancelled"}}, 3_000
+    assert_receive {:entry, :system, "[tool run cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    state = :sys.get_state(agent)
+
+    tool_messages =
+      state
+      |> Map.fetch!(:messages)
+      |> Enum.filter(&(&1.role == "tool"))
+
+    assert length(tool_messages) == 2
+    assert Enum.all?(tool_messages, &(&1.content != "null"))
+
+    for id <- ["call_run", "call_read"] do
+      assert %{"ok" => false, "cancelled" => true} =
+               tool_messages
+               |> Enum.find(&(&1.tool_call_id == id))
+               |> Map.fetch!(:content)
+               |> Jason.decode!()
+    end
   end
 
   @tag :tmp_dir

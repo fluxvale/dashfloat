@@ -26,10 +26,13 @@ defmodule DashFloat.LLM.ChatStream do
   # A single SSE frame that never completes would grow the parser buffer until
   # the node dies: cap it (the parser itself stays pure and unbounded).
   @frame_limit 1024 * 1024
-  # The episode's own accumulations (content + tool argument fragments) are
-  # bounded too: a trickling endpoint that never trips the idle timeout or the
-  # frame cap must not grow them without bound (ADR 0007 §2).
+  # The episode's own accumulations (content + tool-call ids, names, and
+  # argument fragments) are bounded too: a trickling endpoint that never trips
+  # the idle timeout or the frame cap must not grow them without bound
+  # (ADR 0007 §2). The call COUNT is capped separately — a hostile stream of
+  # fresh-index id-only deltas grows the accumulator map, not its bytes.
   @episode_limit 4 * 1024 * 1024
+  @max_tool_calls 64
   @drain_timeout 5_000
   # finch's socket `receive_timeout` is the primary idle detector (it is
   # strictly shorter than the stream loop's timer, so its error arrives first);
@@ -147,7 +150,8 @@ defmodule DashFloat.LLM.ChatStream do
           parser: SSE.new(),
           tool_calls: ToolCalls.new(),
           content: "",
-          tool_bytes: 0
+          tool_bytes: 0,
+          calls_opened: 0
         })
   end
 
@@ -278,12 +282,17 @@ defmodule DashFloat.LLM.ChatStream do
         acc = emit_tool_calls(acc, decoded)
         emit_usage(agent, decoded, acc)
 
-        if episode_bytes(acc) > @episode_limit do
-          # Checked per frame: a single batch carrying many frames must not
-          # slip the whole batch past the cap.
-          {:error, "[llm: episode exceeded 4 MiB — stream aborted]", acc}
-        else
-          emit_frames(agent, provider, resp, rest, acc)
+        cond do
+          acc.calls_opened > @max_tool_calls ->
+            {:error, "[llm: more than #{@max_tool_calls} tool calls — stream aborted]", acc}
+
+          episode_bytes(acc) > @episode_limit ->
+            # Checked per frame: a single batch carrying many frames must not
+            # slip the whole batch past the cap.
+            {:error, "[llm: episode exceeded 4 MiB — stream aborted]", acc}
+
+          true ->
+            emit_frames(agent, provider, resp, rest, acc)
         end
 
       # A data frame that is not JSON is a broken stream, not a keepalive.
@@ -330,23 +339,34 @@ defmodule DashFloat.LLM.ChatStream do
   # binaries and parse once, at the end (ADR 0007 §1).
   defp emit_tool_calls(acc, %{"choices" => [%{"delta" => %{"tool_calls" => deltas}} | _rest]})
        when is_list(deltas) do
-    bytes =
-      Enum.reduce(deltas, 0, fn
-        %{"function" => %{"arguments" => fragment}}, sum when is_binary(fragment) ->
-          sum + byte_size(fragment)
+    # Bytes count id + name + argument fragments (all model-controlled
+    # growth), and each id-bearing delta opens a call (the count cap below).
+    {bytes, opened} =
+      Enum.reduce(deltas, {0, 0}, fn
+        %{"id" => id} = delta, {sum, opened} when is_binary(id) ->
+          {sum + byte_size(id) + name_bytes(delta) + args_bytes(delta), opened + 1}
 
-        _delta, sum ->
-          sum
+        delta, {sum, opened} ->
+          {sum + name_bytes(delta) + args_bytes(delta), opened}
       end)
 
     %{
       acc
       | tool_calls: ToolCalls.feed(acc.tool_calls, deltas),
-        tool_bytes: acc.tool_bytes + bytes
+        tool_bytes: acc.tool_bytes + bytes,
+        calls_opened: acc.calls_opened + opened
     }
   end
 
   defp emit_tool_calls(acc, _decoded), do: acc
+
+  defp name_bytes(%{"function" => %{"name" => name}}) when is_binary(name), do: byte_size(name)
+  defp name_bytes(_delta), do: 0
+
+  defp args_bytes(%{"function" => %{"arguments" => fragment}}) when is_binary(fragment),
+    do: byte_size(fragment)
+
+  defp args_bytes(_delta), do: 0
 
   defp episode_bytes(acc), do: byte_size(acc.content) + acc.tool_bytes
 

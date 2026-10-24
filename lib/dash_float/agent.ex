@@ -216,10 +216,11 @@ defmodule DashFloat.Agent do
   ## Monitors
 
   # A runner dying after the user cancelled (however it died): abort the batch
-  # with a cancelled result for the announced call.
+  # with a cancelled result for the announced call. The monitor ref is matched
+  # so a stale DOWN from an unrelated monitor cannot abort a live batch.
   def handle_info(
-        {:DOWN, _ref, :process, _down_pid, _reason},
-        %__MODULE__{tool_slot: {:running_cancelled, _ref2, _pid, call}} = state
+        {:DOWN, ref, :process, _down_pid, _reason},
+        %__MODULE__{tool_slot: {:running_cancelled, ref, _pid, call}} = state
       ) do
     state = %{state | tool_slot: :none}
     abort_tool_run(state, call)
@@ -453,33 +454,36 @@ defmodule DashFloat.Agent do
 
   # Abort the batch: unresolved calls (from the current index on) get cancelled
   # results so the transcript stays round-trippable; no model re-prompt.
-  # `current == nil` means the current call already recorded its own result.
+  # `current == nil` means the current call already recorded its own result —
+  # both paths fill every remaining call (a nil result would encode as the
+  # string "null" in the tool message).
   defp abort_tool_run(state, nil) do
-    finish_cancelled(%{state | tool_slot: :none})
+    fill_cancelled(%{state | tool_slot: :none})
   end
 
   defp abort_tool_run(state, current) do
+    display(state.ui, {:tool_result, tool_result_msg(current, %{ok: false, cancelled: true})})
+    fill_cancelled(%{state | tool_slot: :none})
+  end
+
+  defp fill_cancelled(state) do
     cancelled = %{ok: false, cancelled: true}
-    display(state.ui, {:tool_result, tool_result_msg(current, cancelled)})
 
     results =
       state.calls
       |> Enum.drop(state.call_index)
       |> Enum.reduce(state.results, &Map.put(&2, &1.id, cancelled))
 
-    finish_cancelled(%{state | results: results})
-  end
-
-  defp finish_cancelled(state) do
     tool_messages =
       Enum.map(state.calls, fn call ->
-        %{role: "tool", tool_call_id: call.id, content: Jason.encode!(state.results[call.id])}
+        %{role: "tool", tool_call_id: call.id, content: Jason.encode!(results[call.id])}
       end)
 
     state = %{
       state
       | status: :idle,
         messages: state.messages ++ tool_messages,
+        results: results,
         call_index: length(state.calls)
     }
 
