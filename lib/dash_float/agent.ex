@@ -221,7 +221,10 @@ defmodule DashFloat.Agent do
         {:DOWN, ref, :process, _pid, reason},
         %__MODULE__{status: :streaming, stream_ref: ref} = state
       ) do
-    state = state |> finalize_episode(state.episode_content) |> reset_turn()
+    state =
+      state
+      |> finalize_episode(state.episode_content)
+      |> reset_turn()
 
     display(state.ui, {:entry, :system, "[stream failed: #{inspect_slice(reason)}]"})
     display(state.ui, {:phase, :idle})
@@ -263,14 +266,22 @@ defmodule DashFloat.Agent do
       display(state.ui, {:entry, :system, "[model returned nothing]"})
     end
 
-    state = state |> finalize_episode(content) |> reset_turn()
+    state =
+      state
+      |> finalize_episode(content)
+      |> reset_turn()
+
     if state.pending_usage, do: display(state.ui, {:usage, state.pending_usage})
     display(state.ui, {:phase, :idle})
     {:noreply, state}
   end
 
   defp end_turn_cancelled(state, content) do
-    state = state |> finalize_episode(content) |> reset_turn()
+    state =
+      state
+      |> finalize_episode(content)
+      |> reset_turn()
+
     display(state.ui, {:entry, :system, "[cancelled]"})
     display(state.ui, {:phase, :idle})
     {:noreply, state}
@@ -312,27 +323,28 @@ defmodule DashFloat.Agent do
   defp next_call(%__MODULE__{call_index: index} = state) do
     call = Enum.at(state.calls, index)
 
-    cond do
-      call.error ->
-        error = %{ok: false, error: call.error}
+    case classify(call) do
+      {:error, error} ->
         display(state.ui, {:tool_call, %{id: call.id, name: call.name, args: call.args}})
         display(state.ui, {:tool_result, tool_result_msg(call, error)})
         record_and_continue(state, call, error)
 
-      true ->
-        case Tools.validate(call.name, call.args || %{}) do
-          {:error, message} ->
-            error = %{ok: false, error: message}
-            display(state.ui, {:tool_call, %{id: call.id, name: call.name, args: call.args}})
-            display(state.ui, {:tool_result, tool_result_msg(call, error)})
-            record_and_continue(state, call, error)
+      # Normalized args (defaults filled) flow to preview, display, and runner.
+      {:ok, args} ->
+        call = %{call | args: args}
+        display(state.ui, {:tool_call, %{id: call.id, name: call.name, args: args}})
+        dispatch_validated(state, call)
+    end
+  end
 
-          # Normalized args (defaults filled) flow to preview, display, and runner.
-          {:ok, args} ->
-            call = %{call | args: args}
-            display(state.ui, {:tool_call, %{id: call.id, name: call.name, args: args}})
-            dispatch_validated(state, call)
-        end
+  # A stream-level error (malformed JSON arguments) short-circuits validation;
+  # otherwise validation itself is the gate.
+  defp classify(%{error: error}) when is_binary(error), do: {:error, %{ok: false, error: error}}
+
+  defp classify(call) do
+    case Tools.validate(call.name, call.args || %{}) do
+      {:error, message} -> {:error, %{ok: false, error: message}}
+      {:ok, args} -> {:ok, args}
     end
   end
 
@@ -413,17 +425,17 @@ defmodule DashFloat.Agent do
       |> Enum.drop(state.call_index)
       |> Enum.reduce(state.results, &Map.put(&2, &1.id, cancelled))
 
-    state = %{state | results: results, call_index: length(state.calls)}
-
     tool_messages =
       Enum.map(state.calls, fn call ->
-        %{role: "tool", tool_call_id: call.id, content: Jason.encode!(state.results[call.id])}
+        %{role: "tool", tool_call_id: call.id, content: Jason.encode!(results[call.id])}
       end)
 
     state = %{
       state
       | status: :idle,
         messages: state.messages ++ tool_messages,
+        results: results,
+        call_index: length(state.calls),
         tool_slot: :none
     }
 
@@ -457,13 +469,12 @@ defmodule DashFloat.Agent do
   ## Display helpers
 
   defp display(ui, message) when is_pid(ui), do: send(ui, message)
-  defp display(_no_ui_yet, _message), do: :ok
 
   defp tool_result_msg(call, result) do
     %{
       id: call.id,
       name: call.name,
-      ok: !!result[:ok],
+      ok: result[:ok] == true,
       status: result_status(result),
       output: display_excerpt(result)
     }
@@ -490,10 +501,16 @@ defmodule DashFloat.Agent do
         if length(lines) <= @display_lines do
           body
         else
-          lines |> Enum.take(@display_lines) |> Enum.join("\n")
+          lines
+          |> Enum.take(@display_lines)
+          |> Enum.join("\n")
         end
     end
   end
 
-  defp inspect_slice(reason), do: String.slice(inspect(reason), 0, 120)
+  defp inspect_slice(reason) do
+    reason
+    |> inspect()
+    |> String.slice(0, 120)
+  end
 end

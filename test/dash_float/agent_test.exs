@@ -99,7 +99,42 @@ defmodule DashFloat.AgentTest do
   end
 
   # Decodes the messages array of a forwarded request body.
-  defp request_messages(body), do: body |> Jason.decode!() |> Map.fetch!("messages")
+  defp request_messages(body) do
+    body
+    |> Jason.decode!()
+    |> Map.fetch!("messages")
+  end
+
+  defp tool_result_of(body, id) do
+    body
+    |> request_messages()
+    |> tool_result_message(id)
+  end
+
+  defp read_sandbox(ctx, relative) do
+    ctx.tmp_dir
+    |> Path.join(relative)
+    |> File.read!()
+  end
+
+  defp write_sandbox(ctx, relative, content) do
+    ctx.tmp_dir
+    |> Path.join(relative)
+    |> File.write!(content)
+  end
+
+  defp sandbox_exists?(ctx, relative) do
+    ctx.tmp_dir
+    |> Path.join(relative)
+    |> File.exists?()
+  end
+
+  defp sandbox_parent_file?(ctx, name) do
+    ctx.tmp_dir
+    |> Path.dirname()
+    |> Path.join(name)
+    |> File.exists?()
+  end
 
   defp tool_result_message(messages, id) do
     Enum.find(messages, &match?(%{"role" => "tool", "tool_call_id" => ^id}, &1))
@@ -130,14 +165,14 @@ defmodule DashFloat.AgentTest do
     assert Enum.any?(lines, &String.contains?(&1, "hello.txt")), inspect(lines)
 
     # NO mutation lands without the keypress — the file does not exist yet.
-    refute File.exists?(sandbox_file(ctx, "out/hello.txt"))
+    refute sandbox_exists?(ctx, "out/hello.txt")
 
     send(agent, {:confirm_decision, ref, :approved})
 
     assert_receive {:tool_result, %{id: "call_1", name: "write_file", ok: true, status: "ok"}},
                    2_000
 
-    assert File.read!(sandbox_file(ctx, "out/hello.txt")) == "hi there"
+    assert read_sandbox(ctx, "out/hello.txt") == "hi there"
 
     # The model sees the outcome: request 2 carries the assistant tool_calls
     # message and the tool result, in protocol shape.
@@ -183,16 +218,16 @@ defmodule DashFloat.AgentTest do
     assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
 
     assert %{"content" => result_json} =
-             request_messages(second_body) |> tool_result_message("call_r")
+             tool_result_of(second_body, "call_r")
 
     assert Jason.decode!(result_json) == %{"ok" => false, "rejected" => true}
-    refute File.exists?(sandbox_file(ctx, "nope.txt"))
+    refute sandbox_exists?(ctx, "nope.txt")
     assert_receive {:phase, :idle}, 2_000
   end
 
   @tag :tmp_dir
   test "reads are automatic: read_file executes with no confirmation", ctx do
-    File.write!(sandbox_file(ctx, "notes.md"), "line one\nline two\n")
+    write_sandbox(ctx, "notes.md", "line one\nline two\n")
 
     server =
       start_server([
@@ -216,7 +251,7 @@ defmodule DashFloat.AgentTest do
     assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
 
     assert %{"content" => result_json} =
-             request_messages(second_body) |> tool_result_message("call_read")
+             tool_result_of(second_body, "call_read")
 
     assert %{"ok" => true, "content" => "line one\nline two", "truncated" => false} =
              Jason.decode!(result_json)
@@ -244,7 +279,7 @@ defmodule DashFloat.AgentTest do
     assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
 
     assert %{"content" => result_json} =
-             request_messages(second_body) |> tool_result_message("call_esc")
+             tool_result_of(second_body, "call_esc")
 
     assert %{"ok" => false, "error" => error} = Jason.decode!(result_json)
     assert error =~ "escape"
@@ -272,13 +307,13 @@ defmodule DashFloat.AgentTest do
     assert_receive {:tool_result, %{name: "write_file", ok: false, status: status}}, 2_000
     assert status =~ "escape"
 
-    refute File.exists?(Path.join(Path.dirname(ctx.tmp_dir), "outside.txt"))
+    refute sandbox_parent_file?(ctx, "outside.txt")
     assert_receive {:phase, :idle}, 2_000
   end
 
   @tag :tmp_dir
   test "an ambiguous edit never reaches the user: straight error to the model", ctx do
-    File.write!(sandbox_file(ctx, "dup.txt"), "alpha\nalpha\n")
+    write_sandbox(ctx, "dup.txt", "alpha\nalpha\n")
 
     server =
       start_server([
@@ -299,12 +334,12 @@ defmodule DashFloat.AgentTest do
     assert_receive {:tool_result, %{name: "edit_file", ok: false, status: status}}, 2_000
     assert status =~ "match"
 
-    assert File.read!(sandbox_file(ctx, "dup.txt")) == "alpha\nalpha\n"
+    assert read_sandbox(ctx, "dup.txt") == "alpha\nalpha\n"
 
     assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
 
     assert %{"content" => result_json} =
-             request_messages(second_body) |> tool_result_message("call_e")
+             tool_result_of(second_body, "call_e")
 
     assert %{"ok" => false, "error" => error} = Jason.decode!(result_json)
     assert error =~ "match"
@@ -332,7 +367,7 @@ defmodule DashFloat.AgentTest do
 
     # Episode 2's request carries the first error; episode 3's carries both.
     assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
-    assert %{"content" => json_u} = request_messages(second_body) |> tool_result_message("call_u")
+    assert %{"content" => json_u} = tool_result_of(second_body, "call_u")
     assert %{"ok" => false, "error" => "unknown tool \"explode\""} = Jason.decode!(json_u)
 
     assert_receive {:sse_request, "POST", _, _, third_body}, 4_000
@@ -376,7 +411,7 @@ defmodule DashFloat.AgentTest do
 
   @tag :tmp_dir
   test "a multi-call batch: automatic read then confirmed write, results in call order", ctx do
-    File.write!(sandbox_file(ctx, "src.txt"), "seed\n")
+    write_sandbox(ctx, "src.txt", "seed\n")
     # Parallel indices: read on 0, write on 1.
     frames =
       tool_frames("call_rd", "read_file", [~s({"path":"src.txt"})]) ++
@@ -397,7 +432,7 @@ defmodule DashFloat.AgentTest do
     send(agent, {:confirm_decision, ref, :approved})
 
     assert_receive {:tool_result, %{id: "call_wr", ok: true}}, 2_000
-    assert File.read!(sandbox_file(ctx, "dst.txt")) == "made"
+    assert read_sandbox(ctx, "dst.txt") == "made"
 
     assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
     messages = request_messages(second_body)
@@ -421,6 +456,32 @@ defmodule DashFloat.AgentTest do
 
     assert_received {:usage, %{total_tokens: 500}}
     refute_received {:usage, %{total_tokens: 100}}
+  end
+
+  @tag :tmp_dir
+  test "a long tool output is excerpted to 30 lines in the log row (the model sees more)", ctx do
+    write_sandbox(ctx, "long.txt", Enum.map_join(1..60, &"line #{&1}\n"))
+
+    server =
+      start_server([
+        call_tool_episode("call_l", "read_file", %{"path" => "long.txt"}),
+        final_episode()
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+    send(agent, {:prompt, self(), "read it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:tool_result, %{name: "read_file", ok: true, output: output}}, 2_000
+
+    excerpt_lines =
+      output
+      |> String.split("\n")
+      |> Enum.reject(&(&1 == ""))
+
+    assert length(excerpt_lines) == 30
+    assert List.first(excerpt_lines) == "line 1"
+    assert List.last(excerpt_lines) == "line 30"
   end
 
   ## Interrupts
@@ -494,7 +555,7 @@ defmodule DashFloat.AgentTest do
     assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
 
     assert %{"content" => result_json} =
-             request_messages(second_body) |> tool_result_message("call_c")
+             tool_result_of(second_body, "call_c")
 
     assert %{"ok" => false, "error" => error} = Jason.decode!(result_json)
     assert error =~ "tool crashed"
@@ -587,6 +648,22 @@ defmodule DashFloat.AgentTest do
 
     send(agent, {:cancel})
     assert_receive {:phase, :idle}, 2_000
+  end
+
+  test "stale stream and runner messages while idle are ignored, never a crash" do
+    server = start_server([final_episode("unused")])
+    {agent, _sup} = start_agent(server, System.tmp_dir!())
+
+    send(agent, {:cancel})
+    send(agent, {:token, "late"})
+    send(agent, {:usage, %{prompt_tokens: 1, completion_tokens: 1, total_tokens: 2}})
+    send(agent, {:stream_failed, "late failure", "late"})
+    send(agent, {:stream_done, %{content: "late", tool_calls: [], cancelled: false}})
+    send(agent, {:tool_done, "call_late", %{ok: true}})
+
+    refute_receive {:token, _text}, 100
+    refute_receive {:entry, :system, _text}, 100
+    assert Process.alive?(agent)
   end
 
   # The tool_call row is announced before the runner task is spawned; poll

@@ -517,9 +517,22 @@ defmodule DashFloat.LLM.ChatStreamTest do
     assert decoded["model"] == "test-model"
     assert decoded["stream"] == true
     assert decoded["stream_options"] == %{"include_usage" => true}
-    assert decoded["messages"] == Jason.decode!(Jason.encode!(messages))
-    assert decoded["tools"] == Jason.decode!(Jason.encode!(tools))
+    assert decoded["messages"] == roundtrip(messages)
+    assert decoded["tools"] == roundtrip(tools)
 
+    await_exit(ref)
+  end
+
+  test "a connection error after Esc still reports the cancel" do
+    # The server accepts but stalls; Esc lands while Req.post is still waiting
+    # for headers, and the eventual dial failure is reported as a cancel.
+    server = start_server([{:sleep, 300}, :close])
+    {pid, ref} = start_stream(SSEServer.base_url(server))
+
+    assert_receive {:sse_request, _, _, _, _body}, 1_000
+    send(pid, :cancel)
+
+    assert {:stream_done, %{cancelled: true}} = done(collect())
     await_exit(ref)
   end
 
@@ -888,6 +901,12 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
     assert {:stream_done, %{tool_calls: []}} = done(collect())
     await_exit(ref)
+  end
+
+  defp roundtrip(value) do
+    value
+    |> Jason.encode!()
+    |> Jason.decode!()
   end
 
   defp json_response(status, body) do
