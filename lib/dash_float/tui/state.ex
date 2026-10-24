@@ -443,6 +443,11 @@ defmodule DashFloat.TUI.State do
     |> Map.put(:stats, frozen(state, now))
   end
 
+  # The turn's banked usage total joins the conversation accumulator exactly
+  # once, here (ADR 0006). Phase 3 caveat: a producer that emits the tool
+  # transition before flushing usage would fold that episode's total into the
+  # next episode's banking slot — producers must send usage before each phase
+  # change (the in-contract order).
   defp frozen(%{stats: stats}, now) do
     %{
       stats

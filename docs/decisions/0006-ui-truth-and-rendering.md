@@ -238,7 +238,7 @@ The exact seams implementers build against:
 - `State` new fields: `cwd` (label, computed at `new/1`), `anim_step`,
   `tick_ref`, `in_flight_lines`, `in_flight_dirty`, `stats`
   (`%{tokens, first_token_at, rate, prompt_tokens, completion_tokens,
-  context_total}`).
+  context_total, turn_total}`).
 - `State.stream_message/2,3`, `State.tick/2` (`→ {state, :cont | :halt}`),
   `State.needs_tick?/1`, `State.paste/2`, `State.cwd_label/1`,
   `State.rate_label/1`, `State.context_label/1`, `State.provider_model/1`,
