@@ -386,6 +386,7 @@ defmodule DashFloat.TUITest do
     assert State.input_text(released) == "pasted text"
 
     # Events and messages we do not use are dropped, not crashes.
+    inject(pid, %ExRatatui.Event.FocusGained{})
     inject(pid, %ExRatatui.Event.Mouse{kind: "down"})
     send(pid, :stray_message)
     after_stray = get_state(pid)
@@ -803,6 +804,132 @@ defmodule DashFloat.TUITest do
     rejected = eventually(pid, fn s -> s.phase == :idle end)
     assert entry?(rejected, :tool, "⚙ write_file → cancelled")
     assert State.input_text(rejected) == ""
+  end
+
+  # Issue #21 (ADR 0006 amendment): the wheel always addresses the log view —
+  # never the input draft. Routing is focus-free: the pane under the cursor,
+  # the draft's contents, and a pending confirm are all irrelevant to it.
+  defp scroll(pid, kind) do
+    inject(pid, %ExRatatui.Event.Mouse{kind: kind, button: "", x: 10, y: 5})
+  end
+
+  # A tall log: one submitted question plus a 100-entry system reply. Returns
+  # once idle, with the bottom offset under a 20-line viewport.
+  defp tall_log(pid) do
+    submit(pid, "first question")
+    assert_receive {:prompt, ui_pid, "first question"}, 1_000
+
+    for i <- 1..100, do: send(ui_pid, {:entry, :system, "line #{i}"})
+    send(ui_pid, {:phase, :idle})
+
+    state = eventually(pid, fn s -> s.phase == :idle and State.log_line_count(s) >= 202 end)
+    State.effective_scroll(state, 20)
+  end
+
+  test "the wheel scrolls the log view, not the input draft" do
+    {:ok, pid} = start_tui(provider: provider())
+    bottom = tall_log(pid)
+    type(pid, "fresh draft")
+
+    scroll(pid, "scroll_up")
+
+    state = get_state(pid)
+    refute state.follow?
+    assert State.effective_scroll(state, 20) == bottom - 3
+    # The wheel never touches the draft — the live bug walked history here.
+    assert State.input_text(state) == "fresh draft"
+    assert state.history_index == nil
+  end
+
+  test "wheel-down re-pins at the bottom; genuine Up still walks history" do
+    {:ok, pid} = start_tui(provider: provider())
+    bottom = tall_log(pid)
+
+    scroll(pid, "scroll_up")
+    scroll(pid, "scroll_up")
+    two_notches = get_state(pid)
+    assert State.effective_scroll(two_notches, 20) == bottom - 6
+
+    scroll(pid, "scroll_down")
+    one_down = get_state(pid)
+    assert State.effective_scroll(one_down, 20) == bottom - 3
+
+    for _notch <- 1..4, do: scroll(pid, "scroll_down")
+    pinned = get_state(pid)
+    assert pinned.follow?
+    assert State.effective_scroll(pinned, 20) == bottom
+
+    # Keyboard truth is unchanged: Up is still history navigation at the
+    # draft's first row (ADR 0002).
+    press(pid, "up")
+    walked = get_state(pid)
+    assert walked.history_index == 0
+    assert State.input_text(walked) == "first question"
+  end
+
+  test "the wheel still scrolls while a confirm is pending" do
+    {:ok, pid} = start_tui(provider: provider())
+    bottom = tall_log(pid)
+
+    send(pid, {:confirm, make_ref(), confirm_request(["+ x"])})
+    confirming = eventually(pid, fn s -> s.phase == :confirming end)
+
+    # The preview appended rows and the activity row is up (confirming is an
+    # active phase): re-read the pinned bottom at the 19-row viewport.
+    confirm_bottom = State.effective_scroll(confirming, 19)
+
+    scroll(pid, "scroll_up")
+    state = get_state(pid)
+    assert state.phase == :confirming
+    refute state.follow?
+    assert State.effective_scroll(state, 19) == confirm_bottom - 3
+  end
+
+  test "non-scroll mouse events change nothing and render nothing" do
+    {:ok, pid} = start_tui()
+    before_count = Runtime.snapshot(pid).render_count
+
+    for event <- [
+          %ExRatatui.Event.Mouse{kind: "moved", button: "", x: 1, y: 1},
+          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 1},
+          %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 1, y: 1},
+          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 2, y: 2},
+          %ExRatatui.Event.Mouse{kind: "scroll_left", button: "", x: 1, y: 1}
+        ] do
+      inject(pid, event)
+    end
+
+    assert Runtime.snapshot(pid).render_count == before_count
+    untouched = get_state(pid)
+    assert State.input_text(untouched) == ""
+  end
+
+  # The lynchpin of the wheel fix: without capture, terminals emulate the
+  # wheel as arrow keys and input history eats it (issue #21). The flag is
+  # the TUI start_link default, so it holds for every starter — pinned via
+  # the transport-connect telemetry span (the test backend itself ignores
+  # the flag, so the span metadata is the observable).
+  test "the TUI starts with mouse capture enabled" do
+    handler_id = {:mouse_capture_test, make_ref()}
+    test_pid = self()
+
+    :telemetry.attach(
+      handler_id,
+      # Span start event; its metadata is the connect meta (exact name —
+      # :telemetry.attach does not prefix-match).
+      [:ex_ratatui, :transport, :connect, :start],
+      fn _event, _measurements, meta, _config ->
+        # Runs inside the starting Server; send to the captured test pid.
+        send(test_pid, {:connect_meta, meta})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    {:ok, _pid} = start_tui()
+    assert_receive {:connect_meta, meta}, 1_000
+    assert meta[:mouse_capture] == true
   end
 
   test "child_spec/1 is temporary and a worker" do

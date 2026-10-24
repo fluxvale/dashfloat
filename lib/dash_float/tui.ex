@@ -36,6 +36,11 @@ defmodule DashFloat.TUI do
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) when is_list(opts) do
     opts
+    # Mouse capture is the TUI's own policy (issue #21; ADR 0006 amendment):
+    # without it terminals emulate the wheel as arrow keys and the input
+    # history eats them. A default here — not an Application opt — so the
+    # connect-span test can pin it for every starter.
+    |> Keyword.put_new(:mouse_capture, true)
     |> Keyword.put(:mod, __MODULE__)
     |> ExRatatui.App.dispatch_start()
   end
@@ -67,6 +72,21 @@ defmodule DashFloat.TUI do
 
   # kitty-protocol terminals also report key releases; ignore them.
   def handle_event(%ExRatatui.Event.Key{}, state), do: schedule(state)
+
+  # The wheel always addresses the log view — never the input draft — so
+  # scrolling works while typing (issue #21; ADR 0006 amendment). Mouse
+  # capture is enabled at startup (Application), so terminals report real
+  # wheel events instead of emulating arrow keys.
+  def handle_event(%ExRatatui.Event.Mouse{kind: "scroll_up"}, state),
+    do: schedule(State.wheel_scroll(state, :up))
+
+  def handle_event(%ExRatatui.Event.Mouse{kind: "scroll_down"}, state),
+    do: schedule(State.wheel_scroll(state, :down))
+
+  # Every other mouse event (clicks, drags, motion) is inert and renders
+  # nothing: a pointer wandering over an idle UI must not draw frames.
+  def handle_event(%ExRatatui.Event.Mouse{}, state),
+    do: {:noreply, state, %{render?: false}}
 
   # Confirmation mode swallows pastes too — nothing may reach the draft
   # mid-decision (ADR 0007).

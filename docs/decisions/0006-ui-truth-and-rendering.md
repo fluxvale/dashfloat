@@ -384,3 +384,74 @@ truncation it defended was the bug.
   parse in `render/2`, any live parse above the 64 KiB cap.
 - Phase 3 tool rows reuse the entry kinds, `Theme` roles, and the dim-row
   vocabulary exactly; confirmation UI remains out of scope until then.
+
+---
+
+## Amendment (2026-10-24, issue #21): mouse wheel routing
+
+**Status:** Accepted. Supersedes exactly one Phase-1 stance — the "mouse
+capture for scrolling — rejected" alternative in
+[ADR 0002](0002-tui-skeleton.md). Everything else in ADR 0002's input and
+scroll contract stands.
+
+### Root cause (the record)
+
+DashFloat always runs in the alternate screen. With mouse tracking off —
+the Phase-1 default — xterm-class terminals (xterm `alternateScroll`, VTE,
+Windows Terminal, iTerm2, Alacritty, WezTerm, foot) translate each wheel
+notch into Up/Down **arrow-key escape sequences**, byte-identical to real
+arrow presses. They decoded as ordinary key events and landed in
+`State.handle_key/3` for `"up"`/`"down"` → input-history navigation. The
+live bug: the wheel walked the input draft instead of scrolling the log.
+Interception at the event boundary is therefore impossible — emulated and
+genuine arrows are the same bytes at every layer the app can observe.
+
+### Decision
+
+- **Real mouse tracking, not interception.** `DashFloat.TUI.start_link/1`
+  defaults `mouse_capture: true` — the policy lives with the TUI module, so
+  every starter (Application, tests) gets it, and the default is pinned by
+  a test on the `[:ex_ratatui, :transport, :connect]` span metadata
+  (ex_ratatui → crossterm `EnableMouseCapture`, `?1000h` + `?1006h` SGR
+  among others; disabled again on every teardown path the runtime owns).
+  Once capture is on, terminals stop emulating and report genuine wheel
+  events; the arrow ambiguity disappears at the source.
+- **Focus-free routing.** `scroll_up`/`scroll_down` mouse events always
+  address the log view — regardless of which pane is under the cursor,
+  whether a draft is being typed, and including mid-confirmation. There is
+  no focus model; the input never sees the wheel. One notch scrolls three
+  lines (the alternate-screen convention). Semantics mirror the page keys
+  at line granularity: up unfollows (with page_up's nothing-to-scroll
+  guard), down re-pins at the bottom, submit re-pins.
+- **All other mouse events are inert and render-suppressed** — clicks,
+  drags, and pointer motion draw nothing. A pointer wandering over an idle
+  UI must not draw frames (the idle discipline above, applied to input).
+- **Keyboard truth unchanged.** Genuine Up/Down keep their
+  history-at-draft-boundary semantics; PgUp/PgDn keep viewport paging
+  (ADR 0002).
+
+### Costs and compatibility
+
+- Native drag-selection is captured while the app runs; selecting log text
+  requires the terminal's bypass modifier (Shift, honored by the mainstream
+  terminals above). That is the price of a wheel that scrolls — Phase 1
+  chose the other side of this trade; the live bug moves the balance.
+- Terminals that ignore mouse-reporting modes entirely keep their legacy
+  wheel behavior (indistinguishable from arrows, so unchanged history
+  navigation); none of the mainstream family above does. tmux with its own
+  `mouse on` intercepts the wheel for its copy mode — DashFloat never sees
+  the event. Not verifiable headless in CI; the manual smoke on real
+  terminals is the issue's acceptance step.
+- Scroll math composes with display-line accounting: wheel scroll consumes
+  `log_line_count/1` and `effective_scroll/2` — the same wrapped-display-line
+  seam as the page keys (see the word-wrap amendment above) — and introduces
+  no new line accounting of its own.
+- **Known pre-existing upstream limitation (verified during this fix, not
+  caused by it):** a single-burst write of more than ~1 KiB of *discrete*
+  input events (e.g. >~100 raw arrow or mouse-motion byte sequences in one
+  write) wedges the ex_ratatui/crossterm reader until the process dies —
+  reproduced identically on main with plain letters. Human-reachable input
+  is unaffected: typing is burst-far-below the threshold, a real mouse
+  delivers at most a couple of events per 16 ms poll, and bracketed paste
+  of any size arrives as one event (probed at 4 KiB). Worth an upstream
+  report; explicitly out of scope here.
