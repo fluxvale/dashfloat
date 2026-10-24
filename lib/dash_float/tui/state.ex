@@ -158,10 +158,23 @@ defmodule DashFloat.TUI.State do
     }
   end
 
-  @doc "The configured model name for the status bar, or nil when unusable."
-  @spec provider_model(t()) :: String.t() | nil
-  def provider_model(%__MODULE__{provider: {:ok, %{model: model}}}), do: model
-  def provider_model(%__MODULE__{}), do: nil
+  @doc """
+  The status bar's model label ([ADR 0008](../../docs/decisions/0008-config-layout-profiles-json5.md)):
+  `"nickname (profile)"`, falling back to the bare nickname, then the model id.
+  """
+  @spec provider_label(t()) :: String.t() | nil
+  def provider_label(%__MODULE__{provider: {:ok, provider}}), do: label(provider)
+  def provider_label(%__MODULE__{}), do: nil
+
+  defp label(%DashFloat.Config{nickname: nickname, profile: profile})
+       when is_binary(nickname) and is_binary(profile),
+       do: "#{nickname} (#{profile})"
+
+  defp label(%DashFloat.Config{nickname: nickname}) when is_binary(nickname),
+    do: nickname
+
+  defp label(%DashFloat.Config{model: model}) when is_binary(model), do: model
+  defp label(_other), do: nil
 
   @doc "The provider's context window, or nil when it was not configured."
   @spec provider_context_tokens(t()) :: pos_integer() | nil

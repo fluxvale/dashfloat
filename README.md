@@ -21,16 +21,34 @@ call execution, context management & history persistence.
 
 ## Run it
 
-Configure your provider — any OpenAI-compatible endpoint — in
-`~/.config/dashfloat/config.json`:
+Configure your provider — any OpenAI-compatible endpoint, one profile per
+subscription — in `~/.config/dashfloat/settings.json5` (created 0600; it holds
+credentials). The first profile is the default; each profile owns its model
+menu, whose first entry is its default model (`settings.defaultModel` can name
+another). A legacy `config.json` migrates itself into a `default` profile on
+first run:
 
-```json
-{"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini", "api_key": "..."}
+```json5
+{
+  configVersion: 1,
+  profiles: [
+    {
+      name: 'work',
+      baseUrl: 'https://api.openai.com/v1',
+      apiKey: 'PLACEHOLDER',
+      models: [{ nickname: 'mini', model: 'gpt-4o-mini', context: 128000 }],
+    },
+  ],
+}
 ```
 
-`DASHFLOAT_BASE_URL`, `DASHFLOAT_MODEL`, and `DASHFLOAT_API_KEY` override the
-file per field. Put your provider's own base URL in `base_url`; DashFloat
-appends `/chat/completions`. Then:
+`DASHFLOAT_BASE_URL`, `DASHFLOAT_MODEL`, `DASHFLOAT_API_KEY`, and
+`DASHFLOAT_CONTEXT_TOKENS` override the file per field; `--profile <name>`
+(startup flag, or `DASHFLOAT_PROFILE`) selects the active profile and
+`--model <nickname>` a model within it. The status bar names the active model
+`nickname (profile)`. Put your provider's own base URL in `baseUrl`; DashFloat
+appends `/chat/completions`. Details:
+[ADR 0008](docs/decisions/0008-config-layout-profiles-json5.md). Then:
 
 ```sh
 mix run --no-halt

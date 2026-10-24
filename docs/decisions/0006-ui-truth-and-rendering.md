@@ -252,7 +252,9 @@ The exact seams implementers build against:
   context_total, turn_total}`).
 - `State.stream_message/2,3`, `State.tick/2` (`→ {state, :cont | :halt}`),
   `State.needs_tick?/1`, `State.paste/2`, `State.cwd_label/1`,
-  `State.rate_label/1`, `State.context_label/1`, `State.provider_model/1`,
+  `State.rate_label/1`, `State.context_label/1`, `State.provider_label/1`
+  (née `provider_model/1`; renamed and profile-aware by
+  [ADR 0008](0008-config-layout-profiles-json5.md)),
   `State.provider_context_tokens/1`.
 - `Render.entry_lines(kind, text) → [Line.t()]` (includes the leading blank
   separator); `Markdown.render(text) → [Line.t()]`; `Theme.style(role)`,

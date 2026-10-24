@@ -95,7 +95,7 @@ defmodule DashFloat.TUI.View do
   end
 
   defp model_spans(state) do
-    [separator(), Span.new(State.provider_model(state) || "—", style: Theme.style(:assistant))]
+    [separator(), Span.new(State.provider_label(state) || "—", style: Theme.style(:assistant))]
   end
 
   defp context_spans(%{stats: %{context_total: 0}}), do: []

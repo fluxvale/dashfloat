@@ -115,6 +115,21 @@ defmodule DashFloat.TUI.ViewTest do
       assert text =~ "gpt-test"
     end
 
+    test "the label shows nickname and profile when configured (ADR 0008)" do
+      provider =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "http://x",
+           model: "glm-5.3",
+           api_key: "k",
+           nickname: "Sol",
+           profile: "work"
+         }}
+
+      text = status_text(new_state(provider: provider))
+      assert text =~ "Sol (work)"
+    end
+
     test "each phase maps to its status label" do
       for {phase, label} <- [
             streaming: "Streaming",

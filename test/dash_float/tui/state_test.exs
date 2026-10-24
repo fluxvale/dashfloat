@@ -124,17 +124,44 @@ defmodule DashFloat.TUI.StateTest do
     "~/" <> Path.join(tail)
   end
 
-  describe "provider_model/1" do
-    test "returns the model for a usable provider, nil otherwise" do
-      ok = {:ok, %DashFloat.Config{base_url: "http://x", model: "gpt-test", api_key: "k"}}
+  describe "provider_label/1" do
+    test "nickname and profile compose as \"nickname (profile)\"" do
+      provider =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "http://x",
+           model: "glm-5.3",
+           api_key: "k",
+           nickname: "Sol",
+           profile: "work"
+         }}
 
-      ok_state = new_state(provider: ok)
+      state = new_state(provider: provider)
+      assert State.provider_label(state) == "Sol (work)"
+    end
+
+    test "falls back to the bare nickname without a profile, then the model id" do
+      nickname_only =
+        {:ok,
+         %DashFloat.Config{base_url: "http://x", model: "glm-5.3", api_key: "k", nickname: "Sol"}}
+
+      model_only = {:ok, %DashFloat.Config{base_url: "http://x", model: "glm-5.3", api_key: "k"}}
+
+      nickname_state = new_state(provider: nickname_only)
+      model_state = new_state(provider: model_only)
+      assert State.provider_label(nickname_state) == "Sol"
+      assert State.provider_label(model_state) == "glm-5.3"
+    end
+
+    test "nil for an error provider, no provider, or a provider with no names" do
       error_state = new_state(provider: {:error, "nope"})
       blank_state = new_state()
-
-      assert State.provider_model(ok_state) == "gpt-test"
-      assert State.provider_model(error_state) == nil
-      assert State.provider_model(blank_state) == nil
+      # A Config with neither nickname nor model (hand-made, e.g. an
+      # env-only shape) has no label — the view's placeholder takes over.
+      nameless = new_state(provider: {:ok, %DashFloat.Config{base_url: "http://x", api_key: "k"}})
+      assert State.provider_label(error_state) == nil
+      assert State.provider_label(blank_state) == nil
+      assert State.provider_label(nameless) == nil
     end
   end
 
@@ -181,10 +208,19 @@ defmodule DashFloat.TUI.StateTest do
       assert State.context_label(base) == "4.1k/128k"
     end
 
-    test "context totals in the millions read as m" do
+    test "context totals in the millions read as m, in the billions b" do
       usage = %{prompt_tokens: 100, completion_tokens: 20, total_tokens: 4_100_000}
       state = bank_usage(new_state(), usage)
       assert State.context_label(state) == "4.1m"
+
+      big =
+        bank_usage(new_state(), %{
+          prompt_tokens: 1,
+          completion_tokens: 1,
+          total_tokens: 2_500_000_000
+        })
+
+      assert State.context_label(big) == "2.5b"
     end
 
     test "humanize boundaries roll into the next unit" do
