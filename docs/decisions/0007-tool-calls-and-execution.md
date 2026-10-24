@@ -158,8 +158,9 @@ stat, before reading; `list_directory` stats at most 501 entries (the alphabetic
 names — a listing beyond the cap hides later-named entries, disclosed by
 `truncated`; on this runtime `File.ls` silently skips non-UTF-8 names); edit
 previews are window-capped at 50 lines with a marker, write previews likewise;
-the episode's own
-accumulations (content plus tool-argument fragments) abort the stream at **4 MiB** and
+the episode's own accumulations (content plus tool-call ids, names, and
+argument fragments — ids/names counted per fragment as conservative headroom)
+abort the stream at **4 MiB** and
 **64 distinct tool calls** — a trickling endpoint that never trips the idle timeout or
 the frame cap still cannot grow memory without bound (the call cap counts distinct
 stream indices, so one call split into a thousand fragments is one call). Exec timeout
