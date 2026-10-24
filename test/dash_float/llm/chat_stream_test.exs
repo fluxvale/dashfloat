@@ -536,6 +536,27 @@ defmodule DashFloat.LLM.ChatStreamTest do
     await_exit(ref)
   end
 
+  test "Esc queued before the headers arrive cancels at the first check" do
+    # 200 headers arrive late; the cancel is already in the mailbox when
+    # handle_response runs, so the stream never starts.
+    server =
+      start_server([
+        {:sleep, 200},
+        {:send, [@headers, frame("never")]},
+        {:sleep, 60_000},
+        {:wait_close, 1_000}
+      ])
+
+    {pid, ref} = start_stream(SSEServer.base_url(server))
+
+    assert_receive {:sse_request, _, _, _, _body}, 1_000
+    send(pid, :cancel)
+
+    assert {:stream_done, %{cancelled: true}} = done(collect())
+    refute_receive {:token, _text}, 100
+    await_exit(ref)
+  end
+
   test "a refused connection degrades to a connection-failed report" do
     port = free_port()
 
