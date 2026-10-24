@@ -91,7 +91,9 @@ defmodule DashFloat.TUI.ViewTest do
 
       text = status_text(state)
 
-      assert text =~ ~r/model · ctx 4\.1k\/128k · 2\.0 tok\/s · ● Idle · /
+      # The usage frame reconciles the count (2 deltas batched 5 tokens), so
+      # the frozen rate uses the authoritative 5 tokens over the 1 s window.
+      assert text =~ ~r/model · ctx 4\.1k\/128k · 5\.0 tok\/s · ● Idle · /
       assert text =~ "test-model"
     end
 
