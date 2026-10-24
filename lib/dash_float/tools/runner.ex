@@ -118,10 +118,12 @@ defmodule DashFloat.Tools.Runner do
 
   ## write_file
 
-  # Writes land via a temp file + rename: rename replaces the final path
-  # ENTRY (symlink included) instead of following it, closing the
-  # check-then-write race where a swapped symlink would redirect the write
-  # outside the sandbox.
+  # Writes land via an exclusively-created temp file + rename. Rename
+  # replaces the final path ENTRY (symlink included) instead of following it,
+  # and O_CREAT|O_EXCL plus a crypto-random temp name mean a symlink
+  # pre-planted at either name is never followed — together closing the
+  # check-then-write races where a swapped or guessed symlink would redirect
+  # the write outside the sandbox. The existing file's mode is preserved.
   defp write_file(args, cwd) do
     case resolve_path(cwd, args["path"]) do
       {:error, result} -> result
@@ -134,22 +136,27 @@ defmodule DashFloat.Tools.Runner do
     parent = Path.dirname(resolved)
 
     case File.mkdir_p(parent) do
-      :ok -> write_atomically(args, resolved, args["content"], existed)
-      {:error, reason} -> mkdir_error(args, reason)
+      :ok ->
+        mode = if existed, do: perm_bits(resolved), else: nil
+        write_atomically(args, resolved, args["content"], existed, mode)
+
+      {:error, reason} ->
+        mkdir_error(args, reason)
     end
   end
 
-  defp write_atomically(args, resolved, content, existed) do
-    case write_atomic(resolved, content) do
+  defp write_atomically(args, resolved, content, existed, mode) do
+    case write_atomic(resolved, content, mode) do
       :ok -> %{ok: true, path: args["path"], bytes: byte_size(content), created: not existed}
       {:error, reason} -> write_error(args, reason)
     end
   end
 
-  defp write_atomic(resolved, content) do
+  defp write_atomic(resolved, content, mode) do
     tmp = temp_path(resolved)
 
-    with :ok <- File.write(tmp, content),
+    with {:ok, device} <- File.open(tmp, [:write, :exclusive]),
+         :ok <- fill(device, tmp, content, mode),
          :ok <- File.rename(tmp, resolved) do
       :ok
     else
@@ -159,9 +166,28 @@ defmodule DashFloat.Tools.Runner do
     end
   end
 
+  # `mode` is nil for fresh files; over an existing entry the old
+  # permissions carry over — a rename alone would reset them to 0644.
+  defp fill(device, tmp, content, mode) do
+    :ok = IO.binwrite(device, content)
+    File.close(device)
+
+    if is_nil(mode) do
+      :ok
+    else
+      File.chmod(tmp, mode)
+    end
+  end
+
+  defp perm_bits(resolved) do
+    %File.Stat{mode: mode} = File.stat!(resolved)
+    Bitwise.&&&(mode, 0o7777)
+  end
+
   defp temp_path(resolved) do
-    unique = System.unique_integer([:positive])
-    resolved <> ".df-tmp-" <> Integer.to_string(unique)
+    rand = :crypto.strong_rand_bytes(6)
+    suffix = Base.url_encode64(rand, padding: false)
+    resolved <> ".df-tmp-" <> suffix
   end
 
   defp mkdir_error(args, reason),
@@ -195,7 +221,7 @@ defmodule DashFloat.Tools.Runner do
   end
 
   defp write_edit(args, resolved, new_content) do
-    case write_atomic(resolved, new_content) do
+    case write_atomic(resolved, new_content, perm_bits(resolved)) do
       :ok -> %{ok: true, path: args["path"], replaced: 1}
       {:error, reason} -> write_error(args, reason)
     end

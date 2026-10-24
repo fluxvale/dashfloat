@@ -169,6 +169,39 @@ defmodule DashFloat.Tools.RunnerTest do
     assert written == "longer"
   end
 
+  test "write_file preserves the permissions of an existing file and leaves no temp litter", %{
+    root: root
+  } do
+    secret = Path.join(root, "secret.env")
+    File.write!(secret, "old\n")
+    File.chmod!(secret, 0o600)
+
+    assert {:ok, _result} =
+             Tools.validate("write_file", %{"path" => "secret.env", "content" => "new\n"})
+
+    run("write_file", %{"path" => "secret.env", "content" => "new\n"}, root)
+
+    mode = File.stat!(secret).mode
+    assert Bitwise.&&&(mode, 0o7777) == 0o600
+    assert File.read!(secret) == "new\n"
+
+    leftovers = File.ls!(root)
+    refute Enum.any?(leftovers, &String.starts_with?(&1, "secret.env.df-tmp-"))
+  end
+
+  test "edit_file preserves the permissions of the file it edits", %{root: root} do
+    script = Path.join(root, "script.sh")
+    File.write!(script, "#!/bin/sh\necho old\n")
+    File.chmod!(script, 0o755)
+
+    args = %{"path" => "script.sh", "search_block" => "old", "replace_block" => "new"}
+    assert run("edit_file", args, root).ok == true
+
+    mode = File.stat!(script).mode
+    assert Bitwise.&&&(mode, 0o7777) == 0o755
+    assert File.read!(script) == "#!/bin/sh\necho new\n"
+  end
+
   test "write_file into a path blocked by a file fails cleanly", %{root: root} do
     root
     |> Path.join("blocked")

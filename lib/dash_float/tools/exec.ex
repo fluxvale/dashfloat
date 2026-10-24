@@ -13,13 +13,14 @@ defmodule DashFloat.Tools.Exec do
   exits 2). Output past the cap is still consumed and counted, never
   accumulated.
 
-  On completion — normal exit OR timeout — the command's whole process group
-  is SIGKILLed: `Port.close/1` only closes the pipes, and a program that
+  On completion — normal exit OR timeout — the command's process group is
+  SIGKILLed: `Port.close/1` only closes the pipes, and a program that
   never reads stdin (a busy shell loop) survives it — verified on this
   system, where it would spin at 100% CPU forever. Group-killing the normal
-  path also reaps children the command left behind (nothing a tool runs may
-  outlive the call). Spawned children lead their own session, so killing the
-  negative pid takes the entire tree; the killer runs with its stderr
+  path also reaps same-group children the command left behind (a child that
+  escapes via `setsid` survives this — closing that needs a process-level
+  sandbox). Spawned children lead their own session, so killing the
+  negative pid takes the entire group; the killer runs with its stderr
   silenced because after a clean exit the group is usually already gone and
   kill(1) would otherwise complain on the BEAM's stderr.
   """
