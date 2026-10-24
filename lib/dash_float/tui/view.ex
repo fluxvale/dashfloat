@@ -18,7 +18,8 @@ defmodule DashFloat.TUI.View do
   @phases %{
     idle: {"Idle", :status_idle},
     streaming: {"Streaming", :status_busy},
-    executing_tool: {"Running tool", :status_tool}
+    executing_tool: {"Running tool", :status_tool},
+    confirming: {"Confirm", :status_tool}
   }
 
   @doc """
@@ -213,7 +214,7 @@ defmodule DashFloat.TUI.View do
           Span.new(spinner_frame(state), style: Theme.style(:accent)),
           Span.new(" "),
           Span.new(activity_label(state), style: Theme.style(:accent)),
-          Span.new("  esc interrupt", style: Theme.style(:hint))
+          Span.new(activity_hint(state), style: Theme.style(:hint))
         ])
       ],
       scroll: {0, 0}
@@ -225,9 +226,14 @@ defmodule DashFloat.TUI.View do
     Enum.at(frames, rem(state.anim_step, length(frames)))
   end
 
+  defp activity_label(%{phase: :confirming}), do: "Approve this change?"
   defp activity_label(%{phase: :executing_tool}), do: "Running tool…"
   defp activity_label(%{stats: %{tokens: 0}}), do: "Thinking…"
   defp activity_label(_state), do: "Streaming…"
+
+  # The confirming decision replaces the interrupt hint (Esc rejects there).
+  defp activity_hint(%{phase: :confirming}), do: "  ⏎ approve · esc reject"
+  defp activity_hint(_state), do: "  esc interrupt"
 
   ## Input
 
