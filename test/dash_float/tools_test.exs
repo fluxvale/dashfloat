@@ -19,7 +19,8 @@ defmodule DashFloat.ToolsTest do
                        "path" => %{
                          "type" => "string",
                          "description" =>
-                           "File path, relative to the working directory or absolute inside it."
+                           "File path, relative to the working directory or absolute inside it.",
+                         "minLength" => 1
                        },
                        "offset" => %{
                          "type" => "integer",
@@ -50,7 +51,8 @@ defmodule DashFloat.ToolsTest do
                      "properties" => %{
                        "path" => %{
                          "type" => "string",
-                         "description" => "File path to write. Parent directories are created."
+                         "description" => "File path to write. Parent directories are created.",
+                         "minLength" => 1
                        },
                        "content" => %{
                          "type" => "string",
@@ -72,7 +74,8 @@ defmodule DashFloat.ToolsTest do
                      "properties" => %{
                        "path" => %{
                          "type" => "string",
-                         "description" => "File path to edit."
+                         "description" => "File path to edit.",
+                         "minLength" => 1
                        },
                        "search_block" => %{
                          "type" => "string",
@@ -99,13 +102,15 @@ defmodule DashFloat.ToolsTest do
                      "properties" => %{
                        "command" => %{
                          "type" => "string",
-                         "description" => "Shell command line to run."
+                         "description" => "Shell command line to run.",
+                         "minLength" => 1
                        },
                        "cwd" => %{
                          "type" => "string",
                          "description" =>
                            "Directory to run the command in, relative to the working directory.",
-                         "default" => "."
+                         "default" => ".",
+                         "minLength" => 1
                        }
                      },
                      "required" => ["command"]
@@ -124,7 +129,8 @@ defmodule DashFloat.ToolsTest do
                        "path" => %{
                          "type" => "string",
                          "description" => "Directory to list, relative to the working directory.",
-                         "default" => "."
+                         "default" => ".",
+                         "minLength" => 1
                        }
                      },
                      "required" => []
@@ -224,6 +230,18 @@ defmodule DashFloat.ToolsTest do
 
       assert Tools.validate("read_file", "path") ==
                {:error, "read_file: arguments must be an object"}
+    end
+
+    test "paths and commands must not be empty strings" do
+      assert Tools.validate("read_file", %{"path" => ""}) ==
+               {:error, "read_file: path must not be empty"}
+
+      assert Tools.validate("execute_command", %{"command" => ""}) ==
+               {:error, "execute_command: command must not be empty"}
+
+      # content may legitimately be empty (truncate a file); replace may delete.
+      assert Tools.validate("write_file", %{"path" => "a", "content" => ""}) ==
+               {:ok, %{"path" => "a", "content" => ""}}
     end
 
     test "unknown argument keys are dropped from the result" do

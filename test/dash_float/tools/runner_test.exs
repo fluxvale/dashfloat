@@ -169,6 +169,39 @@ defmodule DashFloat.Tools.RunnerTest do
     assert written == "longer"
   end
 
+  test "write_file preserves the permissions of an existing file and leaves no temp litter", %{
+    root: root
+  } do
+    secret = Path.join(root, "secret.env")
+    File.write!(secret, "old\n")
+    File.chmod!(secret, 0o600)
+
+    assert {:ok, _result} =
+             Tools.validate("write_file", %{"path" => "secret.env", "content" => "new\n"})
+
+    run("write_file", %{"path" => "secret.env", "content" => "new\n"}, root)
+
+    mode = File.stat!(secret).mode
+    assert Bitwise.&&&(mode, 0o7777) == 0o600
+    assert File.read!(secret) == "new\n"
+
+    leftovers = File.ls!(root)
+    refute Enum.any?(leftovers, &String.starts_with?(&1, "secret.env.df-tmp-"))
+  end
+
+  test "edit_file preserves the permissions of the file it edits", %{root: root} do
+    script = Path.join(root, "script.sh")
+    File.write!(script, "#!/bin/sh\necho old\n")
+    File.chmod!(script, 0o755)
+
+    args = %{"path" => "script.sh", "search_block" => "old", "replace_block" => "new"}
+    assert run("edit_file", args, root).ok == true
+
+    mode = File.stat!(script).mode
+    assert Bitwise.&&&(mode, 0o7777) == 0o755
+    assert File.read!(script) == "#!/bin/sh\necho new\n"
+  end
+
   test "write_file into a path blocked by a file fails cleanly", %{root: root} do
     root
     |> Path.join("blocked")
@@ -281,16 +314,63 @@ defmodule DashFloat.Tools.RunnerTest do
   end
 
   test "edit_file reports a write failure cleanly", %{root: root} do
-    locked = Path.join(root, "locked.txt")
-    File.write!(locked, "target\n")
-    File.chmod!(locked, 0o444)
-    on_exit(fn -> File.chmod(locked, 0o644) end)
+    locked_dir = Path.join(root, "locked")
+    target = Path.join(locked_dir, "target.txt")
+    File.mkdir_p!(locked_dir)
+    File.write!(target, "target\n")
+    File.chmod!(locked_dir, 0o555)
+    on_exit(fn -> File.chmod(locked_dir, 0o755) end)
 
-    args = %{"path" => "locked.txt", "search_block" => "target", "replace_block" => "new"}
+    args = %{"path" => "locked/target.txt", "search_block" => "target", "replace_block" => "new"}
     result = run("edit_file", args, root)
 
     assert result.ok == false
     assert result.error =~ "could not write file"
+  end
+
+  test "write_file onto a swapped symlink replaces the entry, never the target", %{root: root} do
+    outside = Path.join(System.tmp_dir!(), "df-run-outside-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(outside)
+    on_exit(fn -> File.rm_rf(outside) end)
+
+    victim = Path.join(outside, "victim.txt")
+    File.write!(victim, "original\n")
+    link = Path.join(root, "swapme")
+    File.ln_s!(victim, link)
+
+    # Race the writer: flip the final entry between file and symlink while
+    # writes land. With rename-based writes the entry is replaced at worst —
+    # the victim outside the sandbox is never touched.
+    flipper =
+      Task.async(fn ->
+        for _i <- 1..200 do
+          File.rm(link)
+          File.ln_s(victim, link)
+        end
+      end)
+
+    for _i <- 1..100 do
+      run("write_file", %{"path" => "swapme", "content" => "PWNED"}, root)
+    end
+
+    Task.await(flipper)
+
+    # The invariant: whatever the interleaving, the file OUTSIDE the sandbox
+    # was never written through the swapped symlink.
+    assert File.read!(victim) == "original\n"
+  end
+
+  test "read_file scrubs invalid UTF-8 so the result stays JSON-encodable", %{root: root} do
+    root
+    |> Path.join("blob.bin")
+    |> File.write!(<<0xFF, 0xFE, 0x01>>)
+
+    result = run("read_file", %{"path" => "blob.bin"}, root)
+
+    assert result.ok == true
+    assert String.valid?(result.content)
+    assert result.content == "\uFFFD\uFFFD\u0001"
+    assert {:ok, _json} = Jason.encode(result)
   end
 
   ## execute_command

@@ -13,14 +13,22 @@ defmodule DashFloat.Tools.Exec do
   exits 2). Output past the cap is still consumed and counted, never
   accumulated.
 
-  On timeout the command's whole process group is SIGKILLed before the port
-  closes: `Port.close/1` only closes the pipes, and a program that never
-  reads stdin (a busy shell loop) survives it — verified on this system,
-  where it would spin at 100% CPU forever. Spawned children lead their own
-  session, so killing the negative pid takes the entire tree.
+  On completion — normal exit OR timeout — the command's process group is
+  SIGKILLed: `Port.close/1` only closes the pipes, and a program that
+  never reads stdin (a busy shell loop) survives it — verified on this
+  system, where it would spin at 100% CPU forever. Group-killing the normal
+  path also reaps same-group children the command left behind (a child that
+  escapes via `setsid` survives this — closing that needs a process-level
+  sandbox). Spawned children lead their own session, so killing the
+  negative pid takes the entire group; the killer runs with its stderr
+  silenced because after a clean exit the group is usually already gone and
+  kill(1) would otherwise complain on the BEAM's stderr.
   """
 
+  alias DashFloat.Tools.Edit
+
   @drain_grace 10
+  @shell "/bin/sh"
   @kill_executable "/bin/kill"
 
   @doc """
@@ -42,7 +50,11 @@ defmodule DashFloat.Tools.Exec do
             [:binary, :stream, :use_stdio, :stderr_to_stdout, :exit_status, {:cd, cwd}]
           )
 
-        loop(port, deadline, timeout_ms, cap_bytes, "", 0, false)
+        # Captured at birth: once the program exits, Port.info returns nil and
+        # the group id (== the program's pid) would be unfindable.
+        {:os_pid, os_pid} = Port.info(port, :os_pid)
+
+        loop(port, os_pid, deadline, timeout_ms, cap_bytes, "", 0, false)
 
       {:ok, _stat} ->
         %{ok: false, exit: nil, error: "spawn failed: not a directory: " <> cwd}
@@ -54,39 +66,40 @@ defmodule DashFloat.Tools.Exec do
 
   # The receive timeout is an absolute deadline (recomputed after every
   # message), so a producer that never idles still dies at timeout_ms.
-  defp loop(port, deadline, timeout_ms, cap, output, total, truncated) do
+  defp loop(port, os_pid, deadline, timeout_ms, cap, output, total, truncated) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     if remaining <= 0 do
-      timed_out(port, timeout_ms, output, total, truncated)
+      timed_out(port, os_pid, timeout_ms, output, total, truncated)
     else
       receive do
         {^port, {:data, data}} ->
           {output, total, truncated} = take(data, cap, output, total, truncated)
-          loop(port, deadline, timeout_ms, cap, output, total, truncated)
+          loop(port, os_pid, deadline, timeout_ms, cap, output, total, truncated)
 
         {^port, {:exit_status, status}} ->
+          signal_group(os_pid)
           {output, truncated} = stamp(output, total, truncated)
 
           %{
             ok: status == 0,
             exit: status,
-            output: output,
+            output: sanitize(output),
             truncated: truncated,
             total_bytes: total
           }
       after
         remaining ->
-          timed_out(port, timeout_ms, output, total, truncated)
+          timed_out(port, os_pid, timeout_ms, output, total, truncated)
       end
     end
   end
 
-  defp timed_out(port, timeout_ms, output, total, truncated) do
+  defp timed_out(port, os_pid, timeout_ms, output, total, truncated) do
     # No Port.close here: the SIGKILL below terminates the program (and with
     # it the port) — closing a port the kill already ended raises. The drain
     # swallows whatever the dying program flushed, including its exit_status.
-    kill_tree(port)
+    signal_group(os_pid)
     drain(port)
     {output, truncated} = stamp(output, total, truncated)
 
@@ -94,11 +107,15 @@ defmodule DashFloat.Tools.Exec do
       ok: false,
       exit: nil,
       error: "timed out after #{timeout_ms}ms",
-      output: output,
+      output: sanitize(output),
       truncated: truncated,
       total_bytes: total
     }
   end
+
+  # Tool output goes back to the model as JSON: replace invalid UTF-8 bytes
+  # (a partial cap split, or binary command output) so encoding cannot fail.
+  defp sanitize(binary), do: Edit.sanitize(binary)
 
   defp take(data, cap, output, total, truncated) do
     total = total + byte_size(data)
@@ -128,14 +145,19 @@ defmodule DashFloat.Tools.Exec do
     end
   end
 
-  defp kill_tree(port) do
-    {:os_pid, os_pid} = Port.info(port, :os_pid)
+  # Spawned children lead their own session, so the negative pid is the whole
+  # process group — the program itself plus anything it left behind. The tiny
+  # pid-reuse window between a group's death and this signal is accepted
+  # (wrapping pid_max takes far longer than the run of a command). The
+  # killer's stderr is silenced: after a clean exit the group is usually
+  # already gone and kill(1) would otherwise complain on the BEAM's stderr.
+  defp signal_group(os_pid) do
     group = Integer.to_string(-os_pid)
 
     killer =
       Port.open(
-        {:spawn_executable, @kill_executable},
-        [:exit_status, {:args, ["-9", group]}]
+        {:spawn_executable, @shell},
+        [:exit_status, {:args, ["-c", "exec #{@kill_executable} -9 #{group} 2>/dev/null"]}]
       )
 
     # kill(1) only delivers a signal; it always exits promptly.

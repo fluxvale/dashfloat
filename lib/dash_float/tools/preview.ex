@@ -20,12 +20,20 @@ defmodule DashFloat.Tools.Preview do
   @doc """
   Builds `%{lines: lines}` for `write_file`, `edit_file`, and
   `execute_command`; read-only tools and unknown names return an error map.
+  Never raises — like the runner, broken input degrades to an error result.
   """
   @spec build(String.t(), map(), Path.t()) :: {:ok, %{lines: [String.t()]}} | {:error, map()}
-  def build("write_file", args, cwd), do: write_preview(args, cwd)
-  def build("edit_file", args, cwd), do: edit_preview(args, cwd)
-  def build("execute_command", args, cwd), do: exec_preview(args, cwd)
-  def build(name, _args, _cwd), do: {:error, %{ok: false, error: "no preview for " <> name}}
+  def build(name, args, cwd) do
+    dispatch(name, args, cwd)
+  rescue
+    exception ->
+      {:error, %{ok: false, error: "preview crashed: " <> Exception.message(exception)}}
+  end
+
+  defp dispatch("write_file", args, cwd), do: write_preview(args, cwd)
+  defp dispatch("edit_file", args, cwd), do: edit_preview(args, cwd)
+  defp dispatch("execute_command", args, cwd), do: exec_preview(args, cwd)
+  defp dispatch(name, _args, _cwd), do: {:error, %{ok: false, error: "no preview for " <> name}}
 
   ## write_file
 
@@ -91,11 +99,16 @@ defmodule DashFloat.Tools.Preview do
 
     [
       "@@ -#{first + 1},#{old_count} +#{first + 1},#{new_count} @@"
-      | Enum.map(before_lines, &("  " <> &1))
+      | prefixed(before_lines, "  ")
     ] ++
-      Enum.map(search, &("- " <> &1)) ++
-      Enum.map(replace, &("+ " <> &1)) ++
-      Enum.map(after_lines, &("  " <> &1))
+      prefixed(search, "- ") ++
+      prefixed(replace, "+ ") ++
+      prefixed(after_lines, "  ")
+  end
+
+  # File-derived lines may hold invalid UTF-8; the TUI cannot render it.
+  defp prefixed(lines, prefix) do
+    Enum.map(lines, fn line -> prefix <> Edit.sanitize(line) end)
   end
 
   defp newlines_before(content, start) do
@@ -107,10 +120,20 @@ defmodule DashFloat.Tools.Preview do
 
   ## execute_command
 
+  # Every command line gets the "$ " marker: a bare continuation line would
+  # be indistinguishable from preview chrome in the confirmation UI.
   defp exec_preview(args, cwd) do
     case PathPolicy.resolve(cwd, args["cwd"]) do
-      {:ok, resolved} -> {:ok, %{lines: ["$ " <> args["command"], "cwd: " <> resolved]}}
-      {:error, message} -> {:error, %{ok: false, path: args["cwd"], error: message}}
+      {:ok, resolved} ->
+        command_lines =
+          for line <- String.split(args["command"], "\n") do
+            "$ " <> Edit.sanitize(line)
+          end
+
+        {:ok, %{lines: command_lines ++ ["cwd: " <> resolved]}}
+
+      {:error, message} ->
+        {:error, %{ok: false, path: args["cwd"], error: message}}
     end
   end
 end

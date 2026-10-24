@@ -116,6 +116,28 @@ defmodule DashFloat.Tools.ExecTest do
     assert byte_size(result.output) > 4_096
   end
 
+  test "a successful command reaps children it left behind" do
+    # A stale survivor from an earlier, broken run must not read as ours.
+    System.cmd("pkill", ["-9", "-f", "sleep 251"])
+    :timer.sleep(50)
+
+    result =
+      Exec.run("sh -c 'sleep 251 >/dev/null 2>&1 & echo done'", sandbox("reap"), 5_000, 4_096)
+
+    assert result.ok == true
+    assert result.exit == 0
+    assert result.output == "done\n"
+    assert_eventually_gone("sleep 251")
+  end
+
+  test "binary output is scrubbed to valid UTF-8" do
+    result = Exec.run("printf a\\\\377b", sandbox("binary"), 5_000, 4_096)
+
+    assert result.ok == true
+    assert result.output == "a\uFFFDb"
+    assert {:ok, _json} = Jason.encode(result)
+  end
+
   test "a nonexistent cwd fails to spawn" do
     missing = Path.join(System.tmp_dir!(), "df-exec-nope-#{System.unique_integer([:positive])}")
 

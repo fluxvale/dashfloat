@@ -3,10 +3,12 @@ defmodule DashFloat.Tools.Runner do
   Executes one validated tool call against the working directory.
 
   Every path argument goes through `DashFloat.Tools.PathPolicy` first; on
-  rejection the result is `%{ok: false, path: path, error: message}`. The
-  rescue is a belt only — the per-tool clauses cover everything; if it ever
-  fires, the result degrades to `%{ok: false, error: "tool crashed: ..."}`,
-  never a raise into the caller.
+  rejection the result is `%{ok: false, path: path, error: message}`. File
+  writes go through a temp file + rename so a symlink swapped in after the
+  policy check is replaced, not followed. The rescue is a belt only — the
+  per-tool clauses cover everything; if it ever fires, the result degrades
+  to `%{ok: false, error: "tool crashed: ..."}`, never a raise into the
+  caller.
   """
 
   alias DashFloat.Tools.Edit
@@ -94,12 +96,13 @@ defmodule DashFloat.Tools.Runner do
       last_line = args["offset"] + length(shown) - 1
       truncated = last_line < total_lines
 
+      joined_lines = Enum.join(shown, "\n")
+      joined = Edit.sanitize(joined_lines)
+
       shown_content =
         if truncated,
-          do:
-            Enum.join(shown, "\n") <>
-              "\n… [truncated: showing #{length(shown)} of #{total_lines} lines]",
-          else: Enum.join(shown, "\n")
+          do: joined <> "\n… [truncated: showing #{length(shown)} of #{total_lines} lines]",
+          else: joined
 
       %{
         ok: true,
@@ -115,6 +118,12 @@ defmodule DashFloat.Tools.Runner do
 
   ## write_file
 
+  # Writes land via an exclusively-created temp file + rename. Rename
+  # replaces the final path ENTRY (symlink included) instead of following it,
+  # and O_CREAT|O_EXCL plus a crypto-random temp name mean a symlink
+  # pre-planted at either name is never followed — together closing the
+  # check-then-write races where a swapped or guessed symlink would redirect
+  # the write outside the sandbox. The existing file's mode is preserved.
   defp write_file(args, cwd) do
     case resolve_path(cwd, args["path"]) do
       {:error, result} -> result
@@ -127,19 +136,77 @@ defmodule DashFloat.Tools.Runner do
     parent = Path.dirname(resolved)
 
     case File.mkdir_p(parent) do
-      :ok -> write_content(args, resolved, existed)
-      {:error, reason} -> mkdir_error(args, reason)
+      :ok ->
+        mode = if existed, do: perm_bits(resolved), else: nil
+        write_atomically(args, resolved, args["content"], existed, mode)
+
+      {:error, reason} ->
+        mkdir_error(args, reason)
     end
   end
 
-  defp write_content(args, resolved, existed) do
-    case File.write(resolved, args["content"]) do
-      :ok ->
-        %{ok: true, path: args["path"], bytes: byte_size(args["content"]), created: not existed}
-
-      {:error, reason} ->
-        write_error(args, reason)
+  defp write_atomically(args, resolved, content, existed, mode) do
+    case write_atomic(resolved, content, mode) do
+      :ok -> %{ok: true, path: args["path"], bytes: byte_size(content), created: not existed}
+      {:error, reason} -> write_error(args, reason)
     end
+  end
+
+  defp write_atomic(resolved, content, mode) do
+    tmp = temp_path(resolved)
+
+    result =
+      try do
+        with {:ok, device} <- File.open(tmp, [:write, :exclusive]),
+             :ok <- fill(device, tmp, content, mode),
+             :ok <- File.rename(tmp, resolved) do
+          :ok
+        else
+          {:error, reason} -> {:error, reason}
+        end
+      rescue
+        # A mid-write I/O failure raises (ENOSPC, dead device): the write is
+        # over either way — report it through the same error door.
+        exception -> {:error, Exception.message(exception)}
+      end
+
+    case result do
+      :ok -> :ok
+      {:error, reason} -> discard_tmp(tmp, reason)
+    end
+  end
+
+  defp discard_tmp(tmp, reason) do
+    File.rm(tmp)
+    {:error, reason}
+  end
+
+  # `mode` is nil for fresh files; over an existing entry the old
+  # permissions carry over — a rename alone would reset them to 0644.
+  defp fill(device, tmp, content, mode) do
+    result =
+      try do
+        :ok = IO.binwrite(device, content)
+        :ok
+      after
+        File.close(device)
+      end
+
+    case result do
+      :ok when is_nil(mode) -> :ok
+      :ok -> File.chmod(tmp, mode)
+    end
+  end
+
+  defp perm_bits(resolved) do
+    %File.Stat{mode: mode} = File.stat!(resolved)
+    Bitwise.&&&(mode, 0o7777)
+  end
+
+  defp temp_path(resolved) do
+    rand = :crypto.strong_rand_bytes(6)
+    suffix = Base.url_encode64(rand, padding: false)
+    resolved <> ".df-tmp-" <> suffix
   end
 
   defp mkdir_error(args, reason),
@@ -173,7 +240,7 @@ defmodule DashFloat.Tools.Runner do
   end
 
   defp write_edit(args, resolved, new_content) do
-    case File.write(resolved, new_content) do
+    case write_atomic(resolved, new_content, perm_bits(resolved)) do
       :ok -> %{ok: true, path: args["path"], replaced: 1}
       {:error, reason} -> write_error(args, reason)
     end

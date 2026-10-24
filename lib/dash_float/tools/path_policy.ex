@@ -26,9 +26,12 @@ defmodule DashFloat.Tools.PathPolicy do
         {:error, "working directory does not exist"}
 
       {:ok, root_real} ->
+        # Compare against the expanded root too: a trailing slash or a
+        # relative root must not produce bogus escape errors.
+        root_expanded = Path.expand(root)
         abs = Path.expand(path, root)
 
-        if under?(root, abs) do
+        if under?(root_expanded, abs) do
           resolve_real(root_real, path, abs)
         else
           {:error, outside_error(path)}
