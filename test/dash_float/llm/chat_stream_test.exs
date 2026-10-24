@@ -23,7 +23,8 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
   # A streamed tool-call: the id/name frame first, then argument fragments.
   defp tool_frames(id, name, arg_fragments) do
-    opening = ~s(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"#{id}","type":"function","function":{"name":"#{name}","arguments":""}}]}}]}\n\n)
+    opening =
+      ~s(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"#{id}","type":"function","function":{"name":"#{name}","arguments":""}}]}}]}\n\n)
 
     rest =
       for frag <- arg_fragments do
@@ -53,7 +54,9 @@ defmodule DashFloat.LLM.ChatStreamTest do
     run_opts = Keyword.take(opts, [:idle_timeout])
 
     {:ok, pid} =
-      Task.start(fn -> ChatStream.run(agent, provider(base_url, key), messages, tools, run_opts) end)
+      Task.start(fn ->
+        ChatStream.run(agent, provider(base_url, key), messages, tools, run_opts)
+      end)
 
     {pid, Process.monitor(pid)}
   end
@@ -76,7 +79,8 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
   defp failures(messages), do: for({:stream_failed, text, _partial} <- messages, do: text)
 
-  defp done(messages), do: Enum.find_value(messages, &match?({:stream_done, report} when report, &1))
+  defp done(messages),
+    do: Enum.find_value(messages, &match?({:stream_done, report} when report, &1))
 
   # A pre-flight rejection can finish before the monitor attaches, so the DOWN
   # arrives as :noproc — the same race the agent's DOWN handling documents.
@@ -92,7 +96,9 @@ defmodule DashFloat.LLM.ChatStreamTest do
     messages = collect()
 
     assert tokens(messages) == "Hello, world!"
+
     assert {:stream_done, %{content: "Hello, world!", tool_calls: [], cancelled: false}} in messages
+
     assert failures(messages) == []
     await_exit(ref)
   end
@@ -222,7 +228,12 @@ defmodule DashFloat.LLM.ChatStreamTest do
     # carries only the content (ADR 0007 §4).
     script =
       [{:send, [@headers, tool_frames("call_1", "write_file", ["{\"pa"])]}] ++
-        [{:sleep, 1_000}, {:send, ~s(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":1}"}}]}}\n\n)}, {:wait_close, 2_000}]
+        [
+          {:sleep, 1_000},
+          {:send,
+           ~s(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":1}"}}]}}\n\n)},
+          {:wait_close, 2_000}
+        ]
 
     server = start_server(script)
     {pid, ref} = start_stream(SSEServer.base_url(server))
@@ -350,7 +361,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
   test "the idle timeout resets on every chunk" do
     script =
       [{:send, [@headers, frame("a")]}] ++
-        Enum.flat_map(1..8, fn i -> [{:sleep, 60}, {:send, frame("b#{i}")] end) ++
+        Enum.flat_map(1..8, fn i -> [{:sleep, 60}, {:send, frame("b#{i}")}] end) ++
         [{:send, "data: [DONE]\n\n"}, :close]
 
     server = start_server(script)
@@ -458,7 +469,17 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
     messages = [
       %{role: "user", content: "hello"},
-      %{role: "assistant", content: nil, tool_calls: [%{id: "call_1", type: "function", function: %{name: "read_file", arguments: "{\"path\":\"a\"}"}}]},
+      %{
+        role: "assistant",
+        content: nil,
+        tool_calls: [
+          %{
+            id: "call_1",
+            type: "function",
+            function: %{name: "read_file", arguments: "{\"path\":\"a\"}"}
+          }
+        ]
+      },
       %{role: "tool", tool_call_id: "call_1", content: "{\"ok\":true}"}
     ]
 
@@ -509,7 +530,9 @@ defmodule DashFloat.LLM.ChatStreamTest do
   test "an {:error, _} provider is a connection failure, not a crash" do
     agent = self()
 
-    {:ok, pid} = Task.start(fn -> ChatStream.run(agent, {:error, "missing provider config"}, [], []) end)
+    {:ok, pid} =
+      Task.start(fn -> ChatStream.run(agent, {:error, "missing provider config"}, [], []) end)
+
     ref = Process.monitor(pid)
 
     assert ["[llm: connection failed: missing provider config]"] = failures(collect())
@@ -693,7 +716,8 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
     server =
       start_server([
-        {:send, [@headers, frame("Let me look."), tool_frames("call_abc", "read_file", fragments)]},
+        {:send,
+         [@headers, frame("Let me look."), tool_frames("call_abc", "read_file", fragments)]},
         {:send, "data: [DONE]\n\n"},
         :close
       ])
@@ -754,7 +778,10 @@ defmodule DashFloat.LLM.ChatStreamTest do
     messages = collect()
 
     assert failures(messages) == []
-    assert {:stream_done, %{tool_calls: [%{id: "call_1", args: nil, error: "invalid JSON arguments"}]}} in messages
+
+    assert {:stream_done,
+            %{tool_calls: [%{id: "call_1", args: nil, error: "invalid JSON arguments"}]}} in messages
+
     await_exit(ref)
   end
 
@@ -776,7 +803,8 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
     assert {:stream_done, %{tool_calls: calls}} = done(collect())
 
-    assert {%{id: "call_0", name: "read_file"} = synthesized, %{id: "call_x", name: "", error: "missing function name"}} =
+    assert {%{id: "call_0", name: "read_file"} = synthesized,
+            %{id: "call_x", name: "", error: "missing function name"}} =
              {Enum.find(calls, &(&1.id == "call_0")), Enum.find(calls, &(&1.id == "call_x"))}
 
     assert synthesized.error == nil
@@ -794,9 +822,14 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
     # Fragments alternate between the two calls; order of finish is by index.
     script =
-      [{:send, [@headers, opening.(0, "call_a", "read_file"), opening.(1, "call_b", "list_directory")]}] ++
-        [{:send, [defrag.(0, "{\"pa"), defrag.(1, "{\"pa")]},
-         {:send, [defrag.(0, "th\":\"a\"}"), defrag.(1, "th\":\".\"}")]}] ++
+      [
+        {:send,
+         [@headers, opening.(0, "call_a", "read_file"), opening.(1, "call_b", "list_directory")]}
+      ] ++
+        [
+          {:send, [defrag.(0, "{\"pa"), defrag.(1, "{\"pa")]},
+          {:send, [defrag.(0, "th\":\"a\"}"), defrag.(1, "th\":\".\"}")]}
+        ] ++
         [{:send, "data: [DONE]\n\n"}, :close]
 
     server = start_server(script)
