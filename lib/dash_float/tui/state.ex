@@ -794,9 +794,11 @@ defmodule DashFloat.TUI.State do
   @doc """
   Records the new terminal size and, when the width changed, re-wraps the log
   to it: stored entries re-wrap from their logical lines (no re-parse), and
-  the in-flight reply re-renders from its text under the same 64 KiB live cap
-  (above it, the last render sticks until the next tick or finalize — ADR
-  0006). Scroll intents stay and are clamped at render.
+  the in-flight reply re-renders from its text under the same 64 KiB live
+  cap. Above the cap no fresh render is possible until finalize, and a
+  stale-width render would truncate at the new edge, so the live view
+  clears until the reply finalizes (ADR 0006, amended). Scroll intents stay
+  and are clamped at render.
   """
   @spec resize(t(), integer(), integer()) :: t()
   def resize(state, width, height) when is_integer(width) and is_integer(height) do
@@ -814,17 +816,24 @@ defmodule DashFloat.TUI.State do
         %{
           state
           | size: {width, height},
-            entries: Enum.map(state.entries, &%{&1 | lines: Wrap.wrap(&1.logical, width)}),
+            entries: Enum.map(state.entries, &rewrap_entry(&1, width)),
             in_flight_lines: rewrap_in_flight(state, width)
         }
     end
+  end
+
+  # Hand-built entries (tests, older state) may lack :logical; re-wrapping
+  # from their stored lines is the best available truth there.
+  defp rewrap_entry(entry, width) do
+    logical = Map.get(entry, :logical, entry.lines)
+    %{entry | lines: Wrap.wrap(logical, width)}
   end
 
   defp rewrap_in_flight(%{in_flight: in_flight} = _state, width)
        when is_binary(in_flight) and in_flight != "" and byte_size(in_flight) <= @in_flight_cap,
        do: wrapped_assistant(in_flight, width)
 
-  defp rewrap_in_flight(%{in_flight_lines: lines}, _width), do: lines
+  defp rewrap_in_flight(_state, _width), do: nil
 
   defp wrapped_assistant(text, width) do
     :assistant

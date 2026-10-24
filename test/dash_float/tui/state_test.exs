@@ -2,6 +2,7 @@ defmodule DashFloat.TUI.StateTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  alias DashFloat.TUI.Render
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
 
@@ -837,6 +838,23 @@ defmodule DashFloat.TUI.StateTest do
 
       assert State.needs_tick?(%{active | tick_ref: make_ref()}) == false
     end
+
+    # Regression (hostile review P1-3): wrapping an unbreakable run used to
+    # re-measure the whole remainder per row (quadratic); a CJK reply near
+    # the live cap drove one tick to 1.6 s — 13x the 125 ms tick budget.
+    # The wrap is single-pass now; this guards the tick well inside budget.
+    test "a tick wrapping a large unbreakable CJK reply stays well under budget" do
+      cjk = String.duplicate("日本語の長い返事が続きます。", 1_500)
+
+      state =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, cjk}, 1_000)
+
+      {micros, {ticked, :cont}} = :timer.tc(State, :tick, [state, 1_100])
+      assert div(micros, 1000) < 400
+      assert State.log_line_count(ticked) > 100
+    end
   end
 
   describe "scrolling" do
@@ -1136,7 +1154,11 @@ defmodule DashFloat.TUI.StateTest do
       assert String.trim(joined) == text
     end
 
-    test "an above-cap in-flight reply keeps its last render across resize" do
+    test "an above-cap in-flight reply clears its live view across a width change" do
+      # Above the cap no fresh render is possible until finalize, and the
+      # stale one is at the OLD width — rendering it into the narrower pane
+      # would truncate at the edge (the #20 symptom). The live view clears
+      # instead; the reply reappears when it finalizes.
       over_cap = String.duplicate("x", 64 * 1024) <> "y"
 
       state =
@@ -1146,7 +1168,16 @@ defmodule DashFloat.TUI.StateTest do
         |> tick_once()
 
       assert state.in_flight_lines == nil
-      assert State.resize(state, 40, 24).in_flight_lines == state.in_flight_lines
+      assert State.resize(state, 40, 24).in_flight_lines == nil
+    end
+
+    test "resize tolerates entries built without logical lines" do
+      hand_built = %{kind: :user, text: "hi", lines: Render.entry_lines(:user, "hi")}
+      state = %{new_state() | entries: [hand_built]}
+
+      resized = State.resize(state, 40, 24)
+      [entry] = resized.entries
+      assert length(entry.lines) >= 2
     end
 
     test "wrap accounting and the windowed view agree after resize (no drift)" do

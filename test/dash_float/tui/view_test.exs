@@ -476,6 +476,21 @@ defmodule DashFloat.TUI.ViewTest do
         assert buffer =~ word, "expected #{inspect(word)} to survive the wrap"
       end
     end
+
+    # Regression (hostile review P1-1): emoji presentation sequences count
+    # two cells in the renderer but one per codepoint in a naive sum — the
+    # row "fit" and the Paragraph clipped the tail exactly as in issue #20.
+    test "emoji presentation sequences wrap without truncating the tail" do
+      text = String.duplicate("⚠️", 39) <> " CRITICAL_TAIL"
+
+      state = State.stream_message(new_state(), {:entry, :system, text})
+
+      term = ExRatatui.init_test_terminal(80, 24)
+      widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+      assert :ok = ExRatatui.draw(term, widgets)
+
+      assert ExRatatui.get_buffer_content(term) =~ "CRITICAL_TAIL"
+    end
   end
 
   describe "input box" do

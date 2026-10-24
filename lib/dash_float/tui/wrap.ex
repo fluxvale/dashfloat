@@ -4,28 +4,42 @@ defmodule DashFloat.TUI.Wrap do
   display lines no wider than the log region, `:word_or_glyph` semantics
   matching the input textarea — breaks at word boundaries, and at glyph
   boundaries only for runs too long for a row (URLs, hashes). Styles travel
-  with the text: a wrapped piece keeps the style of the span it came from, and
-  a line that already fits is rebuilt chunk-for-chunk (same spans, same
-  content). Every input line yields at least one display line, so blank
-  separators survive untouched.
+  with the text: a wrapped piece keeps the style of the span it came from, a
+  line that already fits is rebuilt chunk-for-chunk, and the line's own
+  style/alignment ride along. Continuation rows re-carry the line's leading
+  whitespace as an indent. Every input line yields at least one display line,
+  so blank separators survive untouched.
 
-  Width accounting matches the Rust renderer (`unicode-width`): East Asian
-  Wide/Fullwidth codepoints count two columns, combining marks and format
-  characters count zero, everything else one. Wrap runs at append, tick, and
-  resize time — never per frame (ADR 0006, amended).
+  Width accounting matches the Rust renderer (`unicode-width`, measured
+  against it): East Asian Wide/Fullwidth codepoints count two columns,
+  combining marks and format characters zero, everything else one. Grapheme
+  clusters that carry a variation selector (emoji presentation) or a ZWJ
+  count two — the renderer's cluster width — never one. Divergence from the
+  renderer's tables is only ever an OVER-count (wraps early); the #20
+  regression tests pin buffer-level no-truncation for the sequence classes
+  that motivated this. Wrap runs at append, tick, and resize time — never
+  per frame (ADR 0006, amended).
   """
 
   alias ExRatatui.Text.Line
   alias ExRatatui.Text.Span
 
   @run ~r/\s+|\S+/
+  @vs16 "\u{FE0F}"
+  @zwj "\u{200D}"
 
-  # East Asian Width W and F codepoints (Unicode 15), as {lo, hi} ranges.
-  # Matches unicode-width's wide set for everything a terminal log plausibly
-  # carries (CJK, Hangul, kana, fullwidth forms, emoji). U+3099..U+309A are
-  # intentionally absent — they are combining marks, counted in @zero.
+  # Width 2 ranges: East Asian Width W and F codepoints, plus codepoints the
+  # bundled renderer (unicode-width 0.2.2, Unicode 15.1/16 data) measures as
+  # two cells even where EAW disagrees. Provenance: measured cell-by-cell
+  # through the renderer's cell session during the #20 hostile review; the
+  # deltas beyond stock EAW W/F are the Khmer/trigram/IDE entries and the
+  # Unicode-16 emoji additions. Unknown codepoints default to one column —
+  # an over-count can wrap early, never truncate. Sorted by lo; the binary
+  # search in covers?/4 relies on it.
   @wide [
     {0x1100, 0x115F},
+    {0x17A4, 0x17A4},
+    {0x17D8, 0x17D8},
     {0x231A, 0x231B},
     {0x2329, 0x232A},
     {0x23E9, 0x23EC},
@@ -33,6 +47,7 @@ defmodule DashFloat.TUI.Wrap do
     {0x23F3, 0x23F3},
     {0x25FD, 0x25FE},
     {0x2614, 0x2615},
+    {0x2630, 0x2637},
     {0x2648, 0x2653},
     {0x267F, 0x267F},
     {0x2693, 0x2693},
@@ -63,13 +78,14 @@ defmodule DashFloat.TUI.Wrap do
     {0x2E80, 0x2E99},
     {0x2E9B, 0x2EF3},
     {0x2F00, 0x2FD5},
-    {0x2FF0, 0x2FFB},
+    {0x2FF0, 0x2FFF},
     {0x3000, 0x303E},
     {0x3041, 0x3096},
     {0x309B, 0x30FF},
     {0x3105, 0x312F},
     {0x3131, 0x318E},
-    {0x3190, 0x31E3},
+    {0x3190, 0x31E5},
+    {0x31EF, 0x31EF},
     {0x31F0, 0x321E},
     {0x3220, 0x3247},
     {0x3250, 0x4DBF},
@@ -126,7 +142,7 @@ defmodule DashFloat.TUI.Wrap do
     {0x1F680, 0x1F6C5},
     {0x1F6CC, 0x1F6CC},
     {0x1F6D0, 0x1F6D2},
-    {0x1F6D5, 0x1F6D7},
+    {0x1F6D5, 0x1F6D8},
     {0x1F6DC, 0x1F6DF},
     {0x1F6EB, 0x1F6EC},
     {0x1F6F4, 0x1F6FC},
@@ -136,20 +152,27 @@ defmodule DashFloat.TUI.Wrap do
     {0x1F93C, 0x1F945},
     {0x1F947, 0x1F9FF},
     {0x1FA70, 0x1FA7C},
-    {0x1FA80, 0x1FA88},
-    {0x1FA90, 0x1FABD},
-    {0x1FABF, 0x1FAC5},
-    {0x1FACE, 0x1FADB},
-    {0x1FAE0, 0x1FAE8},
+    {0x1FA80, 0x1FA8A},
+    {0x1FA8E, 0x1FA8F},
+    {0x1FA90, 0x1FABE},
+    {0x1FABF, 0x1FAC6},
+    {0x1FAC8, 0x1FAC8},
+    {0x1FACD, 0x1FACD},
+    {0x1FACE, 0x1FADF},
+    {0x1FAE0, 0x1FAEA},
+    {0x1FAEF, 0x1FAEF},
     {0x1FAF0, 0x1FAF8},
     {0x20000, 0x2FFFD},
     {0x30000, 0x3FFFD}
   ]
 
   # Zero-width codepoints: combining marks and format characters that render
-  # into the previous cell. Pruned to the scripts a log plausibly carries;
-  # any unknown mark defaults to one column (an over-count wraps a column
-  # early — it can never truncate).
+  # into the previous cell, plus the emoji skin-tone modifiers (they only
+  # appear inside an emoji cluster, where the cluster itself carries the
+  # width). Pruned to what a log plausibly carries; any unknown mark
+  # defaults to one column (an over-count wraps a column early — it can
+  # never truncate). Sorted by lo; the binary search in covers?/4 relies on
+  # it.
   @zero [
     {0x0300, 0x036F},
     {0x0483, 0x0489},
@@ -259,15 +282,65 @@ defmodule DashFloat.TUI.Wrap do
     {0x1D173, 0x1D182},
     {0x1D185, 0x1D18B},
     {0x1D1AA, 0x1D1AD},
+    {0x1F3FB, 0x1F3FF},
     {0xE0100, 0xE01EF}
   ]
+
+  @wide_ranges List.to_tuple(@wide)
+  @wide_count tuple_size(@wide_ranges)
+  @zero_ranges List.to_tuple(@zero)
+  @zero_count tuple_size(@zero_ranges)
+
+  # The binary search in covers?/4 relies on both tables being sorted and
+  # disjoint; enforced at compile time so a future edit cannot silently
+  # unsort a table (a misplaced range once made a whole region of the zero
+  # table unreachable — found in the #20 hostile review).
+  Enum.each([@wide, @zero], fn ranges ->
+    true =
+      ranges
+      |> Enum.zip(tl(ranges))
+      |> Enum.all?(fn {a, b} -> a < b end)
+  end)
 
   @doc "Display width in terminal columns of a single-line string."
   @spec width(String.t()) :: non_neg_integer()
   def width(text) when is_binary(text) do
-    text = sanitized(text)
+    text
+    |> sanitized()
+    |> sum_width(0)
+  end
 
-    for <<cp::utf8 <- text>>, reduce: 0 do
+  defp sum_width(text, acc) do
+    case String.next_grapheme(text) do
+      nil -> acc
+      {grapheme, rest} -> sum_width(rest, acc + cluster_width(grapheme))
+    end
+  end
+
+  # A cluster carrying a variation selector (emoji presentation) or joining
+  # pictographics with a ZWJ renders as one emoji cell pair — the renderer's
+  # cluster width, which a per-codepoint sum would undercount (⚠️ = 1+0) or
+  # wildly overcount (family emoji = 2+0+2+0+2). A bare ZWJ between plain
+  # letters is its own zero-width grapheme and falls through to the sum.
+  defp cluster_width(<<cp::utf8>>) when cp < 0x0300, do: 1
+
+  defp cluster_width(grapheme) do
+    cond do
+      String.contains?(grapheme, @vs16) -> 2
+      joined_emoji?(grapheme) -> 2
+      true -> cp_sum(grapheme)
+    end
+  end
+
+  # A ZWJ sequence reads as one emoji pair when it is led by one (the emoji
+  # planes); a ZWJ that merely follows a plain letter adds nothing.
+  defp joined_emoji?(grapheme) do
+    <<first::utf8, _rest::binary>> = grapheme
+    first >= 0x1F000 and String.contains?(grapheme, @zwj)
+  end
+
+  defp cp_sum(grapheme) do
+    for <<cp::utf8 <- grapheme>>, reduce: 0 do
       acc -> acc + cp_width(cp)
     end
   end
@@ -281,7 +354,8 @@ defmodule DashFloat.TUI.Wrap do
 
   @doc """
   Wraps styled lines to `width` columns (a `width` below 1 wraps at one
-  column). Blank lines and lines that already fit pass through unchanged.
+  column). Blank lines and lines that fit pass through unchanged; the line's
+  leading whitespace becomes the indent of its wrapped continuation rows.
   """
   @spec wrap([Line.t()], integer()) :: [Line.t()]
   def wrap(lines, width) when is_list(lines) and is_integer(width) do
@@ -289,34 +363,69 @@ defmodule DashFloat.TUI.Wrap do
     Enum.flat_map(lines, &wrap_line(&1, width))
   end
 
-  defp wrap_line(%Line{spans: spans}, width) do
+  defp wrap_line(%Line{} = line, width) do
+    chunks = Enum.flat_map(line.spans, &span_chunks/1)
+    {prefix, body} = split_prefix(chunks)
+    indent = chunks_width(prefix)
+
+    cond do
+      # A blank or whitespace-only line that fits is untouched.
+      body == [] and indent <= width ->
+        [line]
+
+      # An indent as wide as the row is degenerate; wrap without it.
+      indent == 0 or indent >= width ->
+        wrap_chunks(chunks, width, line)
+
+      # Continuation rows re-carry the leading whitespace as their indent,
+      # so the body wraps into the columns the indent leaves behind.
+      true ->
+        indent_width = width - indent
+        indent_line = display_line(drop_kinds(prefix), line)
+        indent_spans = indent_line.spans
+
+        body
+        |> wrap_chunks(indent_width, line)
+        |> Enum.map(fn %Line{} = row -> %Line{row | spans: indent_spans ++ row.spans} end)
+    end
+  end
+
+  defp split_prefix(chunks), do: Enum.split_while(chunks, fn {_t, _s, kind} -> kind == :space end)
+
+  defp chunks_width(chunks),
+    do: Enum.reduce(chunks, 0, fn {text, _s, _k}, acc -> acc + width(text) end)
+
+  defp drop_kinds(chunks), do: Enum.map(chunks, fn {text, style, _kind} -> {text, style} end)
+
+  defp wrap_chunks(chunks, width, line) do
     {rev, cur, _col, _continued} =
-      spans
-      |> Enum.flat_map(&span_chunks/1)
-      |> Enum.reduce({[], [], 0, false}, &step(&1, width, &2))
+      Enum.reduce(chunks, {[], [], 0, false}, &step(&1, width, &2))
 
     # The final display line is always emitted: blank in, blank out.
-    emit([cur | rev])
+    emit([cur | rev], line)
   end
 
   ## Filling
 
   # A whitespace run on a fresh continuation row is dropped (wrap points
-  # never inherit leading spaces); one that would overflow a full row is
-  # dropped with it. Otherwise it occupies columns like any other chunk.
+  # never inherit leading spaces). A run that would overflow a full row is
+  # dropped and the row marked full (col := width) — the run is gone, so the
+  # next word must move to the next row rather than abut the last word on
+  # this one.
   defp step({text, style, :space}, width, {rev, cur, col, continued}) do
     w = width(text)
 
     cond do
       col == 0 and continued -> {rev, cur, col, true}
       col + w <= width -> {rev, [{text, style} | cur], col + w, continued}
-      true -> {rev, cur, col, continued}
+      true -> {rev, cur, width, continued}
     end
   end
 
   # A word that fits the remaining columns is placed. A word that fits a row
   # of its own moves to the next row whole. A word wider than a row is split
-  # at glyph boundaries — fill the remainder, then keep filling fresh rows.
+  # at glyph boundaries via split_word/6 — one pass, no re-measuring of the
+  # remainder.
   defp step({text, style, :word}, width, {rev, cur, col, continued}) do
     w = width(text)
 
@@ -332,37 +441,40 @@ defmodule DashFloat.TUI.Wrap do
     end
   end
 
-  # A word wider than a row: fill the remainder, then keep filling fresh
-  # rows. A lone grapheme wider than the budget stays on the current row —
-  # progress beats a perfect fit at width 1, and no phantom row follows it.
+  # Fill the row's remaining columns with the word's head, close the row,
+  # then let fill_rows/4 lay the rest across fresh rows. An empty head means
+  # the row was already full (the P1-2 space rule or an exact fill): close
+  # it and move on.
   defp split_word(text, style, width, rev, cur, col) do
-    {head, rest} = split_fit(text, width - col)
+    {head, rest} = split_fit(text, width - col, false)
+    cur = if head == "", do: cur, else: [{head, style} | cur]
+    rev = if cur == [], do: rev, else: [cur | rev]
+    fill_rows(rest, style, width, rev)
+  end
+
+  # Lay an over-long word across full-width rows. The first grapheme of a
+  # fresh row is always taken (progress beats a perfect fit at width 1);
+  # the tail lands on an open row so no phantom blank follows it.
+  defp fill_rows(text, style, width, rev) do
+    {head, rest} = split_fit(text, width, true)
 
     if rest == "" do
-      {rev, [{head, style} | cur], col + width(head), true}
+      {rev, [{head, style}], width(head), true}
     else
-      # An empty head means the row was already full: close it before the
-      # word, which keeps splitting on the next row. Trailing whitespace
-      # stays on the closed row: it is invisible (the terminal clips the
-      # tail) and dropping it would fuse adjacent words.
-      rev =
-        if head == "" do
-          [cur | rev]
-        else
-          [[{head, style} | cur] | rev]
-        end
-
-      step({rest, style, :word}, width, {rev, [], 0, true})
+      fill_rows(rest, style, width, [[{head, style}] | rev])
     end
   end
 
   # Longest prefix (by display width, at grapheme boundaries) that fits
-  # `budget` columns, and the rest. The first grapheme is taken even when it
-  # alone exceeds the budget — progress beats a perfect fit at width 1.
-  defp split_fit(text, budget) when budget <= 0, do: {"", text}
-  defp split_fit(text, budget), do: take_fit(text, budget, [], 0)
+  # `budget` columns, and the rest. With force? the first grapheme is taken
+  # even when it alone exceeds the budget; without it an unfitting first
+  # grapheme yields an empty head so the caller can close the row first (a
+  # wide grapheme never starts a row it would overflow at width >= 2).
+  defp split_fit(text, budget, force?)
+  defp split_fit(text, budget, _force?) when budget <= 0, do: {"", text}
+  defp split_fit(text, budget, force?), do: take_fit(text, budget, [], 0, force?)
 
-  defp take_fit(text, budget, acc, used) do
+  defp take_fit(text, budget, acc, used, force?) do
     case String.next_grapheme(text) do
       nil ->
         {join(acc), ""}
@@ -370,8 +482,8 @@ defmodule DashFloat.TUI.Wrap do
       {grapheme, rest} ->
         gw = width(grapheme)
 
-        if acc == [] or used + gw <= budget do
-          take_fit(rest, budget, [grapheme | acc], used + gw)
+        if (force? and acc == []) or used + gw <= budget do
+          take_fit(rest, budget, [grapheme | acc], used + gw, force?)
         else
           {join(acc), text}
         end
@@ -400,19 +512,21 @@ defmodule DashFloat.TUI.Wrap do
 
   ## Emitting
 
-  defp emit(rev_display_lines) do
+  defp emit(rev_display_lines, line) do
     rev_display_lines
     |> Enum.reverse()
-    |> Enum.map(&display_line/1)
+    |> Enum.map(&display_line(&1, line))
   end
 
-  defp display_line([]), do: Line.new([Span.new("")])
+  defp display_line([], %Line{} = line), do: %Line{line | spans: [Span.new("")]}
 
-  defp display_line(rev_chunks) do
-    rev_chunks
-    |> Enum.reverse()
-    |> merge_spans([])
-    |> then(&Line.new(&1))
+  defp display_line(rev_chunks, %Line{} = line) do
+    spans =
+      rev_chunks
+      |> Enum.reverse()
+      |> merge_spans([])
+
+    %Line{line | spans: spans}
   end
 
   defp merge_spans([], acc), do: Enum.reverse(acc)
@@ -427,21 +541,31 @@ defmodule DashFloat.TUI.Wrap do
 
   ## Column accounting
 
-  # ASCII and Latin-1 never touch the range tables: the common case is one
-  # comparison.
+  # Codepoints below U+0300 (ASCII, Latin-1, Latin Extended) never touch the
+  # range tables: the common case is one comparison.
   defp cp_width(cp) when cp < 0x0300, do: 1
 
   defp cp_width(cp) do
     cond do
-      in_ranges?(cp, @zero) -> 0
-      in_ranges?(cp, @wide) -> 2
+      covers?(@zero_ranges, @zero_count, cp) -> 0
+      covers?(@wide_ranges, @wide_count, cp) -> 2
       true -> 1
     end
   end
 
-  defp in_ranges?(cp, [{lo, hi} | rest]) do
-    if cp >= lo and cp <= hi, do: true, else: in_ranges?(cp, rest)
-  end
+  # Binary search over a tuple of {lo, hi} ranges sorted by lo.
+  defp covers?(ranges, size, cp), do: covers?(ranges, 0, size - 1, cp)
 
-  defp in_ranges?(_cp, []), do: false
+  defp covers?(_ranges, lo, hi, _cp) when lo > hi, do: false
+
+  defp covers?(ranges, lo, hi, cp) do
+    mid = div(lo + hi, 2)
+    {range_lo, range_hi} = elem(ranges, mid)
+
+    cond do
+      cp < range_lo -> covers?(ranges, lo, mid - 1, cp)
+      cp > range_hi -> covers?(ranges, mid + 1, hi, cp)
+      true -> true
+    end
+  end
 end

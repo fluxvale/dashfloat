@@ -36,10 +36,23 @@ defmodule DashFloat.TUI.WrapTest do
     end
 
     test "combining marks and zero-width format characters count zero" do
-      # e + combining acute (decomposed), variation selector, ZWJ
+      # e + combining acute (decomposed) is one column; the bare ZWJ joins
+      # clusters without adding width of its own (the cluster rule below
+      # handles full ZWJ sequences).
       assert Wrap.width("e\u0301") == 1
-      assert Wrap.width("\u2764\uFE0F") == 1
       assert Wrap.width("a\u200Db") == 2
+    end
+
+    test "emoji presentation sequences and ZWJ clusters render two columns" do
+      # VS16 presentation (⚠️, ❤️, keycap) and ZWJ families are one emoji
+      # cell pair in the renderer — never the per-codepoint sum.
+      assert Wrap.width("⚠️") == 2
+      assert Wrap.width("❤️") == 2
+      assert Wrap.width("1️⃣") == 2
+      assert Wrap.width("👨‍👩‍👧") == 2
+      assert Wrap.width("👍🏽") == 2
+      run = String.duplicate("⚠️", 39)
+      assert Wrap.width(run) == 78
     end
 
     test "mixed runs account per codepoint" do
@@ -59,6 +72,14 @@ defmodule DashFloat.TUI.WrapTest do
       original = [line([{"❯ ", :dim_italic}, {"hello world", :assistant}]), line("second")]
 
       assert Wrap.wrap(original, 80) == original
+    end
+
+    test "the line's own style and alignment ride along wrapped rows" do
+      styled = %Line{line("a very long heading indeed") | alignment: :center}
+
+      wrapped = Wrap.wrap([styled], 10)
+
+      assert Enum.all?(wrapped, &(&1.alignment == :center))
     end
 
     test "blank lines pass through" do
@@ -88,8 +109,32 @@ defmodule DashFloat.TUI.WrapTest do
       assert flat(Wrap.wrap([line("aaa   bbb")], 3)) == ["aaa", "bbb"]
     end
 
-    test "leading whitespace survives on the first row but not continuations" do
-      assert flat(Wrap.wrap([line("  one two")], 5)) == ["  one", "two"]
+    test "leading whitespace survives on the first row and indents continuations" do
+      # The leading whitespace run is the hanging indent: every continuation
+      # row re-carries it (tool output, user echo).
+      assert flat(Wrap.wrap([line("  one two")], 5)) == ["  one", "  two"]
+    end
+
+    test "a whitespace run that overflows the row never fuses adjacent words" do
+      # Regression (hostile review P1-2): the dropped run used to leave the
+      # next word on the same row, deleting the gap — and the words' spacing
+      # with it.
+      assert flat(Wrap.wrap([line("left" <> String.duplicate(" ", 80) <> "right")], 80)) == [
+               "left",
+               "right"
+             ]
+
+      assert flat(Wrap.wrap([line("| a" <> String.duplicate(" ", 10) <> "| b |")], 12)) == [
+               "| a",
+               "| b |"
+             ]
+
+      tail = "xxxx" <> String.duplicate("x", 36) <> String.duplicate(" ", 50) <> "TAIL_VALUE"
+
+      assert flat(Wrap.wrap([line(tail)], 80)) == [
+               String.duplicate("x", 40),
+               "TAIL_VALUE"
+             ]
     end
   end
 
@@ -145,6 +190,25 @@ defmodule DashFloat.TUI.WrapTest do
                "十"
              ]
     end
+
+    test "a wide grapheme never starts a row it would overflow" do
+      # 78 columns filled, one left: the CJK pair needs two, so the row
+      # closes first (regression, hostile review P2-1: it used to emit an
+      # 81-column row and the renderer clipped one glyph).
+      src = String.duplicate("x", 78) <> " " <> String.duplicate("日", 60)
+      rows = Wrap.wrap([line(src)], 80)
+
+      assert Enum.all?(rows, &(Wrap.width(flatten_row(&1)) <= 80))
+
+      joined =
+        rows
+        |> Enum.map_join(&flatten_row/1)
+        |> String.replace(" ", "")
+
+      assert joined == String.replace(src, " ", "")
+    end
+
+    defp flatten_row(row), do: Enum.map_join(row.spans, "", & &1.content)
 
     test "a wide grapheme in a 1-column budget still makes progress" do
       assert flat(Wrap.wrap([line("日x")], 1)) == ["日", "x"]

@@ -295,13 +295,23 @@ What was decided, amending this ADR (and ADR 0002's truncation clause):
   each logical styled line into display lines no wider than the log region —
   word boundaries first, glyph boundaries for runs too long for a row
   (`:word_or_glyph`, same semantics as the input textarea). Styles travel
-  with the text; a line that fits is rebuilt span-for-span; a blank line
-  wraps to a blank line (separators keep the rhythm).
-- **Width accounting matches the Rust renderer** (`unicode-width`): East
-  Asian Wide/Fullwidth and emoji count two columns, combining marks and
-  format characters zero, everything else one — CJK/emoji never misalign
-  after a wrap. Unknown codepoints default to one column: an over-count can
-  wrap early, never truncate.
+  with the text; a line that fits is rebuilt span-for-span (its own
+  style/alignment ride along); a blank line wraps to a blank line
+  (separators keep the rhythm). A line's leading whitespace becomes the
+  indent its wrapped continuation rows re-carry (tool output, user echo);
+  a whitespace run that would overflow a row is dropped *and closes the
+  row*, so a wrap point can never fuse the words it separated.
+- **Width accounting matches the Rust renderer** (`unicode-width`), measured
+  against it during review: East Asian Wide/Fullwidth and emoji count two
+  columns, combining marks and format characters zero, everything else one.
+  Grapheme clusters carrying a variation selector (emoji presentation:
+  ⚠️, ❤️, keycaps) or an emoji-led ZWJ sequence count two — the renderer's
+  cluster width, where a per-codepoint sum would undercount and let the
+  Paragraph clip the row tail (the exact #20 symptom, reproduced in review
+  and pinned by a buffer-level regression test). The width tables are
+  compile-time-checked sorted (the binary search depends on it), provenance
+  documented in the module; residual table drift is deliberately
+  over-count-only (wraps a column early, never truncates).
 - **Entries carry both truths**: `logical` (the width-free render, the parse
   cache — still built once at append by `Render.entry_lines/2`) and `lines`
   (its wrap at the current width — what the view renders and the scroll math
@@ -310,24 +320,36 @@ What was decided, amending this ADR (and ADR 0002's truncation clause):
   append (inside `put_entry`), the tick's in-flight refresh, and now resize
   (width change only, re-wrapping every entry from `logical` — no re-parse;
   the in-flight reply re-renders from its text under the same 64 KiB cap).
-  Never per frame: `render/2` stays `O(viewport)`, slicing stored wrapped
-  lines.
+  Above the cap no fresh render is possible, and a stale-width render would
+  truncate at the new edge, so a width-changing resize clears the live view
+  until finalize. Never per frame: `render/2` stays `O(viewport)`, slicing
+  stored wrapped lines. The wrap itself is single-pass over graphemes with
+  binary-searched width tables — measured at 35 ms for a 48 KB
+  space-free CJK reply (was 1.6 s in the first cut, quadratic; a
+  wall-clock regression test guards the tick budget) and ~21 ms per 1000
+  entries on resize — user-paced, O(session), the same cost class as the
+  accepted scroll-time accounting scans.
 - **Scroll math counts display lines** — the invariant moved from
   "display == logical (no wrapping)" to "accounting and rendering read the
-  same stored wrapped lists". `log_line_count/1`, `effective_scroll/2`, the
-  windowed slice, and the status position all agree by construction.
-  Continuation rows of a wrapped entry carry no prefix (a wrap point never
-  inherits leading whitespace); scroll *intents* survive resize and re-clamp
-  against the new counts.
+  same stored wrapped lines". `log_line_count/1`, `effective_scroll/2`, the
+  windowed slice, and the status position all agree by construction (held
+  through a 300-state randomized differential in review). Scroll *intents*
+  survive resize numerically and re-clamp against the new counts — they are
+  not content-anchored, so a re-wrapped view may sit at different content
+  after a resize; content anchoring is deferred with Phase 4.
+- **Markdown rules wrap like any other unbreakable run** (a 120-column rule
+  at an 80-column terminal renders as two rows) — the visible price of the
+  no-truncation guarantee; the alternative (truncating decorative runs)
+  cannot be distinguished from data at the wrap layer.
 - **Input box unchanged** — the textarea wraps its own draft Rust-side, per
   frame, at the area width, so resize re-wraps it for free; the box height
   stays bound to logical lines (ADR 0002's clamp), wrapped overflow scrolling
   inside the box.
 - **Why the shipped tests missed the bug**: they asserted on stored logical
   lines and widget configuration (`wrap_mode: :word_or_glyph`) — never on
-  what a narrow terminal buffer actually received. The regression test now
-  draws a long entry into a 20-column test terminal and requires every word
-  to reach the buffer.
+  what a narrow terminal buffer actually received. The regression tests now
+  draw long entries into narrow test terminals and require every word (and
+  the tail after an emoji sequence run) to reach the buffer.
 
 ADR 0002's scroll-math rationale ("wrapped log lines" rejected; truncation
 keeps the math exact) is reversed by this amendment: wrapping keeps the math
