@@ -148,6 +148,23 @@ defmodule DashFloat.Tools.RunnerTest do
     assert result.content =~ "… [truncated: showing #{result.lines} lines]"
   end
 
+  test "a single over-cap line reports zero lines shown without a stray newline", %{root: root} do
+    # One 300 KiB line: the byte cap keeps none of it — the marker must still
+    # read cleanly and say what happened.
+    blob = String.duplicate("x", 300 * 1024) <> "\n"
+    one = Path.join(root, "one.log")
+    File.write!(one, blob)
+
+    result = run("read_file", %{"path" => "one.log", "offset" => 1, "limit" => 10}, root)
+
+    assert result.ok == true
+    assert result.truncated == true
+    assert result.lines == 0
+
+    assert result.content ==
+             "… [truncated: showing 0 of 1 lines — line exceeds the byte cap]"
+  end
+
   test "read_file on a large directory degrades to the read error, not a raise", %{root: root} do
     dir = Path.join(root, "many")
     File.mkdir_p!(dir)

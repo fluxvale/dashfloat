@@ -340,6 +340,9 @@ defmodule DashFloat.LLM.ChatStream do
        when is_list(deltas) do
     # Bytes count id + name + argument fragments (all model-controlled
     # growth). The call-count cap counts DISTINCT indices via ToolCalls.
+    # NB ids/names echoed on every fragment are counted per fragment though
+    # stored once — intentional headroom: an id-echoing server near the cap
+    # aborts early (conservative), never late.
     bytes =
       Enum.reduce(deltas, 0, fn delta, sum ->
         sum + id_bytes(delta) + name_bytes(delta) + args_bytes(delta)

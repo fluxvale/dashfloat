@@ -92,7 +92,7 @@ defmodule DashFloat.Tools.Exec do
           loop(port, os_pid, deadline, timeout_ms, cap, output, total, truncated)
 
         {^port, {:exit_status, status}} ->
-          signal_group(os_pid)
+          signal_group(port, os_pid)
           {output, truncated} = stamp(output, total, truncated)
 
           %{
@@ -110,7 +110,7 @@ defmodule DashFloat.Tools.Exec do
   end
 
   defp cancelled(port, os_pid, output, total, truncated) do
-    signal_group(os_pid)
+    signal_group(port, os_pid)
     drain(port)
     {output, truncated} = stamp(output, total, truncated)
 
@@ -128,7 +128,7 @@ defmodule DashFloat.Tools.Exec do
     # No Port.close here: the SIGKILL below terminates the program (and with
     # it the port) — closing a port the kill already ended raises. The drain
     # swallows whatever the dying program flushed, including its exit_status.
-    signal_group(os_pid)
+    signal_group(port, os_pid)
     drain(port)
     {output, truncated} = stamp(output, total, truncated)
 
@@ -180,13 +180,23 @@ defmodule DashFloat.Tools.Exec do
   # (wrapping pid_max takes far longer than the run of a command). The
   # killer's stderr is silenced: after a clean exit the group is usually
   # already gone and kill(1) would otherwise complain on the BEAM's stderr.
+  #
   # Belt for the instant-death window between Port.open and Port.info: only
   # observed under scheduler load (a coverage-instrumented run), never
-  # deterministic in a test.
+  # deterministic in a test. A nil birth pid may just mean the handshake was
+  # slow — re-query while the program lives; only a truly dead program (or a
+  # fast one whose children already died with it) yields nil again.
   # coveralls-ignore-next-line
-  defp signal_group(nil), do: :ok
+  defp signal_group(port, nil) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} -> kill_group(os_pid)
+      _gone -> :ok
+    end
+  end
 
-  defp signal_group(os_pid) do
+  defp signal_group(_port, os_pid), do: kill_group(os_pid)
+
+  defp kill_group(os_pid) do
     group = Integer.to_string(-os_pid)
 
     killer =
