@@ -418,11 +418,9 @@ defmodule DashFloat.Config do
   defp tighten(path, mode) do
     if Bitwise.band(mode, 0o077) != 0 do
       Logger.warning("#{@main_file} is too permissive — repairing to 0600")
-
-      case File.chmod(path, @secret_mode) do
-        :ok -> :ok
-        {:error, reason} -> Logger.warning("cannot repair #{path}: #{:file.format_error(reason)}")
-      end
+      # Best effort; the result is ignored — repair never blocks a load, and
+      # chmod by the file's owner fails only in exotic states.
+      File.chmod(path, @secret_mode)
     else
       :ok
     end

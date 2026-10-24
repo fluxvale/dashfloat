@@ -194,9 +194,12 @@ defmodule DashFloat.Config.Migration do
       |> Path.dirname()
       |> Path.join(@backup_file)
 
+    # Tightened before the rename so whichever name the credential ends up
+    # under is already private.
+    tighten(legacy)
+
     if File.exists?(backup) do
       Logger.warning("#{backup} already exists — leaving the legacy config in place")
-      tighten(legacy)
     else
       case File.rename(legacy, backup) do
         :ok ->
@@ -204,7 +207,6 @@ defmodule DashFloat.Config.Migration do
 
         {:error, _reason} ->
           Logger.warning("cannot back up the legacy config — leaving it in place")
-          tighten(legacy)
       end
     end
   end

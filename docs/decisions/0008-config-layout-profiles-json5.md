@@ -189,8 +189,8 @@ without an `apiKey` therefore surfaces as `api_key` in that message.
   mode 0600 from the moment content can land in it, and **load repairs a
   too-permissive file back to 0600 with a warning** — before parsing, so a
   hand-made file that is both malformed and too permissive (the most likely
-  first-write shape) is still repaired. Repair is best effort; a repair
-  failure warns again and load proceeds. A **symlinked** config warns and is
+  first-write shape) is still repaired. Repair and tightening are best
+  effort — a failure never blocks a load. A **symlinked** config warns and is
   loaded as-is — chmod must never follow a link out of the config directory
   onto a file the loader does not own.
 - `@derive {Inspect, except: [:api_key]}` stays, so a UI crash logging state
