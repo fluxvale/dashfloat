@@ -59,17 +59,24 @@ defmodule DashFloat.Tools.Runner do
           | {:error, map()}
   def prepare_edit(args, cwd) do
     with {:ok, resolved} <- resolve_path(cwd, args["path"]),
+         :ok <- check_edit_size(resolved, args["path"]),
          {:ok, content} <- read_file_content(resolved, args["path"]),
-         :ok <- check_edit_size(args["path"], content),
          {:ok, start} <- locate_unique(args, content) do
       {:ok, %{resolved: resolved, content: content, start: start}}
     end
   end
 
-  defp check_edit_size(path, content) when byte_size(content) > @edit_byte_cap,
-    do: {:error, %{ok: false, path: path, error: "file too large to edit"}}
+  # The size gate stats before reading: an oversized artifact is refused
+  # without ever landing whole in memory.
+  defp check_edit_size(resolved, path) do
+    case File.stat(resolved) do
+      {:ok, %File.Stat{size: size}} when size > @edit_byte_cap ->
+        {:error, %{ok: false, path: path, error: "file too large to edit"}}
 
-  defp check_edit_size(_path, _content), do: :ok
+      _other ->
+        :ok
+    end
+  end
 
   defp locate_unique(args, content) do
     case Edit.locate(content, args["search_block"]) do
@@ -82,37 +89,98 @@ defmodule DashFloat.Tools.Runner do
 
   defp read_file(args, cwd) do
     with {:ok, resolved} <- resolve_path(cwd, args["path"]),
-         {:ok, content} <- read_file_content(resolved, args["path"]) do
-      total_bytes = byte_size(content)
-      all_lines = Edit.lines(content)
-      total_lines = length(all_lines)
+         {:ok, stat} <- stat_source(resolved, args["path"]) do
+      read_window(args, resolved, stat)
+    end
+  end
 
-      window =
-        all_lines
-        |> Enum.drop(args["offset"] - 1)
-        |> Enum.take(args["limit"])
+  # Files above this size stream only the requested window instead of landing
+  # whole in memory (the caps in the result must bound reads, not just output).
+  @read_stream_floor 256 * 1024
 
-      {shown, _bytes} = take_lines(window, @read_byte_cap)
-      last_line = args["offset"] + length(shown) - 1
-      truncated = last_line < total_lines
+  defp read_window(args, resolved, %File.Stat{size: size}) when size > @read_stream_floor do
+    first = args["offset"] - 1
+    last = args["offset"] + args["limit"] - 1
 
-      joined_lines = Enum.join(shown, "\n")
-      joined = Edit.sanitize(joined_lines)
+    window =
+      resolved
+      |> File.stream!()
+      |> Stream.map(&String.trim_trailing(&1, "\n"))
+      |> Enum.slice(first..last//1)
 
-      shown_content =
-        if truncated,
-          do: joined <> "\n… [truncated: showing #{length(shown)} of #{total_lines} lines]",
-          else: joined
+    truncated = length(window) > args["limit"]
 
-      %{
-        ok: true,
-        path: args["path"],
-        content: shown_content,
-        lines: length(shown),
-        total_lines: total_lines,
-        total_bytes: total_bytes,
-        truncated: truncated
-      }
+    shown =
+      window
+      |> Enum.take(args["limit"])
+      |> take_lines(@read_byte_cap)
+      |> elem(0)
+
+    joined =
+      shown
+      |> Enum.join("\n")
+      |> Edit.sanitize()
+
+    content =
+      if truncated, do: joined <> "\n… [truncated: showing #{length(shown)} lines]", else: joined
+
+    %{
+      ok: true,
+      path: args["path"],
+      content: content,
+      lines: length(shown),
+      total_bytes: size,
+      truncated: truncated
+    }
+  end
+
+  # Small files read whole: the exact line total makes the truncation report
+  # honest (total_lines is unknown on the streamed path).
+  defp read_window(args, resolved, %File.Stat{} = _stat) do
+    case File.read(resolved) do
+      {:ok, content} ->
+        total_bytes = byte_size(content)
+        all_lines = Edit.lines(content)
+        total_lines = length(all_lines)
+
+        window =
+          all_lines
+          |> Enum.drop(args["offset"] - 1)
+          |> Enum.take(args["limit"])
+
+        {shown, _bytes} = take_lines(window, @read_byte_cap)
+        last_line = args["offset"] + length(shown) - 1
+        truncated = last_line < total_lines
+
+        joined =
+          shown
+          |> Enum.join("\n")
+          |> Edit.sanitize()
+
+        content =
+          if truncated,
+            do: joined <> "\n… [truncated: showing #{length(shown)} of #{total_lines} lines]",
+            else: joined
+
+        %{
+          ok: true,
+          path: args["path"],
+          content: content,
+          lines: length(shown),
+          total_lines: total_lines,
+          total_bytes: total_bytes,
+          truncated: truncated
+        }
+
+      {:error, reason} ->
+        read_error(args["path"], reason)
+    end
+  end
+
+  defp stat_source(resolved, path) do
+    case File.stat(resolved) do
+      {:ok, stat} -> {:ok, stat}
+      {:error, reason} -> {:error, read_error(path, reason)}
     end
   end
 
@@ -265,8 +333,13 @@ defmodule DashFloat.Tools.Runner do
       {:ok, resolved} ->
         case File.ls(resolved) do
           {:ok, names} ->
+            # Stats touch at most cap+1 entries: a huge directory must not
+            # turn into thousands of lstats (dirs-first ordering holds within
+            # the alphabetical window).
+            window = Enum.take(names, @list_entry_cap + 1)
+
             entries =
-              names
+              window
               |> Enum.map(&classify_entry(resolved, &1))
               |> Enum.sort()
               |> Enum.map(&render_entry/1)
@@ -322,14 +395,15 @@ defmodule DashFloat.Tools.Runner do
       {:ok, content} ->
         {:ok, content}
 
-      {:error, :enoent} ->
-        {:error, %{ok: false, path: path, error: "file not found"}}
-
       {:error, reason} ->
-        {:error,
-         %{ok: false, path: path, error: "could not read file: " <> reason_string(reason)}}
+        {:error, read_error(path, reason)}
     end
   end
+
+  defp read_error(path, :enoent), do: %{ok: false, path: path, error: "file not found"}
+
+  defp read_error(path, reason),
+    do: %{ok: false, path: path, error: "could not read file: " <> reason_string(reason)}
 
   defp edit_error(path, :empty_search),
     do: %{ok: false, path: path, error: "search block is empty"}

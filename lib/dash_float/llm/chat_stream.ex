@@ -26,6 +26,10 @@ defmodule DashFloat.LLM.ChatStream do
   # A single SSE frame that never completes would grow the parser buffer until
   # the node dies: cap it (the parser itself stays pure and unbounded).
   @frame_limit 1024 * 1024
+  # The episode's own accumulations (content + tool argument fragments) are
+  # bounded too: a trickling endpoint that never trips the idle timeout or the
+  # frame cap must not grow them without bound (ADR 0007 §2).
+  @episode_limit 4 * 1024 * 1024
   @drain_timeout 5_000
   # finch's socket `receive_timeout` is the primary idle detector (it is
   # strictly shorter than the stream loop's timer, so its error arrives first);
@@ -142,7 +146,8 @@ defmodule DashFloat.LLM.ChatStream do
         stream(agent, provider, resp, idle_timeout, %{
           parser: SSE.new(),
           tool_calls: ToolCalls.new(),
-          content: ""
+          content: "",
+          tool_bytes: 0
         })
   end
 
@@ -272,7 +277,14 @@ defmodule DashFloat.LLM.ChatStream do
         acc = emit_content(agent, decoded, acc)
         acc = emit_tool_calls(acc, decoded)
         emit_usage(agent, decoded, acc)
-        emit_frames(agent, provider, resp, rest, acc)
+
+        if episode_bytes(acc) > @episode_limit do
+          # Checked per frame: a single batch carrying many frames must not
+          # slip the whole batch past the cap.
+          {:error, "[llm: episode exceeded 4 MiB — stream aborted]", acc}
+        else
+          emit_frames(agent, provider, resp, rest, acc)
+        end
 
       # A data frame that is not JSON is a broken stream, not a keepalive.
       {:error, _error} ->
@@ -318,10 +330,25 @@ defmodule DashFloat.LLM.ChatStream do
   # binaries and parse once, at the end (ADR 0007 §1).
   defp emit_tool_calls(acc, %{"choices" => [%{"delta" => %{"tool_calls" => deltas}} | _rest]})
        when is_list(deltas) do
-    %{acc | tool_calls: ToolCalls.feed(acc.tool_calls, deltas)}
+    bytes =
+      Enum.reduce(deltas, 0, fn
+        %{"function" => %{"arguments" => fragment}}, sum when is_binary(fragment) ->
+          sum + byte_size(fragment)
+
+        _delta, sum ->
+          sum
+      end)
+
+    %{
+      acc
+      | tool_calls: ToolCalls.feed(acc.tool_calls, deltas),
+        tool_bytes: acc.tool_bytes + bytes
+    }
   end
 
   defp emit_tool_calls(acc, _decoded), do: acc
+
+  defp episode_bytes(acc), do: byte_size(acc.content) + acc.tool_bytes
 
   ## Non-2xx: drain a bounded body, then report the provider's message
   #

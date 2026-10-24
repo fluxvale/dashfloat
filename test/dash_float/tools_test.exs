@@ -248,5 +248,18 @@ defmodule DashFloat.ToolsTest do
       assert Tools.validate("list_directory", %{"path" => "src", "recursive" => true}) ==
                {:ok, %{"path" => "src"}}
     end
+
+    test "file write targets with a trailing slash are refused" do
+      # The OS would strip the slash and create a FILE named "newdir" — the
+      # result must not report ok for a path that names a directory.
+      for tool <- ["write_file", "edit_file"] do
+        assert Tools.validate(tool, %{
+                 "path" => "newdir/",
+                 "content" => "x",
+                 "search_block" => "a",
+                 "replace_block" => "b"
+               }) == {:error, "#{tool}: path must name a file, not end in \"/\""}
+      end
+    end
   end
 end

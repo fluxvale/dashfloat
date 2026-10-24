@@ -17,6 +17,49 @@ defmodule DashFloat.Tools.ExecTest do
     assert result == %{ok: true, exit: 0, output: "hello\n", truncated: false, total_bytes: 6}
   end
 
+  test "a :cancel mid-run kills the process group and reports the cancel" do
+    dir = sandbox("cancel")
+    parent = self()
+
+    {:ok, task} =
+      Task.start(fn ->
+        send(parent, {:done, Exec.run("sleep 61", dir, 60_000, 4_096)})
+      end)
+
+    wait_for_process("sleep 61")
+    send(task, :cancel)
+
+    assert_receive {:done, result}, 5_000
+    assert result.cancelled == true
+    assert result.ok == false
+
+    # The group SIGKILL ran: nothing survives (a bare Port.close would leak it).
+    wait_for_gone("sleep 61")
+  end
+
+  # System.cmd returns {output, status}: pgrep exits 0 with matches, 1 without.
+  defp wait_for_process(pattern) do
+    if match?({_pids, 0}, System.cmd("pgrep", ["-f", pattern])) do
+      :ok
+    else
+      Process.sleep(20)
+      wait_for_process(pattern)
+    end
+  end
+
+  defp wait_for_gone(pattern, tries \\ 100) do
+    if match?({_pids, 1}, System.cmd("pgrep", ["-f", pattern])) do
+      :ok
+    else
+      if tries > 0 do
+        Process.sleep(20)
+        wait_for_gone(pattern, tries - 1)
+      else
+        flunk("process #{pattern} survived the cancel")
+      end
+    end
+  end
+
   test "a nonzero exit reports ok: false with the exact status" do
     result = Exec.run("echo hi; exit 3", sandbox("exit3"), 5_000, 4_096)
 

@@ -13,6 +13,7 @@ defmodule DashFloat.AgentTest do
   alias DashFloat.Agent
   alias DashFloat.Config
   alias DashFloat.SSEServer
+  alias DashFloat.TUI.State
 
   @headers "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
 
@@ -404,7 +405,13 @@ defmodule DashFloat.AgentTest do
 
     assert %{"content" => result_json} = tool_result_message(messages, "call_bad")
     assert Jason.decode!(result_json) == %{"ok" => false, "error" => "invalid JSON arguments"}
-    assert_receive {:phase, :idle}, 2_000
+
+    # The turn's display messages (including the nil-args tool_call) must
+    # render in the real UI state, never crash it (hostile-review P1-1).
+    Process.sleep(100)
+    log = display_log()
+    assert {:phase, :idle} in log
+    assert contract_survives?(log)
   end
 
   ## Multiple calls and usage gating
@@ -518,6 +525,10 @@ defmodule DashFloat.AgentTest do
     assert_receive {:confirm, ref, %{name: "execute_command"}}, 2_000
     send(agent, {:confirm_decision, ref, :approved})
 
+    # The phase flips back to executing on approval: the activity line must
+    # not keep asking "Approve this change?" while the command runs (P1-2).
+    assert_receive {:phase, :executing_tool}, 1_000
+
     assert_receive {:tool_call, %{id: "call_x"}}, 2_000
     send(agent, {:cancel})
 
@@ -526,6 +537,55 @@ defmodule DashFloat.AgentTest do
     assert_receive {:phase, :idle}, 2_000
 
     # Aborted: no second request re-prompts the model with a dead command.
+    refute_receive {:sse_request, "POST", _, _, _second}, 300
+  end
+
+  @tag :tmp_dir
+  test "an externally killed runner aborts the batch with a cancelled result", ctx do
+    server =
+      start_server([
+        call_tool_episode("call_k", "execute_command", %{"command" => "sleep 5"}),
+        final_episode()
+      ])
+
+    {agent, sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
+    send(agent, {:prompt, self(), "run it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:confirm, ref, %{name: "execute_command"}}, 2_000
+    send(agent, {:confirm_decision, ref, :approved})
+    assert_receive {:phase, :executing_tool}, 1_000
+
+    runner = await_task(sup)
+    Process.exit(runner, :kill)
+
+    assert_receive {:tool_result, %{id: "call_k", status: "cancelled"}}, 2_000
+    assert_receive {:entry, :system, "[tool run cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+    refute_receive {:sse_request, "POST", _, _, _second}, 300
+  end
+
+  @tag :tmp_dir
+  test "a runner dying between cancel and completion aborts the same way", ctx do
+    server =
+      start_server([
+        call_tool_episode("call_d", "execute_command", %{"command" => "sleep 5"}),
+        final_episode()
+      ])
+
+    {agent, sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
+    send(agent, {:prompt, self(), "run it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:confirm, ref, %{name: "execute_command"}}, 2_000
+    send(agent, {:confirm_decision, ref, :approved})
+
+    runner = await_task(sup)
+    send(agent, {:cancel})
+    Process.exit(runner, :boom)
+
+    assert_receive {:entry, :system, "[tool run cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
     refute_receive {:sse_request, "POST", _, _, _second}, 300
   end
 
@@ -543,6 +603,7 @@ defmodule DashFloat.AgentTest do
 
     assert_receive {:confirm, ref, %{name: "execute_command"}}, 2_000
     send(agent, {:confirm_decision, ref, :approved})
+    assert_receive {:phase, :executing_tool}, 1_000
 
     assert_receive {:tool_call, %{id: "call_c"}}, 2_000
 
@@ -673,6 +734,30 @@ defmodule DashFloat.AgentTest do
       [pid] -> pid
       [] when tries > 0 -> Process.sleep(10) && await_task(sup, tries - 1)
     end
+  end
+
+  # Everything the UI process received this test, in order.
+  defp display_log(acc \\ []) do
+    receive do
+      msg
+      when elem(msg, 0) in [:token, :usage, :phase, :entry, :tool_call, :tool_result, :confirm] ->
+        display_log([msg | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  # The display contract must be crash-free in the real UI process: fold every
+  # message of the turn through State.stream_message. (The hostile review's
+  # P1-1: an unparsed-arguments tool_call once crashed the render path while
+  # the suite stayed green, because the test process never rendered.)
+  defp contract_survives?(messages) do
+    state =
+      Enum.reduce(messages, State.new(test_mode: {80, 24}), fn msg, state ->
+        State.stream_message(state, msg)
+      end)
+
+    state.phase == :idle
   end
 
   defp free_port do

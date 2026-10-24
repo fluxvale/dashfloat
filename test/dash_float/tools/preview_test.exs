@@ -96,6 +96,19 @@ defmodule DashFloat.Tools.PreviewTest do
            ]
   end
 
+  test "an oversized edit previews in a capped window, not a multi-MB entry", %{root: root} do
+    root
+    |> Path.join("huge.txt")
+    |> File.write!(Enum.map_join(1..200, &"line #{&1}\n"))
+
+    big_block = Enum.map_join(41..160, &"line #{&1}\n")
+    args = %{"path" => "huge.txt", "search_block" => big_block, "replace_block" => "new"}
+    assert {:ok, %{lines: lines}} = build("edit_file", args, root)
+
+    assert length(lines) == 51
+    assert List.last(lines) =~ "more preview lines"
+  end
+
   test "context clamps at the start and end of the file", %{root: root} do
     root
     |> Path.join("three.txt")

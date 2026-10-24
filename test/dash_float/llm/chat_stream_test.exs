@@ -930,6 +930,27 @@ defmodule DashFloat.LLM.ChatStreamTest do
     |> Jason.decode!()
   end
 
+  test "episode accumulations past 4 MiB abort the stream" do
+    # ~9 half-MiB content frames: no single frame trips the 1 MiB frame cap
+    # and the stream never idles — only the episode cap stops it.
+    blob = String.duplicate("x", 512 * 1024)
+    frames = Enum.map(1..9, fn _i -> frame(blob) end)
+
+    server =
+      start_server([
+        {:send, [@headers | frames]},
+        {:send, "data: [DONE]\n\n"},
+        :close
+      ])
+
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    messages = collect()
+
+    assert ["[llm: episode exceeded 4 MiB — stream aborted]"] = failures(messages)
+    await_exit(ref)
+  end
+
   defp json_response(status, body) do
     "HTTP/1.1 #{status} Error\r\ncontent-type: application/json\r\n" <>
       "content-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n" <> body

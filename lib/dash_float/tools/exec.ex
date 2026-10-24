@@ -34,7 +34,9 @@ defmodule DashFloat.Tools.Exec do
   @doc """
   Runs `command` in `cwd`, returning `%{ok, exit, output, truncated,
   total_bytes}` on exit, a `timed out after <ms>ms` map on timeout, or a
-  `spawn failed` map when `cwd` is unusable.
+  `spawn failed` map when `cwd` is unusable. A `:cancel` message delivered to
+  the caller mid-run (the agent's Esc interrupt) kills the process group and
+  returns `%{ok: false, cancelled: true, …}` with the partial output.
   """
   @spec run(String.t(), Path.t(), pos_integer(), non_neg_integer()) :: map()
   def run(command, cwd, timeout_ms, cap_bytes)
@@ -73,6 +75,11 @@ defmodule DashFloat.Tools.Exec do
       timed_out(port, os_pid, timeout_ms, output, total, truncated)
     else
       receive do
+        # The user's Esc: kill the group (a bare Port.close would leak the
+        # program spinning), swallow the dying output, report the cancel.
+        :cancel ->
+          cancelled(port, os_pid, output, total, truncated)
+
         {^port, {:data, data}} ->
           {output, total, truncated} = take(data, cap, output, total, truncated)
           loop(port, os_pid, deadline, timeout_ms, cap, output, total, truncated)
@@ -93,6 +100,21 @@ defmodule DashFloat.Tools.Exec do
           timed_out(port, os_pid, timeout_ms, output, total, truncated)
       end
     end
+  end
+
+  defp cancelled(port, os_pid, output, total, truncated) do
+    signal_group(os_pid)
+    drain(port)
+    {output, truncated} = stamp(output, total, truncated)
+
+    %{
+      ok: false,
+      cancelled: true,
+      exit: nil,
+      output: sanitize(output),
+      truncated: truncated,
+      total_bytes: total
+    }
   end
 
   defp timed_out(port, os_pid, timeout_ms, output, total, truncated) do

@@ -40,7 +40,9 @@ defmodule DashFloat.Agent do
     calls: [],
     call_index: 0,
     results: %{},
-    # :none | {:running, reference(), pid(), map()} | {:confirming, reference(), map()}
+    # :none | {:running, reference(), pid(), map()}
+    # | {:running_cancelled, reference(), pid(), map()}
+    # | {:confirming, reference(), map()}
     tool_slot: :none
   ]
 
@@ -117,18 +119,20 @@ defmodule DashFloat.Agent do
   # A stale decision (its confirmation was superseded) is ignored.
   def handle_info({:confirm_decision, _ref, _decision}, state), do: {:noreply, state}
 
-  # Esc always interrupts (ADR 0007 §4): streaming is cancelled by the stream
-  # task's own report; a running tool is killed; a pending confirmation is
-  # answered by the UI's own Esc→reject decision, so a raw cancel is a no-op.
+  # Esc always interrupts (ADR 0007 §4). A running tool is CANCELLED BY
+  # MESSAGE, not killed: the exec loop reaps the command's process group on
+  # cancel (a bare :kill would close the port and leak the OS process), and a
+  # mid-flight file tool simply finishes — it was approved seconds ago — before
+  # the batch aborts. A pending confirmation is answered by the UI's own
+  # Esc→reject decision, so a raw cancel there is a no-op.
   def handle_info({:cancel}, %__MODULE__{status: :streaming} = state) do
     if state.stream_pid, do: send(state.stream_pid, :cancel)
     {:noreply, state}
   end
 
-  def handle_info({:cancel}, %__MODULE__{tool_slot: {:running, _ref, pid, _call}} = state) do
-    # Killing the runner task closes its port (ports die with their owner).
-    if pid, do: Process.exit(pid, :kill)
-    {:noreply, state}
+  def handle_info({:cancel}, %__MODULE__{tool_slot: {:running, ref, pid, call}} = state) do
+    if pid, do: send(pid, :cancel)
+    {:noreply, %{state | tool_slot: {:running_cancelled, ref, pid, call}}}
   end
 
   def handle_info({:cancel}, state), do: {:noreply, state}
@@ -178,6 +182,25 @@ defmodule DashFloat.Agent do
 
   ## Runner messages
 
+  # A result arriving after the user cancelled aborts the rest of the batch —
+  # the completed call keeps its real result, the queue does not continue.
+  def handle_info(
+        {:tool_done, id, result},
+        %__MODULE__{tool_slot: {:running_cancelled, _ref, _pid, call}} = state
+      )
+      when call.id == id do
+    cleared = %{state | tool_slot: :none}
+    display(cleared.ui, {:tool_result, tool_result_msg(call, result)})
+
+    recorded = %{
+      cleared
+      | results: Map.put(cleared.results, call.id, result),
+        call_index: cleared.call_index + 1
+    }
+
+    abort_tool_run(recorded, nil)
+  end
+
   def handle_info(
         {:tool_done, id, result},
         %__MODULE__{tool_slot: {:running, _ref, _pid, call}} = state
@@ -192,7 +215,17 @@ defmodule DashFloat.Agent do
 
   ## Monitors
 
-  # Our own cancel kill of a runner task: the announced call gets a cancelled
+  # A runner dying after the user cancelled (however it died): abort the batch
+  # with a cancelled result for the announced call.
+  def handle_info(
+        {:DOWN, _ref, :process, _down_pid, _reason},
+        %__MODULE__{tool_slot: {:running_cancelled, _ref2, _pid, call}} = state
+      ) do
+    state = %{state | tool_slot: :none}
+    abort_tool_run(state, call)
+  end
+
+  # An externally killed runner task: the announced call gets a cancelled
   # result and the whole batch aborts (ADR 0007 §4).
   def handle_info(
         {:DOWN, ref, :process, _down_pid, :killed},
@@ -373,7 +406,11 @@ defmodule DashFloat.Agent do
   defp automatic?(_mutation), do: false
 
   # The mutating runner starts ONLY after the approval keypress (ADR 0007 §4).
+  # Re-announcing :executing_tool here keeps the activity line truthful for the
+  # whole execution (the confirmation phase would otherwise linger while the
+  # command runs) and re-arms Esc's interrupt.
   defp dispatch_runner(state, call) do
+    display(state.ui, {:phase, :executing_tool})
     agent = self()
     args = call.args
     cwd = state.cwd
@@ -416,6 +453,11 @@ defmodule DashFloat.Agent do
 
   # Abort the batch: unresolved calls (from the current index on) get cancelled
   # results so the transcript stays round-trippable; no model re-prompt.
+  # `current == nil` means the current call already recorded its own result.
+  defp abort_tool_run(state, nil) do
+    finish_cancelled(%{state | tool_slot: :none})
+  end
+
   defp abort_tool_run(state, current) do
     cancelled = %{ok: false, cancelled: true}
     display(state.ui, {:tool_result, tool_result_msg(current, cancelled)})
@@ -425,18 +467,20 @@ defmodule DashFloat.Agent do
       |> Enum.drop(state.call_index)
       |> Enum.reduce(state.results, &Map.put(&2, &1.id, cancelled))
 
+    finish_cancelled(%{state | results: results})
+  end
+
+  defp finish_cancelled(state) do
     tool_messages =
       Enum.map(state.calls, fn call ->
-        %{role: "tool", tool_call_id: call.id, content: Jason.encode!(results[call.id])}
+        %{role: "tool", tool_call_id: call.id, content: Jason.encode!(state.results[call.id])}
       end)
 
     state = %{
       state
       | status: :idle,
         messages: state.messages ++ tool_messages,
-        results: results,
-        call_index: length(state.calls),
-        tool_slot: :none
+        call_index: length(state.calls)
     }
 
     display(state.ui, {:entry, :system, "[tool run cancelled]"})

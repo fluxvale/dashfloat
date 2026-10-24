@@ -63,7 +63,10 @@ Rules, each driven by a test:
   must work even with a sloppy provider. Duplicate ids are not repaired; providers own id
   uniqueness.
 - A call with arguments but no `name`, or a delta that is not a map, is dropped (an
-  ADR-0005-style shape miss, skipped silently).
+  ADR-0005-style shape miss, skipped silently). A call that assembled arguments but
+  never a name keeps its id and surfaces as an **error result** (`missing function
+  name`) — round-trip safety beats dropping; the assistant message carries it with an
+  empty name so the tool reply is never orphaned.
 - `finish_reason` is ignored — the assembled calls alone decide whether an episode is a
   tool episode. A `tool_calls` finish with zero assembled calls is just a final turn.
 
@@ -148,8 +151,13 @@ realpath and open) remains accepted per §3's standing judgment.
 
 Boundaries: exec output is head-capped at **32 KiB** with a trailing marker naming the
 total byte count; `read_file` caps at 2 000 lines *and* 64 KiB (marker reports both
-totals); `list_directory` caps at 500 entries (marker names the truncation); `edit_file`
-refuses files over 8 MiB. Exec timeout default **30 s** (agent opt `:exec_timeout`,
+totals) — and reads are bounded, not just output: files above 256 KiB stream only the
+requested line window (the exact line total is traded away; `truncated` is learned
+from a one-line probe past the window); `edit_file` refuses files over 8 MiB by
+stat, before reading; `list_directory` stats at most 501 entries; the episode's own
+accumulations (content plus tool-argument fragments) abort the stream at **4 MiB** —
+a trickling endpoint that never trips the idle timeout or the frame cap still cannot
+grow memory without bound. Exec timeout default **30 s** (agent opt `:exec_timeout`,
 injectable for tests). Nothing buffers without a bound.
 
 ### 3. Safety policy
@@ -207,11 +215,13 @@ error result, no execution, no confirmation.
   - `write_file` — a `create`/`overwrite` label line plus the content as `+` lines
     (bounded to 50 lines; oversized files get a summary label).
   - `execute_command` — the command line and the resolved cwd.
-- **Keys:** while a confirmation is pending, the phase is `:confirming`; **Enter
-  approves, Esc rejects, every other key is swallowed** (typing mid-decision must not
-  turn into an accidental approve; Ctrl+Q/Ctrl+C still quit). The preview renders as a
-  tool-kind entry in the log; the 1-row activity line becomes the prompt
-  (`Approve this change?` + dim `⏎ approve · esc reject`).
+- **Keys:** while a confirmation is pending, the phase is `:confirming`; **Enter or
+  Ctrl+Enter approves** (mirroring the submit keys), **Esc rejects**, every other key
+  is swallowed (typing mid-decision must not turn into an accidental approve; Ctrl+Q/
+  Ctrl+C still quit). The preview renders as a tool-kind entry in the log; the 1-row
+  activity line becomes the prompt (`Approve this change?` + dim `⏎ approve · esc
+  reject`). Approval flips the phase back to `:executing_tool` before the runner
+  starts — the activity line never keeps asking a question the user already answered.
 - **No mutation without the keypress:** the runner Task for a mutating tool is started
   only after the agent receives `{:confirm_decision, ref, :approved}`. Rejection sends
   `{"ok":false,"rejected":true}` to the model — the model learns the human said no and
@@ -220,9 +230,12 @@ error result, no execution, no confirmation.
 - **Esc always interrupts**, consistently across phases: while `:streaming` it cancels
   the episode (ADR-0005 order preserved: partial content finalized, `[cancelled]`
   entry, idle); while `:confirming` it is the rejection above; while `:executing_tool`
-  it kills the running port (`Port.close`) and aborts the remaining queue — unresolved
-  calls get `cancelled` results, the transcript stays valid, and the loop ends without
-  re-prompting the model.
+  it **cancels the running tool by message** — the exec loop SIGKILLs the command's
+  process group on `:cancel` (killing the runner Task instead would close the port
+  and leak the OS process spinning; a mid-flight file tool simply completes — it was
+  approved seconds earlier) — the completed or cancelled call records its real
+  result, the remaining queue gets `cancelled` results, the transcript stays valid,
+  and the loop ends without re-prompting the model.
 
 ### 5. UI contract
 
@@ -314,7 +327,8 @@ tests own their agents.
 - **Line-number edits / fuzzy matching** — the founding spec fixed the search-block
   protocol; fuzzy would break the "approved diff == landed diff" guarantee.
 - **Esc no-op during tool execution** — would leave the `esc interrupt` hint lying and a
-  30 s timeout unskippable; `Port.close` is cheap. Interrupt implemented.
+  30 s timeout unskippable; cancellation is message-based and reaps the process group.
+  Interrupt implemented.
 - **System-level sandboxing (containers, landlock)** — out of scale for a single-user
   local harness whose mutations are human-confirmed; the path policy plus confirmations
   is the designed boundary. Recorded as a future hardening option, not this slice.

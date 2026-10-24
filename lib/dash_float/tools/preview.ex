@@ -77,8 +77,18 @@ defmodule DashFloat.Tools.Preview do
         {:error, result}
 
       {:ok, %{content: content, start: start}} ->
-        {:ok, %{lines: hunk(content, start, args["search_block"], args["replace_block"])}}
+        lines = hunk(content, start, args["search_block"], args["replace_block"])
+        {:ok, %{lines: preview_window(lines)}}
     end
+  end
+
+  # Model-supplied search/replace blocks are unbounded; the PREVIEW is not —
+  # a multi-MB edit still previews in 50 lines (like write_file content).
+  defp preview_window(lines) when length(lines) <= @max_content_lines, do: lines
+
+  defp preview_window(lines) do
+    Enum.take(lines, @max_content_lines) ++
+      ["… (#{length(lines) - @max_content_lines} more preview lines)"]
   end
 
   # A unified hunk: @context_lines lines around the match, "- " for the search

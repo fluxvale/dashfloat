@@ -92,6 +92,26 @@ defmodule DashFloat.Tools.RunnerTest do
            }
   end
 
+  test "read_file streams only the window of a large file", %{root: root} do
+    # > 256 KiB trips the streamed path: nothing reads the whole file, and the
+    # +1 probe line learns `truncated` without a full scan.
+    big = Enum.map_join(1..40_000, &"row #{&1}\n")
+    path = Path.join(root, "big.log")
+    File.write!(path, big)
+
+    tail = run("read_file", %{"path" => "big.log", "offset" => 39_998, "limit" => 3}, root)
+
+    assert tail.ok == true
+    assert tail.total_bytes == byte_size(big)
+    assert tail.truncated == false
+    assert tail.content == "row 39998\nrow 39999\nrow 40000"
+    refute Map.has_key?(tail, :total_lines)
+
+    window = run("read_file", %{"path" => "big.log", "offset" => 2, "limit" => 2}, root)
+    assert window.truncated == true
+    assert window.content =~ "… [truncated: showing 2 lines]"
+  end
+
   test "read_file on a directory degrades to an error, not a raise", %{root: root} do
     result = run("read_file", %{"path" => "src"}, root)
 

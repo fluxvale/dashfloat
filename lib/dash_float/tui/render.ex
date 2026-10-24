@@ -26,11 +26,18 @@ defmodule DashFloat.TUI.Render do
   @doc """
   Builds the `:tool` entry for a tool call: accent gear glyph, then the call
   and its argument summary dim. The summary is the path arg for file tools,
-  the command for `execute_command`.
+  the command for `execute_command`. `nil` args mean the streamed arguments
+  never parsed — an error result follows (ADR 0007 §1) and must render, never
+  crash the UI.
   """
-  @spec tool_call(String.t(), map()) :: {String.t(), [Line.t()]}
+  @spec tool_call(String.t(), map() | nil) :: {String.t(), [Line.t()]}
   def tool_call(name, args) when is_binary(name) and is_map(args) do
     rest = name_with_summary(name, args_summary(args))
+    {"⚙ " <> rest, [blank(), tool_row(rest)]}
+  end
+
+  def tool_call(name, nil) when is_binary(name) do
+    rest = name_with_summary(name, "(invalid arguments)")
     {"⚙ " <> rest, [blank(), tool_row(rest)]}
   end
 

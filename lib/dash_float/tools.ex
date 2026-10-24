@@ -170,8 +170,13 @@ defmodule DashFloat.Tools do
   @spec validate(String.t(), map() | nil) :: {:ok, map()} | {:error, String.t()}
   def validate(name, args) when is_binary(name) and is_map(args) do
     case @params[name] do
-      nil -> {:error, "unknown tool " <> inspect(name)}
-      params -> validate_params(name, params, args, %{})
+      nil ->
+        {:error, "unknown tool " <> inspect(name)}
+
+      params ->
+        with :ok <- check_file_target(name, args) do
+          validate_params(name, params, args, %{})
+        end
     end
   end
 
@@ -179,6 +184,15 @@ defmodule DashFloat.Tools do
     do: {:error, "#{name}: arguments must be an object"}
 
   def validate(name, _args), do: {:error, "unknown tool " <> inspect(name)}
+
+  # A trailing "/" on a file-write target names a directory; the OS would
+  # silently strip it and create a FILE named "newdir" for "newdir/" — refuse.
+  defp check_file_target(tool, %{"path" => path})
+       when tool in ["write_file", "edit_file"] and is_binary(path) and path != "" and
+              binary_part(path, byte_size(path), -1) == "/",
+       do: {:error, tool <> ": path must name a file, not end in \"/\""}
+
+  defp check_file_target(_tool, _args), do: :ok
 
   defp validate_params(_tool, [], _args, acc), do: {:ok, acc}
 
