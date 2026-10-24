@@ -528,18 +528,18 @@ defmodule DashFloat.TUITest do
     assert get_state(pid).tick_ref == nil
   end
 
-  test "a stale tick is dropped: no double-step, no orphan timer" do
+  test "a stale tick is dropped: no double-step, no orphan timer, no frame" do
     # A tick with no timer pending (its timer was cancelled after firing, or the
-    # message is a leftover) must not step the spinner nor arm anything.
+    # message is a leftover) must not step the spinner, arm anything, or draw.
     idle = State.new(test_mode: {80, 24})
-    assert {:noreply, ^idle} = TUI.handle_info(:dashfloat_tick, idle)
+    assert {:noreply, ^idle, %{render?: false}} = TUI.handle_info(:dashfloat_tick, idle)
 
     # A tick whose tracked timer has not fired yet is stale too, and the live
     # timer is left alone.
     ref = Process.send_after(self(), :never, 10_000)
     active = %{idle | phase: :streaming, tick_ref: ref}
 
-    assert {:noreply, ^active} = TUI.handle_info(:dashfloat_tick, active)
+    assert {:noreply, ^active, %{render?: false}} = TUI.handle_info(:dashfloat_tick, active)
     assert is_integer(Process.read_timer(ref))
 
     Process.cancel_timer(ref)
@@ -547,7 +547,8 @@ defmodule DashFloat.TUITest do
 
   test "a tick that finds idle halts and clears the timer (last-resort net)" do
     # schedule/1 cancels on any idle transition, so this state should be
-    # unreachable; if it ever happens, the tick must still die here.
+    # unreachable; if it ever happens, the tick must still die here — and draw
+    # nothing, since idle renders on no timer (ADR 0006).
     idle = State.new(test_mode: {80, 24})
     ref = Process.send_after(self(), :never, 10_000)
     # A fired timer: read_timer returns false, so the tick is not stale.
@@ -555,7 +556,7 @@ defmodule DashFloat.TUITest do
     Process.sleep(5)
 
     leaked = %{idle | tick_ref: ref}
-    assert {:noreply, cleared} = TUI.handle_info(:dashfloat_tick, leaked)
+    assert {:noreply, cleared, %{render?: false}} = TUI.handle_info(:dashfloat_tick, leaked)
     assert cleared.tick_ref == nil
     assert cleared.phase == :idle
   end
@@ -571,12 +572,52 @@ defmodule DashFloat.TUITest do
     assert state.tick_ref == nil
     assert state.anim_step == 0
 
-    # The runtime draws the frame that carried the message, then nothing:
-    # the timer is not re-armed, so no further frames arrive.
+    # The timer is not re-armed, so no further frames arrive.
     Process.sleep(50)
     settled = Runtime.snapshot(pid).render_count
     Process.sleep(300)
     assert Runtime.snapshot(pid).render_count == settled
+  end
+
+  test "a stale tick draining at idle draws no frame (render-suppressed)" do
+    # The race this pins: a tick timer fires just as the terminal idle
+    # message queues behind a backlog; cancel_timer cannot stop the already-
+    # queued tick, so it drains at idle. Its callback has no state change —
+    # and must draw no frame either (ADR 0006: idle renders nothing on a
+    # timer). The render counter is the metric of record.
+    {:ok, pid} = start_tui()
+    :ok = Runtime.enable_trace(pid, limit: 200)
+    Process.sleep(50)
+    before_count = Runtime.snapshot(pid).render_count
+
+    send(pid, :dashfloat_tick)
+
+    # Wait until the server has processed the tick (it appears in the trace)…
+    await_trace(pid, fn events ->
+      Enum.any?(events, &tick_message?/1)
+    end)
+
+    # …then confirm the processed tick drew nothing. An unsuppressed return
+    # would render immediately here: the mailbox is empty at idle.
+    traced = Runtime.trace_events(pid)
+    assert Enum.any?(traced, &tick_message?/1)
+    assert Runtime.snapshot(pid).render_count == before_count
+  end
+
+  defp tick_message?(%{kind: :message, details: %{source: :info, payload: :dashfloat_tick}}),
+    do: true
+
+  defp tick_message?(_other), do: false
+
+  defp await_trace(pid, predicate, tries \\ 100) do
+    traced = Runtime.trace_events(pid)
+
+    if predicate.(traced) or tries == 0 do
+      :ok
+    else
+      Process.sleep(10)
+      await_trace(pid, predicate, tries - 1)
+    end
   end
 
   test "renders increase while a stream is live and freeze again after :idle" do

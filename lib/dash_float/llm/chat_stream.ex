@@ -238,12 +238,14 @@ defmodule DashFloat.LLM.ChatStream do
   defp emit_usage(ui, %{"usage" => usage}) when is_map(usage) do
     case usage do
       %{"prompt_tokens" => prompt, "completion_tokens" => completion, "total_tokens" => total}
-      when is_integer(prompt) and is_integer(completion) and is_integer(total) ->
+      when is_integer(prompt) and is_integer(completion) and is_integer(total) and
+             prompt >= 0 and completion >= 0 and total >= 0 ->
         send(
           ui,
           {:usage, %{prompt_tokens: prompt, completion_tokens: completion, total_tokens: total}}
         )
 
+      # Non-integer or negative counts are a broken frame, not accounting data.
       _other ->
         :ok
     end

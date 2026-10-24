@@ -79,14 +79,19 @@ defmodule DashFloat.TUI do
   @impl ExRatatui.App
   def handle_info(@tick, state) do
     if stale_tick?(state) do
-      {:noreply, state}
+      # A stale tick carries no state change, so it must not draw a frame
+      # either — the 3-tuple return suppresses the post-message render the
+      # Server would otherwise perform (idle never renders on a timer,
+      # ADR 0006).
+      {:noreply, state, %{render?: false}}
     else
       {ticked, verdict} = State.tick(state, System.monotonic_time(:millisecond))
       cleared = %{ticked | tick_ref: nil}
 
       case verdict do
+        # A halting tick ends the animation with nothing new to draw.
         :cont -> schedule(cleared)
-        :halt -> {:noreply, cleared}
+        :halt -> {:noreply, cleared, %{render?: false}}
       end
     end
   end
@@ -107,8 +112,8 @@ defmodule DashFloat.TUI do
   # A tick is stale when no timer of ours is pending (a timer cancelled after
   # its message was already queued) or when the tracked timer has not fired yet
   # (a message left over from an earlier timer). Dropping it keeps the invariant
-  # at exactly one pending timer and keeps a stale tick from rendering at idle
-  # (ADR 0006).
+  # at exactly one pending timer and keeps a stale tick from affecting state at
+  # idle (ADR 0006); the render-suppressing return keeps it from drawing too.
   defp stale_tick?(%{tick_ref: nil}), do: true
   defp stale_tick?(%{tick_ref: ref}), do: Process.read_timer(ref) != false
 

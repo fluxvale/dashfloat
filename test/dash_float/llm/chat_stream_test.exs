@@ -619,7 +619,10 @@ defmodule DashFloat.LLM.ChatStreamTest do
           ~s({"choices":[],"usage":{"prompt_tokens":"a","completion_tokens":1,"total_tokens":2}}),
           ~s({"choices":[],"usage":{"prompt_tokens":1,"total_tokens":2}}),
           ~s({"choices":[],"usage":"none"}),
-          ~s({"choices":[],"usage":null})
+          ~s({"choices":[],"usage":null}),
+          # Hostile/buggy counts are not accounting data either.
+          ~s({"choices":[],"usage":{"prompt_tokens":-1,"completion_tokens":1,"total_tokens":2}}),
+          ~s({"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":-2}})
         ] do
       server =
         start_server([

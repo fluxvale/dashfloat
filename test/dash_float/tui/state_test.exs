@@ -10,6 +10,14 @@ defmodule DashFloat.TUI.StateTest do
     |> State.new()
   end
 
+  # One completed stream turn carrying `usage` (banked at finalize).
+  defp bank_usage(state, usage) do
+    state
+    |> Map.put(:phase, :streaming)
+    |> State.stream_message({:usage, usage}, 1_000)
+    |> State.stream_message({:phase, :idle}, 2_000)
+  end
+
   defp type(state, text) do
     points = String.codepoints(text)
 
@@ -74,7 +82,8 @@ defmodule DashFloat.TUI.StateTest do
                rate: nil,
                prompt_tokens: nil,
                completion_tokens: nil,
-               context_total: 0
+               context_total: 0,
+               turn_total: nil
              }
     end
 
@@ -159,19 +168,30 @@ defmodule DashFloat.TUI.StateTest do
 
     test "context total alone, then over the configured window" do
       usage = %{prompt_tokens: 100, completion_tokens: 20, total_tokens: 4_100}
-      state = State.stream_message(new_state(), {:usage, usage})
+      state = bank_usage(new_state(), usage)
       assert State.context_label(state) == "4.1k"
 
-      base = new_state(provider: provider(128_000))
-      windowed = State.stream_message(base, {:usage, usage})
-
-      assert State.context_label(windowed) == "4.1k/128k"
+      base = bank_usage(new_state(provider: provider(128_000)), usage)
+      assert State.context_label(base) == "4.1k/128k"
     end
 
     test "context totals in the millions read as m" do
       usage = %{prompt_tokens: 100, completion_tokens: 20, total_tokens: 4_100_000}
-      state = State.stream_message(new_state(), {:usage, usage})
+      state = bank_usage(new_state(), usage)
       assert State.context_label(state) == "4.1m"
+    end
+
+    test "humanize boundaries roll into the next unit" do
+      # 999_999 rounds up and reads "1m", never "1000k".
+      assert new_state()
+             |> bank_usage(%{prompt_tokens: 1, completion_tokens: 1, total_tokens: 999_999})
+             |> State.context_label() ==
+               "1m"
+
+      assert new_state()
+             |> bank_usage(%{prompt_tokens: 1, completion_tokens: 1, total_tokens: 999})
+             |> State.context_label() ==
+               "999"
     end
 
     test "context total accumulates across turns" do
@@ -179,8 +199,8 @@ defmodule DashFloat.TUI.StateTest do
 
       state =
         new_state()
-        |> State.stream_message({:usage, usage})
-        |> State.stream_message({:usage, usage})
+        |> bank_usage(usage)
+        |> bank_usage(usage)
 
       assert state.stats.context_total == 30
       assert State.context_label(state) == "30"
@@ -465,15 +485,19 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.stats.prompt_tokens == 120
       assert state.stats.completion_tokens == 42
-      assert state.stats.context_total == 162
+      # The turn's total is banked, not yet accumulated — per-chunk usage
+      # reporters send running totals, so only the last frame may count.
+      assert state.stats.turn_total == 162
+      assert state.stats.context_total == 0
       # The estimate is reconciled to the provider's authoritative count.
       assert state.stats.tokens == 42
       assert state.phase == :streaming
     end
 
-    test "a later usage frame wins and keeps accumulating context" do
-      state =
+    test "a later usage frame wins; the turn banks once at finalize, then accumulates" do
+      turn_one =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message(
           {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 15}}
         )
@@ -481,9 +505,43 @@ defmodule DashFloat.TUI.StateTest do
           {:usage, %{prompt_tokens: 20, completion_tokens: 8, total_tokens: 28}}
         )
 
-      assert state.stats.prompt_tokens == 20
-      assert state.stats.completion_tokens == 8
-      assert state.stats.context_total == 43
+      assert turn_one.stats.prompt_tokens == 20
+      assert turn_one.stats.turn_total == 28
+
+      idle = State.stream_message(turn_one, {:phase, :idle}, 3_000)
+      assert idle.stats.context_total == 28
+      assert idle.stats.turn_total == nil
+
+      # The next turn adds its own final total, whatever its provider's
+      # reporting cadence.
+      turn_two =
+        idle
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message(
+          {:usage, %{prompt_tokens: 30, completion_tokens: 10, total_tokens: 10}}
+        )
+
+      assert State.stream_message(turn_two, {:phase, :idle}, 5_000).stats.context_total == 38
+    end
+
+    test "a usage frame after the turn finalized is ignored" do
+      state =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "t"}, 1_000)
+        |> State.stream_message({:phase, :idle}, 2_000)
+
+      late =
+        State.stream_message(
+          state,
+          {:usage, %{prompt_tokens: 500, completion_tokens: 500, total_tokens: 1_000}},
+          2_500
+        )
+
+      # Nothing from the finished turn may poison the next one's rate math.
+      assert late.stats.tokens == 0
+      assert late.stats.context_total == 0
+      assert late.stats.turn_total == nil
     end
   end
 
@@ -518,13 +576,19 @@ defmodule DashFloat.TUI.StateTest do
 
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "a"}, 1_000)
         |> State.stream_message({:token, "b"}, 1_500)
+        |> State.stream_message({:usage, usage}, 1_800)
         |> State.stream_message({:phase, :idle}, 2_000)
-        |> State.stream_message({:usage, usage}, 2_100)
 
       assert State.rate_label(state) == "2.0"
       assert state.stats.context_total == 5
+
+      # A usage frame arriving after the turn ended belongs to nobody.
+      late = State.stream_message(state, {:usage, usage}, 2_100)
+      assert late.stats.context_total == 5
+      assert State.rate_label(late) == "2.0"
     end
 
     test "cancel-style finalize with no usage frame still freezes a rate" do

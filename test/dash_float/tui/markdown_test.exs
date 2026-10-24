@@ -220,6 +220,34 @@ defmodule DashFloat.TUI.MarkdownTest do
       assert flatten(line) == "tagged <b>bold</b>"
     end
 
+    test "a verbatim HTML list degrades per-item, not the whole entry" do
+      # EarmarkParser keeps verbatim list children as raw strings (no li
+      # nodes); the item handler must fall through to plain text instead of
+      # blowing the whole entry through the rescue boundary.
+      doc = "Here is a list:\n\n<ul>\n  <li>a</li>\n  <li>b</li>\n</ul>\n\nAnd a **bold** finish."
+
+      lines = Markdown.render(doc)
+      texts = Enum.map(lines, &flatten/1)
+
+      # The verbatim list renders its raw text as lines…
+      assert "  <li>a</li>" in texts
+      assert "  <li>b</li>" in texts
+
+      # …and the surrounding markdown keeps its styling — the rescue path
+      # (whole-entry plain text) would show the asterisks literally.
+      finish = Enum.find(lines, fn line -> flatten(line) =~ "And a" end)
+      assert flatten(finish) == "And a bold finish."
+
+      styled_finish = styled(finish)
+      assert {"bold", style} = List.keyfind(styled_finish, "bold", 0)
+      assert :bold in style.modifiers
+    end
+
+    test "consecutive newlines inside one text token render one blank line" do
+      lines = Markdown.render("<div>x\n\ny</div>")
+      assert Enum.map(lines, &flatten/1) == ["x", "", "y</div>"]
+    end
+
     test "garbage bytes, huge delimiter runs, and unknown tables do not raise" do
       for input <- [
             <<0xFF, 0xFE>>,

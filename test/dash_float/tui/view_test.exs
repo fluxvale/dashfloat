@@ -82,10 +82,12 @@ defmodule DashFloat.TUI.ViewTest do
 
       state =
         base
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "a"}, 1_000)
         |> State.stream_message({:token, "b"}, 1_000)
         |> State.stream_message(
-          {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 4_100}}
+          {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 4_100}},
+          1_500
         )
         |> State.stream_message({:phase, :idle}, 2_000)
 
@@ -137,10 +139,13 @@ defmodule DashFloat.TUI.ViewTest do
 
     test "the context label shows the accumulated usage" do
       state =
-        State.stream_message(
-          new_state(),
-          {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 4_100}}
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message(
+          {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 4_100}},
+          1_000
         )
+        |> State.stream_message({:phase, :idle}, 2_000)
 
       assert status_text(state) =~ "ctx 4.1k"
     end

@@ -162,10 +162,14 @@ by `DashFloat.TUI.Render.entry_lines/2`. The raw text never re-renders.
   the first token's arrival (injected monotonic clock, below). Recomputed on
   each tick while streaming; frozen at finalize/cancel — the last rate stays
   visible after completion.
-- **Context usage** — cumulative `total_tokens` across turns (today's engine
-  sends single-turn requests, so the sum is the honest number; when Phase 3/4
-  send history, `prompt_tokens` already includes it and the display switches
-  to that truth). Optional config field `context_tokens` (+ env
+- **Context usage** — the turn's final usage total (the **last** frame wins;
+  per-chunk usage reporters send running totals on every frame, and summing
+  those would inflate the number) is banked once at finalize into a cumulative
+  `total_tokens` across turns (today's engine sends single-turn requests, so
+  the sum is the honest number; when Phase 3/4 send history, `prompt_tokens`
+  already includes it and the display switches to that truth). A usage frame
+  arriving after the turn finalized is ignored — it belongs to a turn that is
+  over. Optional config field `context_tokens` (+ env
   `DASHFLOAT_CONTEXT_TOKENS`, validated as a positive integer, absent → nil —
   never an error) supplies the window denominator: `ctx 4.1k/128k`. Without
   it, the bar shows the absolute total only.
@@ -187,7 +191,9 @@ scheduled **iff `phase != :idle` and no tick is pending** (a `tick_ref` in
 state), checked at a single choke point after every `handle_event`/`handle_info`
 callback. The tick handler steps the spinner, re-renders dirty in-flight
 markdown (bounded as above), recomputes the rate, and reschedules **only if
-still active**; any transition to `:idle` cancels the pending timer.
+still active**; any transition to `:idle` cancels the pending timer. A tick
+message that arrives stale (its timer was cancelled after the message queued)
+— or that halts — returns render-suppressed, so it can never draw a frame.
 **Idle ⇒ no timers ⇒ no renders.** This is the second sanctioned exception to
 ADR 0002's non-blocking rule (the first is submit-time `start_child`):
 `send_after` schedules a message and blocks nothing.
@@ -200,7 +206,7 @@ DashFloat renders nothing on a timer, ever.
 
 | Message | Effect |
 | --- | --- |
-| `{:usage, %{prompt_tokens: n, completion_tokens: n, total_tokens: n}}` | reconcile token counts, add `total_tokens` to the context accumulator; no phase change |
+| `{:usage, %{prompt_tokens: n, completion_tokens: n, total_tokens: n}}` | reconcile token counts, hold the frame's total as the turn's banked total (last frame wins; non-negative integers only — anything else is ignored by the producer); no phase change |
 
 Sent before the terminal `{:phase, :idle}` when the provider includes usage
 (the stream's final chunk). Engines stay TUI-agnostic — it is data.

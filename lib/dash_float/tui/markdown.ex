@@ -108,8 +108,13 @@ defmodule DashFloat.TUI.Markdown do
   defp list(items, ctx, kind) do
     indexed = Enum.with_index(items, start_of(kind))
 
-    Enum.flat_map(indexed, fn {{"li", _attrs, children, _meta}, index} ->
-      list_item(children, ctx, kind, index)
+    # Total on purpose: verbatim HTML lists reach us as raw strings (Earmark's
+    # %{verbatim: true} nodes keep their children unparsed), and any non-li
+    # item must degrade per-item — never take the whole entry through the
+    # rescue boundary (ADR 0006).
+    Enum.flat_map(indexed, fn
+      {{"li", _attrs, children, _meta}, index} -> list_item(children, ctx, kind, index)
+      {other, _index} -> block(other, ctx)
     end)
   end
 
@@ -262,9 +267,11 @@ defmodule DashFloat.TUI.Markdown do
   defp expand(:break), do: [nil]
 
   defp expand({text, style}) do
+    # Empty split parts become empty spans, not breaks: "a\n\nb" is two lines
+    # with ONE blank between (the nil separators alone carry the line breaks).
     text
     |> String.split("\n")
-    |> Enum.map(&if(&1 == "", do: nil, else: Span.new(&1, style: style)))
+    |> Enum.map(&Span.new(&1, style: style))
     |> Enum.intersperse(nil)
   end
 

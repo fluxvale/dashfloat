@@ -5,7 +5,9 @@
 - **Implements:** [issue #8](https://github.com/fluxvale/dashfloat/issues/8) — Phase 2 of the
   [ADR 0001](0001-founding-stack-and-architecture.md) roadmap. Supersedes the
   synthetic demo path in [ADR 0002](0002-tui-skeleton.md); the stream message
-  contract there is unchanged and remains the integration surface.
+  contract there is unchanged and remains the integration surface. The usage
+  row in the error-taxonomy table below is amended by
+  [ADR 0006](0006-ui-truth-and-rendering.md).
 
 ## Context
 
@@ -112,7 +114,7 @@ text carries status codes and provider-supplied text only.
 | Connect refused / DNS / TLS / header timeout | `Req.post` returns `{:error, e}` | `[llm: connection failed: <message>]` |
 | HTTP non-2xx | initial status; drain body ≤ 64 KiB, ≤ 5 s | `[llm: HTTP 401 — <provider error.message>]` (fallback `[llm: HTTP 502]`) |
 | Malformed frame (`data:` payload is not valid JSON) | decode error mid-loop | cancel + `[llm: malformed SSE data frame — stream aborted]` |
-| Valid JSON frame without `choices[0].delta.content` (role-only, usage, keepalive frames) | shape miss | skipped silently — not an error |
+| Valid JSON frame without `choices[0].delta.content` (role-only, usage, keepalive frames) | shape miss | skipped silently — not an error. (Amended by [ADR 0006](0006-ui-truth-and-rendering.md): usage frames are consumed and forwarded as `{:usage, _}` messages.) |
 | Connection dropped mid-stream | `{ref, {:error, _}}` | `[llm: connection lost mid-stream]` |
 | Stream ended without `[DONE]` | `{ref, :done}` before `[DONE]` | `[llm: stream ended without completion]` |
 | No data for 60 s (configurable via `:idle_timeout`) | socket `receive_timeout`, with the receive `after` as backstop | cancel + `[llm: timed out waiting for stream data]` |

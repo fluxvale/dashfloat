@@ -25,7 +25,8 @@ defmodule DashFloat.TUI.State do
           rate: float() | nil,
           prompt_tokens: non_neg_integer() | nil,
           completion_tokens: non_neg_integer() | nil,
-          context_total: non_neg_integer()
+          context_total: non_neg_integer(),
+          turn_total: non_neg_integer() | nil
         }
 
   @max_history 500
@@ -52,7 +53,8 @@ defmodule DashFloat.TUI.State do
       rate: nil,
       prompt_tokens: nil,
       completion_tokens: nil,
-      context_total: 0
+      context_total: 0,
+      turn_total: nil
     },
     scroll: 0,
     follow?: true,
@@ -197,9 +199,12 @@ defmodule DashFloat.TUI.State do
     end
   end
 
+  # 999_999 reads "1.0m", not "1000k": a value that rounds up to the next
+  # unit's thousand boundary uses that unit.
   defp humanize(n) when n < 1_000, do: Integer.to_string(n)
-  defp humanize(n) when n < 1_000_000, do: trim_zero(n / 1_000) <> "k"
-  defp humanize(n), do: trim_zero(n / 1_000_000) <> "m"
+  defp humanize(n) when n < 999_950, do: trim_zero(n / 1_000) <> "k"
+  defp humanize(n) when n < 999_950_000, do: trim_zero(n / 1_000_000) <> "m"
+  defp humanize(n), do: trim_zero(n / 1_000_000_000) <> "b"
 
   defp trim_zero(x) do
     x
@@ -377,6 +382,11 @@ defmodule DashFloat.TUI.State do
     }
   end
 
+  # A usage frame arriving after the turn finalized belongs to a turn that is
+  # already over: applying it would poison the next turn's rate math (its
+  # completion count is not this turn's). Ignored.
+  def stream_message(%{phase: :idle} = state, {:usage, _usage}, _now), do: state
+
   def stream_message(state, {:usage, usage}, _now) when is_map(usage) do
     %{
       prompt_tokens: prompt,
@@ -384,6 +394,10 @@ defmodule DashFloat.TUI.State do
       total_tokens: total
     } = usage
 
+    # Usage frames carry the turn's running total — single-frame providers
+    # send it once, per-chunk reporters on every frame. The turn's truth is
+    # the LAST frame, banked once at finalize (ADR 0006); summing every frame
+    # would inflate the context on per-chunk providers.
     stats = %{
       state.stats
       | prompt_tokens: prompt,
@@ -391,7 +405,7 @@ defmodule DashFloat.TUI.State do
         # The usage frame is the authoritative count: the per-delta estimate is
         # reconciled here, so the frozen rate is computed from real tokens.
         tokens: completion,
-        context_total: state.stats.context_total + total
+        turn_total: total
     }
 
     %{state | stats: stats}
@@ -434,7 +448,11 @@ defmodule DashFloat.TUI.State do
       stats
       | rate: rate(stats.tokens, stats.first_token_at, now) || stats.rate,
         tokens: 0,
-        first_token_at: nil
+        first_token_at: nil,
+        # The turn's banked usage total joins the conversation accumulator
+        # exactly once, here (ADR 0006).
+        context_total: stats.context_total + (stats.turn_total || 0),
+        turn_total: nil
     }
   end
 
