@@ -580,10 +580,13 @@ defmodule DashFloat.TUI.State do
 
   # Finalizing renders the reply once and freezes the cumulative rate; the
   # streaming counters reset for the next turn, the frozen rate and context
-  # accumulator stay visible. A selection survives only when the finalized
-  # block's display count matches the live view's — the same wrap pipeline
-  # produces identical rows then, so the indices still point at the same
-  # content; any count change shifts rows below and clears it.
+  # accumulator stay visible. The in-flight block is replaced by the
+  # finalized entry's rows: a selection that reaches INTO the block loses
+  # the content under its highlight and clears — judged by identity
+  # (position), not row count, because the live rows can be stale (tokens
+  # arrived since the last tick) and coincidentally equal in count while
+  # their content differs. A selection entirely above the reply survives:
+  # appending cannot move the rows above it.
   defp finalize_in_flight(%{in_flight: in_flight} = state, now) when in_flight in [nil, ""] do
     %{
       state
@@ -595,23 +598,22 @@ defmodule DashFloat.TUI.State do
   end
 
   defp finalize_in_flight(%{in_flight: in_flight} = state, now) do
-    old_count = length(state.in_flight_lines || [])
-
     state
     |> append_entry(:assistant, in_flight)
-    |> maybe_clear_selection(old_count)
+    |> clear_selection_over_reply(state)
     |> Map.merge(%{in_flight: nil, in_flight_lines: nil, in_flight_dirty: false})
     |> Map.put(:stats, frozen(state, now))
   end
 
-  defp maybe_clear_selection(state, old_count) do
-    new_count =
-      state.entries
-      |> List.last()
-      |> Map.get(:lines)
-      |> length()
+  # `before` is the pre-finalize state: the reply's first display row is
+  # everything the entries had, the in-flight block started right after it.
+  defp clear_selection_over_reply(%{selection: nil} = state, _before), do: state
 
-    if old_count != new_count, do: %{state | selection: nil}, else: state
+  defp clear_selection_over_reply(%{selection: selection} = state, before) do
+    {{_from_row, _fc}, {to_row, _tc}} = Selection.range(selection)
+    reply_start = log_line_count(before) - length(before.in_flight_lines || [])
+
+    if to_row >= reply_start, do: %{state | selection: nil}, else: state
   end
 
   # The turn's banked usage total joins the conversation accumulator exactly
@@ -898,21 +900,40 @@ defmodule DashFloat.TUI.State do
 
   ## Mouse selection (issue #28; ADR 0006 amendment)
 
+  # A press+release is a click (clears the selection) unless the pointer
+  # crossed rows or wobbled further than this many columns — mouse jitter on
+  # a plain click must not clobber the clipboard with an OSC 52 write.
+  @drag_jitter 2
+  # The OSC 52 payload is capped: base64 inflates 4/3, so this bounds the
+  # escape sequence at ~86 KiB — comfortably inside every mainstream
+  # terminal's OSC 52 limit, while dropping monster selections with a log
+  # line instead of stalling the writer.
+  @copy_cap 64 * 1024
+
   @doc """
   Applies a left-button mouse event over the log. `"down"` anchors a
   selection at the display row/column under the pointer, `"drag"` extends
-  the head, `"up"` finishes: a press+release without extension clears the
-  selection (click-to-clear), a real drag returns `{:copy, text}` and keeps
-  the highlight until the next click, drag, or width-changing resize.
-  Coordinates outside the log rect clamp to its edges (the terminal
-  convention) — a drag that wanders over the status or input pane selects
-  to the log edge. Selection is content-anchored (absolute display rows),
-  so it survives scrolling and appends.
+  the head, `"up"` finishes: a release within the drag-jitter threshold
+  (same row, at most a couple of columns) clears the selection
+  (click-to-clear), a real drag returns `{:copy, text}` — or
+  `{:copy_too_large, bytes}` past the cap — and keeps the highlight until
+  the next click, drag, or width-changing resize. Coordinates outside the
+  log rect clamp to its edges IN SCREEN SPACE before the scroll mapping,
+  so an off-pane pointer selects the edge row of the viewport, never rows
+  beyond it. A Shift-modified event is inert: Shift is the terminal's
+  native-selection bypass (see the README), and the app must not
+  select/copy underneath it. Selection is content-anchored (absolute
+  display rows), so it survives scrolling and appends.
   """
-  @spec select_mouse(t(), String.t(), integer(), integer()) ::
-          {t(), {:copy, String.t()} | nil}
-  def select_mouse(%__MODULE__{} = state, kind, x, y)
-      when kind in ["down", "drag", "up"] and is_integer(x) and is_integer(y) do
+  @spec select_mouse(t(), String.t(), integer(), integer(), [String.t()]) ::
+          {t(), {:copy, String.t()} | {:copy_too_large, pos_integer()} | nil}
+  def select_mouse(%__MODULE__{} = state, kind, x, y, modifiers \\ [])
+      when kind in ["down", "drag", "up"] and is_integer(x) and is_integer(y) and
+             is_list(modifiers) do
+    if "shift" in modifiers, do: {state, nil}, else: apply_mouse(state, kind, x, y)
+  end
+
+  defp apply_mouse(state, kind, x, y) do
     case cell_at(state, x, y) do
       nil ->
         {state, nil}
@@ -932,24 +953,47 @@ defmodule DashFloat.TUI.State do
   defp release(state, cell) do
     case state.selection do
       %{anchor: anchor} when anchor != cell ->
-        selection = %{state.selection | head: cell}
-        text = selection_text(%{state | selection: selection})
-
-        if String.trim(text) == "" do
-          # A selection of pure blank rows copies nothing — clear it.
-          {%{state | selection: nil}, nil}
+        if drag?(anchor, cell) do
+          copy(state, cell)
         else
-          {%{state | selection: selection}, {:copy, text}}
+          # Jitter, not a drag: treat as a plain click.
+          {%{state | selection: nil}, nil}
         end
 
       _collapsed_or_absent ->
-        # Click-to-clear: a press+release without extension.
+        # Click-to-clear: a press+release on the same cell.
         {%{state | selection: nil}, nil}
     end
   end
 
-  # The {display_row, column} under pointer (x, y), clamped into the log
-  # rect. nil when the log has no rows at all.
+  # A real drag crosses rows or moves further than the jitter threshold in
+  # columns.
+  defp drag?({anchor_row, _ac}, {cell_row, _bc}) when anchor_row != cell_row, do: true
+  defp drag?({_anchor_row, ac}, {_cell_row, bc}), do: abs(ac - bc) > @drag_jitter
+
+  defp copy(state, cell) do
+    selection = %{state.selection | head: cell}
+    text = selection_text(%{state | selection: selection})
+
+    cond do
+      String.trim(text) == "" ->
+        # A selection of pure blank rows copies nothing — clear it.
+        {%{state | selection: nil}, nil}
+
+      byte_size(text) > @copy_cap ->
+        {%{state | selection: selection}, {:copy_too_large, byte_size(text)}}
+
+      true ->
+        {%{state | selection: selection}, {:copy, text}}
+    end
+  end
+
+  # The {display_row, column} under pointer (x, y). The pointer clamps
+  # into the log rect in SCREEN space first — a click on the status bar or
+  # a drag into the input pane selects the rect's edge row, content the
+  # user can see under the clamp, never rows beyond the viewport (review
+  # P1) — then maps through the current scroll. nil when the log has no
+  # rows at all.
   defp cell_at(state, x, y) do
     count = log_line_count(state)
     %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
@@ -962,7 +1006,9 @@ defmodule DashFloat.TUI.State do
         |> elem(0)
         |> View.content_width()
 
-      top = effective_scroll(state, log.height) + (y - log.y)
+      bottom = log.y + max(log.height, 1) - 1
+      screen_row = clamp(y, log.y, bottom)
+      top = effective_scroll(state, log.height) + (screen_row - log.y)
       row = clamp(top, 0, count - 1)
       col = clamp(x - log.x, 0, width)
       {row, col}

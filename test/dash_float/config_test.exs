@@ -883,4 +883,53 @@ defmodule DashFloat.ConfigTest do
 
   defp restore(var, nil), do: System.delete_env(var)
   defp restore(var, value), do: System.put_env(var, value)
+
+  # Issue #28 rider, load-path half (review P2c): an ALREADY-migrated
+  # directory never runs the migration, so a leftover 0644 config.json.bak
+  # (still holding the old credential) was never touched. The load repairs
+  # it like every other secrets-bearing file — and never chmods through a
+  # symlink.
+  test "load repairs a too-permissive leftover config.json.bak to 0600" do
+    dir = fleet_dir()
+    backup = Path.join(dir, "config.json.bak")
+    File.write!(backup, ~s({"api_key": "PLACEHOLDER-old"}))
+    File.chmod!(backup, 0o644)
+
+    logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
+
+    assert logs =~ "config.json.bak"
+    assert logs =~ "too permissive"
+
+    assert {:ok, %File.Stat{mode: mode}} = File.stat(backup)
+    assert Bitwise.band(mode, 0o777) == 0o600
+  end
+
+  test "load leaves a 0600 backup alone and a missing one unmentioned" do
+    dir = fleet_dir()
+    backup = Path.join(dir, "config.json.bak")
+    File.write!(backup, ~s({"api_key": "PLACEHOLDER-old"}))
+    File.chmod!(backup, 0o600)
+
+    assert capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end) == ""
+
+    File.rm!(backup)
+    assert capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end) == ""
+  end
+
+  test "load never chmods a symlinked backup through to its target" do
+    dir = fleet_dir()
+
+    target = Path.join(dir, "elsewhere.json")
+    File.write!(target, ~s({"api_key": "PLACEHOLDER-old"}))
+    File.chmod!(target, 0o644)
+    File.ln_s!(target, Path.join(dir, "config.json.bak"))
+
+    logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
+
+    assert logs =~ "symlink"
+
+    # The target kept its mode — chmod did not follow the link out.
+    assert {:ok, %File.Stat{mode: mode}} = File.stat(target)
+    assert Bitwise.band(mode, 0o777) == 0o644
+  end
 end

@@ -8,7 +8,9 @@ defmodule DashFloat.TUI do
   process starts no tasks. The activity tick (ADR 0006) is the one timer this
   process owns — scheduled only while work is in flight.
 
-  Run with `mix run --no-halt`. Quit with Ctrl+Q or Ctrl+C.
+  Run with `mix run --no-halt`. Quit with Ctrl+Q, or a double Ctrl+C: the
+  first press shows a prompt, the second within two seconds exits
+  (issue #28; ADR 0006 amendment).
   """
 
   # No `use ExRatatui.App`: it injects a :transient child_spec that would
@@ -19,6 +21,8 @@ defmodule DashFloat.TUI do
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
+
+  require Logger
 
   @tick :dashfloat_tick
   @tick_ms 125
@@ -87,10 +91,15 @@ defmodule DashFloat.TUI do
 
   # Left-button selection over the log (issue #28; ADR 0006 amendment):
   # down anchors, drag extends, up copies via OSC 52 — one bounded write on
-  # a user-paced release, live runs only.
-  def handle_event(%ExRatatui.Event.Mouse{kind: kind, button: "left", x: x, y: y}, state)
+  # a user-paced release, live runs only. Shift+left is inert here: Shift
+  # is the terminal's native-selection bypass, and the app must not
+  # select/copy underneath it.
+  def handle_event(
+        %ExRatatui.Event.Mouse{kind: kind, button: "left", x: x, y: y, modifiers: mods},
+        state
+      )
       when kind in ["down", "drag", "up"] do
-    {state, action} = State.select_mouse(state, kind, x, y)
+    {state, action} = State.select_mouse(state, kind, x, y, mods)
     write_clipboard(state, action)
     schedule(state)
   end
@@ -261,9 +270,17 @@ defmodule DashFloat.TUI do
   # Sanctioned one-write exception (ADR 0006 amendment, issue #28): a
   # bounded OSC 52 sequence on a user-paced release. IO.binwrite completes
   # before the post-event frame draws, so bytes never interleave mid-frame;
-  # terminals without OSC 52 ignore it silently. Never in test mode.
+  # terminals without OSC 52 ignore it silently. Never in test mode. An
+  # over-cap selection drops with a log line — the highlight stays, the
+  # clipboard write does not happen.
   defp write_clipboard(%State{live?: true}, {:copy, text}) do
     IO.binwrite(:standard_io, Selection.osc52(text))
+  end
+
+  defp write_clipboard(_state, {:copy_too_large, bytes}) do
+    Logger.warning(
+      "selection copy dropped: #{bytes} bytes exceeds the clipboard cap — the selection stays highlighted"
+    )
   end
 
   defp write_clipboard(_state, _no_copy), do: :ok

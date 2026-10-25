@@ -351,4 +351,34 @@ defmodule DashFloat.Config.MigrationTest do
     %{main: main} = paths(dir)
     assert File.exists?(main)
   end
+
+  # Review probe: chmod must never follow a symlink out of the config
+  # directory (ADR 0008's rule, applied to the migration's tightening too).
+  test "a symlinked legacy config is migrated but its target is never chmod'd" do
+    dir = tmp_dir()
+
+    target = Path.join(dir, "real-legacy.json")
+    File.write!(target, Jason.encode!(full_legacy()))
+    File.chmod!(target, 0o644)
+    File.ln_s!(target, Path.join(dir, "config.json"))
+
+    logs =
+      capture_log(fn ->
+        assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+      end)
+
+    # The migration read through the link, wrote settings.json5 0600, and
+    # renamed the LINK to the backup — the target's mode is untouched.
+    assert logs =~ "symlink"
+    assert {:ok, %File.Stat{mode: mode}} = File.stat(target)
+    assert Bitwise.band(mode, 0o777) == 0o644
+
+    %{main: main, backup: backup} = paths(dir)
+    assert File.exists?(main)
+    assert File.exists?(backup)
+    assert File.lstat!(backup).type == :symlink
+
+    assert {:ok, %File.Stat{mode: main_mode}} = File.stat(main)
+    assert Bitwise.band(main_mode, 0o777) == 0o600
+  end
 end

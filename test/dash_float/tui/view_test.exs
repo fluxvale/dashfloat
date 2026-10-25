@@ -373,8 +373,9 @@ defmodule DashFloat.TUI.ViewTest do
       assert Enum.map_join(row2.spans, "", & &1.content) == ""
       assert Enum.all?(row2.spans, &(:reversed not in &1.style.modifiers))
 
-      # Row 3 (last row): to column 6 ("second").
-      assert [{"second", true}, {" row", false}] =
+      # Row 3 (last row): through column 6's cell ("second " — the
+      # pointed cell is included; review P2a).
+      assert [{"second ", true}, {"row", false}] =
                Enum.map(row3.spans, &{&1.content, :reversed in &1.style.modifiers})
     end
 

@@ -291,8 +291,9 @@ defmodule DashFloat.TUI.StateTest do
 
       {released, {:copy, text}} = State.select_mouse(extended, "up", 6, 5)
       assert released.selection != nil
-      # Last row slices to col 5 ("beta "), trailing blank trimmed.
-      assert text == "alpha line\n\nbeta"
+      # Last row slices through col 5's cell ("beta l" — the pointed cell
+      # is included; review P2a).
+      assert text == "alpha line\n\nbeta l"
 
       # Press+release without extension clears…
       {cleared, nil} = State.select_mouse(anchored, "up", 1, 3)
@@ -353,6 +354,94 @@ defmodule DashFloat.TUI.StateTest do
       assert State.selection_text(paged) == text
     end
 
+    test "coordinates clamp into the log rect in screen space (review P1)" do
+      # A tall, scrolled-up log: the viewport shows rows far from either
+      # content end, so an off-pane pointer must land on the viewport's
+      # edge row — never on invisible rows beyond it.
+      state =
+        Enum.reduce(1..50, selected_state(), fn i, acc ->
+          State.stream_message(acc, {:entry, :system, "filler #{i}"})
+        end)
+
+      scrolled = State.wheel_scroll(state, :up)
+      refute scrolled.follow?
+      top = State.effective_scroll(scrolled, 18)
+      assert top > 0
+
+      # Click on the status bar (screen row 0): anchors the viewport's
+      # first visible display row, not `top - 2` above the viewport.
+      {above, _nil} = State.select_mouse(scrolled, "down", 1, 0)
+      assert above.selection.anchor == {top, 0}
+
+      # Drag into the input pane (screen row 23): the viewport's last
+      # visible row (18-row idle viewport: rows top..top + 17).
+      {below, _nil} = State.select_mouse(scrolled, "down", 1, 23)
+      assert below.selection.anchor == {top + 17, 0}
+    end
+
+    test "click jitter below the drag threshold clears instead of copying" do
+      # Review P2b: a 1-column wobble on a plain click must not clobber
+      # the clipboard with an OSC 52 write.
+      state = selected_state()
+
+      {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
+      {wobbled, action} = State.select_mouse(anchored, "up", 2, 3)
+
+      assert action == nil
+      assert wobbled.selection == nil
+
+      # Two columns of wobble is still a click…
+      {anchored2, _nil} = State.select_mouse(state, "down", 1, 3)
+      {wobbled2, action2} = State.select_mouse(anchored2, "up", 3, 3)
+      assert action2 == nil
+      assert wobbled2.selection == nil
+
+      # …three is a real drag (same row) and copies.
+      {anchored3, _nil} = State.select_mouse(state, "down", 1, 3)
+      {dragged3, {:copy, _text}} = State.select_mouse(anchored3, "up", 4, 3)
+      assert dragged3.selection != nil
+    end
+
+    test "shift-modified events are inert — native selection owns them" do
+      # Review P2d: Shift+drag is the terminal's bypass; the app must not
+      # select or copy underneath it.
+      state = selected_state()
+
+      for kind <- ["down", "drag", "up"] do
+        {^state, nil} = State.select_mouse(state, kind, 1, 3, ["shift"])
+      end
+    end
+
+    test "an over-cap selection reports its size instead of copying" do
+      # Review P2d: the OSC 52 payload is bounded — a monster selection
+      # drops with a log line at the TUI layer, and its bytes are reported.
+      # The real full-log flow: anchor near the bottom, wheel up while the
+      # button is held (the selection is content-anchored and survives
+      # scrolling), extend, release — this is how a full-log selection is
+      # actually made.
+      huge = String.duplicate("word ", 20_000)
+
+      state = State.stream_message(new_state(), {:entry, :system, huge})
+
+      {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
+
+      # 400 notches = 1200 rows above the anchor: a genuine full-log span.
+      scrolled =
+        Enum.reduce(1..400, anchored, fn _i, acc -> State.wheel_scroll(acc, :up) end)
+
+      {dragged, _nil} = State.select_mouse(scrolled, "drag", 1, 3)
+      {selected, action} = State.select_mouse(dragged, "up", 1, 3)
+
+      assert {:copy_too_large, bytes} = action
+      assert bytes > 64 * 1024
+
+      text = State.selection_text(selected)
+      assert bytes == byte_size(text)
+
+      # The highlight stays — the user sees what was too big to copy.
+      assert selected.selection != nil
+    end
+
     test "a selection referencing rows beyond the content copies nothing" do
       # Every current shrink path (width resize, count-changing finalize)
       # clears the selection first, so a stale selection this far out of
@@ -375,24 +464,50 @@ defmodule DashFloat.TUI.StateTest do
       assert taller.selection != nil
     end
 
-    test "a finalize that changes the display count clears the selection" do
-      # A wide log so the in-flight wrap differs from the final render.
-      base = new_state(test_mode: {30, 24})
+    test "a selection reaching into the reply clears at finalize; one above survives" do
+      # Review P1: the live in-flight rows can be STALE (tokens arrived
+      # after the last tick) and equal in count while differing in
+      # content, so row counts cannot decide — the guard is positional.
+      # Display rows: 0 blank, 1 "warm", then the reply's rows from 2.
+      warm = new_state(test_mode: {20, 24})
+
+      base = State.stream_message(warm, {:entry, :system, "warm"})
 
       streaming =
         base
         |> Map.put(:phase, :streaming)
-        |> State.stream_message({:token, "one two three four five"}, 1_000)
+        |> State.stream_message({:token, "one two three"}, 1_000)
 
       {ticked, :cont} = State.tick(streaming, 1_100)
 
-      {anchored, nil} = State.select_mouse(ticked, "down", 1, 2)
-      {extended, nil} = State.select_mouse(anchored, "drag", 1, 10)
+      dirty = State.stream_message(ticked, {:token, " four"}, 1_200)
+      assert dirty.in_flight_dirty
 
-      finalized = State.stream_message(extended, {:phase, :idle}, 1_200)
-      # The live rows (3 wrapped rows + separator) became the entry's rows —
-      # same pipeline, same count, so the selection survives.
+      # Above the reply (row 1): a real drag within "warm" that survives
+      # the finalize untouched.
+      {anchored, _no_copy} = State.select_mouse(dirty, "down", 1, 3)
+      {dragged, _no_copy} = State.select_mouse(anchored, "drag", 4, 3)
+      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 4, 3)
+
+      finalized = State.stream_message(selected, {:phase, :idle}, 1_300)
       assert finalized.selection != nil
+
+      # The P1 shape, pinned: the stale live rows and the final entry rows
+      # are EQUAL in count while differing in content ("one two three" →
+      # "one two three four" — both fit one padded row).
+      reply = Enum.find(finalized.entries, &(&1.kind == :assistant))
+      assert length(dirty.in_flight_lines) == length(reply.lines)
+      assert reply.text == "one two three four"
+
+      # Reaching into the reply (row 2, the reply's blank separator row)
+      # clears even at that equal count.
+      {into, _no_copy} = State.select_mouse(dirty, "down", 1, 4)
+      {into_drag, _no_copy} = State.select_mouse(into, "drag", 6, 5)
+      {into_selected, {:copy, _reply_text}} = State.select_mouse(into_drag, "up", 6, 5)
+      assert into_selected.selection != nil
+
+      replaced = State.stream_message(into_selected, {:phase, :idle}, 1_400)
+      assert replaced.selection == nil
     end
   end
 

@@ -228,7 +228,10 @@ without an `apiKey` therefore surfaces as `api_key` in that message.
   the legacy credential is **tightened to 0600** (best effort): secrets are
   0600 wherever they live, not just in their primary home. *(Clarified
   2026-10-25, issue #28: a pre-existing `.bak` is tightened too — it
-  plausibly holds an older credential; never clobbered, always tightened.)*
+  plausibly holds an older credential; never clobbered, always tightened.
+  The load path repairs a leftover too-permissive `.bak` in an
+  already-migrated directory the same way, and every tightening chmod is
+  lstat-guarded — never through a symlink.)*
 - **Failure safety:** malformed or incomplete legacy JSON → `{:error, …}`
   naming the problem (field names only) with **nothing written**; any
   filesystem failure during the write is an `{:error, _}`, not a crash —

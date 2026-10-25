@@ -215,8 +215,49 @@ defmodule DashFloat.Config.Migration do
   end
 
   # Best effort, failures ignored: the file is inert after migration, this
-  # only keeps its secret private.
-  defp tighten(path), do: File.chmod(path, @secret_mode)
+  # only keeps its secret private. lstat, not stat: chmod must never follow
+  # a symlink out of the config directory onto a file the loader does not
+  # own (ADR 0008's rule, applied here too — review probe).
+  defp tighten(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :symlink}} ->
+        Logger.warning("#{path} is a symlink — not tightening permissions")
+
+      {:ok, %File.Stat{}} ->
+        File.chmod(path, @secret_mode)
+
+      _missing ->
+        :ok
+    end
+  end
+
+  @doc """
+  Best-effort 0600 repair of a leftover legacy backup on the LOAD path
+  (ADR 0008 posture, issue #28): beside an existing `settings.json5` a
+  `config.json.bak` is inert to the loader but still holds a credential —
+  an already-migrated directory never runs the migration that would have
+  tightened it. Symlinks are skipped, never chmod'd through.
+  """
+  @spec repair_backup(Path.t()) :: :ok
+  def repair_backup(dir) do
+    backup = Path.join(dir, @backup_file)
+
+    case File.lstat(backup) do
+      {:ok, %File.Stat{type: :symlink}} ->
+        Logger.warning("#{@backup_file} is a symlink — not repairing permissions")
+
+      {:ok, %File.Stat{mode: mode}} ->
+        if Bitwise.band(mode, 0o077) != 0 do
+          Logger.warning("#{@backup_file} is too permissive — repairing to 0600")
+          File.chmod(backup, @secret_mode)
+        end
+
+      _missing ->
+        :ok
+    end
+
+    :ok
+  end
 
   defp blank_to_nil(value) when is_binary(value) do
     case String.trim_trailing(value) do

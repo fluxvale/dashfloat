@@ -31,7 +31,7 @@ defmodule DashFloat.TUI.SelectionTest do
   describe "columns/2" do
     test "single row: one column range" do
       sel = %{anchor: {4, 2}, head: {4, 9}}
-      assert Selection.columns(sel, 4) == {2, 9}
+      assert Selection.columns(sel, 4) == {2, 10}
       assert Selection.columns(sel, 3) == nil
       assert Selection.columns(sel, 5) == nil
     end
@@ -42,7 +42,7 @@ defmodule DashFloat.TUI.SelectionTest do
       assert Selection.columns(sel, 2) == {5, nil}
       assert Selection.columns(sel, 3) == {0, nil}
       assert Selection.columns(sel, 4) == {0, nil}
-      assert Selection.columns(sel, 5) == {0, 3}
+      assert Selection.columns(sel, 5) == {0, 4}
     end
 
     test "covers_row?/2 follows the range" do
@@ -121,7 +121,7 @@ defmodule DashFloat.TUI.SelectionTest do
 
       # Partial: first row from col 4, last row to col 3.
       partial = %{anchor: {0, 4}, head: {2, 3}}
-      assert Selection.extract(partial, rows, 0) == "quick brown\n  fox jumps over\n  t"
+      assert Selection.extract(partial, rows, 0) == "quick brown\n  fox jumps over\n  th"
     end
 
     test "a selection of pure blank rows copies nothing" do

@@ -1075,6 +1075,12 @@ defmodule DashFloat.TUITest do
     for i <- 1..8, do: send(pid, {:entry, :system, "selectable line #{i}"})
     eventually(pid, &(State.log_line_count(&1) == 16))
 
+    # A drag with no press before it (a missed or dropped down event) is a
+    # no-op, never a crash.
+    inject(pid, %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 5, y: 5})
+    bare = get_state(pid)
+    assert bare.selection == nil
+
     # down at log row 1 ("selectable line 1"), drag to row 3, release.
     inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 3, y: 3})
     drag = eventually(pid, &(&1.selection != nil))
@@ -1091,8 +1097,9 @@ defmodule DashFloat.TUITest do
     assert released.selection != nil
 
     # …and the copy payload is the selected column ranges, newline-joined:
-    # row 1 from col 2 to its end, the blank separator, row 3 to col 4.
-    assert State.selection_text(released) == "lectable line 1\n\nsele"
+    # row 1 from col 2 through its end, the blank separator, row 3 through
+    # col 4's cell ("selec" — the pointed cell is included).
+    assert State.selection_text(released) == "lectable line 1\n\nselec"
 
     # Click-to-clear: a press+release without extension clears it.
     inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 3, y: 3})
@@ -1114,14 +1121,24 @@ defmodule DashFloat.TUITest do
     assert test_state.live? == false
 
     assert ExUnit.CaptureIO.capture_io(fn ->
-             for event <- [
+             threaded =
+               Enum.reduce(
+                 [
                    %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3},
                    %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 12, y: 3},
                    %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 12, y: 3}
-                 ] do
-               assert {:noreply, _state} = TUI.handle_event(event, test_state)
-               test_state = get_state(pid)
-             end
+                 ],
+                 test_state,
+                 fn event, acc ->
+                   assert {:noreply, next} = TUI.handle_event(event, acc)
+                   next
+                 end
+               )
+
+             # A real drag completed (a copy action fired in test mode) —
+             # the empty capture then genuinely proves the live? gate held.
+             assert threaded.selection != nil
+             assert State.selection_text(threaded) != ""
            end) == ""
 
     # A live state (no test_mode): the up event writes the exact sequence.
@@ -1149,9 +1166,59 @@ defmodule DashFloat.TUITest do
         assert {:noreply, _state} = TUI.handle_event(up, dragging)
       end)
 
-    # Columns [0, 11) of "copy me please".
-    expected = "\e]52;c;" <> Base.encode64("copy me ple") <> "\a"
+    # Columns [0, 12) of "copy me please" — through the pointed cell.
+    expected = "\e]52;c;" <> Base.encode64("copy me plea") <> "\a"
     assert output == expected
+  end
+
+  # Review P2d: Shift+drag is the terminal's native-selection bypass — the
+  # app neither selects nor writes underneath it.
+  test "shift-modified left events never select" do
+    {:ok, pid} = start_tui()
+    send(pid, {:entry, :system, "native selection bypass"})
+    eventually(pid, &(State.log_line_count(&1) == 2))
+
+    for event <- [
+          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3, modifiers: ["shift"]},
+          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 10, y: 3, modifiers: ["shift"]},
+          %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 10, y: 3, modifiers: ["shift"]}
+        ] do
+      inject(pid, event)
+    end
+
+    untouched = get_state(pid)
+    assert untouched.selection == nil
+  end
+
+  # Review P2d: an over-cap selection keeps its highlight, writes nothing,
+  # and logs why.
+  test "an over-cap selection drops the copy with a log line" do
+    huge = String.duplicate("word ", 20_000)
+    live_base = State.new([])
+    live = State.stream_message(live_base, {:entry, :system, huge})
+
+    {anchored, _nil} = State.select_mouse(live, "down", 1, 3)
+
+    # 400 notches = 1200 rows above the anchor: a genuine full-log span.
+    scrolled =
+      Enum.reduce(1..400, anchored, fn _i, acc -> State.wheel_scroll(acc, :up) end)
+
+    {dragged, _nil} = State.select_mouse(scrolled, "drag", 1, 3)
+
+    up = %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 1, y: 3}
+
+    logs =
+      ExUnit.CaptureLog.capture_log(fn ->
+        output =
+          ExUnit.CaptureIO.capture_io(fn ->
+            assert {:noreply, kept} = TUI.handle_event(up, dragged)
+            assert kept.selection != nil
+          end)
+
+        assert output == ""
+      end)
+
+    assert logs =~ "clipboard cap"
   end
 
   # The lynchpin of the wheel fix: without capture, terminals emulate the

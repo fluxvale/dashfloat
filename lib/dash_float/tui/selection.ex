@@ -35,7 +35,10 @@ defmodule DashFloat.TUI.Selection do
   @doc """
   The half-open column range `[from, to)` selected on absolute display row
   `row`; `to` nil means the whole row (interior rows), nil means the row is
-  outside the selection.
+  outside the selection. Both endpoints select THROUGH the cell they point
+  at — the range is half-open over cell edges, so the last column of a row
+  is reachable and the pointed cell is always included (review P2a: a
+  full-width row used to lose its final character on copy).
   """
   @spec columns(t(), non_neg_integer()) :: columns()
   def columns(sel, row) do
@@ -43,12 +46,17 @@ defmodule DashFloat.TUI.Selection do
 
     cond do
       row < from_row or row > to_row -> nil
-      from_row == to_row -> {from_col, to_col}
+      from_row == to_row -> {from_col, through(to_col)}
       row == from_row -> {from_col, nil}
-      row == to_row -> {0, to_col}
+      row == to_row -> {0, through(to_col)}
       true -> {0, nil}
     end
   end
+
+  # The selection's edge sits one cell past the pointed cell. An endpoint
+  # already one past the row (drag into the right margin) selects through
+  # the row's end.
+  defp through(col), do: col + 1
 
   @doc "True when absolute display row `row` intersects the selection."
   @spec covers_row?(t(), non_neg_integer()) :: boolean()
