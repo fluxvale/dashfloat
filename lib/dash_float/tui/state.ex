@@ -384,15 +384,14 @@ defmodule DashFloat.TUI.State do
   def exit_guard_live?(_state, _now), do: false
 
   @doc """
-  Milliseconds left on the exit-guard window (0 when it has logically
-  expired), or nil when no guard is armed — the delay for the TUI's one-shot
-  expiry timer.
+  Milliseconds left on the exit-guard window, flooring at 0 when it has
+  logically expired — the delay for the TUI's one-shot expiry timer. Only
+  meaningful while a guard is armed; callers check `exit_guard_at` first
+  (`exit_guard_live?/2` for the window test).
   """
-  @spec exit_guard_delay(t(), integer()) :: non_neg_integer() | nil
+  @spec exit_guard_delay(t(), integer()) :: non_neg_integer()
   def exit_guard_delay(%__MODULE__{exit_guard_at: at}, now) when is_integer(at),
     do: max(@exit_window_ms - (now - at), 0)
-
-  def exit_guard_delay(_state, _now), do: nil
 
   @doc """
   True when a transient row sits between log and input: an active phase
@@ -986,7 +985,9 @@ defmodule DashFloat.TUI.State do
     {{from_row, _fc}, {to_row, _tc}} = Selection.range(selection)
 
     case selection_row_count(from_row, to_row, log_line_count(state)) do
-      0 ->
+      # Nothing selectable: no selection rows survive the clamp (stale
+      # selection over shrunken content).
+      count when count <= 0 ->
         ""
 
       count ->

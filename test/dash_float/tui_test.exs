@@ -238,6 +238,84 @@ defmodule DashFloat.TUITest do
     assert cleared.exit_guard_at == nil and cleared.exit_guard_ref == nil
   end
 
+  # The disarm path: a keystroke between arming and expiry cancels the
+  # pending timer outright — no orphan frame later.
+  test "a disarming key press cancels the pending expiry timer" do
+    {:ok, pid} = start_tui()
+
+    press(pid, "c", ["ctrl"])
+    armed = eventually(pid, fn s -> s.exit_guard_at != nil end)
+    assert armed.exit_guard_ref != nil
+
+    press(pid, "x")
+    disarmed = eventually(pid, fn s -> s.exit_guard_at == nil end)
+
+    assert disarmed.exit_guard_ref == nil
+    assert State.input_text(disarmed) == "x"
+
+    # Disarmed means no expiry frame either: the quiet window stays quiet.
+    settled = Runtime.snapshot(pid).render_count
+    Process.sleep(300)
+    assert Runtime.snapshot(pid).render_count == settled
+  end
+
+  # Incidental events (the wheel here, stream messages equally) must not
+  # disturb a pending expiry: the timer stays live and still fires on time.
+  test "incidental events leave a pending expiry timer alone" do
+    {:ok, pid} = start_tui()
+
+    press(pid, "c", ["ctrl"])
+    armed = eventually(pid, fn s -> s.exit_guard_at != nil end)
+    armed_ref = armed.exit_guard_ref
+
+    scroll(pid, "scroll_up")
+    wheeled = get_state(pid)
+
+    assert wheeled.exit_guard_at != nil
+    assert wheeled.exit_guard_ref == armed_ref
+    assert State.exit_guard_live?(wheeled, System.monotonic_time(:millisecond))
+
+    # The original timer still owns the expiry: the prompt clears without
+    # a second press.
+    cleared = eventually(pid, fn s -> s.exit_guard_at == nil end, 400)
+    assert cleared.exit_guard_ref == nil
+  end
+
+  # The fired-but-undrained race: an event is processed after the timer
+  # fired but before its message drained. The timer is replaced (exactly
+  # one per window) and the orphaned message is dropped by the staleness
+  # check instead of clearing the fresh window.
+  test "a fired-but-undrained guard timer is replaced, orphan dropped" do
+    base = State.new(test_mode: {80, 24})
+
+    fired_ref = Process.send_after(self(), :dashfloat_exit_guard, 1)
+    Process.sleep(20)
+
+    # A fresh arming (1 s left on its window) whose tracked timer already
+    # fired but has not drained.
+    armed = %{
+      base
+      | phase: :streaming,
+        exit_guard_at: System.monotonic_time(:millisecond) - 1_000,
+        exit_guard_ref: fired_ref
+    }
+
+    # A stream message schedules while the fired timer's message is queued.
+    assert {:noreply, rescheduled} = TUI.handle_info({:token, "t"}, armed)
+    assert rescheduled.exit_guard_ref != nil
+    assert rescheduled.exit_guard_ref != fired_ref
+
+    # The orphaned message is stale against the new timer: no frame, and
+    # the fresh window survives it.
+    assert {:noreply, kept, %{render?: false}} =
+             TUI.handle_info(:dashfloat_exit_guard, rescheduled)
+
+    assert kept.exit_guard_at != nil
+    assert kept.exit_guard_ref == rescheduled.exit_guard_ref
+
+    Process.cancel_timer(kept.exit_guard_ref)
+  end
+
   @tag :capture_log
   test "a crashing message tears the app down through the terminal-restore path" do
     {:ok, pid} = start_tui()

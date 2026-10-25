@@ -203,29 +203,31 @@ defmodule DashFloat.TUI do
     end
   end
 
-  # Exactly one expiry timer per armed window. A fired-but-undrained timer
-  # (re-arm raced its queued message) is replaced — the staleness check in
-  # handle_info drops the orphaned message.
-  defp schedule_guard(%{exit_guard_at: nil} = state, _now) do
-    if state.exit_guard_ref != nil do
-      Process.cancel_timer(state.exit_guard_ref)
-    end
+  # Exactly one expiry timer per armed window: disarm cancels a pending
+  # timer, arming schedules one when none is live, a fired-but-undrained
+  # timer (its message still queued) is replaced — the staleness check in
+  # handle_info drops the orphaned message — and a live timer is left
+  # alone, so incidental events never disturb a pending expiry.
+  defp schedule_guard(state, now) do
+    cond do
+      state.exit_guard_at == nil ->
+        if state.exit_guard_ref != nil, do: Process.cancel_timer(state.exit_guard_ref)
+        %{state | exit_guard_ref: nil}
 
-    %{state | exit_guard_ref: nil}
+      state.exit_guard_ref == nil ->
+        arm_guard(state, now)
+
+      Process.read_timer(state.exit_guard_ref) == false ->
+        arm_guard(state, now)
+
+      true ->
+        state
+    end
   end
 
-  defp schedule_guard(state, now) do
-    fired? =
-      state.exit_guard_ref != nil and Process.read_timer(state.exit_guard_ref) == false
-
-    if state.exit_guard_ref == nil or fired? do
-      case State.exit_guard_delay(state, now) do
-        nil -> state
-        delay -> %{state | exit_guard_ref: Process.send_after(self(), @exit_guard, delay)}
-      end
-    else
-      state
-    end
+  defp arm_guard(state, now) do
+    delay = State.exit_guard_delay(state, now)
+    %{state | exit_guard_ref: Process.send_after(self(), @exit_guard, delay)}
   end
 
   @impl ExRatatui.App

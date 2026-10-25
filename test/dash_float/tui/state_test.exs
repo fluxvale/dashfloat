@@ -294,9 +294,11 @@ defmodule DashFloat.TUI.StateTest do
       # Last row slices to col 5 ("beta "), trailing blank trimmed.
       assert text == "alpha line\n\nbeta"
 
-      # Press+release without extension clears.
+      # Press+release without extension clears…
       {cleared, nil} = State.select_mouse(anchored, "up", 1, 3)
       assert cleared.selection == nil
+      # …and an empty selection copies nothing (the nil clause's contract).
+      assert State.selection_text(cleared) == ""
     end
 
     test "an empty log selects nothing" do
@@ -351,6 +353,17 @@ defmodule DashFloat.TUI.StateTest do
       assert State.selection_text(paged) == text
     end
 
+    test "a selection referencing rows beyond the content copies nothing" do
+      # Every current shrink path (width resize, count-changing finalize)
+      # clears the selection first, so a stale selection this far out of
+      # range cannot arise from an interaction today — but selection_text
+      # is total: Phase 4's log trimming will be able to shrink the log
+      # under one, and the clamp guard decides that day's answer now —
+      # copy nothing, never crash, never wrap around.
+      stale = %{selected_state() | selection: %{anchor: {500, 0}, head: {900, 0}}}
+      assert State.selection_text(stale) == ""
+    end
+
     test "a width-changing resize clears; a height-only resize keeps" do
       {state, {:copy, _text}} = drag(selected_state(), {1, 3}, {6, 5})
 
@@ -394,6 +407,9 @@ defmodule DashFloat.TUI.StateTest do
       assert armed.exit_guard_at == 1_000
       assert State.exit_guard_live?(armed, 1_000)
       assert State.exit_guard_delay(armed, 1_000) == 2_000
+      # The delay floors at zero once the window has logically expired —
+      # the timer fires immediately to clear a stale prompt.
+      assert State.exit_guard_delay(armed, 1_000 + 3_000) == 0
     end
 
     test "a second Ctrl+C inside the window quits through the normal path" do
