@@ -7,6 +7,7 @@ defmodule DashFloat.TUI.View do
   """
 
   alias DashFloat.TUI.State
+  alias DashFloat.TUI.Selection
   alias DashFloat.TUI.Theme
   alias ExRatatui.Layout.Rect
   alias ExRatatui.Text.Line
@@ -177,26 +178,44 @@ defmodule DashFloat.TUI.View do
   # Only the visible window is built and encoded per frame: per-frame cost is
   # O(viewport), not O(total log) — the full log stays in memory until Phase 4
   # persistence (ADR 0002). Stored rendered lines are sliced; nothing renders
-  # here (ADR 0006).
-  defp log_widget(state, height) do
+  # here (ADR 0006). A selection highlights its covered columns in reverse
+  # video (issue #28; ADR 0006 amendment).
+  defp log_widget(%State{entries: [], in_flight: in_flight, in_flight_lines: nil}, _height)
+       when in_flight in [nil, ""] do
     %Paragraph{
-      text: log_lines(state, State.effective_scroll(state, height), height),
+      text: [Line.new([Span.new("(log is empty — say something)", style: Theme.style(:dim))])],
       scroll: {0, 0}
     }
   end
 
-  defp log_lines(
-         %State{entries: [], in_flight: in_flight, in_flight_lines: nil},
-         _offset,
-         _height
-       )
-       when in_flight in [nil, ""] do
-    [Line.new([Span.new("(log is empty — say something)", style: Theme.style(:dim))])]
+  defp log_widget(state, height) do
+    offset = State.effective_scroll(state, height)
+
+    %Paragraph{
+      text: state |> display_lines(offset, height) |> highlight_selection(offset, state),
+      scroll: {0, 0}
+    }
   end
 
-  defp log_lines(state, offset, height) do
-    # Walk blocks counting display lines; slice only those that intersect
-    # [offset, offset + height), so per-frame building stays O(viewport).
+  defp highlight_selection(rows, _offset, %State{selection: nil}), do: rows
+
+  defp highlight_selection(rows, offset, %State{selection: selection}) do
+    rows
+    |> Enum.with_index(fn row, i ->
+      Selection.highlight(row, Selection.columns(selection, offset + i))
+    end)
+  end
+
+  @doc """
+  The display rows `[offset, offset + height)` of the log's stored wrapped
+  lines (entries plus the in-flight block), windowed — the same walk feeds
+  the rendered log and the selection copy, so geometry can never disagree.
+  """
+  @spec display_lines(State.t(), non_neg_integer(), non_neg_integer()) :: [
+          ExRatatui.Text.Line.t()
+        ]
+  def display_lines(%State{} = state, offset, height)
+      when is_integer(offset) and is_integer(height) do
     {_skipped, acc} =
       state
       |> blocks()

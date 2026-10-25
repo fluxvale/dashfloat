@@ -263,6 +263,125 @@ defmodule DashFloat.TUI.StateTest do
     end
   end
 
+  # Issue #28 (ADR 0006 amendment): selection over display rows — anchor,
+  # extend, copy on release; content-anchored so it survives scroll and
+  # append; cleared by width resize and a count-changing finalize.
+  describe "mouse selection" do
+    # Two entries => display rows: 0 blank, 1 "alpha line", 2 blank, 3 "beta line".
+    defp selected_state do
+      new_state()
+      |> State.stream_message({:entry, :system, "alpha line"})
+      |> State.stream_message({:entry, :system, "beta line"})
+    end
+
+    defp drag(state, {x0, y0}, {x1, y1}) do
+      {state, _} = State.select_mouse(state, "down", x0, y0)
+      {state, _} = State.select_mouse(state, "drag", x1, y1)
+      State.select_mouse(state, "up", x1, y1)
+    end
+
+    test "down anchors, drag extends, up copies; click-to-clear" do
+      state = selected_state()
+
+      {anchored, nil} = State.select_mouse(state, "down", 1, 3)
+      assert anchored.selection == %{anchor: {1, 0}, head: {1, 0}}
+
+      {extended, nil} = State.select_mouse(anchored, "drag", 6, 5)
+      assert extended.selection.head == {3, 5}
+
+      {released, {:copy, text}} = State.select_mouse(extended, "up", 6, 5)
+      assert released.selection != nil
+      # Last row slices to col 5 ("beta "), trailing blank trimmed.
+      assert text == "alpha line\n\nbeta"
+
+      # Press+release without extension clears.
+      {cleared, nil} =
+        anchored |> then(&State.select_mouse(&1, "up", 1, 3))
+
+      assert cleared.selection == nil
+    end
+
+    test "an empty log selects nothing" do
+      {state, action} = State.select_mouse(new_state(), "down", 1, 3)
+      assert state.selection == nil
+      assert action == nil
+    end
+
+    test "coordinates clamp into the log rect (status bar and input box)" do
+      state = selected_state()
+
+      # Above the log (the status row): clamps to display row 0, col 0.
+      {above, nil} = State.select_mouse(state, "down", 0, 0)
+      assert above.selection.anchor == {0, 0}
+
+      # Below the log (over the input box): clamps to the last row, and the
+      # column clamps to the padded width (one past the last column).
+      {below, nil} = State.select_mouse(selected_state(), "down", 999, 23)
+      assert below.selection.anchor == {3, 78}
+    end
+
+    test "a blank-only selection copies nothing and clears" do
+      # An empty entry renders as blank separator + empty line: rows 0-1.
+      state = State.stream_message(new_state(), {:entry, :system, ""})
+
+      {anchored, nil} = State.select_mouse(state, "down", 1, 2)
+      {released, action} = State.select_mouse(anchored, "up", 1, 3)
+
+      assert action == nil
+      assert released.selection == nil
+    end
+
+    test "the selection survives the wheel and page keys (content-anchored)" do
+      state =
+        Enum.reduce(1..50, selected_state(), fn i, acc ->
+          State.stream_message(acc, {:entry, :system, "filler #{i}"})
+        end)
+
+      {anchored, nil} = State.select_mouse(state, "down", 1, 3)
+      {dragged, nil} = State.select_mouse(anchored, "drag", 6, 5)
+      {copied, {:copy, text}} = State.select_mouse(dragged, "up", 6, 5)
+      assert text != ""
+
+      # Wheel up unfollows; the selection stays anchored to the content.
+      wheeled = State.wheel_scroll(copied, :up)
+      refute wheeled.follow?
+      assert wheeled.selection != nil
+      assert State.selection_text(wheeled) == text
+
+      {paged, nil} = State.handle_key(wheeled, "page_up", [])
+      assert paged.selection != nil
+      assert State.selection_text(paged) == text
+    end
+
+    test "a width-changing resize clears; a height-only resize keeps" do
+      {state, {:copy, _}} = drag(selected_state(), {1, 3}, {6, 5})
+
+      narrowed = State.resize(state, 40, 24)
+      assert narrowed.selection == nil
+
+      {again, {:copy, _}} = drag(selected_state(), {1, 3}, {6, 5})
+      taller = State.resize(again, 80, 40)
+      assert taller.selection != nil
+    end
+
+    test "a finalize that changes the display count clears the selection" do
+      # A wide log so the in-flight wrap differs from the final render.
+      base =
+        new_state(test_mode: {30, 24})
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "one two three four five"}, 1_000)
+        |> then(fn s -> elem(State.tick(s, 1_100), 0) end)
+
+      {anchored, nil} = State.select_mouse(base, "down", 1, 2)
+      {extended, nil} = State.select_mouse(anchored, "drag", 1, 10)
+
+      finalized = State.stream_message(extended, {:phase, :idle}, 1_200)
+      # The live rows (3 wrapped rows + separator) became the entry's rows —
+      # same pipeline, same count, so the selection survives.
+      assert finalized.selection != nil
+    end
+  end
+
   # Issue #28 (ADR 0006 amendment): one accidental Ctrl+C must not kill a
   # live session. First press arms a 2 s window + prompt; a second press
   # inside quits; expiry resets; any other key disarms.

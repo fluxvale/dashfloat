@@ -965,15 +965,16 @@ defmodule DashFloat.TUITest do
     assert State.effective_scroll(state, active_viewport(state)) == confirm_bottom - 3
   end
 
-  test "non-scroll mouse events change nothing and render nothing" do
+  test "inert mouse events change nothing and render nothing" do
     {:ok, pid} = start_tui()
     before_count = Runtime.snapshot(pid).render_count
 
     for event <- [
           %ExRatatui.Event.Mouse{kind: "moved", button: "", x: 1, y: 1},
-          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 1},
-          %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 1, y: 1},
-          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 2, y: 2},
+          %ExRatatui.Event.Mouse{kind: "moved", button: "", x: 7, y: 9},
+          %ExRatatui.Event.Mouse{kind: "down", button: "right", x: 1, y: 1},
+          %ExRatatui.Event.Mouse{kind: "up", button: "middle", x: 2, y: 2},
+          %ExRatatui.Event.Mouse{kind: "drag", button: "right", x: 3, y: 3},
           %ExRatatui.Event.Mouse{kind: "scroll_left", button: "", x: 1, y: 1}
         ] do
       inject(pid, event)
@@ -982,11 +983,97 @@ defmodule DashFloat.TUITest do
     assert Runtime.snapshot(pid).render_count == before_count
     untouched = get_state(pid)
     assert State.input_text(untouched) == ""
+    assert untouched.selection == nil
+  end
+
+  # Issue #28: click-drag over the log anchors a display-row selection,
+  # extends with the drag, and copies on release. Test mode never writes
+  # the OSC 52 sequence (live?-gated); the selection state is the observable.
+  test "a left drag over the log selects display rows and copies on release" do
+    {:ok, pid} = start_tui()
+
+    for i <- 1..8, do: send(pid, {:entry, :system, "selectable line #{i}"})
+    eventually(pid, &(State.log_line_count(&1) == 16))
+
+    # down at log row 1 ("selectable line 1"), drag to row 3, release.
+    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 3, y: 3})
+    drag = eventually(pid, &(&1.selection != nil))
+    assert drag.selection.anchor == {1, 2}
+
+    inject(pid, %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 5, y: 5})
+    extended = get_state(pid)
+    assert extended.selection.head == {3, 4}
+
+    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 5, y: 5})
+    released = get_state(pid)
+
+    # The highlight stays after the copy (terminal convention)…
+    assert released.selection != nil
+
+    # …and the copy payload is the selected column ranges, newline-joined:
+    # row 1 from col 2 to its end, the blank separator, row 3 to col 4.
+    assert State.selection_text(released) == "lectable line 1\n\nsele"
+
+    # Click-to-clear: a press+release without extension clears it.
+    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 3, y: 3})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 3, y: 3})
+    cleared = get_state(pid)
+    assert cleared.selection == nil
+  end
+
+  # The live-only OSC 52 write (ADR 0006 amendment, issue #28): test mode
+  # never writes; a live state writes exactly one bounded sequence on
+  # release.
+  test "copy on release writes the OSC 52 sequence on live runs only" do
+    # Test mode: the full down/drag/up flow through TUI.handle_event, with
+    # nothing reaching standard output.
+    {:ok, pid} = start_tui()
+    send(pid, {:entry, :system, "copy me please"})
+    eventually(pid, &(State.log_line_count(&1) == 2))
+    test_state = get_state(pid)
+    assert test_state.live? == false
+
+    assert ExUnit.CaptureIO.capture_io(fn ->
+             for event <- [
+                   %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3},
+                   %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 12, y: 3},
+                   %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 12, y: 3}
+                 ] do
+               assert {:noreply, _} = TUI.handle_event(event, test_state)
+               test_state = get_state(pid)
+             end
+           end) == ""
+
+    # A live state (no test_mode): the up event writes the exact sequence.
+    live = State.new([]) |> State.stream_message({:entry, :system, "copy me please"})
+    assert live.live? == true
+
+    live =
+      Enum.reduce(
+        [
+          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3},
+          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 12, y: 3}
+        ],
+        live,
+        fn event, acc ->
+          {acc, _} = State.select_mouse(acc, event.kind, event.x, event.y)
+          acc
+        end
+      )
+
+    up = %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 12, y: 3}
+
+    output =
+      ExUnit.CaptureIO.capture_io(fn ->
+        assert {:noreply, _} = TUI.handle_event(up, live)
+      end)
+
+    # Columns [0, 11) of "copy me please".
+    assert output == "\e]52;c;" <> Base.encode64("copy me ple") <> "\a"
   end
 
   # The lynchpin of the wheel fix: without capture, terminals emulate the
-  # wheel as arrow keys and input history eats it (issue #21). The flag is
-  # the TUI start_link default, so it holds for every starter — pinned via
+  # wheel as arrow keys and input history eats it (issue #21). The flag is  # the TUI start_link default, so it holds for every starter — pinned via
   # the transport-connect telemetry span (the test backend itself ignores
   # the flag, so the span metadata is the observable).
   test "the TUI starts with mouse capture enabled" do

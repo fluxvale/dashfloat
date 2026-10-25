@@ -59,7 +59,11 @@ flips Streaming → Idle when the reply completes. Press Esc mid-stream to cance
 — the partial reply is kept and a gray `[cancelled]` line marks it. Shift+Enter
 inserts a newline on terminals that report enhanced key events (kitty
 protocol, modifyOtherKeys) — on others, use Alt+Enter. Up/Down walk input
-history, PageUp/PageDown scroll the log, Ctrl+Q (or Ctrl+C) quits.
+history, PageUp/PageDown and the mouse wheel scroll the log. Ctrl+Q quits; a
+double Ctrl+C does too (one press shows a prompt, the second within two
+seconds exits). Click-drag over the log selects text — highlighted live,
+copied to your system clipboard on release via OSC 52 (works over SSH). Hold
+Shift while dragging to use the terminal's own selection instead.
 
 Without a provider configured the TUI still starts; submitting logs the setup
 instructions instead of a reply. This live-key run is the manual smoke step —

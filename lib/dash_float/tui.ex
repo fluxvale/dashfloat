@@ -17,6 +17,7 @@ defmodule DashFloat.TUI do
   @behaviour ExRatatui.App
 
   alias DashFloat.TUI.State
+  alias DashFloat.TUI.Selection
   alias DashFloat.TUI.View
 
   @tick :dashfloat_tick
@@ -84,8 +85,19 @@ defmodule DashFloat.TUI do
   def handle_event(%ExRatatui.Event.Mouse{kind: "scroll_down"}, state),
     do: schedule(State.wheel_scroll(state, :down))
 
-  # Every other mouse event (clicks, drags, motion) is inert and renders
-  # nothing: a pointer wandering over an idle UI must not draw frames.
+  # Left-button selection over the log (issue #28; ADR 0006 amendment):
+  # down anchors, drag extends, up copies via OSC 52 — one bounded write on
+  # a user-paced release, live runs only.
+  def handle_event(%ExRatatui.Event.Mouse{kind: kind, button: "left", x: x, y: y}, state)
+      when kind in ["down", "drag", "up"] do
+    {state, action} = State.select_mouse(state, kind, x, y)
+    write_clipboard(state, action)
+    schedule(state)
+  end
+
+  # Every other mouse event (motion without a button, other buttons, stray
+  # scroll axes) is inert and renders nothing: a pointer wandering over an
+  # idle UI must not draw frames.
   def handle_event(%ExRatatui.Event.Mouse{}, state),
     do: {:noreply, state, %{render?: false}}
 
@@ -243,6 +255,16 @@ defmodule DashFloat.TUI do
     send(state.agent, {:prompt, self(), prompt})
     state
   end
+
+  # Sanctioned one-write exception (ADR 0006 amendment, issue #28): a
+  # bounded OSC 52 sequence on a user-paced release. IO.binwrite completes
+  # before the post-event frame draws, so bytes never interleave mid-frame;
+  # terminals without OSC 52 ignore it silently. Never in test mode.
+  defp write_clipboard(%State{live?: true}, {:copy, text}) do
+    IO.binwrite(:standard_io, Selection.osc52(text))
+  end
+
+  defp write_clipboard(_state, _no_copy), do: :ok
 
   defp cancel_agent(state) do
     send(state.agent, {:cancel})

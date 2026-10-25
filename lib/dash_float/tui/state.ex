@@ -14,6 +14,7 @@ defmodule DashFloat.TUI.State do
   """
 
   alias DashFloat.TUI.Render
+  alias DashFloat.TUI.Selection
   alias DashFloat.TUI.View
   alias DashFloat.TUI.Wrap
 
@@ -80,7 +81,8 @@ defmodule DashFloat.TUI.State do
     draft: "",
     size: @default_size,
     live?: false,
-    agent_ref: nil
+    agent_ref: nil,
+    selection: nil
   ]
 
   @type t :: %__MODULE__{
@@ -106,7 +108,8 @@ defmodule DashFloat.TUI.State do
           agent_ref: reference() | nil,
           confirm: confirm() | nil,
           exit_guard_at: integer() | nil,
-          exit_guard_ref: reference() | nil
+          exit_guard_ref: reference() | nil,
+          selection: Selection.t() | nil
         }
 
   @typedoc """
@@ -578,7 +581,10 @@ defmodule DashFloat.TUI.State do
 
   # Finalizing renders the reply once and freezes the cumulative rate; the
   # streaming counters reset for the next turn, the frozen rate and context
-  # accumulator stay visible.
+  # accumulator stay visible. A selection survives only when the finalized
+  # block's display count matches the live view's — the same wrap pipeline
+  # produces identical rows then, so the indices still point at the same
+  # content; any count change shifts rows below and clears it.
   defp finalize_in_flight(%{in_flight: in_flight} = state, now) when in_flight in [nil, ""] do
     %{
       state
@@ -590,10 +596,18 @@ defmodule DashFloat.TUI.State do
   end
 
   defp finalize_in_flight(%{in_flight: in_flight} = state, now) do
+    old_count = length(state.in_flight_lines || [])
+
     state
     |> append_entry(:assistant, in_flight)
+    |> maybe_clear_selection(old_count)
     |> Map.merge(%{in_flight: nil, in_flight_lines: nil, in_flight_dirty: false})
     |> Map.put(:stats, frozen(state, now))
+  end
+
+  defp maybe_clear_selection(state, old_count) do
+    new_count = state.entries |> List.last() |> Map.get(:lines) |> length()
+    if old_count != new_count, do: %{state | selection: nil}, else: state
   end
 
   # The turn's banked usage total joins the conversation accumulator exactly
@@ -878,6 +892,112 @@ defmodule DashFloat.TUI.State do
     log.height
   end
 
+  ## Mouse selection (issue #28; ADR 0006 amendment)
+
+  @doc """
+  Applies a left-button mouse event over the log. `"down"` anchors a
+  selection at the display row/column under the pointer, `"drag"` extends
+  the head, `"up"` finishes: a press+release without extension clears the
+  selection (click-to-clear), a real drag returns `{:copy, text}` and keeps
+  the highlight until the next click, drag, or width-changing resize.
+  Coordinates outside the log rect clamp to its edges (the terminal
+  convention) — a drag that wanders over the status or input pane selects
+  to the log edge. Selection is content-anchored (absolute display rows),
+  so it survives scrolling and appends.
+  """
+  @spec select_mouse(t(), String.t(), integer(), integer()) ::
+          {t(), {:copy, String.t()} | nil}
+  def select_mouse(%__MODULE__{} = state, kind, x, y)
+      when kind in ["down", "drag", "up"] and is_integer(x) and is_integer(y) do
+    case cell_at(state, x, y) do
+      nil ->
+        {state, nil}
+
+      cell ->
+        case kind do
+          "down" -> {%{state | selection: %{anchor: cell, head: cell}}, nil}
+          "drag" -> {%{state | selection: extend(state.selection, cell)}, nil}
+          "up" -> release(state, cell)
+        end
+    end
+  end
+
+  defp extend(nil, _cell), do: nil
+  defp extend(selection, cell), do: %{selection | head: cell}
+
+  defp release(state, cell) do
+    case state.selection do
+      %{anchor: anchor} when anchor != cell ->
+        selection = %{state.selection | head: cell}
+        text = selection_text(%{state | selection: selection})
+
+        if String.trim(text) == "" do
+          # A selection of pure blank rows copies nothing — clear it.
+          {%{state | selection: nil}, nil}
+        else
+          {%{state | selection: selection}, {:copy, text}}
+        end
+
+      _collapsed_or_absent ->
+        # Click-to-clear: a press+release without extension.
+        {%{state | selection: nil}, nil}
+    end
+  end
+
+  # The {display_row, column} under pointer (x, y), clamped into the log
+  # rect. nil when the log has no rows at all.
+  defp cell_at(state, x, y) do
+    count = log_line_count(state)
+    %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
+
+    if count == 0 do
+      nil
+    else
+      row =
+        state
+        |> effective_scroll(log.height)
+        |> Kernel.+(y - log.y)
+        |> clamp(0, count - 1)
+
+      col = clamp(x - log.x, 0, View.content_width(elem(state.size, 0)))
+      {row, col}
+    end
+  end
+
+  defp clamp(n, lo, _hi) when n < lo, do: lo
+  defp clamp(n, _lo, hi) when n > hi, do: hi
+  defp clamp(n, _lo, _hi), do: n
+
+  @doc """
+  The copied text of the current selection: display-faithful rows (edge rows
+  by column range, interior rows verbatim) joined with newlines. `""` when
+  nothing is selected.
+  """
+  @spec selection_text(t()) :: String.t()
+  def selection_text(%__MODULE__{selection: nil}), do: ""
+
+  def selection_text(%__MODULE__{selection: selection} = state) do
+    {{from_row, _fc}, {to_row, _tc}} = Selection.range(selection)
+
+    case selection_row_count(from_row, to_row, log_line_count(state)) do
+      0 ->
+        ""
+
+      count ->
+        selection
+        |> Selection.extract(View.display_lines(state, from_row, count), from_row)
+    end
+  end
+
+  # The selection may reference rows the content no longer has (it shrank
+  # after the anchor landed) — clamp to what exists.
+  defp selection_row_count(from_row, to_row, total)
+       when is_integer(from_row) and is_integer(to_row) and is_integer(total) do
+    wanted = to_row - from_row + 1
+    available = total - from_row
+    if wanted <= available, do: wanted, else: available
+  end
+
   ## Resize
 
   @doc """
@@ -903,14 +1023,17 @@ defmodule DashFloat.TUI.State do
 
       _old_size ->
         # Re-wrap at the padded content width — the same width append and
-        # tick wrap at (issue #28), never the raw frame width.
+        # tick wrap at (issue #28), never the raw frame width. A width
+        # change invalidates the display-row geometry a selection indexes,
+        # so it clears (ADR 0006 amendment).
         wrap_width = View.content_width(width)
 
         %{
           state
           | size: {width, height},
             entries: Enum.map(state.entries, &rewrap_entry(&1, wrap_width)),
-            in_flight_lines: rewrap_in_flight(state, wrap_width)
+            in_flight_lines: rewrap_in_flight(state, wrap_width),
+            selection: nil
         }
     end
   end

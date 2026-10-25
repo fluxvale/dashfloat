@@ -341,6 +341,61 @@ defmodule DashFloat.TUI.ViewTest do
       widgets = View.render(new_state(), %ExRatatui.Frame{width: 1, height: 1})
       assert length(widgets) == 4
     end
+
+    # Issue #28: a selection highlights its covered rows in reverse video —
+    # interior rows whole, edge rows by column range; untouched rows pass
+    # through unchanged.
+    test "a selection reverse-highlights exactly its covered rows" do
+      state =
+        new_state()
+        |> State.stream_message({:entry, :system, "first row"})
+        |> State.stream_message({:entry, :system, "second row"})
+        |> Map.put(:selection, %{anchor: {1, 3}, head: {3, 6}})
+
+      {widget, _rect} =
+        state
+        |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+        |> Enum.at(1)
+
+      [row0, row1, row2, row3 | _rest] = widget.text
+
+      # Row 0 is outside the selection.
+      assert Enum.map_join(row0.spans, "", & &1.content) == ""
+      assert Enum.all?(row0.spans, &(:reversed not in &1.style.modifiers))
+
+      # Row 1 (first row): from column 3 to the end.
+      assert [{"fir", false}, {"st row", true}] =
+               Enum.map(row1.spans, &{&1.content, :reversed in &1.style.modifiers})
+
+      # Row 2 (interior) is the blank separator: it has no cells to
+      # reverse, so it passes through — the highlight reads from the rows
+      # around it.
+      assert Enum.map_join(row2.spans, "", & &1.content) == ""
+      assert Enum.all?(row2.spans, &(:reversed not in &1.style.modifiers))
+
+      # Row 3 (last row): to column 6 ("second").
+      assert [{"second", true}, {" row", false}] =
+               Enum.map(row3.spans, &{&1.content, :reversed in &1.style.modifiers})
+    end
+
+    test "an interior text row highlights whole" do
+      state =
+        new_state()
+        |> State.stream_message({:entry, :system, "alpha"})
+        |> State.stream_message({:entry, :system, "beta"})
+        |> State.stream_message({:entry, :system, "gamma"})
+        |> Map.put(:selection, %{anchor: {1, 0}, head: {5, 2}})
+
+      {widget, _rect} =
+        state
+        |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+        |> Enum.at(1)
+
+      # Row 3 ("beta", interior) is reversed whole.
+      row3 = Enum.at(widget.text, 3)
+      assert Enum.map_join(row3.spans, "", & &1.content) == "beta"
+      assert Enum.all?(row3.spans, &(:reversed in &1.style.modifiers))
+    end
   end
 
   describe "activity line" do
