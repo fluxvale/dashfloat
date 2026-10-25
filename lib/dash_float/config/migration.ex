@@ -8,9 +8,10 @@ defmodule DashFloat.Config.Migration do
   non-empty `settings.json5` is the migration marker, which makes re-runs
   no-ops. The new file is written to a private temp path and renamed into
   place, so a crash can never leave a torn or half-written marker. The legacy
-  file is renamed to a backup, never deleted, both are tightened to 0600
-  (each still holds the credential), and a pre-existing backup is never
-  clobbered. Malformed or incomplete legacy input fails with field names
+  file is renamed to a backup, never deleted; every secrets-bearing file is
+  tightened to 0600 — the legacy file, the backup it becomes, and a
+  pre-existing backup as well (never clobbered, but it may hold an older
+  credential). Malformed or incomplete legacy input fails with field names
   only — nothing is written, no value is ever echoed.
   """
 
@@ -186,19 +187,21 @@ defmodule DashFloat.Config.Migration do
   # The rename is last: until it happens, a crash leaves the new layout
   # partial and the legacy file intact, so a re-run converges. An existing
   # backup is never clobbered — the legacy file then simply stays (inert
-  # once settings.json5 exists). Either way both files are tightened to 0600:
-  # each holds the credential, and secrets are 0600 wherever they live.
+  # once settings.json5 exists). Either way every secrets-bearing file is
+  # tightened to 0600: the legacy file (before the rename, so whichever
+  # name the credential ends up under is already private), the backup it
+  # becomes, and a pre-existing backup too — it plausibly holds an older
+  # credential, and secrets are 0600 wherever they live (ADR 0008).
   defp backup_legacy(legacy) do
     backup =
       legacy
       |> Path.dirname()
       |> Path.join(@backup_file)
 
-    # Tightened before the rename so whichever name the credential ends up
-    # under is already private.
     tighten(legacy)
 
     if File.exists?(backup) do
+      tighten(backup)
       Logger.warning("#{backup} already exists — leaving the legacy config in place")
     else
       case File.rename(legacy, backup) do

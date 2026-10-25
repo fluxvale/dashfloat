@@ -78,6 +78,9 @@ defmodule DashFloat.Config.MigrationTest do
     legacy_contents = Jason.encode!(full_legacy())
     legacy = Path.join(dir, "config.json")
     File.write!(legacy, legacy_contents)
+    # A world-readable legacy file (the v1 default shape) so the assertion
+    # is umask-independent.
+    File.chmod!(legacy, 0o644)
 
     assert {:ok, :migrated} = @migration.maybe_migrate(dir)
     %{main: main, backup: backup} = paths(dir)
@@ -90,12 +93,13 @@ defmodule DashFloat.Config.MigrationTest do
 
   test "the backup is tightened to 0600 and no temp debris is left behind" do
     dir = write_legacy!(tmp_dir(), full_legacy())
+    # 0644 on disk — exactly the rider's live-smoke finding (issue #28):
+    # the backup still holds the credential, so it lands 0600.
+    File.chmod!(Path.join(dir, "config.json"), 0o644)
 
     assert {:ok, :migrated} = @migration.maybe_migrate(dir)
     %{backup: backup} = paths(dir)
 
-    # The backup still holds the credential — it is 0600 too (hostile-review
-    # finding), and the tmp+rename write leaves nothing behind.
     assert {:ok, %File.Stat{mode: backup_mode}} = File.stat(backup)
     assert Bitwise.band(backup_mode, 0o777) == 0o600
 
@@ -321,7 +325,12 @@ defmodule DashFloat.Config.MigrationTest do
     legacy = Path.join(dir, "config.json")
     File.write!(legacy, Jason.encode!(full_legacy()))
     backup = Path.join(dir, "config.json.bak")
-    File.write!(backup, ~s({"base_url": "https://older.example"}))
+    File.write!(backup, ~s({"base_url": "https://older.example", "api_key": "PLACEHOLDER-old"}))
+
+    # The older backup may itself carry a credential (issue #28 rider): it
+    # is left content-intact but tightened to 0600 like every other
+    # secrets-bearing file.
+    File.chmod!(backup, 0o644)
 
     logs =
       capture_log(fn ->
@@ -330,6 +339,8 @@ defmodule DashFloat.Config.MigrationTest do
 
     assert logs =~ "already exists"
     assert File.read!(backup) =~ "older.example"
+    assert {:ok, %File.Stat{mode: backup_mode}} = File.stat(backup)
+    assert Bitwise.band(backup_mode, 0o777) == 0o600
     # The legacy file was NOT renamed over the user's backup…
     assert File.exists?(legacy)
     # …but it still holds the credential, so it is tightened to 0600.

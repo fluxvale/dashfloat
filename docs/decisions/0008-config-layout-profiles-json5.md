@@ -226,7 +226,9 @@ without an `apiKey` therefore surfaces as `api_key` in that message.
   the legacy file is then simply left in place (inert — the loader ignores it
   once `settings.json5` exists) with a warning. Whichever of the two holds
   the legacy credential is **tightened to 0600** (best effort): secrets are
-  0600 wherever they live, not just in their primary home.
+  0600 wherever they live, not just in their primary home. *(Clarified
+  2026-10-25, issue #28: a pre-existing `.bak` is tightened too — it
+  plausibly holds an older credential; never clobbered, always tightened.)*
 - **Failure safety:** malformed or incomplete legacy JSON → `{:error, …}`
   naming the problem (field names only) with **nothing written**; any
   filesystem failure during the write is an `{:error, _}`, not a crash —
