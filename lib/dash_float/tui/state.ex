@@ -45,6 +45,8 @@ defmodule DashFloat.TUI.State do
   # Live re-renders of the in-flight reply stop above this; finalize still
   # parses once at the end (ADR 0006).
   @in_flight_cap 64 * 1024
+  # The double Ctrl+C exit window (issue #28; ADR 0006 amendment).
+  @exit_window_ms 2_000
 
   @enforce_keys [:input]
   defstruct [
@@ -60,6 +62,8 @@ defmodule DashFloat.TUI.State do
     in_flight_dirty: false,
     anim_step: 0,
     tick_ref: nil,
+    exit_guard_at: nil,
+    exit_guard_ref: nil,
     stats: %{
       tokens: 0,
       first_token_at: nil,
@@ -100,7 +104,9 @@ defmodule DashFloat.TUI.State do
           size: {pos_integer(), pos_integer()},
           live?: boolean(),
           agent_ref: reference() | nil,
-          confirm: confirm() | nil
+          confirm: confirm() | nil,
+          exit_guard_at: integer() | nil,
+          exit_guard_ref: reference() | nil
         }
 
   @typedoc """
@@ -284,58 +290,74 @@ defmodule DashFloat.TUI.State do
 
   @doc """
   Routes one key event. Modifiers arrive as `ExRatatui` strings
-  (`["ctrl"]`, `["shift"]`, ...). Returns `{state, action}`.
+  (`["ctrl"]`, `["shift"]`, ...). Returns `{state, action}`. `now` is
+  monotonic milliseconds (injectable so the exit-guard window is testable).
   """
-  @spec handle_key(t(), String.t(), [String.t()]) :: {t(), action()}
-  def handle_key(state, code, modifiers)
+  @spec handle_key(t(), String.t(), [String.t()], integer()) :: {t(), action()}
+  def handle_key(state, code, modifiers, now \\ System.monotonic_time(:millisecond)) do
+    {state, action} = route_key(state, code, modifiers, now)
+    # Any key other than Ctrl+C disarms a pending exit guard — the intent
+    # to exit died with the keystroke that was not "exit again" (issue #28).
+    {disarm_exit_guard(state, code, modifiers), action}
+  end
 
-  # Quit (raw mode turns Ctrl+C into a key event, not SIGINT) — even
-  # mid-decision.
-  def handle_key(state, "c", ["ctrl"]), do: {state, :quit}
-  def handle_key(state, "q", ["ctrl"]), do: {state, :quit}
+  # The double Ctrl+C exit guard (issue #28; ADR 0006 amendment): one press
+  # arms a 2 s window and shows the prompt; a second press inside it quits
+  # through the normal teardown; a late press re-arms. Applies in every
+  # phase, including mid-decision.
+  defp route_key(state, "c", ["ctrl"], now) do
+    if exit_guard_live?(state, now) do
+      {%{state | exit_guard_at: nil}, :quit}
+    else
+      {%{state | exit_guard_at: now}, nil}
+    end
+  end
+
+  # Ctrl+Q stays the immediate, deliberate quit (named in the placeholder).
+  defp route_key(state, "q", ["ctrl"], _now), do: {state, :quit}
 
   # Confirmation mode (a pending confirm from the agent, ADR 0007): Enter
   # approves, Esc rejects, and every other key is swallowed — typing
   # mid-decision must not reach the textarea nor become an accidental
   # approve.
-  def handle_key(%{confirm: pending} = state, "enter", mods)
-      when pending != nil and mods in [[], ["ctrl"]],
-      do: {state, {:confirm, :approved}}
+  defp route_key(%{confirm: pending} = state, "enter", mods, _now)
+       when pending != nil and mods in [[], ["ctrl"]],
+       do: {state, {:confirm, :approved}}
 
-  def handle_key(%{confirm: pending} = state, "esc", _modifiers) when pending != nil,
+  defp route_key(%{confirm: pending} = state, "esc", _modifiers, _now) when pending != nil,
     do: {state, {:confirm, :rejected}}
 
-  def handle_key(%{confirm: pending} = state, _code, _modifiers) when pending != nil,
+  defp route_key(%{confirm: pending} = state, _code, _modifiers, _now) when pending != nil,
     do: {state, nil}
 
   # Enter / Ctrl+Enter submit; Shift+Enter / Alt+Enter insert a newline.
-  def handle_key(state, "enter", mods) when mods in [[], ["ctrl"]], do: submit(state)
-  def handle_key(state, "enter", ["shift"]), do: forward(state, "enter", [])
-  def handle_key(state, "enter", ["alt"]), do: forward(state, "enter", [])
+  defp route_key(state, "enter", mods, _now) when mods in [[], ["ctrl"]], do: submit(state)
+  defp route_key(state, "enter", ["shift"], _now), do: forward(state, "enter", [])
+  defp route_key(state, "enter", ["alt"], _now), do: forward(state, "enter", [])
 
   # Esc interrupts a streaming reply or a running tool (ADR 0005/0007); a
   # no-op otherwise (including the post-decision confirming gap).
-  def handle_key(%{phase: phase} = state, "esc", _modifiers)
-      when phase in [:streaming, :executing_tool],
-      do: {state, :cancel}
+  defp route_key(%{phase: phase} = state, "esc", _modifiers, _now)
+       when phase in [:streaming, :executing_tool],
+       do: {state, :cancel}
 
-  def handle_key(state, "esc", _modifiers), do: {state, nil}
+  defp route_key(state, "esc", _modifiers, _now), do: {state, nil}
 
   # Log scrolling.
-  def handle_key(state, "page_up", _modifiers), do: {page_up(state), nil}
-  def handle_key(state, "page_down", _modifiers), do: {page_down(state), nil}
+  defp route_key(state, "page_up", _modifiers, _now), do: {page_up(state), nil}
+  defp route_key(state, "page_down", _modifiers, _now), do: {page_down(state), nil}
 
   # History-aware Up/Down: history only at the draft's row boundaries.
-  def handle_key(state, "up", _modifiers) do
+  defp route_key(state, "up", _modifiers, _now) do
     if on_first_row?(state), do: {history_prev(state), nil}, else: forward(state, "up", [])
   end
 
-  def handle_key(state, "down", _modifiers) do
+  defp route_key(state, "down", _modifiers, _now) do
     if on_last_row?(state), do: {history_next(state), nil}, else: forward(state, "down", [])
   end
 
   # Everything else (typing, editing, Emacs shortcuts) goes to the textarea.
-  def handle_key(state, code, modifiers) when is_binary(code) and is_list(modifiers),
+  defp route_key(state, code, modifiers, _now) when is_binary(code) and is_list(modifiers),
     do: forward(state, code, modifiers)
 
   defp forward(state, code, modifiers) do
@@ -344,6 +366,39 @@ defmodule DashFloat.TUI.State do
     # live draft (no longer restorable by navigating down).
     {leave_history(state), nil}
   end
+
+  ## Exit guard (issue #28; ADR 0006 amendment)
+
+  defp disarm_exit_guard(state, "c", ["ctrl"]), do: state
+  defp disarm_exit_guard(%{exit_guard_at: nil} = state, _code, _modifiers), do: state
+  defp disarm_exit_guard(state, _code, _modifiers), do: %{state | exit_guard_at: nil}
+
+  @doc "True while the exit-guard window is still live at `now`."
+  @spec exit_guard_live?(t(), integer()) :: boolean()
+  def exit_guard_live?(%__MODULE__{exit_guard_at: at}, now) when is_integer(at),
+    do: now - at <= @exit_window_ms
+
+  def exit_guard_live?(_state, _now), do: false
+
+  @doc """
+  Milliseconds left on the exit-guard window (0 when it has logically
+  expired), or nil when no guard is armed — the delay for the TUI's one-shot
+  expiry timer.
+  """
+  @spec exit_guard_delay(t(), integer()) :: non_neg_integer() | nil
+  def exit_guard_delay(%__MODULE__{exit_guard_at: at}, now) when is_integer(at),
+    do: max(@exit_window_ms - (now - at), 0)
+
+  def exit_guard_delay(_state, _now), do: nil
+
+  @doc """
+  True when a transient row sits between log and input: an active phase
+  (ADR 0006) or the armed exit-guard prompt (issue #28). The view's layout
+  and the scroll viewport both read this — one predicate, one height.
+  """
+  @spec overlay?(t()) :: boolean()
+  def overlay?(%__MODULE__{phase: :idle, exit_guard_at: nil}), do: false
+  def overlay?(%__MODULE__{}), do: true
 
   # Only for actual editing keys; history_prev/next call the textarea API
   # directly and must not trip this.
@@ -819,7 +874,7 @@ defmodule DashFloat.TUI.State do
   end
 
   defp log_height(state) do
-    %{log: log} = View.regions(state.size, input_line_count(state), state.phase != :idle)
+    %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
     log.height
   end
 

@@ -168,6 +168,76 @@ defmodule DashFloat.TUITest do
     assert_receive {:transport_disconnect, :normal}, 1_000
   end
 
+  # Issue #28: a single accidental Ctrl+C must not exit. One press shows the
+  # transient prompt (activity row up while idle); a second press inside the
+  # 2 s window exits through the normal teardown.
+  test "one Ctrl+C shows the prompt and does not exit; the prompt self-clears" do
+    {:ok, pid} = start_tui()
+    attach_disconnect_listener()
+
+    press(pid, "c", ["ctrl"])
+
+    armed = eventually(pid, fn s -> s.exit_guard_at != nil end)
+    assert armed.exit_guard_ref != nil
+    assert Process.alive?(pid)
+    assert activity_text(armed) == "Press Ctrl+C again to exit"
+
+    # The expiry is one frame, not a loop: the prompt clears at ~2 s and the
+    # app goes quiet again — no idle-render regression (ADR 0006).
+    cleared = eventually(pid, fn s -> s.exit_guard_at == nil end, 400)
+    assert cleared.exit_guard_ref == nil
+
+    {cleared_activity, _rect} =
+      cleared
+      |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+      |> Enum.at(2)
+
+    assert cleared_activity.text == []
+
+    settled = Runtime.snapshot(pid).render_count
+    Process.sleep(300)
+    assert Runtime.snapshot(pid).render_count == settled
+    assert Process.alive?(pid)
+  end
+
+  test "two Ctrl+C presses inside the window quit through the normal teardown" do
+    {:ok, pid} = start_tui()
+    attach_disconnect_listener()
+
+    ref = Process.monitor(pid)
+    press(pid, "c", ["ctrl"])
+    armed = eventually(pid, fn s -> s.exit_guard_at != nil end)
+    press(pid, "c", ["ctrl"])
+
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
+    assert_receive {:transport_disconnect, :normal}, 1_000
+    assert armed.phase == :idle
+  end
+
+  # The guard's one-shot timer must never clear a live window: a message
+  # from a cancelled or superseded timer is dropped without a frame.
+  test "stale exit-guard messages are dropped without a frame" do
+    idle = State.new(test_mode: {80, 24})
+    assert {:noreply, ^idle, %{render?: false}} = TUI.handle_info(:dashfloat_exit_guard, idle)
+
+    # A guard message while the tracked timer has not fired yet is stale —
+    # it belongs to an earlier, superseded window.
+    ref = Process.send_after(self(), :never, 10_000)
+    armed = %{idle | exit_guard_at: 1, exit_guard_ref: ref}
+
+    assert {:noreply, ^armed, %{render?: false}} = TUI.handle_info(:dashfloat_exit_guard, armed)
+    Process.cancel_timer(ref)
+
+    # A fired timer's message clears the prompt and renders (the prompt
+    # disappearing IS the frame).
+    fired_ref = Process.send_after(self(), :dashfloat_exit_guard, 1)
+    fired = %{idle | exit_guard_at: 1_000, exit_guard_ref: fired_ref}
+    Process.sleep(20)
+
+    assert {:noreply, cleared} = TUI.handle_info(:dashfloat_exit_guard, fired)
+    assert cleared.exit_guard_at == nil and cleared.exit_guard_ref == nil
+  end
+
   @tag :capture_log
   test "a crashing message tears the app down through the terminal-restore path" do
     {:ok, pid} = start_tui()
@@ -833,7 +903,7 @@ defmodule DashFloat.TUITest do
 
   test "the wheel scrolls the log view, not the input draft" do
     {:ok, pid} = start_tui(provider: provider())
-    {state, bottom} = tall_log(pid)
+    {_state, bottom} = tall_log(pid)
     type(pid, "fresh draft")
 
     scroll(pid, "scroll_up")

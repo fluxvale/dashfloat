@@ -21,6 +21,7 @@ defmodule DashFloat.TUI do
 
   @tick :dashfloat_tick
   @tick_ms 125
+  @exit_guard :dashfloat_exit_guard
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -121,6 +122,18 @@ defmodule DashFloat.TUI do
     end
   end
 
+  # The exit-guard expiry (issue #28; ADR 0006 amendment — sanctioned
+  # exception #3): a ONE-SHOT timer armed only by an explicit Ctrl+C. It
+  # clears the transient prompt the moment the window dies — at most one
+  # frame, never a loop; the idle discipline holds everywhere else.
+  def handle_info(@exit_guard, state) do
+    if stale_guard?(state) do
+      {:noreply, state, %{render?: false}}
+    else
+      {:noreply, %{state | exit_guard_at: nil, exit_guard_ref: nil}}
+    end
+  end
+
   def handle_info({:entry, _kind, _text} = msg, state),
     do: schedule(State.stream_message(state, msg))
 
@@ -146,23 +159,61 @@ defmodule DashFloat.TUI do
   defp stale_tick?(%{tick_ref: nil}), do: true
   defp stale_tick?(%{tick_ref: ref}), do: Process.read_timer(ref) != false
 
+  # Same staleness rule for the exit-guard timer: a message from a cancelled
+  # or superseded window's timer must not clear a live one.
+  defp stale_guard?(%{exit_guard_ref: nil}), do: true
+
+  defp stale_guard?(%{exit_guard_ref: ref}), do: Process.read_timer(ref) != false
+
   # The single tick choke point (ADR 0006): any active phase keeps exactly one
-  # timer pending; idle always cancels it. Idle => no timers => no renders.
+  # timer pending; idle always cancels it. Idle => no timers => no renders
+  # (the exit guard's one-shot is the sole, user-armed exception).
   defp schedule(state) do
     state =
-      cond do
-        State.needs_tick?(state) ->
-          %{state | tick_ref: Process.send_after(self(), @tick, @tick_ms)}
-
-        state.phase == :idle and state.tick_ref != nil ->
-          Process.cancel_timer(state.tick_ref)
-          %{state | tick_ref: nil}
-
-        true ->
-          state
-      end
+      state
+      |> schedule_tick()
+      |> schedule_guard(System.monotonic_time(:millisecond))
 
     {:noreply, state}
+  end
+
+  defp schedule_tick(state) do
+    cond do
+      State.needs_tick?(state) ->
+        %{state | tick_ref: Process.send_after(self(), @tick, @tick_ms)}
+
+      state.phase == :idle and state.tick_ref != nil ->
+        Process.cancel_timer(state.tick_ref)
+        %{state | tick_ref: nil}
+
+      true ->
+        state
+    end
+  end
+
+  # Exactly one expiry timer per armed window. A fired-but-undrained timer
+  # (re-arm raced its queued message) is replaced — the staleness check in
+  # handle_info drops the orphaned message.
+  defp schedule_guard(%{exit_guard_at: nil} = state, _now) do
+    if state.exit_guard_ref != nil do
+      Process.cancel_timer(state.exit_guard_ref)
+    end
+
+    %{state | exit_guard_ref: nil}
+  end
+
+  defp schedule_guard(state, now) do
+    fired? =
+      state.exit_guard_ref != nil and Process.read_timer(state.exit_guard_ref) == false
+
+    if state.exit_guard_ref == nil or fired? do
+      case State.exit_guard_delay(state, now) do
+        nil -> state
+        delay -> %{state | exit_guard_ref: Process.send_after(self(), @exit_guard, delay)}
+      end
+    else
+      state
+    end
   end
 
   @impl ExRatatui.App

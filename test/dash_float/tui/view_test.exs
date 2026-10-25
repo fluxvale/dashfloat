@@ -414,6 +414,27 @@ defmodule DashFloat.TUI.ViewTest do
       assert View.regions({80, 24}, 1, false).activity.height == 0
       assert View.regions({80, 24}, 1, true).activity.height == 1
     end
+
+    # Issue #28: the armed exit-guard prompt claims the transient row —
+    # even while idle — and outranks the streaming/confirm activity text.
+    test "the exit-guard prompt shows while armed, even at idle" do
+      state = %{new_state() | exit_guard_at: 1_000}
+      {widget, rect} = activity(state)
+
+      assert rect.height == 1
+      assert activity_text(state) == "Press Ctrl+C again to exit"
+
+      [span] = hd(widget.text).spans
+      assert span.style == Theme.style(:status_tool)
+    end
+
+    test "the guard prompt outranks streaming and confirm text while armed" do
+      for phase <- [:streaming, :confirming] do
+        state = %{new_state() | phase: phase, exit_guard_at: 1_000}
+        text = activity_text(state)
+        assert text == "Press Ctrl+C again to exit"
+      end
+    end
   end
 
   describe "tool entries (ADR 0007)" do

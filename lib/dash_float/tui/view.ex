@@ -29,8 +29,9 @@ defmodule DashFloat.TUI.View do
 
   @doc """
   Splits `width` x `height` into status (1 row), log (rest), activity
-  (1 row while active, else 0), and input (`2 + input_lines` rows, clamped to
-  a third of the frame) — the whole chrome inset by one cell per side.
+  (1 row while an overlay exists — an active phase or the exit prompt —
+  else 0), and input (`2 + input_lines` rows, clamped to a third of the
+  frame) — the whole chrome inset by one cell per side.
   """
   @spec regions({integer(), integer()}, integer(), boolean()) :: %{
           status: Rect.t(),
@@ -87,8 +88,9 @@ defmodule DashFloat.TUI.View do
   @doc "Renders the four regions. Pure; never raises on odd sizes."
   @spec render(State.t(), ExRatatui.Frame.t()) :: [{ExRatatui.widget(), Rect.t()}]
   def render(%State{} = state, %ExRatatui.Frame{width: width, height: height}) do
-    active? = state.phase != :idle
-    regions = regions({width, height}, State.input_line_count(state), active?)
+    # The transient row exists for an active phase OR an armed exit guard
+    # (issue #28; ADR 0006 amendment) — even while idle.
+    regions = regions({width, height}, State.input_line_count(state), State.overlay?(state))
 
     [
       {status_widget(state, regions.log.height), regions.status},
@@ -226,6 +228,17 @@ defmodule DashFloat.TUI.View do
   end
 
   ## Activity line
+
+  # The armed exit guard outranks every other activity text while it lives
+  # (issue #28) — including mid-stream and mid-confirm.
+  defp activity_widget(%State{exit_guard_at: at}) when is_integer(at) do
+    %Paragraph{
+      text: [
+        Line.new([Span.new("Press Ctrl+C again to exit", style: Theme.style(:status_tool))])
+      ],
+      scroll: {0, 0}
+    }
+  end
 
   defp activity_widget(%{phase: :idle}) do
     %Paragraph{text: [], scroll: {0, 0}}

@@ -250,14 +250,80 @@ defmodule DashFloat.TUI.StateTest do
   end
 
   describe "handle_key/3 — quit" do
-    test "Ctrl+C and Ctrl+Q quit" do
-      assert {_state, :quit} = State.handle_key(new_state(), "c", ["ctrl"])
+    test "Ctrl+Q quits immediately; Ctrl+C needs a second press (issue #28)" do
       assert {_state, :quit} = State.handle_key(new_state(), "q", ["ctrl"])
+      # One Ctrl+C only arms the guard — see the exit-guard describe block.
+      {armed, nil} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+      assert armed.exit_guard_at == 1_000
     end
 
     test "plain c and q type" do
       state = type(new_state(), "cq")
       assert State.input_text(state) == "cq"
+    end
+  end
+
+  # Issue #28 (ADR 0006 amendment): one accidental Ctrl+C must not kill a
+  # live session. First press arms a 2 s window + prompt; a second press
+  # inside quits; expiry resets; any other key disarms.
+  describe "exit guard" do
+    test "a single Ctrl+C arms the window and does not quit" do
+      {armed, action} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+
+      assert action == nil
+      assert armed.exit_guard_at == 1_000
+      assert State.exit_guard_live?(armed, 1_000)
+      assert State.exit_guard_delay(armed, 1_000) == 2_000
+    end
+
+    test "a second Ctrl+C inside the window quits through the normal path" do
+      {armed, nil} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+      {cleared, action} = State.handle_key(armed, "c", ["ctrl"], 2_999)
+
+      assert action == :quit
+      assert cleared.exit_guard_at == nil
+    end
+
+    test "the window boundary is inclusive at 2 s" do
+      {armed, nil} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+      assert {_state, :quit} = State.handle_key(armed, "c", ["ctrl"], 3_000)
+    end
+
+    test "an expired window resets: a late press re-arms instead of quitting" do
+      {armed, nil} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+      refute State.exit_guard_live?(armed, 1_000 + 2_001)
+
+      {rearmed, action} = State.handle_key(armed, "c", ["ctrl"], 1_000 + 2_001)
+
+      assert action == nil
+      assert rearmed.exit_guard_at == 3_001
+
+      # The fresh window is live and completes a quit of its own.
+      {_, :quit} = State.handle_key(rearmed, "c", ["ctrl"], 3_001 + 1_999)
+    end
+
+    test "any other key disarms the guard" do
+      {armed, nil} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+
+      {typed, nil} = State.handle_key(armed, "x", [], 1_100)
+      assert typed.exit_guard_at == nil
+
+      # A follow-up Ctrl+C inside the original window re-arms, not quits.
+      {rearmed, action} = State.handle_key(typed, "c", ["ctrl"], 1_200)
+      assert action == nil
+      assert rearmed.exit_guard_at == 1_200
+    end
+
+    test "Esc disarms too — it never becomes an exit key" do
+      {armed, nil} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+      {escaped, nil} = State.handle_key(armed, "esc", [], 1_100)
+      assert escaped.exit_guard_at == nil
+    end
+
+    test "overlay? is true for an active phase or an armed guard, else false" do
+      refute State.overlay?(new_state())
+      assert State.overlay?(%{new_state() | phase: :streaming})
+      assert State.overlay?(%{new_state() | exit_guard_at: 1_000})
     end
   end
 
@@ -340,7 +406,9 @@ defmodule DashFloat.TUI.StateTest do
     test "quit keys still quit mid-decision" do
       {state, _ref} = confirming()
       assert {_state, :quit} = State.handle_key(state, "q", ["ctrl"])
-      assert {_state, :quit} = State.handle_key(state, "c", ["ctrl"])
+      # Ctrl+C mid-decision follows the guard like anywhere else: arm, quit.
+      {armed, nil} = State.handle_key(state, "c", ["ctrl"], 1_000)
+      assert {_state, :quit} = State.handle_key(armed, "c", ["ctrl"], 1_500)
     end
 
     test "every other key is swallowed — nothing reaches the textarea" do
