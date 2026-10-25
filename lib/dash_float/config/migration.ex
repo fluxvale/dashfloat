@@ -164,104 +164,164 @@ defmodule DashFloat.Config.Migration do
 
     # Renders are pure and run before any write: an unrepresentable value
     # anywhere in the document (including tolerated extras) fails the split
-    # with the whole directory untouched. The no-loss guard runs before them
-    # all — a credential is NEVER silently lost, in every combination of
-    # pre-existing state (hostile review P1-1).
+    # with the whole directory untouched.
     with {:ok, existing} <- read_existing_keys(keys_path),
-         :ok <- ensure_no_loss(dir, map, collected, existing),
          {:ok, main_doc} <- render_doc(@main_file, de_secreted, "split it"),
          {:ok, keys_doc} <- render_collected_keys(collected) do
-      # Leftover backups tighten like the rider does: an old config.json.bak
-      # in this directory plausibly holds a credential (issue #28), and the
-      # split is the one moment this directory's credentials move.
-      repair_backup(dir)
-      backup_main(dir, raw)
+      # The backup is written (or provably already on disk) BEFORE the
+      # no-loss decision, and its ACTUAL outcome feeds the decision — a
+      # best-effort write that silently failed is exactly the loss window
+      # the first fix round missed. The backup itself is never destructive
+      # (it only adds a file); the destructive step — the settings rewrite —
+      # happens only after the decision passes.
+      backup_state = backup_main(dir, raw)
 
-      # The credential must reach its new home before the old one is
-      # emptied: a failed keys write aborts before the settings rewrite.
-      with :ok <- write_keys(keys_path, keys_doc, existing),
-           :ok <- write_private(main, main_doc <> "\n") do
-        {:ok, :migrated}
+      case ensure_no_loss(map, collected, existing, backup_state) do
+        :ok ->
+          finalize_split(dir, main, keys_path, keys_doc, existing, main_doc, backup_state)
+
+        {:error, _reason} = error ->
+          error
       end
     end
   end
 
-  # Every inline credential the split removes needs one of two homes: a
-  # keys.json5 slot holding exactly that value (written fresh, or a
-  # pre-existing file that already carries it), or the byte-exact backup
-  # this split writes. When settings.json5.bak already exists (never
-  # clobbered) there is no fresh backup — so a pre-existing keys.json5 that
-  # lacks a collected name or carries a DIFFERENT value for it, or a
-  # credential with no usable profile name to key it by (blank-name profile,
-  # root-level apiKey), would leave the value in NO file. REFUSE the split
-  # loudly; the user reconciles keys.json5 or splits by hand. Identical
-  # values (the crash-recovery state: a partial run already wrote keys and
-  # the backup) lose nothing and converge. Never proceed silently.
-  defp ensure_no_loss(dir, map, collected, existing) do
-    backup = Path.join(dir, @main_backup)
+  defp finalize_split(dir, main, keys_path, keys_doc, existing, main_doc, backup_state) do
+    warn_existing_keys(existing, backup_state)
+
+    # Leftover backups tighten like the rider does: an old config.json.bak
+    # plausibly holds a credential (issue #28), and the split is the one
+    # moment this directory's credentials move.
+    repair_backup(dir)
+
+    # The credential must reach its new home before the old one is emptied:
+    # a failed keys write aborts before the settings rewrite.
+    with :ok <- write_keys(keys_path, keys_doc, existing),
+         :ok <- write_private(main, main_doc <> "\n") do
+      {:ok, :migrated}
+    end
+  end
+
+  # THE INVARIANT: every inline credential VALUE the split removes must land
+  # in at least one file on disk — a keys.json5 slot holding exactly that
+  # value, or the byte-exact backup — or the split refuses with no
+  # destructive step taken. Decided from the backup's actual outcome, never
+  # from a prediction; pinned cell-by-cell by the table-driven sweep test.
+  defp ensure_no_loss(map, collected, existing, backup_state) do
+    preserved? = backup_state in [:written, :identical]
+
+    if preserved? or at_risk_values(map, collected, existing) == [] do
+      :ok
+    else
+      {:error,
+       "cannot split #{@main_file}: an inline credential would have no home — " <>
+         "#{@main_backup} is never clobbered and a pre-existing #{@keys_file} wins; " <>
+         "add the keys to #{@keys_file}, or move a stale #{@main_backup} aside so a fresh " <>
+         "backup can be written, or split it by hand"}
+    end
+  end
+
+  # Values this split cannot home in keys.json5:
+  #   * collected entries whose name in a pre-existing keys.json5 carries a
+  #     different value — the pre-existing file wins and is never rewritten;
+  #   * duplicate-name losers that differ from the first-wins value —
+  #     keys.json5 is keyed by NAME, so only the first definition's value
+  #     can live there (the loader tolerates duplicates, so the migration
+  #     must account for every one);
+  #   * credentials with no usable profile name at all (root-level apiKey,
+  #     blank-name profile).
+  # A value already present in the pre-existing keys.json5 (under its name,
+  # or anywhere for the nameless ones) is NOT at risk. Blank values are not
+  # credentials.
+  defp at_risk_values(map, collected, existing) do
+    existing_values = if existing, do: Map.values(existing), else: []
+
+    named_risk =
+      if existing do
+        for {name, key} <- collected, blank_to_nil(existing[name]) != key, do: key
+      else
+        []
+      end
+
+    at_risk = duplicate_orphan_values(map) ++ unnameable_values(map)
+    unnamed_risk = Enum.reject(at_risk, &(&1 in existing_values))
+    Enum.uniq(named_risk ++ unnamed_risk)
+  end
+
+  # Second-and-later duplicate-name keys that differ from the first-wins
+  # value (first-wins matches collect_keys and the loader's duplicate rule).
+  defp duplicate_orphan_values(map) do
+    map
+    |> profiles_list()
+    |> Enum.flat_map(&name_key_pair/1)
+    |> Enum.group_by(fn {name, _key} -> name end, fn {_name, key} -> key end)
+    |> Enum.flat_map(fn {_name, [winner | losers]} ->
+      Enum.filter(losers, &(&1 != winner))
+    end)
+  end
+
+  defp name_key_pair(%{"name" => name, "apiKey" => key} = entry)
+       when is_map(entry),
+       do:
+         if(usable?(name) and usable?(key),
+           do: [{blank_to_nil(name), blank_to_nil(key)}],
+           else: []
+         )
+
+  defp name_key_pair(_entry), do: []
+
+  defp unnameable_values(map) do
+    root = if usable?(map["apiKey"]), do: [blank_to_nil(map["apiKey"])], else: []
     profiles = profiles_list(map)
 
-    lost? =
-      File.exists?(backup) and
-        (uncollectable?(profiles, map) or
-           (existing != nil and
-              Enum.any?(collected, fn {name, key} -> blank_to_nil(existing[name]) != key end)))
+    nameless =
+      Enum.flat_map(profiles, fn
+        %{"apiKey" => key} = entry ->
+          if usable?(key) and not usable?(entry["name"]), do: [blank_to_nil(key)], else: []
 
-    if lost?,
-      do:
-        {:error,
-         "cannot split #{@main_file}: an inline credential would have no home — " <>
-           "#{@main_backup} is never clobbered and a pre-existing #{@keys_file} wins; " <>
-           "add the keys to #{@keys_file} or split it by hand"},
-      else: :ok
-  end
-
-  # Credentials collect_keys cannot key by profile name: a root-level
-  # apiKey, or a profile apiKey whose name is blank/unusable — both are
-  # deleted by de_secret, so with no fresh backup they would vanish.
-  defp uncollectable?(profiles, map) do
-    root_key?(map) or
-      Enum.any?(profiles, fn
-        %{"apiKey" => value} = entry -> usable?(value) and not usable?(entry["name"])
-        _entry -> false
+        _entry ->
+          []
       end)
-  end
 
-  defp root_key?(map), do: usable?(map["apiKey"])
+    root ++ nameless
+  end
 
   defp usable?(value), do: blank_to_nil(value) != nil
 
   # A pre-existing keys.json5 WINS over collected inline keys — it is the
   # user's explicit new home; ensure_no_loss refuses the states where that
-  # would actually drop a value. A malformed one is an error: never destroy
-  # unreadable data. (The regular? guard already kept non-regular files out
-  # of here.) The warning claims only what is true in every reachable
-  # state: the backup clause holds because a pre-existing .bak plus a
-  # losing keys.json5 is refused before this proceeds.
+  # would actually drop a value, and the unblock is real: adding the key
+  # under its name clears the refusal (name present ⇒ no value at risk). A
+  # malformed one is an error: never destroy unreadable data. No warning
+  # here — warn_existing_keys speaks once the backup outcome is known, so
+  # every claim is about something that already happened.
   defp read_existing_keys(keys_path) do
     if File.exists?(keys_path) do
-      case JSON5.read_map(keys_path) do
-        {:ok, keys} ->
-          dir = Path.dirname(keys_path)
-          backup = Path.join(dir, @main_backup)
-
-          Logger.warning(
-            "#{@keys_file} already exists — keeping it" <>
-              backup_clause(File.exists?(backup))
-          )
-
-          {:ok, keys}
-
-        {:error, _message} = error ->
-          error
-      end
+      JSON5.read_map(keys_path)
     else
       {:ok, nil}
     end
   end
 
-  defp backup_clause(false), do: "; the current #{@main_file} is backed up first"
-  defp backup_clause(true), do: ""
+  # Outcome-truthful messaging for a pre-existing keys.json5: the "backed up
+  # first" clause may only ever follow an actual backup write.
+  defp warn_existing_keys(nil, _backup_state), do: :ok
+
+  defp warn_existing_keys(_existing, :written) do
+    Logger.warning(
+      "#{@keys_file} already exists — keeping it; the current #{@main_file} is backed up first"
+    )
+  end
+
+  defp warn_existing_keys(_existing, :identical) do
+    Logger.warning(
+      "#{@keys_file} already exists — keeping it; #{@main_backup} already holds the current #{@main_file}"
+    )
+  end
+
+  defp warn_existing_keys(_existing, _no_backup) do
+    Logger.warning("#{@keys_file} already exists — keeping it")
+  end
 
   # No collected keys (every inline value was blank/unusable) → no keys file;
   # an existing keys.json5 is never rewritten (it wins over collected keys).
@@ -272,25 +332,40 @@ defmodule DashFloat.Config.Migration do
   defp write_keys(_keys_path, nil, nil), do: :ok
   defp write_keys(keys_path, doc, nil), do: write_private(keys_path, doc <> "\n")
 
-  # The credential always has its new home before the old one is emptied.
-  # The existing-.bak warning claims only the fact (kept, no new backup) —
-  # ensure_no_loss has already refused every state where a value would
-  # actually be lost here.
+  # Returns the backup's ACTUAL outcome — the no-loss decision is made from
+  # this, never from a prediction:
+  #
+  #   :written    fresh byte-exact backup written now (every value preserved)
+  #   :identical  a pre-existing .bak already holds this exact file — the
+  #               crash-recovery state between our backup write and the
+  #               settings rewrite; every value is already on disk, so the
+  #               split converges instead of refusing
+  #   :kept       a pre-existing .bak differs from the current file — kept
+  #               (never clobbered); it preserves nothing from THIS file
+  #   :failed     the write failed (best effort); the decision below refuses
+  #               unless every at-risk value is homed in keys.json5
   defp backup_main(dir, raw) do
     backup = Path.join(dir, @main_backup)
 
     if File.exists?(backup) do
       Posture.tighten(backup, @main_backup)
-      Logger.warning("#{@main_backup} already exists — keeping it; no new backup is written")
+
+      case File.read(backup) do
+        {:ok, contents} when contents == raw ->
+          :identical
+
+        _other ->
+          Logger.warning("#{@main_backup} already exists — keeping it; no new backup is written")
+          :kept
+      end
     else
-      # Best effort: a failed backup is a warning, not an error — the keys
-      # still land in keys.json5 before the settings file is emptied.
       case write_private(backup, raw) do
         :ok ->
-          :ok
+          :written
 
         {:error, _reason} ->
           Logger.warning("cannot write #{@main_backup} — splitting without a backup")
+          :failed
       end
     end
   end
