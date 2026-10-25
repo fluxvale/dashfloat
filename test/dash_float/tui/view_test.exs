@@ -19,16 +19,19 @@ defmodule DashFloat.TUI.ViewTest do
       %{status: status, log: log, activity: activity, input: input} =
         View.regions({80, 24}, 1, false)
 
-      assert {status.height, log.height, activity.height, input.height} == {1, 20, 0, 3}
-      assert status.y == 0 and log.y == 1 and activity.y == 21 and input.y == 21
-      assert Enum.map([status, log, activity, input], & &1.width) == [80, 80, 80, 80]
+      assert {status.height, log.height, activity.height, input.height} == {1, 18, 0, 3}
+      assert status.y == 1 and log.y == 2 and activity.y == 20 and input.y == 20
+      assert Enum.map([status, log, activity, input], & &1.width) == [78, 78, 78, 78]
+      # One cell of padding on every side (issue #28): nothing at the edges.
+      assert status.x == 1 and log.x == 1 and input.x == 1
+      assert input.y + input.height == 23
     end
 
     test "an active phase claims one activity row between log and input" do
       %{log: log, activity: activity, input: input} = View.regions({80, 24}, 1, true)
       assert activity.height == 1
-      assert log.height == 19
-      assert activity.y == 20 and input.y == 21
+      assert log.height == 17
+      assert activity.y == 19 and input.y == 20
     end
 
     test "the input grows with the draft" do
@@ -48,6 +51,21 @@ defmodule DashFloat.TUI.ViewTest do
 
       assert status.height == 0 and log.height == 0
       assert activity.height + input.height <= 1
+    end
+
+    # Issue #28: the wrap width is the log rect's width — one seam, so
+    # wrap, re-wrap, windowing, and selection can never disagree.
+    test "content_width is the log rect width across odd and narrow frames" do
+      for width <- [3, 4, 12, 25, 61, 78, 80, 81, 120] do
+        %{log: log} = View.regions({width, 24}, 1, false)
+
+        assert View.content_width(width) == max(width - 2, 1)
+        assert log.width == max(width - 2, 0)
+      end
+
+      # Degenerate frames clamp to one column, never zero.
+      assert View.content_width(2) == 1
+      assert View.content_width(1) == 1
     end
 
     defp assert_region_sum({_w, h}, regions) do
@@ -205,7 +223,7 @@ defmodule DashFloat.TUI.ViewTest do
 
       widget = log_widget(state, 80, 24)
       lines = widget.text
-      assert length(lines) == 20
+      assert length(lines) == 18
       assert flatten(List.last(lines)) =~ "line 100"
       # the window is pre-scrolled; the paragraph itself does no scrolling
       assert widget.scroll == {0, 0}
@@ -221,7 +239,7 @@ defmodule DashFloat.TUI.ViewTest do
       widget = log_widget(paged, 80, 24)
       texts = Enum.map(widget.text, &flatten/1)
       refute Enum.any?(texts, &(&1 =~ "line 100"))
-      assert Enum.any?(texts, &(&1 =~ "line 81"))
+      assert Enum.any?(texts, &(&1 =~ "line 91"))
     end
 
     # The full markdown vocabulary wraps coherently: every display row fits
@@ -249,7 +267,7 @@ defmodule DashFloat.TUI.ViewTest do
       [entry] = state.entries
       rows = Enum.map(entry.lines, &flatten/1)
 
-      assert Enum.all?(rows, &(Wrap.width(&1) <= 20))
+      assert Enum.all?(rows, &(Wrap.width(&1) <= 18))
 
       # Every word of the source survives somewhere in the wrapped rows.
       joined = Enum.join(rows, " ")
@@ -269,7 +287,7 @@ defmodule DashFloat.TUI.ViewTest do
         end)
 
       widget = log_widget(state, 80, 24)
-      assert length(widget.text) == 20
+      assert length(widget.text) == 18
     end
 
     test "the status position never shows an inverted range on tiny frames" do
@@ -307,16 +325,16 @@ defmodule DashFloat.TUI.ViewTest do
       state = State.stream_message(new_state(), {:entry, :system, long})
       [entry] = state.entries
 
-      # Blank separator + one 80-column row per 80 chars; the wrapped pieces
-      # join back to exactly the input.
-      assert length(entry.lines) == 1 + div(5_000, 80) + 1
+      # Blank separator + one 78-column row per 78 chars (the padded width,
+      # issue #28); the wrapped pieces join back to exactly the input.
+      assert length(entry.lines) == 1 + div(5_000, 78) + 1
       assert Enum.map_join(entry.lines, &flatten/1) == long
 
       # The windowed view agrees with the accounting: follow shows the last
-      # 20 display rows — 19 full rows plus the 40-char tail, nothing else.
+      # 18 display rows — 17 full rows plus the 8-char tail, nothing else.
       visible = log_lines(state)
-      assert length(visible) == 20
-      assert Enum.map_join(visible, &flatten/1) == String.duplicate("x", 19 * 80 + 40)
+      assert length(visible) == 18
+      assert Enum.map_join(visible, &flatten/1) == String.duplicate("x", 17 * 78 + 8)
     end
 
     test "a tiny frame renders without raising" do
@@ -492,6 +510,47 @@ defmodule DashFloat.TUI.ViewTest do
       end
     end
 
+    # Issue #28: the margin takes two columns off the wrap width — at odd
+    # frame widths (61 → 59 content columns, 81 → 79) the wrap math must use
+    # the padded width consistently. No truncation at the pane edge.
+    test "padded wrap width holds at odd and narrow frame widths" do
+      for {frame_w, expected} <- [{19, 17}, {20, 18}, {61, 59}, {81, 79}] do
+        state =
+          State.stream_message(new_state(test_mode: {frame_w, 24}), {:entry, :system, fox_text()})
+
+        assert_entry_width(state, expected)
+
+        term = ExRatatui.init_test_terminal(frame_w, 24)
+        widgets = View.render(state, %ExRatatui.Frame{width: frame_w, height: 24})
+        assert :ok = ExRatatui.draw(term, widgets)
+
+        buffer = ExRatatui.get_buffer_content(term)
+
+        for word <- ~w(quick brown fox jumps over lazy dog again) do
+          assert buffer =~ word, "width #{frame_w}: expected #{inspect(word)} to survive"
+        end
+
+        # The unbreakable run must survive whole: if the wrap math used any
+        # width wider than the rect, the Paragraph would clip each row's
+        # tail and the buffer would come up short of Z's. (Z appears nowhere
+        # else in the chrome — "w" collides with "brown"/"newline".)
+        run =
+          new_state(test_mode: {frame_w, 24})
+          |> State.stream_message({:entry, :system, String.duplicate("Z", expected * 3)})
+
+        assert_entry_width(run, expected)
+
+        term = ExRatatui.init_test_terminal(frame_w, 24)
+        widgets = View.render(run, %ExRatatui.Frame{width: frame_w, height: 24})
+        assert :ok = ExRatatui.draw(term, widgets)
+
+        buffer = ExRatatui.get_buffer_content(term)
+
+        z_count = buffer |> String.graphemes() |> Enum.count(&(&1 == "Z"))
+        assert z_count == expected * 3, "width #{frame_w}: lost graphemes to clipping"
+      end
+    end
+
     # Regression (hostile review P1-1): emoji presentation sequences count
     # two cells in the renderer but one per codepoint in a naive sum — the
     # row "fit" and the Paragraph clipped the tail exactly as in issue #20.
@@ -588,6 +647,12 @@ defmodule DashFloat.TUI.ViewTest do
   end
 
   defp fox_text, do: "the quick brown fox jumps over the lazy dog again and again"
+
+  defp assert_entry_width(state, expected) do
+    for entry <- state.entries do
+      assert Enum.all?(entry.lines, &(Wrap.width(flatten(&1)) <= expected))
+    end
+  end
 
   defp input(state) do
     state

@@ -584,7 +584,10 @@ defmodule DashFloat.TUI.State do
     %{state | entries: state.entries ++ [entry]}
   end
 
-  defp log_width(%__MODULE__{size: {width, _height}}), do: width
+  # The wrap width is the padded content width — the log rect's width, from
+  # the same split that renders it (issue #28; ADR 0006 amendment). Never
+  # the raw frame width.
+  defp log_width(%__MODULE__{size: {width, _height}}), do: View.content_width(width)
 
   ## Animation tick
 
@@ -844,17 +847,19 @@ defmodule DashFloat.TUI.State do
         %{state | size: {width, height}}
 
       _old_size ->
+        # Re-wrap at the padded content width — the same width append and
+        # tick wrap at (issue #28), never the raw frame width.
+        wrap_width = View.content_width(width)
+
         %{
           state
           | size: {width, height},
-            entries: Enum.map(state.entries, &rewrap_entry(&1, width)),
-            in_flight_lines: rewrap_in_flight(state, width)
+            entries: Enum.map(state.entries, &rewrap_entry(&1, wrap_width)),
+            in_flight_lines: rewrap_in_flight(state, wrap_width)
         }
     end
   end
 
-  # Hand-built entries (tests, older state) may lack :logical; re-wrapping
-  # from their stored lines is the best available truth there.
   defp rewrap_entry(entry, width) do
     logical = Map.get(entry, :logical, entry.lines)
     %{entry | lines: Wrap.wrap(logical, width)}

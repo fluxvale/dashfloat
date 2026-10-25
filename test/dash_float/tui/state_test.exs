@@ -861,8 +861,9 @@ defmodule DashFloat.TUI.StateTest do
       final = State.stream_message(over, {:phase, :idle}, 1_300)
       [entry] = final.entries
       assert entry.text == over_cap
-      # blank separator + 64 KiB + 1 of x's at 80 columns = 820 display rows
-      assert length(entry.lines) == 1 + div(64 * 1024, 80) + 1
+      # blank separator + 64 KiB + 1 of x's at 78 columns (the padded width)
+      # = 841 display rows
+      assert length(entry.lines) == 1 + div(64 * 1024, 78) + 1
     end
 
     test "needs_tick?/1 is true only while active and unscheduled" do
@@ -913,12 +914,14 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up on a viewport-sized log is a no-op (stays pinned)" do
-      base = full_state(10)
-      assert State.log_line_count(base) == 20
+      # The real idle viewport at 80x24 is 18 rows with the margin (issue #28);
+      # 9 entries = blank + line each = exactly one viewport.
+      base = full_state(9)
+      assert State.log_line_count(base) == 18
 
       {paged, nil} = State.handle_key(base, "page_up", [])
       assert paged.follow?
-      assert State.effective_scroll(paged, 20) == 0
+      assert State.effective_scroll(paged, 18) == 0
     end
 
     test "submit re-pins the log so the new reply is visible" do
@@ -940,45 +943,46 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up unfollows and pages back; page_down re-pins at the bottom" do
+      # 200 lines, 18-row viewport (the padded 80x24 layout) → bottom 182.
       base = full_state(100)
       {up_one, nil} = State.handle_key(base, "page_up", [])
       refute up_one.follow?
-      assert State.effective_scroll(up_one, 20) == 160
+      assert State.effective_scroll(up_one, 18) == 164
 
       {up_two, nil} = State.handle_key(up_one, "page_up", [])
-      assert State.effective_scroll(up_two, 20) == 140
+      assert State.effective_scroll(up_two, 18) == 146
 
       {down_one, nil} = State.handle_key(up_two, "page_down", [])
-      assert State.effective_scroll(down_one, 20) == 160
+      assert State.effective_scroll(down_one, 18) == 164
 
       {down_two, nil} = State.handle_key(down_one, "page_down", [])
       assert down_two.follow?
-      assert State.effective_scroll(down_two, 20) == 180
+      assert State.effective_scroll(down_two, 18) == 182
     end
 
     test "wheel_scroll: one notch is three lines; up unfollows, down re-pins at the bottom" do
       base = full_state(100)
-      assert State.effective_scroll(base, 20) == 180
+      assert State.effective_scroll(base, 18) == 182
 
       wheeled = State.wheel_scroll(base, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 20) == 177
+      assert State.effective_scroll(wheeled, 18) == 179
 
       again = State.wheel_scroll(wheeled, :up)
-      assert State.effective_scroll(again, 20) == 174
+      assert State.effective_scroll(again, 18) == 176
 
       down = State.wheel_scroll(again, :down)
       refute down.follow?
-      assert State.effective_scroll(down, 20) == 177
+      assert State.effective_scroll(down, 18) == 179
 
       pinned = State.wheel_scroll(down, :down)
       assert pinned.follow?
-      assert State.effective_scroll(pinned, 20) == 180
+      assert State.effective_scroll(pinned, 18) == 182
     end
 
     test "wheel up on a viewport-sized log is a no-op (stays pinned)" do
-      base = full_state(10)
-      assert State.log_line_count(base) == 20
+      base = full_state(9)
+      assert State.log_line_count(base) == 18
       assert State.wheel_scroll(base, :up) == base
     end
 
@@ -993,11 +997,11 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.phase == :confirming
 
-      # The activity row is up while confirming: the log viewport is 19 rows.
-      bottom = State.effective_scroll(state, 19)
+      # The activity row is up while confirming: the viewport is 17 rows.
+      bottom = State.effective_scroll(state, 17)
       wheeled = State.wheel_scroll(state, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 19) == bottom - 3
+      assert State.effective_scroll(wheeled, 17) == bottom - 3
     end
 
     test "new content does not move an unfollowed view, but clamping still holds" do
@@ -1189,20 +1193,13 @@ defmodule DashFloat.TUI.StateTest do
       assert entry.text == text
 
       # One logical line becomes wrapped display rows, blank separator first;
-      # the pieces still carry the whole text.
+      # every word survives the wrap (spaces at break points are dropped by
+      # design — comparing word sequences, not raw concatenation).
       pieces = Enum.map(entry.lines, &flatten/1)
       assert hd(pieces) == ""
 
-      joined =
-        pieces
-        |> Enum.join("")
-        |> String.trim()
-
-      assert joined == text
-
-      pieces
-      |> tl()
-      |> Enum.all?(&(&1 == "" or String.length(&1) <= 20))
+      assert_words_survive(pieces, text)
+      assert Enum.all?(tl(pieces), &(&1 == "" or String.length(&1) <= 18))
     end
 
     test "re-wrapping is exact in both directions" do
@@ -1243,8 +1240,7 @@ defmodule DashFloat.TUI.StateTest do
 
       refute narrow.in_flight_lines == state.in_flight_lines
       assert State.log_line_count(narrow) > State.log_line_count(state)
-      joined = Enum.map_join(narrow.in_flight_lines, &flatten/1)
-      assert String.trim(joined) == text
+      assert_words_survive(Enum.map(narrow.in_flight_lines, &flatten/1), text)
     end
 
     test "an above-cap in-flight reply clears its live view across a width change" do
@@ -1357,6 +1353,12 @@ defmodule DashFloat.TUI.StateTest do
   end
 
   defp flatten(%ExRatatui.Text.Line{spans: spans}), do: Enum.map_join(spans, "", & &1.content)
+
+  # Wrap drops whitespace at break points, so concatenation is width-luck;
+  # word sequences are the honest no-loss assertion.
+  defp assert_words_survive(pieces, text) do
+    assert Enum.join(pieces, " ") |> String.split() == String.split(text)
+  end
 
   # Runs one animation tick (rendering dirty in-flight lines), keeping state.
   defp tick_once(state), do: elem(State.tick(state, 1_100), 0)

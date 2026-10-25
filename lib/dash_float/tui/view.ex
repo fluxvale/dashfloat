@@ -22,10 +22,15 @@ defmodule DashFloat.TUI.View do
     confirming: {"Confirm", :status_tool}
   }
 
+  # One cell of padding on every side of the chrome (issue #28; ADR 0006
+  # amendment): text never hugs a screen edge, and the log rect's width —
+  # which IS the wrap width — shrinks with it.
+  @margin 1
+
   @doc """
   Splits `width` x `height` into status (1 row), log (rest), activity
   (1 row while active, else 0), and input (`2 + input_lines` rows, clamped to
-  a third of the frame).
+  a third of the frame) — the whole chrome inset by one cell per side.
   """
   @spec regions({integer(), integer()}, integer(), boolean()) :: %{
           status: Rect.t(),
@@ -36,17 +41,36 @@ defmodule DashFloat.TUI.View do
   def regions({width, height}, input_lines, active?)
       when is_integer(width) and is_integer(height) and is_integer(input_lines) and
              is_boolean(active?) do
-    area = %Rect{x: 0, y: 0, width: max(width, 0), height: max(height, 0)}
+    area = inset_area(width, height)
 
     [status, log, activity, input] =
       ExRatatui.Layout.split(area, :vertical, [
         {:length, 1},
         {:min, 0},
         {:length, if(active?, do: 1, else: 0)},
-        {:length, input_height(input_lines, height)}
+        {:length, input_height(input_lines, area.height)}
       ])
 
     %{status: status, log: log, activity: activity, input: input}
+  end
+
+  @doc """
+  The wrap width at a frame width: the log rect's width (same inset as
+  `regions/3`), floored at 1 so a degenerate frame wraps at one column
+  instead of zero. Everything that measures log text — wrap, re-wrap,
+  windowing, selection columns — reads this, never the raw frame width.
+  """
+  @spec content_width(integer()) :: pos_integer()
+  def content_width(frame_width) when is_integer(frame_width),
+    do: max(frame_width - 2 * @margin, 1)
+
+  defp inset_area(width, height) do
+    %Rect{
+      x: @margin,
+      y: @margin,
+      width: max(width - 2 * @margin, 0),
+      height: max(height - 2 * @margin, 0)
+    }
   end
 
   @doc "Input region height: borders plus draft lines, capped at a third of the frame."

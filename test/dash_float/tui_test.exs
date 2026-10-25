@@ -348,17 +348,12 @@ defmodule DashFloat.TUITest do
     full = eventually(pid, &(State.log_line_count(&1) > 24))
     assert State.effective_scroll(full, 20) == State.log_line_count(full) - 20
 
-    # Full text survives the re-wrap, every row fits the new width.
+    # Full text survives the re-wrap, every row fits the new padded width.
     [entry] = narrowed.entries
     rows = Enum.map(entry.lines, &Enum.map_join(&1.spans, "", fn s -> s.content end))
 
-    joined =
-      rows
-      |> Enum.join("")
-      |> String.trim()
-
-    assert joined == long
-    assert Enum.all?(rows, &(&1 == "" or String.length(&1) <= 20))
+    assert Enum.join(rows, " ") |> String.split() == String.split(long)
+    assert Enum.all?(rows, &(&1 == "" or String.length(&1) <= 18))
 
     # And the drawn frame really carries the wrapped rows, not a truncation.
     term = ExRatatui.init_test_terminal(20, 24)
@@ -815,7 +810,16 @@ defmodule DashFloat.TUITest do
   end
 
   # A tall log: one submitted question plus a 100-entry system reply. Returns
-  # once idle, with the bottom offset under a 20-line viewport.
+  # once idle, with the bottom offset under the real rendered viewport (the
+  # margin took two rows off the log height — issue #28).
+  defp viewport(state) do
+    View.regions(state.size, State.input_line_count(state), false).log.height
+  end
+
+  defp active_viewport(state) do
+    View.regions(state.size, State.input_line_count(state), true).log.height
+  end
+
   defp tall_log(pid) do
     submit(pid, "first question")
     assert_receive {:prompt, ui_pid, "first question"}, 1_000
@@ -824,41 +828,41 @@ defmodule DashFloat.TUITest do
     send(ui_pid, {:phase, :idle})
 
     state = eventually(pid, fn s -> s.phase == :idle and State.log_line_count(s) >= 202 end)
-    State.effective_scroll(state, 20)
+    {state, State.effective_scroll(state, viewport(state))}
   end
 
   test "the wheel scrolls the log view, not the input draft" do
     {:ok, pid} = start_tui(provider: provider())
-    bottom = tall_log(pid)
+    {state, bottom} = tall_log(pid)
     type(pid, "fresh draft")
 
     scroll(pid, "scroll_up")
 
-    state = get_state(pid)
-    refute state.follow?
-    assert State.effective_scroll(state, 20) == bottom - 3
+    wheeled = get_state(pid)
+    refute wheeled.follow?
+    assert State.effective_scroll(wheeled, viewport(wheeled)) == bottom - 3
     # The wheel never touches the draft — the live bug walked history here.
-    assert State.input_text(state) == "fresh draft"
-    assert state.history_index == nil
+    assert State.input_text(wheeled) == "fresh draft"
+    assert wheeled.history_index == nil
   end
 
   test "wheel-down re-pins at the bottom; genuine Up still walks history" do
     {:ok, pid} = start_tui(provider: provider())
-    bottom = tall_log(pid)
+    {_state, bottom} = tall_log(pid)
 
     scroll(pid, "scroll_up")
     scroll(pid, "scroll_up")
     two_notches = get_state(pid)
-    assert State.effective_scroll(two_notches, 20) == bottom - 6
+    assert State.effective_scroll(two_notches, viewport(two_notches)) == bottom - 6
 
     scroll(pid, "scroll_down")
     one_down = get_state(pid)
-    assert State.effective_scroll(one_down, 20) == bottom - 3
+    assert State.effective_scroll(one_down, viewport(one_down)) == bottom - 3
 
     for _notch <- 1..4, do: scroll(pid, "scroll_down")
     pinned = get_state(pid)
     assert pinned.follow?
-    assert State.effective_scroll(pinned, 20) == bottom
+    assert State.effective_scroll(pinned, viewport(pinned)) == bottom
 
     # Keyboard truth is unchanged: Up is still history navigation at the
     # draft's first row (ADR 0002).
@@ -870,20 +874,25 @@ defmodule DashFloat.TUITest do
 
   test "the wheel still scrolls while a confirm is pending" do
     {:ok, pid} = start_tui(provider: provider())
-    bottom = tall_log(pid)
+    {_state, _bottom} = tall_log(pid)
 
     send(pid, {:confirm, make_ref(), confirm_request(["+ x"])})
-    confirming = eventually(pid, fn s -> s.phase == :confirming end)
+
+    confirming =
+      eventually(pid, fn s ->
+        s.phase == :confirming and
+          State.effective_scroll(s, active_viewport(s)) > 0
+      end)
 
     # The preview appended rows and the activity row is up (confirming is an
-    # active phase): re-read the pinned bottom at the 19-row viewport.
-    confirm_bottom = State.effective_scroll(confirming, 19)
+    # active phase): the pinned bottom under the real active viewport.
+    confirm_bottom = State.effective_scroll(confirming, active_viewport(confirming))
 
     scroll(pid, "scroll_up")
     state = get_state(pid)
     assert state.phase == :confirming
     refute state.follow?
-    assert State.effective_scroll(state, 19) == confirm_bottom - 3
+    assert State.effective_scroll(state, active_viewport(state)) == confirm_bottom - 3
   end
 
   test "non-scroll mouse events change nothing and render nothing" do
