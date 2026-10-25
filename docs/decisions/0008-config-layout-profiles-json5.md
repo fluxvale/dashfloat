@@ -426,9 +426,16 @@ up-front per-field representability checks so its field-name error survives.
   has already happened (the "backed up first" clause only follows an actual
   backup write).
 - The LOAD path surfaces historical loss: a profile with no key under its
-  name in an existing keys.json5 warns at startup (names only) — the shape
-  a lost credential or a stale keys file leaves behind; silent when
-  keys.json5 is absent (env-keyed setups are legitimate).
+  name in an existing keys.json5 warns at startup (names only, respecting
+  the loader's own precedence — a profile completed by
+  `DASHFLOAT_API_KEY` is keyed and stays silent; quiet when keys.json5 is
+  absent entirely). The refusal-unblock sidecar `settings.json5.bak.old`
+  is part of the same posture: the load tightens it like every other
+  secrets-bearing leftover, so the documented `mv` remedy cannot strand a
+  world-readable credential copy. A symlinked `settings.json5.bak` is
+  lstat-guarded (never read through — a self-referential link would
+  masquerade as a byte-exact backup while the rewrite empties the only
+  real copy): it counts as no backup and feeds the loss decision.
 - A ROOT-level `apiKey` is stripped by the split and warned by the loader
   exactly like a profile-level stray — nothing credential-shaped rides into
   live v2 settings unwarned.

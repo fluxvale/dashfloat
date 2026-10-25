@@ -340,34 +340,57 @@ defmodule DashFloat.Config.Migration do
   #               crash-recovery state between our backup write and the
   #               settings rewrite; every value is already on disk, so the
   #               split converges instead of refusing
-  #   :kept       a pre-existing .bak differs from the current file — kept
+  #   :kept       a pre-existing .bak differs from the current file — or is
+  #               a symlink/non-regular file (delta-2 P2: reading through a
+  #               self-referential link would "prove" the values preserved
+  #               while the rewrite empties the only real copy) — kept
   #               (never clobbered); it preserves nothing from THIS file
   #   :failed     the write failed (best effort); the decision below refuses
   #               unless every at-risk value is homed in keys.json5
   defp backup_main(dir, raw) do
     backup = Path.join(dir, @main_backup)
 
-    if File.exists?(backup) do
-      Posture.tighten(backup, @main_backup)
+    cond do
+      not File.exists?(backup) ->
+        case write_private(backup, raw) do
+          :ok ->
+            :written
 
-      case File.read(backup) do
-        {:ok, contents} when contents == raw ->
-          :identical
+          {:error, _reason} ->
+            Logger.warning("cannot write #{@main_backup} — splitting without a backup")
+            :failed
+        end
 
-        _other ->
-          Logger.warning("#{@main_backup} already exists — keeping it; no new backup is written")
-          :kept
-      end
-    else
-      case write_private(backup, raw) do
-        :ok ->
-          :written
+      not regular_file?(backup) ->
+        # lstat, not the read: File.read FOLLOWS the link, and a symlink to
+        # the settings file itself would otherwise masquerade as a real
+        # byte-exact backup while the rewrite empties the only real copy
+        # (delta-2 P2). A non-regular .bak is KEPT — never clobbered, never
+        # chmod'd, never read through — and feeds the loss decision as a
+        # backup that preserves nothing from this file.
+        Logger.warning("#{@main_backup} is not a regular file — keeping it; not read through")
 
-        {:error, _reason} ->
-          Logger.warning("cannot write #{@main_backup} — splitting without a backup")
-          :failed
-      end
+        :kept
+
+      true ->
+        Posture.tighten(backup, @main_backup)
+
+        case File.read(backup) do
+          {:ok, contents} when contents == raw ->
+            :identical
+
+          _other ->
+            Logger.warning(
+              "#{@main_backup} already exists — keeping it; no new backup is written"
+            )
+
+            :kept
+        end
     end
+  end
+
+  defp regular_file?(path) do
+    match?({:ok, %File.Stat{type: :regular}}, File.lstat(path))
   end
 
   ## Legacy migration (config.json → default profile + keys.json5)
@@ -581,20 +604,25 @@ defmodule DashFloat.Config.Migration do
   @doc """
   Best-effort 0600 repair of leftover secrets-bearing files on the LOAD path
   (ADR 0008 posture, issue #28): beside an existing `settings.json5`, a
-  `config.json.bak`, `settings.json5.bak`, or an inert never-renamed
+  `config.json.bak`, `settings.json5.bak`, an inert never-renamed
   `config.json` (the legacy migration's crash window, or a #23-era partial
-  run) may still hold a credential — an already-migrated directory never
-  runs the migration that would have tightened it. Only regular files are
-  repaired; symlinks are never chmod'd through.
+  run), or the DOCUMENTED refusal-unblock sidecar `settings.json5.bak.old`
+  (`mv settings.json5.bak settings.json5.bak.old` — delta-2 P3b: the remedy
+  must not be able to strand a world-readable credential copy no path ever
+  tightens) may still hold a credential — an already-migrated directory
+  never runs the migration that would have tightened it. Only regular files
+  are repaired; symlinks are never chmod'd through.
   """
   @spec repair_backup(Path.t()) :: :ok
   def repair_backup(dir) do
     legacy = Path.join(dir, @legacy_file)
     backup = Path.join(dir, @backup_file)
     settings_backup = Path.join(dir, @main_backup)
+    sidecar = Path.join(dir, @main_backup <> ".old")
     Posture.tighten(legacy, @legacy_file)
     Posture.tighten(backup, @backup_file)
     Posture.tighten(settings_backup, @main_backup)
+    Posture.tighten(sidecar, "#{@main_backup}.old")
     :ok
   end
 

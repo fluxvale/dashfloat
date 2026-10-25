@@ -608,8 +608,15 @@ defmodule DashFloat.Config.MigrationTest do
         :malformed ->
           write_keys_file!(dir, "{ broken")
 
+        :keys_tmp_blocked ->
+          # The keys WRITE failure state (delta-2 modeling note): the split
+          # reaches write_keys with a blocked tmp path — backup already
+          # written, settings still untouched.
+          keys_tmp = Path.join(dir, "keys.json5.tmp")
+          File.mkdir!(keys_tmp)
+
         variant when variant in [:same, :different, :superset, :subset] ->
-          write_keys_file!(dir, "{#{render_keys(variant, spec)},}")
+          write_keys_file!(dir, "{#{render_keys(variant, spec)}}")
       end
     end
 
@@ -631,26 +638,78 @@ defmodule DashFloat.Config.MigrationTest do
 
     defp write_bak_state(dir, bak_state, spec) do
       backup_tmp = Path.join(dir, "settings.json5.bak.tmp")
+      backup = Path.join(dir, "settings.json5.bak")
+      main = Path.join(dir, "settings.json5")
 
       case bak_state do
-        :absent -> :ok
-        :identical -> write_backup!(dir, spec.file)
-        :stale -> write_backup!(dir, "// stale pre-split backup")
-        :tmp_occupied -> File.mkdir!(backup_tmp)
+        :absent ->
+          :ok
+
+        :identical ->
+          write_backup!(dir, spec.file)
+
+        :stale ->
+          write_backup!(dir, "// stale pre-split backup")
+
+        :tmp_occupied ->
+          File.mkdir!(backup_tmp)
+
+        # Delta-2 P2 shapes: a .bak that is a symlink (lstat, never the
+        # read-through) is KEPT — it preserves nothing from this file.
+        :self_link ->
+          File.ln_s!(main, backup)
+
+        :outside_link ->
+          copy = Path.join(dir, "dotfiles-copy")
+          File.write!(copy, spec.file)
+          File.ln_s!(copy, backup)
+
+        :link_dir ->
+          target = Path.join(dir, "a-directory")
+          File.mkdir!(target)
+          File.ln_s!(target, backup)
       end
     end
 
     defp file_texts(dir) do
+      # File.read, not read!: a .bak symlink may point at a directory —
+      # unreadable holders contribute nothing rather than raising.
       ["settings.json5", "keys.json5", "settings.json5.bak", "config.json.bak"]
       |> Enum.map(&Path.join(dir, &1))
       |> Enum.filter(&File.exists?/1)
-      |> Enum.map_join("\n", &File.read!/1)
+      |> Enum.flat_map(&read_or_empty/1)
+      |> Enum.join("\n")
+    end
+
+    defp read_or_empty(path) do
+      case File.read(path) do
+        {:ok, text} -> [text]
+        _error -> []
+      end
     end
 
     test "every pre-state cell preserves every credential value or refuses cleanly" do
       shapes = Map.keys(@shapes)
-      keys_states = [:absent, :same, :different, :superset, :subset, :malformed]
-      bak_states = [:absent, :identical, :stale, :tmp_occupied]
+
+      keys_states = [
+        :absent,
+        :same,
+        :different,
+        :superset,
+        :subset,
+        :malformed,
+        :keys_tmp_blocked
+      ]
+
+      bak_states = [
+        :absent,
+        :identical,
+        :stale,
+        :tmp_occupied,
+        :self_link,
+        :outside_link,
+        :link_dir
+      ]
 
       for shape <- shapes, keys_state <- keys_states, bak_state <- bak_states do
         dir = build_cell(shape, keys_state, bak_state)
@@ -659,7 +718,8 @@ defmodule DashFloat.Config.MigrationTest do
         keys_path = Path.join(dir, "keys.json5")
         backup_path = Path.join(dir, "settings.json5.bak")
         original_main = File.read!(main_path)
-        original_keys = if keys_state != :absent, do: File.read!(keys_path)
+        keys_file_states = [:same, :different, :superset, :subset, :malformed]
+        original_keys = if keys_state in keys_file_states, do: File.read!(keys_path)
 
         original_bak =
           if bak_state in [:identical, :stale],
@@ -668,6 +728,17 @@ defmodule DashFloat.Config.MigrationTest do
         cell = "#{shape}/#{keys_state}/#{bak_state}"
 
         {outcome, _logs} = with_log(fn -> @migration.maybe_migrate(dir) end)
+
+        # Symlinked backups are never clobbered, in either arm.
+        if bak_state in [:self_link, :outside_link, :link_dir] do
+          assert File.lstat!(backup_path).type == :symlink, "cell #{cell}: .bak link replaced"
+        end
+
+        # The blocked keys tmp path is likewise untouched.
+        if keys_state == :keys_tmp_blocked do
+          blocked = Path.join(dir, "keys.json5.tmp")
+          assert File.lstat!(blocked).type == :directory, "cell #{cell}: keys tmp replaced"
+        end
 
         case outcome do
           # REFUSED: the invariant's other arm — nothing destructive happened.
@@ -1062,7 +1133,74 @@ defmodule DashFloat.Config.MigrationTest do
       assert File.read!(paths(fresh).settings_backup) =~ "PLACEHOLDER-dup-new"
     end
 
-    # Round-2 P2: the refusal must have a real, tested unblock for each arm.
+    # Delta-2 P2: a self-referential .bak symlink made File.read "prove" the
+    # values preserved while the rewrite emptied the only real copy — the
+    # split migrated and the root key vanished from every file.
+    test "a self-referential .bak symlink is kept, not trusted — the split refuses" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 1,
+          apiKey: 'PLACEHOLDER-root-key',
+          profiles: [
+            { name: 'work', baseUrl: 'https://provider.example/v1',
+              models: [{ nickname: 'Sol', model: 'glm-5.3' }] },
+          ],
+        }
+        """
+      )
+
+      backup = Path.join(dir, "settings.json5.bak")
+      main = Path.join(dir, "settings.json5")
+      File.ln_s!(main, backup)
+
+      logs =
+        capture_log(fn ->
+          assert {:error, message} = @migration.maybe_migrate(dir)
+          assert message =~ "no home"
+        end)
+
+      assert logs =~ "not a regular file"
+
+      # Nothing was destroyed: the live file keeps the key, the link stays a
+      # link (never clobbered), no rewrite happened through it.
+      assert File.read!(paths(dir).main) =~ "PLACEHOLDER-root-key"
+
+      link = Path.join(dir, "settings.json5.bak")
+      assert File.lstat!(link).type == :symlink
+      assert File.read!(link) =~ "PLACEHOLDER-root-key"
+
+      # The safe variant keeps working: an OUTSIDE target is kept too, and a
+      # split with nothing at risk still completes.
+      outside = tmp_dir()
+
+      write_v1!(outside, """
+      {
+        configVersion: 1,
+        profiles: [
+          { name: 'work', baseUrl: 'https://provider.example/v1',
+            apiKey: 'PLACEHOLDER-work-key',
+            models: [{ nickname: 'Sol', model: 'glm-5.3' }] },
+        ],
+      }
+      """)
+
+      copy = Path.join(outside, "dotfiles-copy")
+      File.write!(copy, File.read!(paths(outside).main))
+      File.ln_s!(copy, Path.join(outside, "settings.json5.bak"))
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(outside)
+
+      assert File.read!(paths(outside).keys) =~ "PLACEHOLDER-work-key"
+      assert File.read!(copy) =~ "PLACEHOLDER-work-key"
+
+      outside_link = Path.join(outside, "settings.json5.bak")
+      assert File.lstat!(outside_link).type == :symlink
+    end
+
     test "adding the missing key to keys.json5 clears the refusal" do
       dir = write_v1!(tmp_dir())
       write_keys_file!(dir, "{'work': 'PLACEHOLDER-work-key',}")

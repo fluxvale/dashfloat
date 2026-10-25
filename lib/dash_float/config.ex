@@ -116,7 +116,7 @@ defmodule DashFloat.Config do
       warn_stray_root_key(main)
 
       profiles = parse_profiles(main)
-      warn_unkeyed_profiles(profiles, keys, keys_path)
+      warn_unkeyed_profiles(profiles, keys, keys_path, env)
       select(profiles, keys, env, cli)
     end
   end
@@ -124,11 +124,14 @@ defmodule DashFloat.Config do
   # Surfaces HISTORICAL loss at startup (hostile review, incident-hiding
   # note): a settings profile with no key under its name in an existing
   # keys.json5 is exactly the shape a lost credential leaves behind — and
-  # the dead-key mirror. Profile NAMES only, never values; silent when
-  # keys.json5 is absent (env-keyed setups are a legitimate shape).
-  defp warn_unkeyed_profiles(profiles, keys, keys_path) do
+  # the dead-key mirror. The warning respects the loader's own precedence
+  # (env > keys[profile]): a profile completed by DASHFLOAT_API_KEY is keyed
+  # and stays silent (delta-2 P3a). Profile NAMES only, never values;
+  # silent when keys.json5 is absent (env-keyed setups are legitimate).
+  defp warn_unkeyed_profiles(profiles, keys, keys_path, env) do
     for profile <- profiles,
         File.exists?(keys_path),
+        is_nil(env_value(env, @fields[:api_key])),
         is_nil(value(keys[profile.name])) do
       Logger.warning(~s(profile "#{profile.name}" has no key in #{@keys_file}))
     end

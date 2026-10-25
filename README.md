@@ -67,8 +67,11 @@ holding that exact value, and a `settings.json5.bak` that cannot be
 re-written), startup fails with `cannot split settings.json5: … no home`.
 The error's remedies are real: add the key under its profile name to
 `keys.json5`, or move the stale backup aside
-(`mv settings.json5.bak settings.json5.bak.old`) so the next start can write
-a fresh one. Details:
+(`mv settings.json5.bak settings.json5.bak.old` — the next start tightens
+the moved file to 0600 automatically) so the next start can write
+a fresh one. A `settings.json5.bak` that is a symlink is never read
+through or replaced — it counts as no backup, and the split refuses if a
+key would be lost. Details:
 [ADR 0008](docs/decisions/0008-config-layout-profiles-json5.md). Then:
 
 ```sh

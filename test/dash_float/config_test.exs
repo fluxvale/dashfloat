@@ -974,12 +974,38 @@ defmodule DashFloat.ConfigTest do
       refute logs =~ ~s(profile "work" has no key)
       refute logs =~ "PLACEHOLDER"
 
+      # Delta-2 P3a: the warning respects the loader's own precedence —
+      # DASHFLOAT_API_KEY keys the profile, so no nag (pre-fix: warned).
+      env = %{"DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"}
+
+      env_logs =
+        capture_log(fn ->
+          assert {:ok, %Config{api_key: "PLACEHOLDER-env-key"}} =
+                   Config.load(dir, env, profile: "personal")
+        end)
+
+      assert env_logs == ""
+
       # No keys.json5 at all → silent (env-keyed setups).
       keys_path = Path.join(dir, "keys.json5")
       File.rm!(keys_path)
 
-      env = %{"DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"}
       assert capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, env, []) end) == ""
+    end
+
+    # Delta-2 P3b: the documented "mv settings.json5.bak aside" unblock must
+    # not be able to strand a world-readable credential copy no path
+    # tightens — the load repairs the sidecar name.
+    test "load tightens a leftover .bak.old sidecar to 0600" do
+      dir = fleet_dir()
+      sidecar = Path.join(dir, "settings.json5.bak.old")
+      File.write!(sidecar, ~s({"apiKey": "PLACEHOLDER-old"}))
+      File.chmod!(sidecar, 0o644)
+
+      logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
+
+      assert logs =~ "settings.json5.bak.old is too permissive"
+      assert mode(sidecar) == 0o600
     end
 
     # Hostile review P2-1, load-path half: the legacy migration's crash
