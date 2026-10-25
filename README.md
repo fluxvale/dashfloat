@@ -59,7 +59,16 @@ key is `DASHFLOAT_API_KEY`, else `keys[profile name]`); `--profile <name>`
 `--model <nickname>` a model within it. A stray inline `apiKey` in
 settings.json5 is warned about and ignored — never a fallback. The status bar
 names the active model `nickname (profile)`. Put your provider's own base URL
-in `baseUrl`; DashFloat appends `/chat/completions`. Details:
+in `baseUrl`; DashFloat appends `/chat/completions`.
+
+The v1→v2 split never loses a credential silently: if a key it is about to
+remove would end up in no file (a pre-existing `keys.json5` that wins without
+holding that exact value, and a `settings.json5.bak` that cannot be
+re-written), startup fails with `cannot split settings.json5: … no home`.
+The error's remedies are real: add the key under its profile name to
+`keys.json5`, or move the stale backup aside
+(`mv settings.json5.bak settings.json5.bak.old`) so the next start can write
+a fresh one. Details:
 [ADR 0008](docs/decisions/0008-config-layout-profiles-json5.md). Then:
 
 ```sh

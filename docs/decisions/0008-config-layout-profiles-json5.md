@@ -407,16 +407,28 @@ up-front per-field representability checks so its field-name error survives.
   UTF-8 included — any parser crash degrades to the fixed error string, so
   startup always reaches its config-error path); the `Config.t()` struct,
   env overrides, and consumers are untouched.
-- **A credential is never silently lost** (review fix-round rule): every
-  inline credential the split removes gets a home — a keys.json5 slot with
-  exactly that value, or the byte-exact backup this split writes. When
-  `settings.json5.bak` already exists (never clobbered) and a pre-existing
-  `keys.json5` lacks a collected name or carries a different value — or the
-  credential has no usable profile name (blank-name profile, root-level
-  `apiKey`) — the split REFUSES with an error naming the situation; the
-  user reconciles keys.json5 or splits by hand. Identical values (the
-  crash-recovery state from a partial run) converge instead of refusing.
-  Warnings claim only what is true in the state they fire in.
+- **A credential is never silently lost** (review fix-round rule, proven
+  cell-by-cell by a table-driven sweep test over the constructible
+  pre-state matrix — keys.json5 × backup × v1 shape, crash states modeled
+  as pre-states since writes are tmp+rename atomic): every inline
+  credential the split removes gets a home — a keys.json5 slot with exactly
+  that value, or the byte-exact backup. The decision is made from the
+  backup's ACTUAL outcome (`:written`/`:identical`/`:kept`/`:failed`),
+  never from a prediction, and completes before the one destructive step
+  (the settings rewrite). It REFUSES when a pre-existing keys.json5 wins
+  without holding a value (a differing value under a collected name, a
+  duplicate-name loser keys.json5 cannot key by name, a root-level or
+  blank-name credential) and no usable backup exists. Both unblocks are
+  real and tested: adding the key under its name to keys.json5 clears the
+  refusal, a `settings.json5.bak` byte-identical to the current file (the
+  crash-recovery state) converges automatically, and moving a stale `.bak`
+  aside lets the next start write a fresh backup. Warnings claim only what
+  has already happened (the "backed up first" clause only follows an actual
+  backup write).
+- The LOAD path surfaces historical loss: a profile with no key under its
+  name in an existing keys.json5 warns at startup (names only) — the shape
+  a lost credential or a stale keys file leaves behind; silent when
+  keys.json5 is absent (env-keyed setups are legitimate).
 - A ROOT-level `apiKey` is stripped by the split and warned by the loader
   exactly like a profile-level stray — nothing credential-shaped rides into
   live v2 settings unwarned.

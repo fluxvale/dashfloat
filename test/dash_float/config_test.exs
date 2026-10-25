@@ -938,6 +938,50 @@ defmodule DashFloat.ConfigTest do
       refute logs =~ "PLACEHOLDER"
     end
 
+    # Historical-loss surfacing (round-2 review, incident-hiding note): a
+    # profile with no key under its name in an EXISTING keys.json5 warns at
+    # load — the shape a lost credential leaves behind. Names only; silent
+    # when keys.json5 is absent (env-keyed setups are legitimate).
+    test "an unkeyed profile warns at load when keys.json5 exists" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 2,
+          profiles: [
+            { name: 'work', baseUrl: 'https://provider.example/v1',
+              models: [{ model: 'glm-5.3' }] },
+            { name: 'personal', baseUrl: 'https://provider.example/v1',
+              models: [{ model: 'glm-5.3' }] },
+          ],
+        }
+        """
+      )
+
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
+
+          assert {:error, message} = Config.load(dir, %{}, profile: "personal")
+          assert message =~ "api_key"
+        end)
+
+      assert logs =~ ~s(profile "personal" has no key in keys.json5)
+      refute logs =~ ~s(profile "work" has no key)
+      refute logs =~ "PLACEHOLDER"
+
+      # No keys.json5 at all → silent (env-keyed setups).
+      keys_path = Path.join(dir, "keys.json5")
+      File.rm!(keys_path)
+
+      env = %{"DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"}
+      assert capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, env, []) end) == ""
+    end
+
     # Hostile review P2-1, load-path half: the legacy migration's crash
     # window leaves a 0644 config.json beside a complete layout — re-runs
     # stand down, so the load itself must converge it to 0600.

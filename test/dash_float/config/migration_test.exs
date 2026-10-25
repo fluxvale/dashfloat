@@ -514,6 +514,196 @@ defmodule DashFloat.Config.MigrationTest do
     end
   end
 
+  ## The never-lose-a-credential invariant (round-2 hostile review): after
+  ## ANY migration outcome on ANY constructible pre-state, every credential
+  ## VALUE that existed before is still present in at least one file on
+  ## disk afterward — or the migration REFUSED with no destructive step.
+  ## Crash states are modeled as constructible pre-states: writes are
+  ## tmp+rename atomic, so every intermediate is either whole or absent,
+  ## and the cells below ARE those intermediates (keys written + identical
+  ## .bak + v1 main = post-keys crash; identical .bak + v1 main = post-
+  ## backup crash; occupied .bak.tmp = blocked re-run).
+
+  describe "invariant sweep: no credential value is ever silently lost" do
+    @shapes %{
+      plain: %{
+        file: """
+        {
+          configVersion: 1,
+          profiles: [
+            { name: 'work', baseUrl: 'https://provider.example/v1',
+              apiKey: 'PLACEHOLDER-work-key',
+              models: [{ model: 'glm-5.3' }] },
+            { name: 'personal', baseUrl: 'https://provider.example/v1',
+              apiKey: 'PLACEHOLDER-personal-key',
+              models: [{ model: 'glm-5.3' }] },
+          ],
+        }
+        """,
+        values: ["PLACEHOLDER-work-key", "PLACEHOLDER-personal-key"],
+        collected: %{"work" => "PLACEHOLDER-work-key", "personal" => "PLACEHOLDER-personal-key"}
+      },
+      duplicates: %{
+        file: """
+        {
+          configVersion: 1,
+          profiles: [
+            { name: 'work', baseUrl: 'https://provider.example/v1',
+              apiKey: 'PLACEHOLDER-dup-old', models: [{ model: 'glm-5.3' }] },
+            { name: 'work', baseUrl: 'https://provider.example/v1',
+              apiKey: 'PLACEHOLDER-dup-new', models: [{ model: 'glm-5.3' }] },
+          ],
+        }
+        """,
+        values: ["PLACEHOLDER-dup-old", "PLACEHOLDER-dup-new"],
+        collected: %{"work" => "PLACEHOLDER-dup-old"}
+      },
+      blank_name: %{
+        file: """
+        {
+          configVersion: 1,
+          profiles: [
+            { name: '', baseUrl: 'https://provider.example/v1',
+              apiKey: 'PLACEHOLDER-nameless-key', models: [{ model: 'glm-5.3' }] },
+            { name: 'work', baseUrl: 'https://provider.example/v1',
+              apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'glm-5.3' }] },
+          ],
+        }
+        """,
+        values: ["PLACEHOLDER-nameless-key", "PLACEHOLDER-work-key"],
+        collected: %{"work" => "PLACEHOLDER-work-key"}
+      },
+      root_key: %{
+        file: """
+        {
+          configVersion: 1,
+          apiKey: 'PLACEHOLDER-root-key',
+          profiles: [
+            { name: 'work', baseUrl: 'https://provider.example/v1',
+              apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'glm-5.3' }] },
+          ],
+        }
+        """,
+        values: ["PLACEHOLDER-root-key", "PLACEHOLDER-work-key"],
+        collected: %{"work" => "PLACEHOLDER-work-key"}
+      }
+    }
+
+    defp build_cell(shape, keys_state, bak_state) do
+      dir = tmp_dir()
+      spec = @shapes[shape]
+      main = Path.join(dir, "settings.json5")
+      File.write!(main, spec.file)
+      File.chmod!(main, 0o600)
+      write_keys_state(dir, keys_state, spec)
+      write_bak_state(dir, bak_state, spec)
+      dir
+    end
+
+    defp write_keys_state(dir, keys_state, spec) do
+      case keys_state do
+        :absent ->
+          :ok
+
+        :malformed ->
+          write_keys_file!(dir, "{ broken")
+
+        variant when variant in [:same, :different, :superset, :subset] ->
+          write_keys_file!(dir, "{#{render_keys(variant, spec)},}")
+      end
+    end
+
+    defp render_keys(variant, spec) do
+      base = spec.collected
+
+      contents =
+        case variant do
+          :same -> base
+          :different -> Map.put(base, "work", "PLACEHOLDER-different-key")
+          :superset -> Map.put(base, "ghost", "PLACEHOLDER-ghost-key")
+          :subset -> Map.delete(base, "work")
+        end
+
+      contents
+      |> Enum.sort()
+      |> Enum.map_join(", ", fn {name, key} -> "'#{name}': '#{key}'" end)
+    end
+
+    defp write_bak_state(dir, bak_state, spec) do
+      backup_tmp = Path.join(dir, "settings.json5.bak.tmp")
+
+      case bak_state do
+        :absent -> :ok
+        :identical -> write_backup!(dir, spec.file)
+        :stale -> write_backup!(dir, "// stale pre-split backup")
+        :tmp_occupied -> File.mkdir!(backup_tmp)
+      end
+    end
+
+    defp file_texts(dir) do
+      ["settings.json5", "keys.json5", "settings.json5.bak", "config.json.bak"]
+      |> Enum.map(&Path.join(dir, &1))
+      |> Enum.filter(&File.exists?/1)
+      |> Enum.map_join("\n", &File.read!/1)
+    end
+
+    test "every pre-state cell preserves every credential value or refuses cleanly" do
+      shapes = Map.keys(@shapes)
+      keys_states = [:absent, :same, :different, :superset, :subset, :malformed]
+      bak_states = [:absent, :identical, :stale, :tmp_occupied]
+
+      for shape <- shapes, keys_state <- keys_states, bak_state <- bak_states do
+        dir = build_cell(shape, keys_state, bak_state)
+        spec = @shapes[shape]
+        main_path = Path.join(dir, "settings.json5")
+        keys_path = Path.join(dir, "keys.json5")
+        backup_path = Path.join(dir, "settings.json5.bak")
+        original_main = File.read!(main_path)
+        original_keys = if keys_state != :absent, do: File.read!(keys_path)
+
+        original_bak =
+          if bak_state in [:identical, :stale],
+            do: File.read!(backup_path)
+
+        cell = "#{shape}/#{keys_state}/#{bak_state}"
+
+        {outcome, _logs} = with_log(fn -> @migration.maybe_migrate(dir) end)
+
+        case outcome do
+          # REFUSED: the invariant's other arm — nothing destructive happened.
+          {:error, _message} ->
+            assert File.read!(main_path) == original_main,
+                   "cell #{cell}: refusal rewrote settings"
+
+            if original_keys,
+              do: assert(File.read!(keys_path) == original_keys, "cell #{cell}")
+
+            if original_bak,
+              do: assert(File.read!(backup_path) == original_bak, "cell #{cell}")
+
+          # MIGRATED: every original value survives in at least one file,
+          # and the LIVE settings file carries none of them.
+          {:ok, :migrated} ->
+            on_disk = file_texts(dir)
+            live_main = File.read!(main_path)
+
+            for value <- spec.values do
+              assert String.contains?(on_disk, value),
+                     "cell #{cell}: credential value LOST from every file"
+            end
+
+            for value <- spec.values do
+              refute String.contains?(live_main, value),
+                     "cell #{cell}: credential value still in live settings"
+            end
+
+          {:ok, :not_needed} ->
+            flunk("cell #{cell}: split unexpectedly stood down")
+        end
+      end
+    end
+  end
+
   describe "split path: v1 inline keys split in place" do
     test "a v1 inline-keys settings.json5 splits: settings de-secreted, keys.json5 0600, backup 0600" do
       dir = tmp_dir()
@@ -803,6 +993,141 @@ defmodule DashFloat.Config.MigrationTest do
                |> JSON5.decode()
 
       refute File.exists?(tmp)
+    end
+
+    # Round-2 P1: the no-loss decision must be made from the backup's
+    # ACTUAL outcome, not from the .bak's pre-existence — a failing backup
+    # write (occupied .bak.tmp) plus a differing key used to "migrate" with
+    # the key in no file.
+    test "an occupied .bak.tmp with a differing key refuses — the backup's failure feeds the decision" do
+      dir = write_v1!(tmp_dir())
+      keys = write_keys_file!(dir, "{'work': 'PLACEHOLDER-work-old',}")
+      blocked_tmp = Path.join(dir, "settings.json5.bak.tmp")
+      File.mkdir!(blocked_tmp)
+
+      logs =
+        capture_log(fn ->
+          assert {:error, message} = @migration.maybe_migrate(dir)
+          assert message =~ "no home"
+          refute message =~ "PLACEHOLDER"
+        end)
+
+      # No destructive step, and the user's occupied tmp path is untouched.
+      assert logs =~ "cannot write settings.json5.bak"
+      refute logs =~ "backed up first"
+      main = File.read!(paths(dir).main)
+      assert main =~ "PLACEHOLDER-work-key"
+      assert main =~ "PLACEHOLDER-personal-key"
+      assert File.read!(keys) =~ "PLACEHOLDER-work-old"
+      assert File.lstat!(blocked_tmp).type == :directory
+      refute File.exists?(paths(dir).settings_backup)
+    end
+
+    # Round-2 P1-adjacent: duplicate profile names — the loader tolerates
+    # the shape, so the migration must account for the second key too.
+    defp duplicates_file do
+      """
+      {
+        configVersion: 1,
+        profiles: [
+          { name: 'work', baseUrl: 'https://provider.example/v1',
+            apiKey: 'PLACEHOLDER-dup-old',
+            models: [{ model: 'glm-5.3' }] },
+          { name: 'work', baseUrl: 'https://provider.example/v1',
+            apiKey: 'PLACEHOLDER-dup-new',
+            models: [{ model: 'glm-5.3' }] },
+        ],
+      }
+      """
+    end
+
+    test "duplicate-name keys refuse without a backup; both values survive with one" do
+      refusing = write_v1!(tmp_dir(), duplicates_file())
+      write_backup!(refusing, "// stale")
+
+      assert {:error, message} = @migration.maybe_migrate(refusing)
+      assert message =~ "no home"
+      # BOTH keys still in the live file — the loser was not silently
+      # dropped from disk.
+      main = File.read!(paths(refusing).main)
+      assert main =~ "PLACEHOLDER-dup-old"
+      assert main =~ "PLACEHOLDER-dup-new"
+
+      fresh = write_v1!(tmp_dir(), duplicates_file())
+      assert {:ok, :migrated} = @migration.maybe_migrate(fresh)
+
+      # First-wins value lands in keys.json5; the loser survives byte-exact
+      # in the backup. Neither value is lost.
+      assert File.read!(paths(fresh).keys) =~ "PLACEHOLDER-dup-old"
+      assert File.read!(paths(fresh).settings_backup) =~ "PLACEHOLDER-dup-new"
+    end
+
+    # Round-2 P2: the refusal must have a real, tested unblock for each arm.
+    test "adding the missing key to keys.json5 clears the refusal" do
+      dir = write_v1!(tmp_dir())
+      write_keys_file!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+      write_backup!(dir, "// stale")
+
+      assert {:error, _message} = @migration.maybe_migrate(dir)
+
+      # The error's own advice: add the keys under their names.
+      write_keys_file!(
+        dir,
+        "{'work': 'PLACEHOLDER-work-key', 'personal': 'PLACEHOLDER-personal-key',}"
+      )
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+      refute File.read!(paths(dir).main) =~ "PLACEHOLDER"
+    end
+
+    test "a byte-identical pre-existing .bak converges instead of refusing (crash recovery)" do
+      dir = write_v1!(tmp_dir())
+      write_backup!(dir, File.read!(paths(dir).main))
+
+      # Any shape — including the nameless credentials that have no
+      # keys.json5 name to be added under.
+      root_dir = tmp_dir()
+
+      write_v1!(
+        root_dir,
+        """
+        {
+          configVersion: 1,
+          apiKey: 'PLACEHOLDER-root-key',
+          profiles: [
+            { name: 'work', baseUrl: 'https://provider.example/v1',
+              models: [{ nickname: 'Sol', model: 'glm-5.3' }] },
+          ],
+        }
+        """
+      )
+
+      write_backup!(root_dir, File.read!(paths(root_dir).main))
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+      assert {:ok, :migrated} = @migration.maybe_migrate(root_dir)
+
+      refute File.read!(paths(root_dir).main) =~ "PLACEHOLDER-root-key"
+      assert File.read!(paths(root_dir).settings_backup) =~ "PLACEHOLDER-root-key"
+    end
+
+    test "moving a stale .bak aside lets a fresh backup clear the refusal (documented unblock)" do
+      dir = write_v1!(tmp_dir())
+      write_keys_file!(dir, "{'work': 'PLACEHOLDER-work-old',}")
+      stale = write_backup!(dir, "// stale")
+
+      assert {:error, _message} = @migration.maybe_migrate(dir)
+
+      # The error's other documented remedy: move the stale backup aside.
+      File.rename!(stale, stale <> ".old")
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      # Fresh byte-exact backup now holds both inline values.
+      backup = File.read!(paths(dir).settings_backup)
+      assert backup =~ "PLACEHOLDER-work-key"
+      assert backup =~ "PLACEHOLDER-personal-key"
+      refute File.read!(paths(dir).main) =~ "PLACEHOLDER"
     end
 
     test "an existing keys.json5 wins over collected inline keys" do
