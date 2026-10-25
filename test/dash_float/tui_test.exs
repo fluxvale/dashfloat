@@ -168,6 +168,154 @@ defmodule DashFloat.TUITest do
     assert_receive {:transport_disconnect, :normal}, 1_000
   end
 
+  # Issue #28: a single accidental Ctrl+C must not exit. One press shows the
+  # transient prompt (activity row up while idle); a second press inside the
+  # 2 s window exits through the normal teardown.
+  test "one Ctrl+C shows the prompt and does not exit; the prompt self-clears" do
+    {:ok, pid} = start_tui()
+    attach_disconnect_listener()
+
+    press(pid, "c", ["ctrl"])
+
+    armed = eventually(pid, fn s -> s.exit_guard_at != nil end)
+    assert armed.exit_guard_ref != nil
+    assert Process.alive?(pid)
+    assert activity_text(armed) == "Press Ctrl+C again to exit"
+
+    # The expiry is one frame, not a loop: the prompt clears at ~2 s and the
+    # app goes quiet again — no idle-render regression (ADR 0006).
+    cleared = eventually(pid, fn s -> s.exit_guard_at == nil end, 400)
+    assert cleared.exit_guard_ref == nil
+
+    {cleared_activity, _rect} =
+      cleared
+      |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+      |> Enum.at(2)
+
+    assert cleared_activity.text == []
+
+    settled = Runtime.snapshot(pid).render_count
+    Process.sleep(300)
+    assert Runtime.snapshot(pid).render_count == settled
+    assert Process.alive?(pid)
+  end
+
+  test "two Ctrl+C presses inside the window quit through the normal teardown" do
+    {:ok, pid} = start_tui()
+    attach_disconnect_listener()
+
+    ref = Process.monitor(pid)
+    press(pid, "c", ["ctrl"])
+    armed = eventually(pid, fn s -> s.exit_guard_at != nil end)
+    press(pid, "c", ["ctrl"])
+
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
+    assert_receive {:transport_disconnect, :normal}, 1_000
+    assert armed.phase == :idle
+  end
+
+  # The guard's one-shot timer must never clear a live window: a message
+  # from a cancelled or superseded timer is dropped without a frame.
+  test "stale exit-guard messages are dropped without a frame" do
+    idle = State.new(test_mode: {80, 24})
+    assert {:noreply, ^idle, %{render?: false}} = TUI.handle_info(:dashfloat_exit_guard, idle)
+
+    # A guard message while the tracked timer has not fired yet is stale —
+    # it belongs to an earlier, superseded window.
+    ref = Process.send_after(self(), :never, 10_000)
+    armed = %{idle | exit_guard_at: 1, exit_guard_ref: ref}
+
+    assert {:noreply, ^armed, %{render?: false}} = TUI.handle_info(:dashfloat_exit_guard, armed)
+    Process.cancel_timer(ref)
+
+    # A fired timer's message clears the prompt and renders (the prompt
+    # disappearing IS the frame).
+    fired_ref = Process.send_after(self(), :dashfloat_exit_guard, 1)
+    fired = %{idle | exit_guard_at: 1_000, exit_guard_ref: fired_ref}
+    Process.sleep(20)
+
+    assert {:noreply, cleared} = TUI.handle_info(:dashfloat_exit_guard, fired)
+    assert cleared.exit_guard_at == nil and cleared.exit_guard_ref == nil
+  end
+
+  # The disarm path: a keystroke between arming and expiry cancels the
+  # pending timer outright — no orphan frame later.
+  test "a disarming key press cancels the pending expiry timer" do
+    {:ok, pid} = start_tui()
+
+    press(pid, "c", ["ctrl"])
+    armed = eventually(pid, fn s -> s.exit_guard_at != nil end)
+    assert armed.exit_guard_ref != nil
+
+    press(pid, "x")
+    disarmed = eventually(pid, fn s -> s.exit_guard_at == nil end)
+
+    assert disarmed.exit_guard_ref == nil
+    assert State.input_text(disarmed) == "x"
+
+    # Disarmed means no expiry frame either: the quiet window stays quiet.
+    settled = Runtime.snapshot(pid).render_count
+    Process.sleep(300)
+    assert Runtime.snapshot(pid).render_count == settled
+  end
+
+  # Incidental events (the wheel here, stream messages equally) must not
+  # disturb a pending expiry: the timer stays live and still fires on time.
+  test "incidental events leave a pending expiry timer alone" do
+    {:ok, pid} = start_tui()
+
+    press(pid, "c", ["ctrl"])
+    armed = eventually(pid, fn s -> s.exit_guard_at != nil end)
+    armed_ref = armed.exit_guard_ref
+
+    scroll(pid, "scroll_up")
+    wheeled = get_state(pid)
+
+    assert wheeled.exit_guard_at != nil
+    assert wheeled.exit_guard_ref == armed_ref
+    assert State.exit_guard_live?(wheeled, System.monotonic_time(:millisecond))
+
+    # The original timer still owns the expiry: the prompt clears without
+    # a second press.
+    cleared = eventually(pid, fn s -> s.exit_guard_at == nil end, 400)
+    assert cleared.exit_guard_ref == nil
+  end
+
+  # The fired-but-undrained race: an event is processed after the timer
+  # fired but before its message drained. The timer is replaced (exactly
+  # one per window) and the orphaned message is dropped by the staleness
+  # check instead of clearing the fresh window.
+  test "a fired-but-undrained guard timer is replaced, orphan dropped" do
+    base = State.new(test_mode: {80, 24})
+
+    fired_ref = Process.send_after(self(), :dashfloat_exit_guard, 1)
+    Process.sleep(20)
+
+    # A fresh arming (1 s left on its window) whose tracked timer already
+    # fired but has not drained.
+    armed = %{
+      base
+      | phase: :streaming,
+        exit_guard_at: System.monotonic_time(:millisecond) - 1_000,
+        exit_guard_ref: fired_ref
+    }
+
+    # A stream message schedules while the fired timer's message is queued.
+    assert {:noreply, rescheduled} = TUI.handle_info({:token, "t"}, armed)
+    assert rescheduled.exit_guard_ref != nil
+    assert rescheduled.exit_guard_ref != fired_ref
+
+    # The orphaned message is stale against the new timer: no frame, and
+    # the fresh window survives it.
+    assert {:noreply, kept, %{render?: false}} =
+             TUI.handle_info(:dashfloat_exit_guard, rescheduled)
+
+    assert kept.exit_guard_at != nil
+    assert kept.exit_guard_ref == rescheduled.exit_guard_ref
+
+    Process.cancel_timer(kept.exit_guard_ref)
+  end
+
   @tag :capture_log
   test "a crashing message tears the app down through the terminal-restore path" do
     {:ok, pid} = start_tui()
@@ -348,17 +496,14 @@ defmodule DashFloat.TUITest do
     full = eventually(pid, &(State.log_line_count(&1) > 24))
     assert State.effective_scroll(full, 20) == State.log_line_count(full) - 20
 
-    # Full text survives the re-wrap, every row fits the new width.
+    # Full text survives the re-wrap, every row fits the new padded width.
     [entry] = narrowed.entries
+
     rows = Enum.map(entry.lines, &Enum.map_join(&1.spans, "", fn s -> s.content end))
 
-    joined =
-      rows
-      |> Enum.join("")
-      |> String.trim()
-
-    assert joined == long
-    assert Enum.all?(rows, &(&1 == "" or String.length(&1) <= 20))
+    joined = Enum.join(rows, " ")
+    assert String.split(joined) == String.split(long)
+    assert Enum.all?(rows, &(&1 == "" or String.length(&1) <= 18))
 
     # And the drawn frame really carries the wrapped rows, not a truncation.
     term = ExRatatui.init_test_terminal(20, 24)
@@ -815,7 +960,16 @@ defmodule DashFloat.TUITest do
   end
 
   # A tall log: one submitted question plus a 100-entry system reply. Returns
-  # once idle, with the bottom offset under a 20-line viewport.
+  # once idle, with the bottom offset under the real rendered viewport (the
+  # margin took two rows off the log height — issue #28).
+  defp viewport(state) do
+    View.regions(state.size, State.input_line_count(state), false).log.height
+  end
+
+  defp active_viewport(state) do
+    View.regions(state.size, State.input_line_count(state), true).log.height
+  end
+
   defp tall_log(pid) do
     submit(pid, "first question")
     assert_receive {:prompt, ui_pid, "first question"}, 1_000
@@ -824,41 +978,41 @@ defmodule DashFloat.TUITest do
     send(ui_pid, {:phase, :idle})
 
     state = eventually(pid, fn s -> s.phase == :idle and State.log_line_count(s) >= 202 end)
-    State.effective_scroll(state, 20)
+    {state, State.effective_scroll(state, viewport(state))}
   end
 
   test "the wheel scrolls the log view, not the input draft" do
     {:ok, pid} = start_tui(provider: provider())
-    bottom = tall_log(pid)
+    {_state, bottom} = tall_log(pid)
     type(pid, "fresh draft")
 
     scroll(pid, "scroll_up")
 
-    state = get_state(pid)
-    refute state.follow?
-    assert State.effective_scroll(state, 20) == bottom - 3
+    wheeled = get_state(pid)
+    refute wheeled.follow?
+    assert State.effective_scroll(wheeled, viewport(wheeled)) == bottom - 3
     # The wheel never touches the draft — the live bug walked history here.
-    assert State.input_text(state) == "fresh draft"
-    assert state.history_index == nil
+    assert State.input_text(wheeled) == "fresh draft"
+    assert wheeled.history_index == nil
   end
 
   test "wheel-down re-pins at the bottom; genuine Up still walks history" do
     {:ok, pid} = start_tui(provider: provider())
-    bottom = tall_log(pid)
+    {_state, bottom} = tall_log(pid)
 
     scroll(pid, "scroll_up")
     scroll(pid, "scroll_up")
     two_notches = get_state(pid)
-    assert State.effective_scroll(two_notches, 20) == bottom - 6
+    assert State.effective_scroll(two_notches, viewport(two_notches)) == bottom - 6
 
     scroll(pid, "scroll_down")
     one_down = get_state(pid)
-    assert State.effective_scroll(one_down, 20) == bottom - 3
+    assert State.effective_scroll(one_down, viewport(one_down)) == bottom - 3
 
     for _notch <- 1..4, do: scroll(pid, "scroll_down")
     pinned = get_state(pid)
     assert pinned.follow?
-    assert State.effective_scroll(pinned, 20) == bottom
+    assert State.effective_scroll(pinned, viewport(pinned)) == bottom
 
     # Keyboard truth is unchanged: Up is still history navigation at the
     # draft's first row (ADR 0002).
@@ -870,31 +1024,37 @@ defmodule DashFloat.TUITest do
 
   test "the wheel still scrolls while a confirm is pending" do
     {:ok, pid} = start_tui(provider: provider())
-    bottom = tall_log(pid)
+    {_state, _bottom} = tall_log(pid)
 
     send(pid, {:confirm, make_ref(), confirm_request(["+ x"])})
-    confirming = eventually(pid, fn s -> s.phase == :confirming end)
+
+    confirming =
+      eventually(pid, fn s ->
+        s.phase == :confirming and
+          State.effective_scroll(s, active_viewport(s)) > 0
+      end)
 
     # The preview appended rows and the activity row is up (confirming is an
-    # active phase): re-read the pinned bottom at the 19-row viewport.
-    confirm_bottom = State.effective_scroll(confirming, 19)
+    # active phase): the pinned bottom under the real active viewport.
+    confirm_bottom = State.effective_scroll(confirming, active_viewport(confirming))
 
     scroll(pid, "scroll_up")
     state = get_state(pid)
     assert state.phase == :confirming
     refute state.follow?
-    assert State.effective_scroll(state, 19) == confirm_bottom - 3
+    assert State.effective_scroll(state, active_viewport(state)) == confirm_bottom - 3
   end
 
-  test "non-scroll mouse events change nothing and render nothing" do
+  test "inert mouse events change nothing and render nothing" do
     {:ok, pid} = start_tui()
     before_count = Runtime.snapshot(pid).render_count
 
     for event <- [
           %ExRatatui.Event.Mouse{kind: "moved", button: "", x: 1, y: 1},
-          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 1},
-          %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 1, y: 1},
-          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 2, y: 2},
+          %ExRatatui.Event.Mouse{kind: "moved", button: "", x: 7, y: 9},
+          %ExRatatui.Event.Mouse{kind: "down", button: "right", x: 1, y: 1},
+          %ExRatatui.Event.Mouse{kind: "up", button: "middle", x: 2, y: 2},
+          %ExRatatui.Event.Mouse{kind: "drag", button: "right", x: 3, y: 3},
           %ExRatatui.Event.Mouse{kind: "scroll_left", button: "", x: 1, y: 1}
         ] do
       inject(pid, event)
@@ -903,6 +1063,162 @@ defmodule DashFloat.TUITest do
     assert Runtime.snapshot(pid).render_count == before_count
     untouched = get_state(pid)
     assert State.input_text(untouched) == ""
+    assert untouched.selection == nil
+  end
+
+  # Issue #28: click-drag over the log anchors a display-row selection,
+  # extends with the drag, and copies on release. Test mode never writes
+  # the OSC 52 sequence (live?-gated); the selection state is the observable.
+  test "a left drag over the log selects display rows and copies on release" do
+    {:ok, pid} = start_tui()
+
+    for i <- 1..8, do: send(pid, {:entry, :system, "selectable line #{i}"})
+    eventually(pid, &(State.log_line_count(&1) == 16))
+
+    # A drag with no press before it (a missed or dropped down event) is a
+    # no-op, never a crash.
+    inject(pid, %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 5, y: 5})
+    bare = get_state(pid)
+    assert bare.selection == nil
+
+    # down at log row 1 ("selectable line 1"), drag to row 3, release.
+    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 3, y: 3})
+    drag = eventually(pid, &(&1.selection != nil))
+    assert drag.selection.anchor == {1, 2}
+
+    inject(pid, %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 5, y: 5})
+    extended = get_state(pid)
+    assert extended.selection.head == {3, 4}
+
+    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 5, y: 5})
+    released = get_state(pid)
+
+    # The highlight stays after the copy (terminal convention)…
+    assert released.selection != nil
+
+    # …and the copy payload is the selected column ranges, newline-joined:
+    # row 1 from col 2 through its end, the blank separator, row 3 through
+    # col 4's cell ("selec" — the pointed cell is included).
+    assert State.selection_text(released) == "lectable line 1\n\nselec"
+
+    # Click-to-clear: a press+release without extension clears it.
+    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 3, y: 3})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 3, y: 3})
+    cleared = get_state(pid)
+    assert cleared.selection == nil
+  end
+
+  # The live-only OSC 52 write (ADR 0006 amendment, issue #28): test mode
+  # never writes; a live state writes exactly one bounded sequence on
+  # release.
+  test "copy on release writes the OSC 52 sequence on live runs only" do
+    # Test mode: the full down/drag/up flow through TUI.handle_event, with
+    # nothing reaching standard output.
+    {:ok, pid} = start_tui()
+    send(pid, {:entry, :system, "copy me please"})
+    eventually(pid, &(State.log_line_count(&1) == 2))
+    test_state = get_state(pid)
+    assert test_state.live? == false
+
+    assert ExUnit.CaptureIO.capture_io(fn ->
+             threaded =
+               Enum.reduce(
+                 [
+                   %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3},
+                   %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 12, y: 3},
+                   %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 12, y: 3}
+                 ],
+                 test_state,
+                 fn event, acc ->
+                   assert {:noreply, next} = TUI.handle_event(event, acc)
+                   next
+                 end
+               )
+
+             # A real drag completed (a copy action fired in test mode) —
+             # the empty capture then genuinely proves the live? gate held.
+             assert threaded.selection != nil
+             assert State.selection_text(threaded) != ""
+           end) == ""
+
+    # A live state (no test_mode): the up event writes the exact sequence.
+    live_base = State.new([])
+    live = State.stream_message(live_base, {:entry, :system, "copy me please"})
+    assert live.live? == true
+
+    dragging =
+      Enum.reduce(
+        [
+          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3},
+          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 12, y: 3}
+        ],
+        live,
+        fn event, acc ->
+          {acc, _action} = State.select_mouse(acc, event.kind, event.x, event.y)
+          acc
+        end
+      )
+
+    up = %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 12, y: 3}
+
+    output =
+      ExUnit.CaptureIO.capture_io(fn ->
+        assert {:noreply, _state} = TUI.handle_event(up, dragging)
+      end)
+
+    # Columns [0, 12) of "copy me please" — through the pointed cell.
+    expected = "\e]52;c;" <> Base.encode64("copy me plea") <> "\a"
+    assert output == expected
+  end
+
+  # Review P2d: Shift+drag is the terminal's native-selection bypass — the
+  # app neither selects nor writes underneath it.
+  test "shift-modified left events never select" do
+    {:ok, pid} = start_tui()
+    send(pid, {:entry, :system, "native selection bypass"})
+    eventually(pid, &(State.log_line_count(&1) == 2))
+
+    for event <- [
+          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3, modifiers: ["shift"]},
+          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 10, y: 3, modifiers: ["shift"]},
+          %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 10, y: 3, modifiers: ["shift"]}
+        ] do
+      inject(pid, event)
+    end
+
+    untouched = get_state(pid)
+    assert untouched.selection == nil
+  end
+
+  # Review P2d: an over-cap selection keeps its highlight, writes nothing,
+  # and logs why.
+  test "an over-cap selection drops the copy with a log line" do
+    huge = String.duplicate("word ", 20_000)
+    live_base = State.new([])
+    live = State.stream_message(live_base, {:entry, :system, huge})
+
+    {anchored, _nil} = State.select_mouse(live, "down", 1, 3)
+
+    # 400 notches = 1200 rows above the anchor: a genuine full-log span.
+    scrolled =
+      Enum.reduce(1..400, anchored, fn _i, acc -> State.wheel_scroll(acc, :up) end)
+
+    {dragged, _nil} = State.select_mouse(scrolled, "drag", 1, 3)
+
+    up = %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 1, y: 3}
+
+    logs =
+      ExUnit.CaptureLog.capture_log(fn ->
+        output =
+          ExUnit.CaptureIO.capture_io(fn ->
+            assert {:noreply, kept} = TUI.handle_event(up, dragged)
+            assert kept.selection != nil
+          end)
+
+        assert output == ""
+      end)
+
+    assert logs =~ "clipboard cap"
   end
 
   # The lynchpin of the wheel fix: without capture, terminals emulate the

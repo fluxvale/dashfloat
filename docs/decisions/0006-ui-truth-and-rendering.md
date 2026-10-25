@@ -2,7 +2,11 @@
 
 - **Status:** Accepted; **amended 2026-10-24** ([issue #20](https://github.com/fluxvale/dashfloat/issues/20) —
   the log word-wraps to the current width; see
-  [Amendment: log word-wrap](#amendment-log-word-wrap-issue-20) below)
+  [Amendment: log word-wrap](#amendment-log-word-wrap-issue-20) below);
+  **amended 2026-10-25** ([issue #28](https://github.com/fluxvale/dashfloat/issues/28) —
+  layout margin, double Ctrl+C exit guard, mouse selection/copy; see
+  [Amendment (2026-10-25, issue #28)](#amendment-2026-10-25-issue-28-margin-exit-guard-mouse-selection)
+  below)
 - **Date:** 2026-10-24
 - **Implements:** [issue #16](https://github.com/fluxvale/dashfloat/issues/16) — Phase 2.5 of the
   [ADR 0001](0001-founding-stack-and-architecture.md) roadmap.
@@ -374,6 +378,133 @@ keeps the math exact) is reversed by this amendment: wrapping keeps the math
 exact *by storing the wrapped lines as the counted truth*, and the
 truncation it defended was the bug.
 
+
+## Amendment (2026-10-25, issue #28): margin, exit guard, mouse selection
+
+**Status:** Accepted. Extends this ADR's layout, input-contract, and
+render-rate sections; supersedes nothing in ADR 0002 beyond what the mouse
+amendment below already reversed. Live smoke testing (Oct 25) drove all three.
+
+### Margin geometry — the padded width is the only width
+
+One cell of padding on every side of the chrome: `View.regions/3` splits an
+inner area inset by one from the frame, so no text hugs a screen edge.
+
+- **Single source of truth:** the log rect *is* the wrap width.
+  `State.log_width/1` reads the log rect from the same `View.regions/3` split
+  that renders it — wrap at append, the tick's in-flight refresh, resize
+  re-wrap, scroll viewport heights, windowed slicing, and (below) selection
+  columns all derive from the one split. Consistency is by construction; the
+  alternative (subtracting a margin constant at each consumer) re-creates the
+  exact class of edge bug this guards against.
+- **Odd and narrow widths** wrap at the padded width with no truncation —
+  the #20 buffer-level regression tests now draw at odd frame widths with the
+  margin, and every word must still reach the buffer.
+- Degenerate frames collapse as before: the inset area can go to zero and the
+  layout degrades without raising; `Wrap.wrap/2` still clamps below 1.
+
+### Double Ctrl+C exit guard — and the sibling-key survey
+
+Raw mode makes Ctrl+C a key event, and one accidental press must not kill a
+live session.
+
+- **State machine:** the first Ctrl+C arms a **2 s window** (monotonic,
+  injectable like every other clock read in `State`) and shows a transient
+  prompt on the activity row. A second press **inside the window** quits
+  through the normal `{:stop, state}` teardown. A second press **after
+  expiry re-arms** — the window never extends. Any other key press disarms.
+- **Prompt:** the activity row now also exists while idle while a transient
+  message is showing (`overlay?` in `View.regions/3`: active phase or armed
+  guard). The exit prompt outranks the streaming/confirm activity text while
+  it lives.
+- **Sanctioned exception #3 (one-shot, bounded):** the prompt's visual expiry
+  is a single `Process.send_after` ~2 s after the press — armed only by an
+  explicit Ctrl+C, firing at most one frame, never looping. The idle
+  discipline stands for everything else: no user action, no timer, no render.
+  (The tick is exception #2; submit-time `start_child` #1.)
+- **Sibling keys, each decided:**
+  - **Ctrl+Q stays an immediate quit** — the deliberate exit path, named in
+    the input placeholder; users keep a one-press way out.
+  - **Ctrl+D was never an exit key** in DashFloat (it forwards to the
+    textarea like any editing key) — nothing to guard, deliberately left.
+  - **Ctrl+Z deliberately does not suspend.** Raw mode means no SIGTSTP
+    reaches us; the event is inert textarea input. Real suspend support
+    (restore terminal, signal self, re-init on resume) is unjustified
+    complexity for a full-screen alternate-screen app — leave it out.
+  - **Esc is untouched:** cancels a stream / rejects a confirm, never exits.
+- The guard applies in every phase, including mid-confirmation (a pending
+  confirm does not swallow Ctrl+C, matching the pre-guard quit ordering).
+
+### Mouse selection and OSC 52 copy
+
+Mouse capture (#21) took the terminal's native selection away; the app now
+owns selection over the log.
+
+- **Geometry is display-row based.** A left-press anchors a range at
+  `{display_row, column}` in the same wrapped-display-line space the scroll
+  math counts — and snapshots the entries' display-row count as the
+  gesture's **base**; a drag moves the head; both clamp into the log rect
+  **in screen space before the scroll mapping** — a click on the status bar
+  or a drag into the input pane selects the viewport's edge row, content
+  under the visible clamp, never rows beyond the viewport (a first cut
+  clamped in content space instead and anchored off-screen; caught in
+  review).
+- **Content-anchored, not viewport-anchored:** indices are absolute display
+  rows, so a selection **survives scrolling** (wheel or page keys — the
+  highlight translates with the content) and **survives appends** (indices
+  are stable under append-at-end). It is **cleared** by a width-changing
+  resize (re-wrap invalidates the geometry) and by an in-flight finalize
+  that the selection **reaches into** — judged against the gesture's own
+  base, never a finalize-time recount: rows appended between the anchor
+  and the finalize (the Esc-cancel contract's system entry, late tokens)
+  shift the live block, and a recount drifts with them (a first cut
+  recounted and silently kept selections whose content had changed;
+  caught in review). A selection entirely below the base survives the
+  finalize; appending cannot move the rows below it.
+- **Click-to-clear, extent-based:** a press+release is a click unless the
+  release sits on a different row or at least **three cells** (inclusive
+  extent) from the anchor — a deliberate 3-cell same-row selection copies;
+  the 1–2 cell wobble of a shaky click does not (a first cut measured the
+  column distance strictly-greater and made 3-cell selections impossible;
+  caught in review). Known, deliberate edge: a drag that returns to its
+  anchor cell releases with a 1-cell extent and reads as a click — the
+  extent at release decides, not the path.
+- **Wide/emoji clusters are atomic:** a cluster is selected iff its *first*
+  column is in range; slicing and highlighting never split a cluster
+  (the wrap width tables do the measuring — one width vocabulary). Both
+  endpoints select **through the cell they point at** — the range is
+  half-open over cell edges, so the last column of a row is reachable (a
+  first cut treated the pointed cell as exclusive and lost every row's
+  final character; caught in review). A collapsed selection (press, not
+  yet a drag) highlights nothing — one reversed cell would read as a
+  cursor artifact.
+- **Copy is display-faithful and bounded at the BUILD:** interior rows copy
+  their rendered text verbatim (hanging indents included — exactly what a
+  native terminal gives you when selecting a wrapped region), first/last
+  rows by column range, rows joined with `\n`, per-row trailing blanks
+  trimmed. The payload is capped at 64 KiB of text and the *build* stops
+  at the cap — a monster span costs one cap-sized pass, never a full
+  materialisation (a first cut built the whole span and froze the UI
+  process on multi-megabyte logs; caught in review). Past the cap the
+  write is dropped with a log line, the highlight stays, and the reported
+  bytes are the accumulated size at the stop.
+- **OSC 52 delivery:** on release the UI process writes one bounded
+  BEL-terminated `\e]52;c;<base64>\a` sequence to standard output — the
+  **third one-shot exception** pattern (a bounded write on a user-paced
+  action, never in `render/2`, never blocking; `IO.binwrite` completes
+  before the post-event frame draws, so bytes cannot interleave mid-frame).
+  Live runs only; test mode never writes. Terminals that ignore OSC 52
+  simply do nothing — degradation is silence, never a crash or block.
+- **Shift is latched at gesture start:** a left-down with Shift is a
+  native-selection gesture — it dismisses any existing app selection, and
+  nothing in that gesture can select or copy (a later plain up after
+  releasing Shift has no anchor to copy from — a first cut was inert only
+  while Shift was held and leaked a clipboard write from a stale anchor;
+  caught in review). Shift mid-gesture merely pauses extension; a
+  plain-start gesture still copies at its release.
+- **Render discipline:** down/drag/up are user-paced events that may draw,
+  like keys; pointer motion without a button stays render-suppressed, and
+  the wheel routing amendment below is unchanged.
 
 ## Consequences
 

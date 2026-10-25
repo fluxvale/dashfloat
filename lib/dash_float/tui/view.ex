@@ -6,6 +6,7 @@ defmodule DashFloat.TUI.View do
   activity, and entry styling are ADR 0006's.
   """
 
+  alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Theme
   alias ExRatatui.Layout.Rect
@@ -22,10 +23,16 @@ defmodule DashFloat.TUI.View do
     confirming: {"Confirm", :status_tool}
   }
 
+  # One cell of padding on every side of the chrome (issue #28; ADR 0006
+  # amendment): text never hugs a screen edge, and the log rect's width —
+  # which IS the wrap width — shrinks with it.
+  @margin 1
+
   @doc """
   Splits `width` x `height` into status (1 row), log (rest), activity
-  (1 row while active, else 0), and input (`2 + input_lines` rows, clamped to
-  a third of the frame).
+  (1 row while an overlay exists — an active phase or the exit prompt —
+  else 0), and input (`2 + input_lines` rows, clamped to a third of the
+  frame) — the whole chrome inset by one cell per side.
   """
   @spec regions({integer(), integer()}, integer(), boolean()) :: %{
           status: Rect.t(),
@@ -36,17 +43,36 @@ defmodule DashFloat.TUI.View do
   def regions({width, height}, input_lines, active?)
       when is_integer(width) and is_integer(height) and is_integer(input_lines) and
              is_boolean(active?) do
-    area = %Rect{x: 0, y: 0, width: max(width, 0), height: max(height, 0)}
+    area = inset_area(width, height)
 
     [status, log, activity, input] =
       ExRatatui.Layout.split(area, :vertical, [
         {:length, 1},
         {:min, 0},
         {:length, if(active?, do: 1, else: 0)},
-        {:length, input_height(input_lines, height)}
+        {:length, input_height(input_lines, area.height)}
       ])
 
     %{status: status, log: log, activity: activity, input: input}
+  end
+
+  @doc """
+  The wrap width at a frame width: the log rect's width (same inset as
+  `regions/3`), floored at 1 so a degenerate frame wraps at one column
+  instead of zero. Everything that measures log text — wrap, re-wrap,
+  windowing, selection columns — reads this, never the raw frame width.
+  """
+  @spec content_width(integer()) :: pos_integer()
+  def content_width(frame_width) when is_integer(frame_width),
+    do: max(frame_width - 2 * @margin, 1)
+
+  defp inset_area(width, height) do
+    %Rect{
+      x: @margin,
+      y: @margin,
+      width: max(width - 2 * @margin, 0),
+      height: max(height - 2 * @margin, 0)
+    }
   end
 
   @doc "Input region height: borders plus draft lines, capped at a third of the frame."
@@ -63,8 +89,9 @@ defmodule DashFloat.TUI.View do
   @doc "Renders the four regions. Pure; never raises on odd sizes."
   @spec render(State.t(), ExRatatui.Frame.t()) :: [{ExRatatui.widget(), Rect.t()}]
   def render(%State{} = state, %ExRatatui.Frame{width: width, height: height}) do
-    active? = state.phase != :idle
-    regions = regions({width, height}, State.input_line_count(state), active?)
+    # The transient row exists for an active phase OR an armed exit guard
+    # (issue #28; ADR 0006 amendment) — even while idle.
+    regions = regions({width, height}, State.input_line_count(state), State.overlay?(state))
 
     [
       {status_widget(state, regions.log.height), regions.status},
@@ -151,26 +178,51 @@ defmodule DashFloat.TUI.View do
   # Only the visible window is built and encoded per frame: per-frame cost is
   # O(viewport), not O(total log) — the full log stays in memory until Phase 4
   # persistence (ADR 0002). Stored rendered lines are sliced; nothing renders
-  # here (ADR 0006).
-  defp log_widget(state, height) do
+  # here (ADR 0006). A selection highlights its covered columns in reverse
+  # video (issue #28; ADR 0006 amendment).
+  defp log_widget(%State{entries: [], in_flight: in_flight, in_flight_lines: nil}, _height)
+       when in_flight in [nil, ""] do
     %Paragraph{
-      text: log_lines(state, State.effective_scroll(state, height), height),
+      text: [Line.new([Span.new("(log is empty — say something)", style: Theme.style(:dim))])],
       scroll: {0, 0}
     }
   end
 
-  defp log_lines(
-         %State{entries: [], in_flight: in_flight, in_flight_lines: nil},
-         _offset,
-         _height
-       )
-       when in_flight in [nil, ""] do
-    [Line.new([Span.new("(log is empty — say something)", style: Theme.style(:dim))])]
+  defp log_widget(state, height) do
+    offset = State.effective_scroll(state, height)
+
+    text =
+      state
+      |> display_lines(offset, height)
+      |> highlight_selection(offset, state)
+
+    %Paragraph{text: text, scroll: {0, 0}}
   end
 
-  defp log_lines(state, offset, height) do
-    # Walk blocks counting display lines; slice only those that intersect
-    # [offset, offset + height), so per-frame building stays O(viewport).
+  defp highlight_selection(rows, _offset, %State{selection: nil}), do: rows
+
+  # A collapsed selection (press without extension yet) highlights
+  # nothing: a single reversed cell under the pointer reads as a cursor
+  # artifact, not a selection (review cosmetic).
+  defp highlight_selection(rows, _offset, %State{selection: %{anchor: cell, head: cell}}),
+    do: rows
+
+  defp highlight_selection(rows, offset, %State{selection: selection}) do
+    Enum.with_index(rows, fn row, i ->
+      Selection.highlight(row, Selection.columns(selection, offset + i))
+    end)
+  end
+
+  @doc """
+  The display rows `[offset, offset + height)` of the log's stored wrapped
+  lines (entries plus the in-flight block), windowed — the same walk feeds
+  the rendered log and the selection copy, so geometry can never disagree.
+  """
+  @spec display_lines(State.t(), non_neg_integer(), non_neg_integer()) :: [
+          ExRatatui.Text.Line.t()
+        ]
+  def display_lines(%State{} = state, offset, height)
+      when is_integer(offset) and is_integer(height) do
     {_skipped, acc} =
       state
       |> blocks()
@@ -202,6 +254,17 @@ defmodule DashFloat.TUI.View do
   end
 
   ## Activity line
+
+  # The armed exit guard outranks every other activity text while it lives
+  # (issue #28) — including mid-stream and mid-confirm.
+  defp activity_widget(%State{exit_guard_at: at}) when is_integer(at) do
+    %Paragraph{
+      text: [
+        Line.new([Span.new("Press Ctrl+C again to exit", style: Theme.style(:status_tool))])
+      ],
+      scroll: {0, 0}
+    }
+  end
 
   defp activity_widget(%{phase: :idle}) do
     %Paragraph{text: [], scroll: {0, 0}}

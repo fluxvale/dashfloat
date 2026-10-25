@@ -14,6 +14,7 @@ defmodule DashFloat.TUI.State do
   """
 
   alias DashFloat.TUI.Render
+  alias DashFloat.TUI.Selection
   alias DashFloat.TUI.View
   alias DashFloat.TUI.Wrap
 
@@ -45,6 +46,8 @@ defmodule DashFloat.TUI.State do
   # Live re-renders of the in-flight reply stop above this; finalize still
   # parses once at the end (ADR 0006).
   @in_flight_cap 64 * 1024
+  # The double Ctrl+C exit window (issue #28; ADR 0006 amendment).
+  @exit_window_ms 2_000
 
   @enforce_keys [:input]
   defstruct [
@@ -60,6 +63,8 @@ defmodule DashFloat.TUI.State do
     in_flight_dirty: false,
     anim_step: 0,
     tick_ref: nil,
+    exit_guard_at: nil,
+    exit_guard_ref: nil,
     stats: %{
       tokens: 0,
       first_token_at: nil,
@@ -76,7 +81,8 @@ defmodule DashFloat.TUI.State do
     draft: "",
     size: @default_size,
     live?: false,
-    agent_ref: nil
+    agent_ref: nil,
+    selection: nil
   ]
 
   @type t :: %__MODULE__{
@@ -100,7 +106,10 @@ defmodule DashFloat.TUI.State do
           size: {pos_integer(), pos_integer()},
           live?: boolean(),
           agent_ref: reference() | nil,
-          confirm: confirm() | nil
+          confirm: confirm() | nil,
+          exit_guard_at: integer() | nil,
+          exit_guard_ref: reference() | nil,
+          selection: Selection.t() | nil
         }
 
   @typedoc """
@@ -284,58 +293,74 @@ defmodule DashFloat.TUI.State do
 
   @doc """
   Routes one key event. Modifiers arrive as `ExRatatui` strings
-  (`["ctrl"]`, `["shift"]`, ...). Returns `{state, action}`.
+  (`["ctrl"]`, `["shift"]`, ...). Returns `{state, action}`. `now` is
+  monotonic milliseconds (injectable so the exit-guard window is testable).
   """
-  @spec handle_key(t(), String.t(), [String.t()]) :: {t(), action()}
-  def handle_key(state, code, modifiers)
+  @spec handle_key(t(), String.t(), [String.t()], integer()) :: {t(), action()}
+  def handle_key(state, code, modifiers, now \\ System.monotonic_time(:millisecond)) do
+    {state, action} = route_key(state, code, modifiers, now)
+    # Any key other than Ctrl+C disarms a pending exit guard — the intent
+    # to exit died with the keystroke that was not "exit again" (issue #28).
+    {disarm_exit_guard(state, code, modifiers), action}
+  end
 
-  # Quit (raw mode turns Ctrl+C into a key event, not SIGINT) — even
-  # mid-decision.
-  def handle_key(state, "c", ["ctrl"]), do: {state, :quit}
-  def handle_key(state, "q", ["ctrl"]), do: {state, :quit}
+  # The double Ctrl+C exit guard (issue #28; ADR 0006 amendment): one press
+  # arms a 2 s window and shows the prompt; a second press inside it quits
+  # through the normal teardown; a late press re-arms. Applies in every
+  # phase, including mid-decision.
+  defp route_key(state, "c", ["ctrl"], now) do
+    if exit_guard_live?(state, now) do
+      {%{state | exit_guard_at: nil}, :quit}
+    else
+      {%{state | exit_guard_at: now}, nil}
+    end
+  end
+
+  # Ctrl+Q stays the immediate, deliberate quit (named in the placeholder).
+  defp route_key(state, "q", ["ctrl"], _now), do: {state, :quit}
 
   # Confirmation mode (a pending confirm from the agent, ADR 0007): Enter
   # approves, Esc rejects, and every other key is swallowed — typing
   # mid-decision must not reach the textarea nor become an accidental
   # approve.
-  def handle_key(%{confirm: pending} = state, "enter", mods)
-      when pending != nil and mods in [[], ["ctrl"]],
-      do: {state, {:confirm, :approved}}
+  defp route_key(%{confirm: pending} = state, "enter", mods, _now)
+       when pending != nil and mods in [[], ["ctrl"]],
+       do: {state, {:confirm, :approved}}
 
-  def handle_key(%{confirm: pending} = state, "esc", _modifiers) when pending != nil,
+  defp route_key(%{confirm: pending} = state, "esc", _modifiers, _now) when pending != nil,
     do: {state, {:confirm, :rejected}}
 
-  def handle_key(%{confirm: pending} = state, _code, _modifiers) when pending != nil,
+  defp route_key(%{confirm: pending} = state, _code, _modifiers, _now) when pending != nil,
     do: {state, nil}
 
   # Enter / Ctrl+Enter submit; Shift+Enter / Alt+Enter insert a newline.
-  def handle_key(state, "enter", mods) when mods in [[], ["ctrl"]], do: submit(state)
-  def handle_key(state, "enter", ["shift"]), do: forward(state, "enter", [])
-  def handle_key(state, "enter", ["alt"]), do: forward(state, "enter", [])
+  defp route_key(state, "enter", mods, _now) when mods in [[], ["ctrl"]], do: submit(state)
+  defp route_key(state, "enter", ["shift"], _now), do: forward(state, "enter", [])
+  defp route_key(state, "enter", ["alt"], _now), do: forward(state, "enter", [])
 
   # Esc interrupts a streaming reply or a running tool (ADR 0005/0007); a
   # no-op otherwise (including the post-decision confirming gap).
-  def handle_key(%{phase: phase} = state, "esc", _modifiers)
-      when phase in [:streaming, :executing_tool],
-      do: {state, :cancel}
+  defp route_key(%{phase: phase} = state, "esc", _modifiers, _now)
+       when phase in [:streaming, :executing_tool],
+       do: {state, :cancel}
 
-  def handle_key(state, "esc", _modifiers), do: {state, nil}
+  defp route_key(state, "esc", _modifiers, _now), do: {state, nil}
 
   # Log scrolling.
-  def handle_key(state, "page_up", _modifiers), do: {page_up(state), nil}
-  def handle_key(state, "page_down", _modifiers), do: {page_down(state), nil}
+  defp route_key(state, "page_up", _modifiers, _now), do: {page_up(state), nil}
+  defp route_key(state, "page_down", _modifiers, _now), do: {page_down(state), nil}
 
   # History-aware Up/Down: history only at the draft's row boundaries.
-  def handle_key(state, "up", _modifiers) do
+  defp route_key(state, "up", _modifiers, _now) do
     if on_first_row?(state), do: {history_prev(state), nil}, else: forward(state, "up", [])
   end
 
-  def handle_key(state, "down", _modifiers) do
+  defp route_key(state, "down", _modifiers, _now) do
     if on_last_row?(state), do: {history_next(state), nil}, else: forward(state, "down", [])
   end
 
   # Everything else (typing, editing, Emacs shortcuts) goes to the textarea.
-  def handle_key(state, code, modifiers) when is_binary(code) and is_list(modifiers),
+  defp route_key(state, code, modifiers, _now) when is_binary(code) and is_list(modifiers),
     do: forward(state, code, modifiers)
 
   defp forward(state, code, modifiers) do
@@ -344,6 +369,38 @@ defmodule DashFloat.TUI.State do
     # live draft (no longer restorable by navigating down).
     {leave_history(state), nil}
   end
+
+  ## Exit guard (issue #28; ADR 0006 amendment)
+
+  defp disarm_exit_guard(state, "c", ["ctrl"]), do: state
+  defp disarm_exit_guard(%{exit_guard_at: nil} = state, _code, _modifiers), do: state
+  defp disarm_exit_guard(state, _code, _modifiers), do: %{state | exit_guard_at: nil}
+
+  @doc "True while the exit-guard window is still live at `now`."
+  @spec exit_guard_live?(t(), integer()) :: boolean()
+  def exit_guard_live?(%__MODULE__{exit_guard_at: at}, now) when is_integer(at),
+    do: now - at <= @exit_window_ms
+
+  def exit_guard_live?(_state, _now), do: false
+
+  @doc """
+  Milliseconds left on the exit-guard window, flooring at 0 when it has
+  logically expired — the delay for the TUI's one-shot expiry timer. Only
+  meaningful while a guard is armed; callers check `exit_guard_at` first
+  (`exit_guard_live?/2` for the window test).
+  """
+  @spec exit_guard_delay(t(), integer()) :: non_neg_integer()
+  def exit_guard_delay(%__MODULE__{exit_guard_at: at}, now) when is_integer(at),
+    do: max(@exit_window_ms - (now - at), 0)
+
+  @doc """
+  True when a transient row sits between log and input: an active phase
+  (ADR 0006) or the armed exit-guard prompt (issue #28). The view's layout
+  and the scroll viewport both read this — one predicate, one height.
+  """
+  @spec overlay?(t()) :: boolean()
+  def overlay?(%__MODULE__{phase: :idle, exit_guard_at: nil}), do: false
+  def overlay?(%__MODULE__{}), do: true
 
   # Only for actual editing keys; history_prev/next call the textarea API
   # directly and must not trip this.
@@ -523,7 +580,10 @@ defmodule DashFloat.TUI.State do
 
   # Finalizing renders the reply once and freezes the cumulative rate; the
   # streaming counters reset for the next turn, the frozen rate and context
-  # accumulator stay visible.
+  # accumulator stay visible. The in-flight block is replaced by the
+  # finalized entry's rows: a selection reaching into the rows that were
+  # live at its anchor loses the content under its highlight and clears —
+  # see clear_selection_over_reply for the boundary rule.
   defp finalize_in_flight(%{in_flight: in_flight} = state, now) when in_flight in [nil, ""] do
     %{
       state
@@ -537,8 +597,26 @@ defmodule DashFloat.TUI.State do
   defp finalize_in_flight(%{in_flight: in_flight} = state, now) do
     state
     |> append_entry(:assistant, in_flight)
+    |> clear_selection_over_reply(state)
     |> Map.merge(%{in_flight: nil, in_flight_lines: nil, in_flight_dirty: false})
     |> Map.put(:stats, frozen(state, now))
+  end
+
+  # The boundary is the gesture's OWN base — the entries' display-row count
+  # snapshotted at the "down" — not a finalize-time recount: rows appended
+  # between the anchor and the finalize (the Esc-cancel contract's system
+  # entry, tokens) shift the live block's position, and recounting would
+  # misjudge selections by the drift (review P1). Rows below the base are
+  # stable under appends and the finalize's replacement; a selection
+  # entirely below it survives. Hand-built selections without a base clear
+  # conservatively.
+  defp clear_selection_over_reply(%{selection: nil} = state, _before), do: state
+
+  defp clear_selection_over_reply(%{selection: selection} = state, _before) do
+    {{_from_row, _fc}, {to_row, _tc}} = Selection.range(selection)
+    base = Map.get(selection, :base_rows, 0)
+
+    if to_row >= base, do: %{state | selection: nil}, else: state
   end
 
   # The turn's banked usage total joins the conversation accumulator exactly
@@ -584,7 +662,10 @@ defmodule DashFloat.TUI.State do
     %{state | entries: state.entries ++ [entry]}
   end
 
-  defp log_width(%__MODULE__{size: {width, _height}}), do: width
+  # The wrap width is the padded content width — the log rect's width, from
+  # the same split that renders it (issue #28; ADR 0006 amendment). Never
+  # the raw frame width.
+  defp log_width(%__MODULE__{size: {width, _height}}), do: View.content_width(width)
 
   ## Animation tick
 
@@ -816,8 +897,192 @@ defmodule DashFloat.TUI.State do
   end
 
   defp log_height(state) do
-    %{log: log} = View.regions(state.size, input_line_count(state), state.phase != :idle)
+    %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
     log.height
+  end
+
+  ## Mouse selection (issue #28; ADR 0006 amendment)
+
+  # A press+release is a click (clears the selection) unless the pointer
+  # crossed rows or the anchor-to-release EXTENT spans at least three
+  # cells — a deliberate 3-cell same-row selection must copy, while the
+  # 1-2 cell wobble of a shaky click must not (review contract).
+  @drag_jitter 2
+  # The OSC 52 payload is capped: base64 inflates 4/3, so this bounds the
+  # escape sequence at ~86 KiB — comfortably inside every mainstream
+  # terminal's OSC 52 limit, while dropping monster selections with a log
+  # line instead of stalling the writer.
+  @copy_cap 64 * 1024
+
+  @doc """
+  Applies a left-button mouse event over the log. `"down"` anchors a
+  selection at the display row/column under the pointer — snapshotting the
+  entries' display-row count as the gesture's base — `"drag"` extends the
+  head, `"up"` finishes: a release within the drag threshold (same row,
+  under a three-cell extent) clears the selection (click-to-clear), a real
+  drag returns `{:copy, text}` — or `{:copy_too_large, bytes}` past the
+  cap, decided by a cap-bounded build — and keeps the highlight until the
+  next click, drag, or width-changing resize. Coordinates outside the log
+  rect clamp to its edges IN SCREEN SPACE before the scroll mapping, so an
+  off-pane pointer selects the edge row of the viewport, never rows beyond
+  it. A gesture that STARTS Shift-modified is a native-selection gesture:
+  the down dismisses any existing app selection and nothing in the gesture
+  can select or copy (Shift mid-gesture merely pauses extension).
+  Selection is content-anchored (absolute display rows), so it survives
+  scrolling and appends.
+  """
+  @spec select_mouse(t(), String.t(), integer(), integer(), [String.t()]) ::
+          {t(), {:copy, String.t()} | {:copy_too_large, pos_integer()} | nil}
+  def select_mouse(%__MODULE__{} = state, kind, x, y, modifiers \\ [])
+      when kind in ["down", "drag", "up"] and is_integer(x) and is_integer(y) and
+             is_list(modifiers) do
+    cond do
+      kind == "down" and "shift" in modifiers ->
+        # Native-selection gesture, latched at its start: the old app
+        # selection goes away and no later plain up can copy from a stale
+        # anchor (review P2b — the bypass must never write).
+        {%{state | selection: nil}, nil}
+
+      "shift" in modifiers ->
+        {state, nil}
+
+      true ->
+        apply_mouse(state, kind, x, y)
+    end
+  end
+
+  defp apply_mouse(state, kind, x, y) do
+    case cell_at(state, x, y) do
+      nil ->
+        {state, nil}
+
+      cell ->
+        case kind do
+          "down" ->
+            base = log_line_count(state) - length(state.in_flight_lines || [])
+            {%{state | selection: %{anchor: cell, head: cell, base_rows: base}}, nil}
+
+          "drag" ->
+            {%{state | selection: extend(state.selection, cell)}, nil}
+
+          "up" ->
+            release(state, cell)
+        end
+    end
+  end
+
+  defp extend(nil, _cell), do: nil
+  defp extend(selection, cell), do: %{selection | head: cell}
+
+  defp release(state, cell) do
+    case state.selection do
+      %{anchor: anchor} when anchor != cell ->
+        if drag?(anchor, cell) do
+          copy(state, cell)
+        else
+          # Jitter, not a drag: treat as a plain click.
+          {%{state | selection: nil}, nil}
+        end
+
+      _collapsed_or_absent ->
+        # Click-to-clear: a press+release on the same cell.
+        {%{state | selection: nil}, nil}
+    end
+  end
+
+  # A real drag crosses rows or spans at least three cells on a row: the
+  # inclusive extent is the column distance plus one, so @drag_jitter = 2
+  # as the minimum distance keeps 1-2 cell wobble a click while a
+  # deliberate 3-cell selection copies (review contract).
+  defp drag?({anchor_row, _ac}, {cell_row, _bc}) when anchor_row != cell_row, do: true
+
+  defp drag?({_anchor_row, ac}, {_cell_row, bc}),
+    do: abs(ac - bc) >= @drag_jitter
+
+  # The copy is BUILT bounded: accumulation stops at the cap, so a monster
+  # span costs at most one cap-sized pass before the decision — the build,
+  # not the write, was the freeze (review P2a).
+  defp copy(state, cell) do
+    selection = %{state.selection | head: cell}
+    {{from_row, _fc}, {to_row, _tc}} = Selection.range(selection)
+    count = selection_row_count(from_row, to_row, log_line_count(state))
+    rows = if count > 0, do: View.display_lines(state, from_row, count), else: []
+
+    case Selection.extract_capped(selection, rows, from_row, @copy_cap) do
+      {:ok, text} ->
+        if String.trim(text) == "" do
+          # A selection of pure blank rows copies nothing — clear it.
+          {%{state | selection: nil}, nil}
+        else
+          {%{state | selection: selection}, {:copy, text}}
+        end
+
+      {:too_large, bytes} ->
+        {%{state | selection: selection}, {:copy_too_large, bytes}}
+    end
+  end
+
+  # The {display_row, column} under pointer (x, y). The pointer clamps
+  # into the log rect in SCREEN space first — a click on the status bar or
+  # a drag into the input pane selects the rect's edge row, content the
+  # user can see under the clamp, never rows beyond the viewport (review
+  # P1) — then maps through the current scroll. nil when the log has no
+  # rows at all.
+  defp cell_at(state, x, y) do
+    count = log_line_count(state)
+    %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
+
+    if count == 0 do
+      nil
+    else
+      width =
+        state.size
+        |> elem(0)
+        |> View.content_width()
+
+      bottom = log.y + max(log.height, 1) - 1
+      screen_row = clamp(y, log.y, bottom)
+      top = effective_scroll(state, log.height) + (screen_row - log.y)
+      row = clamp(top, 0, count - 1)
+      col = clamp(x - log.x, 0, width)
+      {row, col}
+    end
+  end
+
+  defp clamp(n, lo, _hi) when n < lo, do: lo
+  defp clamp(n, _lo, hi) when n > hi, do: hi
+  defp clamp(n, _lo, _hi), do: n
+
+  @doc """
+  The copied text of the current selection: display-faithful rows (edge rows
+  by column range, interior rows verbatim) joined with newlines. `""` when
+  nothing is selected.
+  """
+  @spec selection_text(t()) :: String.t()
+  def selection_text(%__MODULE__{selection: nil}), do: ""
+
+  def selection_text(%__MODULE__{selection: selection} = state) do
+    {{from_row, _fc}, {to_row, _tc}} = Selection.range(selection)
+
+    case selection_row_count(from_row, to_row, log_line_count(state)) do
+      # Nothing selectable: no selection rows survive the clamp (stale
+      # selection over shrunken content).
+      count when count <= 0 ->
+        ""
+
+      count ->
+        rows = View.display_lines(state, from_row, count)
+        Selection.extract(selection, rows, from_row)
+    end
+  end
+
+  # The selection may reference rows the content no longer has (it shrank
+  # after the anchor landed) — clamp to what exists.
+  defp selection_row_count(from_row, to_row, total)
+       when is_integer(from_row) and is_integer(to_row) and is_integer(total) do
+    wanted = to_row - from_row + 1
+    available = total - from_row
+    if wanted <= available, do: wanted, else: available
   end
 
   ## Resize
@@ -844,17 +1109,22 @@ defmodule DashFloat.TUI.State do
         %{state | size: {width, height}}
 
       _old_size ->
+        # Re-wrap at the padded content width — the same width append and
+        # tick wrap at (issue #28), never the raw frame width. A width
+        # change invalidates the display-row geometry a selection indexes,
+        # so it clears (ADR 0006 amendment).
+        wrap_width = View.content_width(width)
+
         %{
           state
           | size: {width, height},
-            entries: Enum.map(state.entries, &rewrap_entry(&1, width)),
-            in_flight_lines: rewrap_in_flight(state, width)
+            entries: Enum.map(state.entries, &rewrap_entry(&1, wrap_width)),
+            in_flight_lines: rewrap_in_flight(state, wrap_width),
+            selection: nil
         }
     end
   end
 
-  # Hand-built entries (tests, older state) may lack :logical; re-wrapping
-  # from their stored lines is the best available truth there.
   defp rewrap_entry(entry, width) do
     logical = Map.get(entry, :logical, entry.lines)
     %{entry | lines: Wrap.wrap(logical, width)}

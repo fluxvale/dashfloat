@@ -8,9 +8,10 @@ defmodule DashFloat.Config.Migration do
   non-empty `settings.json5` is the migration marker, which makes re-runs
   no-ops. The new file is written to a private temp path and renamed into
   place, so a crash can never leave a torn or half-written marker. The legacy
-  file is renamed to a backup, never deleted, both are tightened to 0600
-  (each still holds the credential), and a pre-existing backup is never
-  clobbered. Malformed or incomplete legacy input fails with field names
+  file is renamed to a backup, never deleted; every secrets-bearing file is
+  tightened to 0600 — the legacy file, the backup it becomes, and a
+  pre-existing backup as well (never clobbered, but it may hold an older
+  credential). Malformed or incomplete legacy input fails with field names
   only — nothing is written, no value is ever echoed.
   """
 
@@ -186,24 +187,26 @@ defmodule DashFloat.Config.Migration do
   # The rename is last: until it happens, a crash leaves the new layout
   # partial and the legacy file intact, so a re-run converges. An existing
   # backup is never clobbered — the legacy file then simply stays (inert
-  # once settings.json5 exists). Either way both files are tightened to 0600:
-  # each holds the credential, and secrets are 0600 wherever they live.
+  # once settings.json5 exists). Either way every secrets-bearing file is
+  # tightened to 0600: the legacy file (before the rename, so whichever
+  # name the credential ends up under is already private), the backup it
+  # becomes, and a pre-existing backup too — it plausibly holds an older
+  # credential, and secrets are 0600 wherever they live (ADR 0008).
   defp backup_legacy(legacy) do
     backup =
       legacy
       |> Path.dirname()
       |> Path.join(@backup_file)
 
-    # Tightened before the rename so whichever name the credential ends up
-    # under is already private.
-    tighten(legacy)
+    tighten(legacy, legacy)
 
     if File.exists?(backup) do
+      tighten(backup, backup)
       Logger.warning("#{backup} already exists — leaving the legacy config in place")
     else
       case File.rename(legacy, backup) do
         :ok ->
-          tighten(backup)
+          tighten(backup, backup)
 
         {:error, _reason} ->
           Logger.warning("cannot back up the legacy config — leaving it in place")
@@ -211,9 +214,45 @@ defmodule DashFloat.Config.Migration do
     end
   end
 
-  # Best effort, failures ignored: the file is inert after migration, this
-  # only keeps its secret private.
-  defp tighten(path), do: File.chmod(path, @secret_mode)
+  # Best effort, failures ignored: the target is inert to the loader; this
+  # only keeps its secret private. Only REGULAR files are chmod'd — lstat,
+  # not stat: chmod must never follow a symlink out of the config
+  # directory (ADR 0008), and a non-regular file by a secrets name keeps
+  # its own semantics (0600 on a directory strips the execute bit and
+  # makes it untraversable — review finding). A missing target is a no-op
+  # (the load path calls this unconditionally).
+  defp tighten(path, label) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :symlink}} ->
+        Logger.warning("#{label} is a symlink — not repairing permissions")
+
+      {:ok, %File.Stat{type: :regular, mode: mode}} ->
+        if Bitwise.band(mode, 0o077) != 0 do
+          Logger.warning("#{label} is too permissive — repairing to 0600")
+          File.chmod(path, @secret_mode)
+        end
+
+      {:ok, %File.Stat{type: other}} ->
+        Logger.warning("#{label} is a #{other}, not a regular file — permissions left alone")
+
+      _missing ->
+        :ok
+    end
+  end
+
+  @doc """
+  Best-effort 0600 repair of a leftover legacy backup on the LOAD path
+  (ADR 0008 posture, issue #28): beside an existing `settings.json5` a
+  `config.json.bak` is inert to the loader but still holds a credential —
+  an already-migrated directory never runs the migration that would have
+  tightened it. Only regular files are repaired; symlinks are never
+  chmod'd through.
+  """
+  @spec repair_backup(Path.t()) :: :ok
+  def repair_backup(dir) do
+    tighten(Path.join(dir, @backup_file), @backup_file)
+    :ok
+  end
 
   defp blank_to_nil(value) when is_binary(value) do
     case String.trim_trailing(value) do

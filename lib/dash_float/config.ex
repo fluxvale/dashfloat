@@ -84,9 +84,12 @@ defmodule DashFloat.Config do
 
     # Repair runs BEFORE the parse: a hand-made file is most likely both
     # malformed and too permissive, and the security posture must not depend
-    # on the file also being valid JSON5 (hostile-review finding).
+    # on the file also being valid JSON5 (hostile-review finding). A
+    # leftover legacy backup repairs too — an already-migrated directory
+    # never runs the migration that would have tightened it (issue #28).
     with {:ok, _migration} <- Migration.maybe_migrate(dir),
          :ok <- repair_perms(main_path),
+         :ok <- Migration.repair_backup(dir),
          {:ok, main} <- read_map(main_path) do
       check_version(main)
 

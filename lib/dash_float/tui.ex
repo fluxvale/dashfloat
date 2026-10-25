@@ -8,7 +8,9 @@ defmodule DashFloat.TUI do
   process starts no tasks. The activity tick (ADR 0006) is the one timer this
   process owns — scheduled only while work is in flight.
 
-  Run with `mix run --no-halt`. Quit with Ctrl+Q or Ctrl+C.
+  Run with `mix run --no-halt`. Quit with Ctrl+Q, or a double Ctrl+C: the
+  first press shows a prompt, the second within two seconds exits
+  (issue #28; ADR 0006 amendment).
   """
 
   # No `use ExRatatui.App`: it injects a :transient child_spec that would
@@ -16,11 +18,15 @@ defmodule DashFloat.TUI do
   # back blank (ADR 0002). The behaviour form is documented as equivalent.
   @behaviour ExRatatui.App
 
+  alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
 
+  require Logger
+
   @tick :dashfloat_tick
   @tick_ms 125
+  @exit_guard :dashfloat_exit_guard
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -83,8 +89,24 @@ defmodule DashFloat.TUI do
   def handle_event(%ExRatatui.Event.Mouse{kind: "scroll_down"}, state),
     do: schedule(State.wheel_scroll(state, :down))
 
-  # Every other mouse event (clicks, drags, motion) is inert and renders
-  # nothing: a pointer wandering over an idle UI must not draw frames.
+  # Left-button selection over the log (issue #28; ADR 0006 amendment):
+  # down anchors, drag extends, up copies via OSC 52 — one bounded write on
+  # a user-paced release, live runs only. Shift+left is inert here: Shift
+  # is the terminal's native-selection bypass, and the app must not
+  # select/copy underneath it.
+  def handle_event(
+        %ExRatatui.Event.Mouse{kind: kind, button: "left", x: x, y: y, modifiers: mods},
+        state
+      )
+      when kind in ["down", "drag", "up"] do
+    {state, action} = State.select_mouse(state, kind, x, y, mods)
+    write_clipboard(state, action)
+    schedule(state)
+  end
+
+  # Every other mouse event (motion without a button, other buttons, stray
+  # scroll axes) is inert and renders nothing: a pointer wandering over an
+  # idle UI must not draw frames.
   def handle_event(%ExRatatui.Event.Mouse{}, state),
     do: {:noreply, state, %{render?: false}}
 
@@ -121,6 +143,18 @@ defmodule DashFloat.TUI do
     end
   end
 
+  # The exit-guard expiry (issue #28; ADR 0006 amendment — sanctioned
+  # exception #3): a ONE-SHOT timer armed only by an explicit Ctrl+C. It
+  # clears the transient prompt the moment the window dies — at most one
+  # frame, never a loop; the idle discipline holds everywhere else.
+  def handle_info(@exit_guard, state) do
+    if stale_guard?(state) do
+      {:noreply, state, %{render?: false}}
+    else
+      {:noreply, %{state | exit_guard_at: nil, exit_guard_ref: nil}}
+    end
+  end
+
   def handle_info({:entry, _kind, _text} = msg, state),
     do: schedule(State.stream_message(state, msg))
 
@@ -146,23 +180,63 @@ defmodule DashFloat.TUI do
   defp stale_tick?(%{tick_ref: nil}), do: true
   defp stale_tick?(%{tick_ref: ref}), do: Process.read_timer(ref) != false
 
+  # Same staleness rule for the exit-guard timer: a message from a cancelled
+  # or superseded window's timer must not clear a live one.
+  defp stale_guard?(%{exit_guard_ref: nil}), do: true
+
+  defp stale_guard?(%{exit_guard_ref: ref}), do: Process.read_timer(ref) != false
+
   # The single tick choke point (ADR 0006): any active phase keeps exactly one
-  # timer pending; idle always cancels it. Idle => no timers => no renders.
+  # timer pending; idle always cancels it. Idle => no timers => no renders
+  # (the exit guard's one-shot is the sole, user-armed exception).
   defp schedule(state) do
     state =
-      cond do
-        State.needs_tick?(state) ->
-          %{state | tick_ref: Process.send_after(self(), @tick, @tick_ms)}
-
-        state.phase == :idle and state.tick_ref != nil ->
-          Process.cancel_timer(state.tick_ref)
-          %{state | tick_ref: nil}
-
-        true ->
-          state
-      end
+      state
+      |> schedule_tick()
+      |> schedule_guard(System.monotonic_time(:millisecond))
 
     {:noreply, state}
+  end
+
+  defp schedule_tick(state) do
+    cond do
+      State.needs_tick?(state) ->
+        %{state | tick_ref: Process.send_after(self(), @tick, @tick_ms)}
+
+      state.phase == :idle and state.tick_ref != nil ->
+        Process.cancel_timer(state.tick_ref)
+        %{state | tick_ref: nil}
+
+      true ->
+        state
+    end
+  end
+
+  # Exactly one expiry timer per armed window: disarm cancels a pending
+  # timer, arming schedules one when none is live, a fired-but-undrained
+  # timer (its message still queued) is replaced — the staleness check in
+  # handle_info drops the orphaned message — and a live timer is left
+  # alone, so incidental events never disturb a pending expiry.
+  defp schedule_guard(state, now) do
+    cond do
+      state.exit_guard_at == nil ->
+        if state.exit_guard_ref != nil, do: Process.cancel_timer(state.exit_guard_ref)
+        %{state | exit_guard_ref: nil}
+
+      state.exit_guard_ref == nil ->
+        arm_guard(state, now)
+
+      Process.read_timer(state.exit_guard_ref) == false ->
+        arm_guard(state, now)
+
+      true ->
+        state
+    end
+  end
+
+  defp arm_guard(state, now) do
+    delay = State.exit_guard_delay(state, now)
+    %{state | exit_guard_ref: Process.send_after(self(), @exit_guard, delay)}
   end
 
   @impl ExRatatui.App
@@ -192,6 +266,24 @@ defmodule DashFloat.TUI do
     send(state.agent, {:prompt, self(), prompt})
     state
   end
+
+  # Sanctioned one-write exception (ADR 0006 amendment, issue #28): a
+  # bounded OSC 52 sequence on a user-paced release. IO.binwrite completes
+  # before the post-event frame draws, so bytes never interleave mid-frame;
+  # terminals without OSC 52 ignore it silently. Never in test mode. An
+  # over-cap selection drops with a log line — the highlight stays, the
+  # clipboard write does not happen.
+  defp write_clipboard(%State{live?: true}, {:copy, text}) do
+    IO.binwrite(:standard_io, Selection.osc52(text))
+  end
+
+  defp write_clipboard(_state, {:copy_too_large, bytes}) do
+    Logger.warning(
+      "selection copy dropped: #{bytes} bytes exceeds the clipboard cap — the selection stays highlighted"
+    )
+  end
+
+  defp write_clipboard(_state, _no_copy), do: :ok
 
   defp cancel_agent(state) do
     send(state.agent, {:cancel})

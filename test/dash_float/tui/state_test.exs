@@ -250,14 +250,401 @@ defmodule DashFloat.TUI.StateTest do
   end
 
   describe "handle_key/3 — quit" do
-    test "Ctrl+C and Ctrl+Q quit" do
-      assert {_state, :quit} = State.handle_key(new_state(), "c", ["ctrl"])
+    test "Ctrl+Q quits immediately; Ctrl+C needs a second press (issue #28)" do
       assert {_state, :quit} = State.handle_key(new_state(), "q", ["ctrl"])
+      # One Ctrl+C only arms the guard — see the exit-guard describe block.
+      {armed, nil} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+      assert armed.exit_guard_at == 1_000
     end
 
     test "plain c and q type" do
       state = type(new_state(), "cq")
       assert State.input_text(state) == "cq"
+    end
+  end
+
+  # Issue #28 (ADR 0006 amendment): selection over display rows — anchor,
+  # extend, copy on release; content-anchored so it survives scroll and
+  # append; cleared by width resize and a count-changing finalize.
+  describe "mouse selection" do
+    # Two entries => display rows: 0 blank, 1 "alpha line", 2 blank, 3 "beta line".
+    defp selected_state do
+      new_state()
+      |> State.stream_message({:entry, :system, "alpha line"})
+      |> State.stream_message({:entry, :system, "beta line"})
+    end
+
+    defp drag(state, {x0, y0}, {x1, y1}) do
+      {down, _action} = State.select_mouse(state, "down", x0, y0)
+      {dragged, _action} = State.select_mouse(down, "drag", x1, y1)
+      State.select_mouse(dragged, "up", x1, y1)
+    end
+
+    test "down anchors, drag extends, up copies; click-to-clear" do
+      state = selected_state()
+
+      {anchored, nil} = State.select_mouse(state, "down", 1, 3)
+      assert anchored.selection.anchor == {1, 0}
+      # The gesture snapshots the entries' display-row count as its base —
+      # the finalize boundary (review P1).
+      assert anchored.selection.base_rows == 4
+      assert anchored.selection.head == {1, 0}
+
+      {extended, nil} = State.select_mouse(anchored, "drag", 6, 5)
+      assert extended.selection.head == {3, 5}
+
+      {released, {:copy, text}} = State.select_mouse(extended, "up", 6, 5)
+      assert released.selection != nil
+      # Last row slices through col 5's cell ("beta l" — the pointed cell
+      # is included; review P2a).
+      assert text == "alpha line\n\nbeta l"
+
+      # Press+release without extension clears…
+      {cleared, nil} = State.select_mouse(anchored, "up", 1, 3)
+      assert cleared.selection == nil
+      # …and an empty selection copies nothing (the nil clause's contract).
+      assert State.selection_text(cleared) == ""
+    end
+
+    test "an empty log selects nothing" do
+      {state, action} = State.select_mouse(new_state(), "down", 1, 3)
+      assert state.selection == nil
+      assert action == nil
+    end
+
+    test "coordinates clamp into the log rect (status bar and input box)" do
+      state = selected_state()
+
+      # Above the log (the status row): clamps to display row 0, col 0.
+      {above, nil} = State.select_mouse(state, "down", 0, 0)
+      assert above.selection.anchor == {0, 0}
+
+      # Below the log (over the input box): clamps to the last row, and the
+      # column clamps to the padded width (one past the last column).
+      {below, nil} = State.select_mouse(selected_state(), "down", 999, 23)
+      assert below.selection.anchor == {3, 78}
+    end
+
+    test "a blank-only selection copies nothing and clears" do
+      # An empty entry renders as blank separator + empty line: rows 0-1.
+      state = State.stream_message(new_state(), {:entry, :system, ""})
+
+      {anchored, nil} = State.select_mouse(state, "down", 1, 2)
+      {released, action} = State.select_mouse(anchored, "up", 1, 3)
+
+      assert action == nil
+      assert released.selection == nil
+    end
+
+    test "the selection survives the wheel and page keys (content-anchored)" do
+      state =
+        Enum.reduce(1..50, selected_state(), fn i, acc ->
+          State.stream_message(acc, {:entry, :system, "filler #{i}"})
+        end)
+
+      {anchored, nil} = State.select_mouse(state, "down", 1, 3)
+      {dragged, nil} = State.select_mouse(anchored, "drag", 6, 5)
+      {copied, {:copy, text}} = State.select_mouse(dragged, "up", 6, 5)
+      assert text != ""
+
+      # Wheel up unfollows; the selection stays anchored to the content.
+      wheeled = State.wheel_scroll(copied, :up)
+      refute wheeled.follow?
+      assert wheeled.selection != nil
+      assert State.selection_text(wheeled) == text
+
+      {paged, nil} = State.handle_key(wheeled, "page_up", [])
+      assert paged.selection != nil
+      assert State.selection_text(paged) == text
+    end
+
+    test "coordinates clamp into the log rect in screen space (review P1)" do
+      # A tall, scrolled-up log: the viewport shows rows far from either
+      # content end, so an off-pane pointer must land on the viewport's
+      # edge row — never on invisible rows beyond it.
+      state =
+        Enum.reduce(1..50, selected_state(), fn i, acc ->
+          State.stream_message(acc, {:entry, :system, "filler #{i}"})
+        end)
+
+      scrolled = State.wheel_scroll(state, :up)
+      refute scrolled.follow?
+      top = State.effective_scroll(scrolled, 18)
+      assert top > 0
+
+      # Click on the status bar (screen row 0): anchors the viewport's
+      # first visible display row, not `top - 2` above the viewport.
+      {above, _nil} = State.select_mouse(scrolled, "down", 1, 0)
+      assert above.selection.anchor == {top, 0}
+
+      # Drag into the input pane (screen row 23): the viewport's last
+      # visible row (18-row idle viewport: rows top..top + 17).
+      {below, _nil} = State.select_mouse(scrolled, "down", 1, 23)
+      assert below.selection.anchor == {top + 17, 0}
+    end
+
+    test "click jitter below the drag threshold clears instead of copying" do
+      # Review contract: a deliberate 3-cell same-row selection MUST copy;
+      # a ≤2-cell wobble MUST NOT. The extent is inclusive (distance + 1).
+      state = selected_state()
+
+      # Same cell (1-cell extent): a plain click.
+      {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
+      {same, action} = State.select_mouse(anchored, "up", 1, 3)
+      assert action == nil
+      assert same.selection == nil
+
+      # Adjacent cell (2-cell extent): still wobble.
+      {anchored2, _nil} = State.select_mouse(state, "down", 1, 3)
+      {wobbled, action2} = State.select_mouse(anchored2, "up", 2, 3)
+      assert action2 == nil
+      assert wobbled.selection == nil
+
+      # Two cells away (3-cell extent): a deliberate selection — copies.
+      {anchored3, _nil} = State.select_mouse(state, "down", 1, 3)
+      {dragged3, {:copy, text}} = State.select_mouse(anchored3, "up", 3, 3)
+      assert dragged3.selection != nil
+      assert text == "alp"
+    end
+
+    test "shift-modified events are inert — native selection owns them" do
+      # Review P2d: Shift+drag is the terminal's bypass; the app must not
+      # select or copy underneath it.
+      state = selected_state()
+
+      for kind <- ["down", "drag", "up"] do
+        {^state, nil} = State.select_mouse(state, kind, 1, 3, ["shift"])
+      end
+    end
+
+    test "a gesture that starts shifted can never copy (latched at its down)" do
+      # Review P2b (delta): releasing Shift before the button used to leak
+      # a clipboard write from the stale anchor of an EARLIER selection.
+      # The shifted down dismisses the old selection, so the later plain
+      # up has nothing to copy from.
+      state = selected_state()
+
+      # An existing selection from a previous gesture…
+      {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
+      {dragged, _nil} = State.select_mouse(anchored, "drag", 6, 5)
+      {kept, {:copy, _text}} = State.select_mouse(dragged, "up", 6, 5)
+      assert kept.selection != nil
+
+      # …a native-selection gesture starts (shift+down): the old highlight
+      # goes away…
+      {native, nil} = State.select_mouse(kept, "down", 1, 3, ["shift"])
+      assert native.selection == nil
+
+      # …Shift is released, and the plain up at a distant cell still
+      # cannot copy from the stale anchor.
+      {leaked, action} = State.select_mouse(native, "up", 6, 5)
+      assert action == nil
+      assert leaked.selection == nil
+    end
+
+    test "shift mid-gesture only pauses extension; a plain-start gesture copies" do
+      state = selected_state()
+
+      {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
+      {paused, _nil} = State.select_mouse(anchored, "drag", 6, 5, ["shift"])
+      {resumed, {:copy, _text}} = State.select_mouse(paused, "up", 6, 5)
+      assert resumed.selection != nil
+    end
+
+    test "an over-cap selection reports its size instead of copying" do
+      # Review P2d: the OSC 52 payload is bounded — a monster selection
+      # drops with a log line at the TUI layer, and its bytes are reported.
+      # The real full-log flow: anchor near the bottom, wheel up while the
+      # button is held (the selection is content-anchored and survives
+      # scrolling), extend, release — this is how a full-log selection is
+      # actually made.
+      huge = String.duplicate("word ", 20_000)
+
+      state = State.stream_message(new_state(), {:entry, :system, huge})
+
+      {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
+
+      # 400 notches = 1200 rows above the anchor: a genuine full-log span.
+      scrolled =
+        Enum.reduce(1..400, anchored, fn _i, acc -> State.wheel_scroll(acc, :up) end)
+
+      {dragged, _nil} = State.select_mouse(scrolled, "drag", 1, 3)
+      {selected, action} = State.select_mouse(dragged, "up", 1, 3)
+
+      assert {:copy_too_large, bytes} = action
+
+      # The build stopped AT the cap: the reported bytes are the
+      # accumulated lower bound, not the full span's size (which never
+      # materialises — that was the freeze).
+      assert bytes > 64 * 1024
+      text = State.selection_text(selected)
+      assert byte_size(text) > bytes
+
+      # The highlight stays — the user sees what was too big to copy.
+      assert selected.selection != nil
+    end
+
+    test "the Esc-cancel contract: a selection into the reply clears despite appended rows" do
+      # Review P1 (delta): the reply boundary must come from the gesture's
+      # own base, not a finalize-time recount — the cancel contract's
+      # system entry lands between the anchor and the idle, shifting the
+      # live block 2 rows and drifting any recount.
+      opened = new_state(test_mode: {20, 24})
+
+      streaming =
+        opened
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "one two three"}, 1_000)
+
+      {ticked, :cont} = State.tick(streaming, 1_100)
+
+      # Select into the live reply (rows 0-1; the base is 0 — no entries).
+      {anchored, _nil} = State.select_mouse(ticked, "down", 1, 2)
+      {dragged, _nil} = State.select_mouse(anchored, "drag", 10, 3)
+      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 10, 3)
+      assert selected.selection.base_rows == 0
+
+      cancelled =
+        selected
+        |> State.stream_message({:entry, :system, "[cancelled]"})
+        |> State.stream_message({:phase, :idle}, 1_200)
+
+      assert cancelled.selection == nil
+    end
+
+    test "a selection referencing rows beyond the content copies nothing" do
+      # Every current shrink path (width resize, count-changing finalize)
+      # clears the selection first, so a stale selection this far out of
+      # range cannot arise from an interaction today — but selection_text
+      # is total: Phase 4's log trimming will be able to shrink the log
+      # under one, and the clamp guard decides that day's answer now —
+      # copy nothing, never crash, never wrap around.
+      stale = %{selected_state() | selection: %{anchor: {500, 0}, head: {900, 0}}}
+      assert State.selection_text(stale) == ""
+    end
+
+    test "a width-changing resize clears; a height-only resize keeps" do
+      {state, {:copy, _text}} = drag(selected_state(), {1, 3}, {6, 5})
+
+      narrowed = State.resize(state, 40, 24)
+      assert narrowed.selection == nil
+
+      {again, {:copy, _text}} = drag(selected_state(), {1, 3}, {6, 5})
+      taller = State.resize(again, 80, 40)
+      assert taller.selection != nil
+    end
+
+    test "a selection reaching into the reply clears at finalize; one above survives" do
+      # Review P1: the live in-flight rows can be STALE (tokens arrived
+      # after the last tick) and equal in count while differing in
+      # content, so row counts cannot decide — the guard is positional.
+      # Display rows: 0 blank, 1 "warm", then the reply's rows from 2.
+      warm = new_state(test_mode: {20, 24})
+
+      base = State.stream_message(warm, {:entry, :system, "warm"})
+
+      streaming =
+        base
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "one two three"}, 1_000)
+
+      {ticked, :cont} = State.tick(streaming, 1_100)
+
+      dirty = State.stream_message(ticked, {:token, " four"}, 1_200)
+      assert dirty.in_flight_dirty
+
+      # Above the reply (row 1): a real drag within "warm" that survives
+      # the finalize untouched.
+      {anchored, _no_copy} = State.select_mouse(dirty, "down", 1, 3)
+      {dragged, _no_copy} = State.select_mouse(anchored, "drag", 4, 3)
+      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 4, 3)
+
+      finalized = State.stream_message(selected, {:phase, :idle}, 1_300)
+      assert finalized.selection != nil
+
+      # The P1 shape, pinned: the stale live rows and the final entry rows
+      # are EQUAL in count while differing in content ("one two three" →
+      # "one two three four" — both fit one padded row).
+      reply = Enum.find(finalized.entries, &(&1.kind == :assistant))
+      assert length(dirty.in_flight_lines) == length(reply.lines)
+      assert reply.text == "one two three four"
+
+      # Reaching into the reply (row 2, the reply's blank separator row)
+      # clears even at that equal count.
+      {into, _no_copy} = State.select_mouse(dirty, "down", 1, 4)
+      {into_drag, _no_copy} = State.select_mouse(into, "drag", 6, 5)
+      {into_selected, {:copy, _reply_text}} = State.select_mouse(into_drag, "up", 6, 5)
+      assert into_selected.selection != nil
+
+      replaced = State.stream_message(into_selected, {:phase, :idle}, 1_400)
+      assert replaced.selection == nil
+    end
+  end
+
+  # Issue #28 (ADR 0006 amendment): one accidental Ctrl+C must not kill a
+  # live session. First press arms a 2 s window + prompt; a second press
+  # inside quits; expiry resets; any other key disarms.
+  describe "exit guard" do
+    test "a single Ctrl+C arms the window and does not quit" do
+      {armed, action} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+
+      assert action == nil
+      assert armed.exit_guard_at == 1_000
+      assert State.exit_guard_live?(armed, 1_000)
+      assert State.exit_guard_delay(armed, 1_000) == 2_000
+      # The delay floors at zero once the window has logically expired —
+      # the timer fires immediately to clear a stale prompt.
+      assert State.exit_guard_delay(armed, 1_000 + 3_000) == 0
+    end
+
+    test "a second Ctrl+C inside the window quits through the normal path" do
+      {armed, nil} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+      {cleared, action} = State.handle_key(armed, "c", ["ctrl"], 2_999)
+
+      assert action == :quit
+      assert cleared.exit_guard_at == nil
+    end
+
+    test "the window boundary is inclusive at 2 s" do
+      {armed, nil} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+      assert {_state, :quit} = State.handle_key(armed, "c", ["ctrl"], 3_000)
+    end
+
+    test "an expired window resets: a late press re-arms instead of quitting" do
+      {armed, nil} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+      refute State.exit_guard_live?(armed, 1_000 + 2_001)
+
+      {rearmed, action} = State.handle_key(armed, "c", ["ctrl"], 1_000 + 2_001)
+
+      assert action == nil
+      assert rearmed.exit_guard_at == 3_001
+
+      # The fresh window is live and completes a quit of its own.
+      {_state, :quit} = State.handle_key(rearmed, "c", ["ctrl"], 3_001 + 1_999)
+    end
+
+    test "any other key disarms the guard" do
+      {armed, nil} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+
+      {typed, nil} = State.handle_key(armed, "x", [], 1_100)
+      assert typed.exit_guard_at == nil
+
+      # A follow-up Ctrl+C inside the original window re-arms, not quits.
+      {rearmed, action} = State.handle_key(typed, "c", ["ctrl"], 1_200)
+      assert action == nil
+      assert rearmed.exit_guard_at == 1_200
+    end
+
+    test "Esc disarms too — it never becomes an exit key" do
+      {armed, nil} = State.handle_key(new_state(), "c", ["ctrl"], 1_000)
+      {escaped, nil} = State.handle_key(armed, "esc", [], 1_100)
+      assert escaped.exit_guard_at == nil
+    end
+
+    test "overlay? is true for an active phase or an armed guard, else false" do
+      refute State.overlay?(new_state())
+      assert State.overlay?(%{new_state() | phase: :streaming})
+      assert State.overlay?(%{new_state() | exit_guard_at: 1_000})
     end
   end
 
@@ -340,7 +727,9 @@ defmodule DashFloat.TUI.StateTest do
     test "quit keys still quit mid-decision" do
       {state, _ref} = confirming()
       assert {_state, :quit} = State.handle_key(state, "q", ["ctrl"])
-      assert {_state, :quit} = State.handle_key(state, "c", ["ctrl"])
+      # Ctrl+C mid-decision follows the guard like anywhere else: arm, quit.
+      {armed, nil} = State.handle_key(state, "c", ["ctrl"], 1_000)
+      assert {_state, :quit} = State.handle_key(armed, "c", ["ctrl"], 1_500)
     end
 
     test "every other key is swallowed — nothing reaches the textarea" do
@@ -861,8 +1250,9 @@ defmodule DashFloat.TUI.StateTest do
       final = State.stream_message(over, {:phase, :idle}, 1_300)
       [entry] = final.entries
       assert entry.text == over_cap
-      # blank separator + 64 KiB + 1 of x's at 80 columns = 820 display rows
-      assert length(entry.lines) == 1 + div(64 * 1024, 80) + 1
+      # blank separator + 64 KiB + 1 of x's at 78 columns (the padded width)
+      # = 841 display rows
+      assert length(entry.lines) == 1 + div(64 * 1024, 78) + 1
     end
 
     test "needs_tick?/1 is true only while active and unscheduled" do
@@ -913,12 +1303,14 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up on a viewport-sized log is a no-op (stays pinned)" do
-      base = full_state(10)
-      assert State.log_line_count(base) == 20
+      # The real idle viewport at 80x24 is 18 rows with the margin (issue #28);
+      # 9 entries = blank + line each = exactly one viewport.
+      base = full_state(9)
+      assert State.log_line_count(base) == 18
 
       {paged, nil} = State.handle_key(base, "page_up", [])
       assert paged.follow?
-      assert State.effective_scroll(paged, 20) == 0
+      assert State.effective_scroll(paged, 18) == 0
     end
 
     test "submit re-pins the log so the new reply is visible" do
@@ -940,45 +1332,46 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up unfollows and pages back; page_down re-pins at the bottom" do
+      # 200 lines, 18-row viewport (the padded 80x24 layout) → bottom 182.
       base = full_state(100)
       {up_one, nil} = State.handle_key(base, "page_up", [])
       refute up_one.follow?
-      assert State.effective_scroll(up_one, 20) == 160
+      assert State.effective_scroll(up_one, 18) == 164
 
       {up_two, nil} = State.handle_key(up_one, "page_up", [])
-      assert State.effective_scroll(up_two, 20) == 140
+      assert State.effective_scroll(up_two, 18) == 146
 
       {down_one, nil} = State.handle_key(up_two, "page_down", [])
-      assert State.effective_scroll(down_one, 20) == 160
+      assert State.effective_scroll(down_one, 18) == 164
 
       {down_two, nil} = State.handle_key(down_one, "page_down", [])
       assert down_two.follow?
-      assert State.effective_scroll(down_two, 20) == 180
+      assert State.effective_scroll(down_two, 18) == 182
     end
 
     test "wheel_scroll: one notch is three lines; up unfollows, down re-pins at the bottom" do
       base = full_state(100)
-      assert State.effective_scroll(base, 20) == 180
+      assert State.effective_scroll(base, 18) == 182
 
       wheeled = State.wheel_scroll(base, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 20) == 177
+      assert State.effective_scroll(wheeled, 18) == 179
 
       again = State.wheel_scroll(wheeled, :up)
-      assert State.effective_scroll(again, 20) == 174
+      assert State.effective_scroll(again, 18) == 176
 
       down = State.wheel_scroll(again, :down)
       refute down.follow?
-      assert State.effective_scroll(down, 20) == 177
+      assert State.effective_scroll(down, 18) == 179
 
       pinned = State.wheel_scroll(down, :down)
       assert pinned.follow?
-      assert State.effective_scroll(pinned, 20) == 180
+      assert State.effective_scroll(pinned, 18) == 182
     end
 
     test "wheel up on a viewport-sized log is a no-op (stays pinned)" do
-      base = full_state(10)
-      assert State.log_line_count(base) == 20
+      base = full_state(9)
+      assert State.log_line_count(base) == 18
       assert State.wheel_scroll(base, :up) == base
     end
 
@@ -993,11 +1386,11 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.phase == :confirming
 
-      # The activity row is up while confirming: the log viewport is 19 rows.
-      bottom = State.effective_scroll(state, 19)
+      # The activity row is up while confirming: the viewport is 17 rows.
+      bottom = State.effective_scroll(state, 17)
       wheeled = State.wheel_scroll(state, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 19) == bottom - 3
+      assert State.effective_scroll(wheeled, 17) == bottom - 3
     end
 
     test "new content does not move an unfollowed view, but clamping still holds" do
@@ -1189,20 +1582,14 @@ defmodule DashFloat.TUI.StateTest do
       assert entry.text == text
 
       # One logical line becomes wrapped display rows, blank separator first;
-      # the pieces still carry the whole text.
+      # every word survives the wrap (spaces at break points are dropped by
+      # design — comparing word sequences, not raw concatenation).
       pieces = Enum.map(entry.lines, &flatten/1)
       assert hd(pieces) == ""
 
-      joined =
-        pieces
-        |> Enum.join("")
-        |> String.trim()
-
-      assert joined == text
-
-      pieces
-      |> tl()
-      |> Enum.all?(&(&1 == "" or String.length(&1) <= 20))
+      assert_words_survive(pieces, text)
+      tail = tl(pieces)
+      assert Enum.all?(tail, &(&1 == "" or String.length(&1) <= 18))
     end
 
     test "re-wrapping is exact in both directions" do
@@ -1243,8 +1630,7 @@ defmodule DashFloat.TUI.StateTest do
 
       refute narrow.in_flight_lines == state.in_flight_lines
       assert State.log_line_count(narrow) > State.log_line_count(state)
-      joined = Enum.map_join(narrow.in_flight_lines, &flatten/1)
-      assert String.trim(joined) == text
+      assert_words_survive(Enum.map(narrow.in_flight_lines, &flatten/1), text)
     end
 
     test "an above-cap in-flight reply clears its live view across a width change" do
@@ -1357,6 +1743,13 @@ defmodule DashFloat.TUI.StateTest do
   end
 
   defp flatten(%ExRatatui.Text.Line{spans: spans}), do: Enum.map_join(spans, "", & &1.content)
+
+  # Wrap drops whitespace at break points, so concatenation is width-luck;
+  # word sequences are the honest no-loss assertion.
+  defp assert_words_survive(pieces, text) do
+    joined = Enum.join(pieces, " ")
+    assert String.split(joined) == String.split(text)
+  end
 
   # Runs one animation tick (rendering dirty in-flight lines), keeping state.
   defp tick_once(state), do: elem(State.tick(state, 1_100), 0)

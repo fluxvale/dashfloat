@@ -78,6 +78,9 @@ defmodule DashFloat.Config.MigrationTest do
     legacy_contents = Jason.encode!(full_legacy())
     legacy = Path.join(dir, "config.json")
     File.write!(legacy, legacy_contents)
+    # A world-readable legacy file (the v1 default shape) so the assertion
+    # is umask-independent.
+    File.chmod!(legacy, 0o644)
 
     assert {:ok, :migrated} = @migration.maybe_migrate(dir)
     %{main: main, backup: backup} = paths(dir)
@@ -90,12 +93,14 @@ defmodule DashFloat.Config.MigrationTest do
 
   test "the backup is tightened to 0600 and no temp debris is left behind" do
     dir = write_legacy!(tmp_dir(), full_legacy())
+    # 0644 on disk — exactly the rider's live-smoke finding (issue #28):
+    # the backup still holds the credential, so it lands 0600.
+    legacy = Path.join(dir, "config.json")
+    File.chmod!(legacy, 0o644)
 
     assert {:ok, :migrated} = @migration.maybe_migrate(dir)
     %{backup: backup} = paths(dir)
 
-    # The backup still holds the credential — it is 0600 too (hostile-review
-    # finding), and the tmp+rename write leaves nothing behind.
     assert {:ok, %File.Stat{mode: backup_mode}} = File.stat(backup)
     assert Bitwise.band(backup_mode, 0o777) == 0o600
 
@@ -321,7 +326,12 @@ defmodule DashFloat.Config.MigrationTest do
     legacy = Path.join(dir, "config.json")
     File.write!(legacy, Jason.encode!(full_legacy()))
     backup = Path.join(dir, "config.json.bak")
-    File.write!(backup, ~s({"base_url": "https://older.example"}))
+    File.write!(backup, ~s({"base_url": "https://older.example", "api_key": "PLACEHOLDER-old"}))
+
+    # The older backup may itself carry a credential (issue #28 rider): it
+    # is left content-intact but tightened to 0600 like every other
+    # secrets-bearing file.
+    File.chmod!(backup, 0o644)
 
     logs =
       capture_log(fn ->
@@ -330,6 +340,8 @@ defmodule DashFloat.Config.MigrationTest do
 
     assert logs =~ "already exists"
     assert File.read!(backup) =~ "older.example"
+    assert {:ok, %File.Stat{mode: backup_mode}} = File.stat(backup)
+    assert Bitwise.band(backup_mode, 0o777) == 0o600
     # The legacy file was NOT renamed over the user's backup…
     assert File.exists?(legacy)
     # …but it still holds the credential, so it is tightened to 0600.
@@ -338,5 +350,63 @@ defmodule DashFloat.Config.MigrationTest do
     # …and the layout is complete and loadable regardless.
     %{main: main} = paths(dir)
     assert File.exists?(main)
+  end
+
+  # Review probe: chmod must never follow a symlink out of the config
+  # directory (ADR 0008's rule, applied to the migration's tightening too).
+  test "a symlinked legacy config is migrated but its target is never chmod'd" do
+    dir = tmp_dir()
+
+    target = Path.join(dir, "real-legacy.json")
+    File.write!(target, Jason.encode!(full_legacy()))
+    File.chmod!(target, 0o644)
+    File.ln_s!(target, Path.join(dir, "config.json"))
+
+    logs =
+      capture_log(fn ->
+        assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+      end)
+
+    # The migration read through the link, wrote settings.json5 0600, and
+    # renamed the LINK to the backup — the target's mode is untouched.
+    assert logs =~ "symlink"
+    assert {:ok, %File.Stat{mode: mode}} = File.stat(target)
+    assert Bitwise.band(mode, 0o777) == 0o644
+
+    %{main: main, backup: backup} = paths(dir)
+    assert File.exists?(main)
+    assert File.exists?(backup)
+    assert File.lstat!(backup).type == :symlink
+
+    assert {:ok, %File.Stat{mode: main_mode}} = File.stat(main)
+    assert Bitwise.band(main_mode, 0o777) == 0o600
+  end
+
+  # Review finding: only REGULAR files are tightened. A directory named
+  # config.json.bak keeps its own semantics — chmod 0600 would strip its
+  # execute bit and make it untraversable.
+  test "a non-regular backup is warned about and left alone" do
+    dir = tmp_dir()
+    legacy = Path.join(dir, "config.json")
+    File.write!(legacy, Jason.encode!(full_legacy()))
+    backup = Path.join(dir, "config.json.bak")
+    File.mkdir(backup)
+    File.chmod!(backup, 0o700)
+
+    logs =
+      capture_log(fn ->
+        assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+      end)
+
+    assert logs =~ "not a regular file"
+
+    # The directory kept its traverse bit and its contents.
+    assert {:ok, %File.Stat{type: :directory, mode: mode}} = File.lstat(backup)
+    assert Bitwise.band(mode, 0o777) == 0o700
+  end
+
+  test "repair_backup/1 covers the missing case silently" do
+    empty = tmp_dir()
+    assert @migration.repair_backup(empty) == :ok
   end
 end
