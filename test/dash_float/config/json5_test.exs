@@ -74,4 +74,105 @@ defmodule DashFloat.Config.JSON5Test do
   test "values with one quote kind parse fine raw (the other style delimits)" do
     assert JSON5.decode(~s({ a: "k'x", b: 'y"z' })) == {:ok, %{"a" => "k'x", "b" => "y\"z"}}
   end
+
+  ## Rendering (the general renderer both migrations rewrite through)
+
+  test "read_map decodes an object file; missing is empty; errors name the path" do
+    dir = Path.join("/tmp/opencode", "json5-read-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    file = Path.join(dir, "keys.json5")
+    File.write!(file, "{'work':'PLACEHOLDER-1',}")
+
+    assert JSON5.read_map(file) == {:ok, %{"work" => "PLACEHOLDER-1"}}
+
+    missing_path = Path.join(dir, "absent.json5")
+    assert JSON5.read_map(missing_path) == {:ok, %{}}
+
+    File.write!(file, "{ broken")
+    assert JSON5.read_map(file) == {:error, "invalid JSON5 in #{file}"}
+
+    File.write!(file, "[1]")
+    assert JSON5.read_map(file) == {:error, "invalid JSON5 in #{file}: expected an object"}
+  end
+
+  test "render pretty-prints sorted keys, bare identifier keys, and trailing commas" do
+    assert {:ok, "{}"} = JSON5.render(%{})
+
+    assert {:ok, text} =
+             JSON5.render(%{
+               "b" => [],
+               "a" => %{},
+               "configVersion" => 2,
+               "x" => nil,
+               "o" => false
+             })
+
+    assert text == "{\n  a: {},\n  b: [],\n  configVersion: 2,\n  o: false,\n  x: null,\n}"
+  end
+
+  test "render round-trips a decoded profile-shaped document" do
+    original = %{
+      "configVersion" => 2,
+      "yourName" => "terry-placeholder",
+      "profiles" => [
+        %{
+          "name" => "work",
+          "baseUrl" => "https://provider.example/v1",
+          "settings" => %{"defaultModel" => "Flash"},
+          "models" => [
+            %{"nickname" => "Sol", "model" => "glm-5.3", "context" => 524_288, "type" => true},
+            %{"nickname" => "Flash", "model" => "glm-5.3-flash", "ratio" => 1.5}
+          ]
+        }
+      ]
+    }
+
+    assert {:ok, text} = JSON5.render(original)
+    assert JSON5.decode(text) == {:ok, original}
+
+    # Hand-editing is the primary workflow: the shape is familiar JSON5.
+    assert text =~ "configVersion: 2,"
+    assert text =~ "settings: {"
+    assert text =~ "'glm-5.3',"
+  end
+
+  test "render double-quotes values holding a single quote" do
+    assert {:ok, "{\n  k: \"it's\",\n}"} = JSON5.render(%{"k" => "it's"})
+  end
+
+  test "render quotes keys that are not bare identifiers" do
+    assert {:ok, text} = JSON5.render(%{"my key" => 1, "9lives" => 2})
+    assert text == "{\n  '9lives': 2,\n  'my key': 1,\n}"
+    assert {:ok, %{"my key" => 1, "9lives" => 2}} = JSON5.decode(text)
+  end
+
+  test "render quotes the parser's reserved words — a bare default: key is unreadable" do
+    # Verified against the dep: the Combine backend rejects bare ECMA
+    # reserved words as keys, and the legacy migration writes "default" as a
+    # keys.json5 key. Quoting is always legal.
+    assert JSON5.decode("{ default: 1 }") == {:error, "invalid JSON5"}
+
+    assert {:ok, text} = JSON5.render(%{"default" => "PLACEHOLDER-legacy-key"})
+    assert text == "{\n  'default': 'PLACEHOLDER-legacy-key',\n}"
+    assert {:ok, %{"default" => "PLACEHOLDER-legacy-key"}} = JSON5.decode(text)
+  end
+
+  test "render fails naming the value's path, never its content" do
+    assert {:error, "yourName"} = JSON5.render(%{"yourName" => "back\\slash"})
+
+    assert {:error, "profiles[0].apiKey"} =
+             JSON5.render(%{"profiles" => [%{"apiKey" => "both'kinds\""}]})
+
+    assert {:error, ~s(["bad\\key"])} = JSON5.render(%{"bad\\key" => 1})
+
+    assert {:error, "profiles[1].models[0].modalities[0]"} =
+             JSON5.render(%{
+               "profiles" => [
+                 %{"name" => "a"},
+                 %{"models" => [%{"modalities" => ["no'pe\"yes"]}]}
+               ]
+             })
+  end
 end
