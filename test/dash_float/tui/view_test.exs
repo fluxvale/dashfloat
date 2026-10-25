@@ -591,8 +591,8 @@ defmodule DashFloat.TUI.ViewTest do
     # the padded width consistently. No truncation at the pane edge.
     test "padded wrap width holds at odd and narrow frame widths" do
       for {frame_w, expected} <- [{19, 17}, {20, 18}, {61, 59}, {81, 79}] do
-        state =
-          State.stream_message(new_state(test_mode: {frame_w, 24}), {:entry, :system, fox_text()})
+        base = new_state(test_mode: {frame_w, 24})
+        state = State.stream_message(base, {:entry, :system, fox_text()})
 
         assert_entry_width(state, expected)
 
@@ -610,19 +610,24 @@ defmodule DashFloat.TUI.ViewTest do
         # width wider than the rect, the Paragraph would clip each row's
         # tail and the buffer would come up short of Z's. (Z appears nowhere
         # else in the chrome — "w" collides with "brown"/"newline".)
+        run_base = new_state(test_mode: {frame_w, 24})
+
         run =
-          new_state(test_mode: {frame_w, 24})
-          |> State.stream_message({:entry, :system, String.duplicate("Z", expected * 3)})
+          State.stream_message(run_base, {:entry, :system, String.duplicate("Z", expected * 3)})
 
         assert_entry_width(run, expected)
 
-        term = ExRatatui.init_test_terminal(frame_w, 24)
-        widgets = View.render(run, %ExRatatui.Frame{width: frame_w, height: 24})
-        assert :ok = ExRatatui.draw(term, widgets)
+        zterm = ExRatatui.init_test_terminal(frame_w, 24)
+        zwidgets = View.render(run, %ExRatatui.Frame{width: frame_w, height: 24})
+        assert :ok = ExRatatui.draw(zterm, zwidgets)
 
-        buffer = ExRatatui.get_buffer_content(term)
+        zbuffer = ExRatatui.get_buffer_content(zterm)
 
-        z_count = buffer |> String.graphemes() |> Enum.count(&(&1 == "Z"))
+        z_count =
+          zbuffer
+          |> String.graphemes()
+          |> Enum.count(&(&1 == "Z"))
+
         assert z_count == expected * 3, "width #{frame_w}: lost graphemes to clipping"
       end
     end

@@ -13,7 +13,9 @@ defmodule DashFloat.TUI.SelectionTest do
   alias ExRatatui.Text.Span
 
   defp line(texts) when is_list(texts) do
-    Line.new(Enum.map(texts, &Span.new(&1)))
+    texts
+    |> Enum.map(&Span.new(&1))
+    |> Line.new()
   end
 
   defp plain(%Line{} = line), do: Enum.map_join(line.spans, "", & &1.content)
@@ -54,17 +56,17 @@ defmodule DashFloat.TUI.SelectionTest do
 
   describe "slice_text/2" do
     test "slices plain text by half-open column range" do
-      assert Selection.slice_text(line(["hello world"]), {0, 5}) == "hello"
-      assert Selection.slice_text(line(["hello world"]), {6, 11}) == "world"
-      assert Selection.slice_text(line(["hello world"]), {3, 3}) == ""
+      assert slice(["hello world"], {0, 5}) == "hello"
+      assert slice(["hello world"], {6, 11}) == "world"
+      assert slice(["hello world"], {3, 3}) == ""
     end
 
     test "whole row with nil to-column, trailing blanks trimmed" do
-      assert Selection.slice_text(line(["row text   "]), nil) == "row text"
+      assert slice(["row text   "], nil) == "row text"
     end
 
     test "slices across span boundaries" do
-      assert Selection.slice_text(line(["abc", "def", "ghi"]), {2, 5}) == "cde"
+      assert slice(["abc", "def", "ghi"], {2, 5}) == "cde"
     end
 
     # "漢字xy": 漢 occupies columns 0-1, 字 2-3, x 4, y 5. A cluster belongs
@@ -109,7 +111,12 @@ defmodule DashFloat.TUI.SelectionTest do
 
       # Whole wrap selected: every word arrives, in order, rows joined.
       sel = %{anchor: {0, 0}, head: {2, 14}}
-      words = Selection.extract(sel, rows, 0) |> String.split()
+
+      words =
+        sel
+        |> Selection.extract(rows, 0)
+        |> String.split()
+
       assert words == ~w(the quick brown fox jumps over the lazy dog)
 
       # Partial: first row from col 4, last row to col 3.
@@ -128,7 +135,7 @@ defmodule DashFloat.TUI.SelectionTest do
 
   describe "highlight/2" do
     test "whole-row coverage reverses every span" do
-      highlighted = Selection.highlight(line(["abc", "def"]), {0, nil})
+      highlighted = highlight(["abc", "def"], {0, nil})
 
       assert Enum.all?(highlighted.spans, &(:reversed in &1.style.modifiers))
       assert plain(highlighted) == "abcdef"
@@ -149,7 +156,7 @@ defmodule DashFloat.TUI.SelectionTest do
     end
 
     test "a wide cluster is never halved by the highlight boundary" do
-      highlighted = Selection.highlight(line(["漢字"]), {1, 3})
+      highlighted = highlight(["漢字"], {1, 3})
 
       assert [{"漢", false}, {"字", true}] =
                Enum.map(highlighted.spans, &{&1.content, :reversed in &1.style.modifiers})
@@ -159,6 +166,18 @@ defmodule DashFloat.TUI.SelectionTest do
       row = line(["untouched"])
       assert Selection.highlight(row, nil) == row
     end
+  end
+
+  defp slice(texts, cols) do
+    texts
+    |> line()
+    |> Selection.slice_text(cols)
+  end
+
+  defp highlight(texts, cols) do
+    texts
+    |> line()
+    |> Selection.highlight(cols)
   end
 
   describe "osc52/1" do

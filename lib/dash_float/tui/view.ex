@@ -6,8 +6,8 @@ defmodule DashFloat.TUI.View do
   activity, and entry styling are ADR 0006's.
   """
 
-  alias DashFloat.TUI.State
   alias DashFloat.TUI.Selection
+  alias DashFloat.TUI.State
   alias DashFloat.TUI.Theme
   alias ExRatatui.Layout.Rect
   alias ExRatatui.Text.Line
@@ -191,17 +191,18 @@ defmodule DashFloat.TUI.View do
   defp log_widget(state, height) do
     offset = State.effective_scroll(state, height)
 
-    %Paragraph{
-      text: state |> display_lines(offset, height) |> highlight_selection(offset, state),
-      scroll: {0, 0}
-    }
+    text =
+      state
+      |> display_lines(offset, height)
+      |> highlight_selection(offset, state)
+
+    %Paragraph{text: text, scroll: {0, 0}}
   end
 
   defp highlight_selection(rows, _offset, %State{selection: nil}), do: rows
 
   defp highlight_selection(rows, offset, %State{selection: selection}) do
-    rows
-    |> Enum.with_index(fn row, i ->
+    Enum.with_index(rows, fn row, i ->
       Selection.highlight(row, Selection.columns(selection, offset + i))
     end)
   end

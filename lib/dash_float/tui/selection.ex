@@ -66,8 +66,7 @@ defmodule DashFloat.TUI.Selection do
   def extract(selection, rows, first_row) when is_list(rows) do
     rows
     |> Enum.with_index(fn row, i -> slice_text(row, columns(selection, first_row + i)) end)
-    |> Enum.map(&String.trim_trailing/1)
-    |> Enum.join("\n")
+    |> Enum.map_join("\n", &String.trim_trailing/1)
   end
 
   @doc """
@@ -77,8 +76,11 @@ defmodule DashFloat.TUI.Selection do
   """
   @spec slice_text(Line.t(), columns()) :: String.t()
 
-  def slice_text(%Line{} = line, nil),
-    do: line |> plain() |> String.trim_trailing()
+  def slice_text(%Line{} = line, nil) do
+    line
+    |> plain()
+    |> String.trim_trailing()
+  end
 
   def slice_text(%Line{} = line, {from, to}) do
     {acc, _col} =
@@ -86,7 +88,9 @@ defmodule DashFloat.TUI.Selection do
         walk_span(span.content, {acc, col}, from, to)
       end)
 
-    acc |> Enum.reverse() |> IO.iodata_to_binary()
+    acc
+    |> Enum.reverse()
+    |> IO.iodata_to_binary()
   end
 
   defp walk_span(content, {acc, col}, from, to) do
@@ -124,9 +128,7 @@ defmodule DashFloat.TUI.Selection do
       end)
 
     spans =
-      rev_spans
-      |> Enum.reverse()
-      |> case do
+      case Enum.reverse(rev_spans) do
         [] -> line.spans
         spans -> spans
       end

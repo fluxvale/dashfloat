@@ -95,7 +95,8 @@ defmodule DashFloat.Config.MigrationTest do
     dir = write_legacy!(tmp_dir(), full_legacy())
     # 0644 on disk — exactly the rider's live-smoke finding (issue #28):
     # the backup still holds the credential, so it lands 0600.
-    File.chmod!(Path.join(dir, "config.json"), 0o644)
+    legacy = Path.join(dir, "config.json")
+    File.chmod!(legacy, 0o644)
 
     assert {:ok, :migrated} = @migration.maybe_migrate(dir)
     %{backup: backup} = paths(dir)

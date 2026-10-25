@@ -16,8 +16,8 @@ defmodule DashFloat.TUI do
   # back blank (ADR 0002). The behaviour form is documented as equivalent.
   @behaviour ExRatatui.App
 
-  alias DashFloat.TUI.State
   alias DashFloat.TUI.Selection
+  alias DashFloat.TUI.State
   alias DashFloat.TUI.View
 
   @tick :dashfloat_tick

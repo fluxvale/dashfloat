@@ -606,7 +606,12 @@ defmodule DashFloat.TUI.State do
   end
 
   defp maybe_clear_selection(state, old_count) do
-    new_count = state.entries |> List.last() |> Map.get(:lines) |> length()
+    new_count =
+      state.entries
+      |> List.last()
+      |> Map.get(:lines)
+      |> length()
+
     if old_count != new_count, do: %{state | selection: nil}, else: state
   end
 
@@ -953,13 +958,14 @@ defmodule DashFloat.TUI.State do
     if count == 0 do
       nil
     else
-      row =
-        state
-        |> effective_scroll(log.height)
-        |> Kernel.+(y - log.y)
-        |> clamp(0, count - 1)
+      width =
+        state.size
+        |> elem(0)
+        |> View.content_width()
 
-      col = clamp(x - log.x, 0, View.content_width(elem(state.size, 0)))
+      top = effective_scroll(state, log.height) + (y - log.y)
+      row = clamp(top, 0, count - 1)
+      col = clamp(x - log.x, 0, width)
       {row, col}
     end
   end
@@ -984,8 +990,8 @@ defmodule DashFloat.TUI.State do
         ""
 
       count ->
-        selection
-        |> Selection.extract(View.display_lines(state, from_row, count), from_row)
+        rows = View.display_lines(state, from_row, count)
+        Selection.extract(selection, rows, from_row)
     end
   end
 

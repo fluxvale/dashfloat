@@ -275,9 +275,9 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     defp drag(state, {x0, y0}, {x1, y1}) do
-      {state, _} = State.select_mouse(state, "down", x0, y0)
-      {state, _} = State.select_mouse(state, "drag", x1, y1)
-      State.select_mouse(state, "up", x1, y1)
+      {down, _action} = State.select_mouse(state, "down", x0, y0)
+      {dragged, _action} = State.select_mouse(down, "drag", x1, y1)
+      State.select_mouse(dragged, "up", x1, y1)
     end
 
     test "down anchors, drag extends, up copies; click-to-clear" do
@@ -295,9 +295,7 @@ defmodule DashFloat.TUI.StateTest do
       assert text == "alpha line\n\nbeta"
 
       # Press+release without extension clears.
-      {cleared, nil} =
-        anchored |> then(&State.select_mouse(&1, "up", 1, 3))
-
+      {cleared, nil} = State.select_mouse(anchored, "up", 1, 3)
       assert cleared.selection == nil
     end
 
@@ -354,25 +352,28 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "a width-changing resize clears; a height-only resize keeps" do
-      {state, {:copy, _}} = drag(selected_state(), {1, 3}, {6, 5})
+      {state, {:copy, _text}} = drag(selected_state(), {1, 3}, {6, 5})
 
       narrowed = State.resize(state, 40, 24)
       assert narrowed.selection == nil
 
-      {again, {:copy, _}} = drag(selected_state(), {1, 3}, {6, 5})
+      {again, {:copy, _text}} = drag(selected_state(), {1, 3}, {6, 5})
       taller = State.resize(again, 80, 40)
       assert taller.selection != nil
     end
 
     test "a finalize that changes the display count clears the selection" do
       # A wide log so the in-flight wrap differs from the final render.
-      base =
-        new_state(test_mode: {30, 24})
+      base = new_state(test_mode: {30, 24})
+
+      streaming =
+        base
         |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "one two three four five"}, 1_000)
-        |> then(fn s -> elem(State.tick(s, 1_100), 0) end)
 
-      {anchored, nil} = State.select_mouse(base, "down", 1, 2)
+      {ticked, :cont} = State.tick(streaming, 1_100)
+
+      {anchored, nil} = State.select_mouse(ticked, "down", 1, 2)
       {extended, nil} = State.select_mouse(anchored, "drag", 1, 10)
 
       finalized = State.stream_message(extended, {:phase, :idle}, 1_200)
@@ -418,7 +419,7 @@ defmodule DashFloat.TUI.StateTest do
       assert rearmed.exit_guard_at == 3_001
 
       # The fresh window is live and completes a quit of its own.
-      {_, :quit} = State.handle_key(rearmed, "c", ["ctrl"], 3_001 + 1_999)
+      {_state, :quit} = State.handle_key(rearmed, "c", ["ctrl"], 3_001 + 1_999)
     end
 
     test "any other key disarms the guard" do
@@ -1386,7 +1387,8 @@ defmodule DashFloat.TUI.StateTest do
       assert hd(pieces) == ""
 
       assert_words_survive(pieces, text)
-      assert Enum.all?(tl(pieces), &(&1 == "" or String.length(&1) <= 18))
+      tail = tl(pieces)
+      assert Enum.all?(tail, &(&1 == "" or String.length(&1) <= 18))
     end
 
     test "re-wrapping is exact in both directions" do
@@ -1544,7 +1546,8 @@ defmodule DashFloat.TUI.StateTest do
   # Wrap drops whitespace at break points, so concatenation is width-luck;
   # word sequences are the honest no-loss assertion.
   defp assert_words_survive(pieces, text) do
-    assert Enum.join(pieces, " ") |> String.split() == String.split(text)
+    joined = Enum.join(pieces, " ")
+    assert String.split(joined) == String.split(text)
   end
 
   # Runs one animation tick (rendering dirty in-flight lines), keeping state.

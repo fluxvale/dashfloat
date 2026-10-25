@@ -420,9 +420,11 @@ defmodule DashFloat.TUITest do
 
     # Full text survives the re-wrap, every row fits the new padded width.
     [entry] = narrowed.entries
+
     rows = Enum.map(entry.lines, &Enum.map_join(&1.spans, "", fn s -> s.content end))
 
-    assert Enum.join(rows, " ") |> String.split() == String.split(long)
+    joined = Enum.join(rows, " ")
+    assert String.split(joined) == String.split(long)
     assert Enum.all?(rows, &(&1 == "" or String.length(&1) <= 18))
 
     # And the drawn frame really carries the wrapped rows, not a truncation.
@@ -1039,16 +1041,17 @@ defmodule DashFloat.TUITest do
                    %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 12, y: 3},
                    %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 12, y: 3}
                  ] do
-               assert {:noreply, _} = TUI.handle_event(event, test_state)
+               assert {:noreply, _state} = TUI.handle_event(event, test_state)
                test_state = get_state(pid)
              end
            end) == ""
 
     # A live state (no test_mode): the up event writes the exact sequence.
-    live = State.new([]) |> State.stream_message({:entry, :system, "copy me please"})
+    live_base = State.new([])
+    live = State.stream_message(live_base, {:entry, :system, "copy me please"})
     assert live.live? == true
 
-    live =
+    dragging =
       Enum.reduce(
         [
           %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3},
@@ -1056,7 +1059,7 @@ defmodule DashFloat.TUITest do
         ],
         live,
         fn event, acc ->
-          {acc, _} = State.select_mouse(acc, event.kind, event.x, event.y)
+          {acc, _action} = State.select_mouse(acc, event.kind, event.x, event.y)
           acc
         end
       )
@@ -1065,15 +1068,17 @@ defmodule DashFloat.TUITest do
 
     output =
       ExUnit.CaptureIO.capture_io(fn ->
-        assert {:noreply, _} = TUI.handle_event(up, live)
+        assert {:noreply, _state} = TUI.handle_event(up, dragging)
       end)
 
     # Columns [0, 11) of "copy me please".
-    assert output == "\e]52;c;" <> Base.encode64("copy me ple") <> "\a"
+    expected = "\e]52;c;" <> Base.encode64("copy me ple") <> "\a"
+    assert output == expected
   end
 
   # The lynchpin of the wheel fix: without capture, terminals emulate the
-  # wheel as arrow keys and input history eats it (issue #21). The flag is  # the TUI start_link default, so it holds for every starter — pinned via
+  # wheel as arrow keys and input history eats it (issue #21). The flag is
+  # the TUI start_link default, so it holds for every starter — pinned via
   # the transport-connect telemetry span (the test backend itself ignores
   # the flag, so the span metadata is the observable).
   test "the TUI starts with mouse capture enabled" do
