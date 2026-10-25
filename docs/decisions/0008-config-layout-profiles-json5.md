@@ -399,10 +399,35 @@ up-front per-field representability checks so its field-name error survives.
 - Three files share one posture (`DashFloat.Config.Posture`): 0600 at
   creation, best-effort repair on load before anything parses a file,
   regular-files-only, lstat-guarded (never chmod through a symlink; a
-  directory by a secrets name keeps its own semantics).
+  directory by a secrets name keeps its own semantics). The `.tmp` staging
+  paths get the same guard — a pre-planted `keys.json5.tmp` symlink is
+  refused, never written through.
 - `DashFloat.Config.load/2,3` reads both `settings.json5` and `keys.json5`
-  (missing = empty map; malformed = load error naming the file); the
-  `Config.t()` struct, env overrides, and consumers are untouched.
+  (missing = empty map; malformed = load error naming the file; invalid
+  UTF-8 included — any parser crash degrades to the fixed error string, so
+  startup always reaches its config-error path); the `Config.t()` struct,
+  env overrides, and consumers are untouched.
+- **A credential is never silently lost** (review fix-round rule): every
+  inline credential the split removes gets a home — a keys.json5 slot with
+  exactly that value, or the byte-exact backup this split writes. When
+  `settings.json5.bak` already exists (never clobbered) and a pre-existing
+  `keys.json5` lacks a collected name or carries a different value — or the
+  credential has no usable profile name (blank-name profile, root-level
+  `apiKey`) — the split REFUSES with an error naming the situation; the
+  user reconciles keys.json5 or splits by hand. Identical values (the
+  crash-recovery state from a partial run) converge instead of refusing.
+  Warnings claim only what is true in the state they fire in.
+- A ROOT-level `apiKey` is stripped by the split and warned by the loader
+  exactly like a profile-level stray — nothing credential-shaped rides into
+  live v2 settings unwarned.
+- The legacy file is tightened to 0600 BEFORE the legacy migration writes
+  anything, and the load path tightens a leftover never-renamed
+  `config.json` beside a complete layout — the crash window between the
+  settings write and the backup rename can no longer strand a world-readable
+  credential that re-runs (marker present) would never touch.
+- Rendered keys are fully anchored identifiers (a trailing-newline key must
+  render quoted, not silently rename to its prefix) and dodge the parser's
+  ECMA reserved words.
 - The grep-able invariant: after any migration or load, the live
   `settings.json5` contains no credential value — asserted across both
   migration paths; by-design backups hold old values at 0600, which is the

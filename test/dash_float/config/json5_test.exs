@@ -75,6 +75,22 @@ defmodule DashFloat.Config.JSON5Test do
     assert JSON5.decode(~s({ a: "k'x", b: 'y"z' })) == {:ok, %{"a" => "k'x", "b" => "y\"z"}}
   end
 
+  # Hostile review P3-1: `=~` with `$` lets a trailing newline through, so a
+  # bare `a\n:` key silently RENAMED to `a` on rewrite. Fully anchored now.
+  test "keys with hostile whitespace render quoted, never silently renamed" do
+    original = %{"a\n" => 1, "b\t" => 2}
+
+    assert {:ok, text} = JSON5.render(original)
+    assert text =~ "'a" <> "\n'"
+    assert JSON5.decode(text) == {:ok, original}
+  end
+
+  # Hostile review P2-3: invalid UTF-8 raised FunctionClauseError out of the
+  # parser; the wrapper degrades ANY crash to the fixed error string.
+  test "invalid UTF-8 is an error, not a crash" do
+    assert JSON5.decode("{ a: '\xFF' }") == {:error, "invalid JSON5"}
+  end
+
   ## Rendering (the general renderer both migrations rewrite through)
 
   test "read_map decodes an object file; missing is empty; errors name the path" do

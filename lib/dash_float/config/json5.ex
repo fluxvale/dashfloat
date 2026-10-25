@@ -41,7 +41,11 @@ defmodule DashFloat.Config.JSON5 do
       {:error, _reason} -> {:error, "invalid JSON5"}
     end
   rescue
-    Decimal.Error -> {:error, "invalid JSON5"}
+    # Decimal.Error quotes the literal it cannot represent; invalid UTF-8
+    # surfaces as a FunctionClauseError deep in Combine's char matcher.
+    # Startup must always reach its config-error path, so the wrapper
+    # degrades ANY parser crash to the fixed error string.
+    _other -> {:error, "invalid JSON5"}
   end
 
   @doc """
@@ -175,9 +179,11 @@ defmodule DashFloat.Config.JSON5 do
 
   # Bare keys must ALSO dodge the parser's ECMA reserved words — the Combine
   # backend rejects `default:` as a bare key (verified against the dep), and
-  # the legacy migration writes "default" as a keys.json5 key.
+  # the legacy migration writes "default" as a keys.json5 key. The pattern is
+  # fully anchored: `=~` with `$` lets a trailing newline through, and a bare
+  # `a\n:` key would silently RENAME to `a` on rewrite (hostile review).
   defp bare_key?(key),
-    do: key =~ ~r/^[A-Za-z_$][A-Za-z0-9_$]*$/ and not Json5.ECMA.reserved_word?(key)
+    do: Regex.match?(~r/\A[A-Za-z_$][A-Za-z0-9_$]*\z/, key) and not Json5.ECMA.reserved_word?(key)
 
   # Error paths name locations like `profiles[0].apiKey` — dot-joined map
   # keys, bracket-joined list indices, quoted when the key is not bare.

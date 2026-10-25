@@ -105,12 +105,18 @@ defmodule DashFloat.Config.Migration do
     end
   end
 
-  # The split fires only when a NAMED profile carries an apiKey field and the
-  # file predates the split layout — a credential-free file of any version
-  # stays byte-untouched (rewriting it churns user formatting for nothing).
+  # The split fires only when the file predates the split layout AND carries
+  # an inline credential — a profile-level apiKey on a NAMED profile, or a
+  # ROOT-level apiKey (hostile review P1-2: nothing credential-shaped may
+  # ride into live v2 settings unwarned). A credential-free file of any
+  # version stays byte-untouched (rewriting it churns user formatting for
+  # nothing); a v2+ file's stray credentials are the loader's warning, not
+  # a rewrite.
   defp split_pending?(map) do
     profiles = profiles_list(map)
-    not version_two_or_newer?(map) and Enum.any?(profiles, &inline_key?/1)
+
+    not version_two_or_newer?(map) and
+      (Map.has_key?(map, "apiKey") or Enum.any?(profiles, &inline_key?/1))
   end
 
   defp version_two_or_newer?(%{"configVersion" => version})
@@ -158,8 +164,11 @@ defmodule DashFloat.Config.Migration do
 
     # Renders are pure and run before any write: an unrepresentable value
     # anywhere in the document (including tolerated extras) fails the split
-    # with the whole directory untouched.
-    with {:ok, existing?} <- read_existing_keys(keys_path),
+    # with the whole directory untouched. The no-loss guard runs before them
+    # all — a credential is NEVER silently lost, in every combination of
+    # pre-existing state (hostile review P1-1).
+    with {:ok, existing} <- read_existing_keys(keys_path),
+         :ok <- ensure_no_loss(dir, map, collected, existing),
          {:ok, main_doc} <- render_doc(@main_file, de_secreted, "split it"),
          {:ok, keys_doc} <- render_collected_keys(collected) do
       # Leftover backups tighten like the rider does: an old config.json.bak
@@ -170,55 +179,109 @@ defmodule DashFloat.Config.Migration do
 
       # The credential must reach its new home before the old one is
       # emptied: a failed keys write aborts before the settings rewrite.
-      with :ok <- write_keys(keys_path, keys_doc, existing?),
+      with :ok <- write_keys(keys_path, keys_doc, existing),
            :ok <- write_private(main, main_doc <> "\n") do
         {:ok, :migrated}
       end
     end
   end
 
+  # Every inline credential the split removes needs one of two homes: a
+  # keys.json5 slot holding exactly that value (written fresh, or a
+  # pre-existing file that already carries it), or the byte-exact backup
+  # this split writes. When settings.json5.bak already exists (never
+  # clobbered) there is no fresh backup — so a pre-existing keys.json5 that
+  # lacks a collected name or carries a DIFFERENT value for it, or a
+  # credential with no usable profile name to key it by (blank-name profile,
+  # root-level apiKey), would leave the value in NO file. REFUSE the split
+  # loudly; the user reconciles keys.json5 or splits by hand. Identical
+  # values (the crash-recovery state: a partial run already wrote keys and
+  # the backup) lose nothing and converge. Never proceed silently.
+  defp ensure_no_loss(dir, map, collected, existing) do
+    backup = Path.join(dir, @main_backup)
+    profiles = profiles_list(map)
+
+    lost? =
+      File.exists?(backup) and
+        (uncollectable?(profiles, map) or
+           (existing != nil and
+              Enum.any?(collected, fn {name, key} -> blank_to_nil(existing[name]) != key end)))
+
+    if lost?,
+      do:
+        {:error,
+         "cannot split #{@main_file}: an inline credential would have no home — " <>
+           "#{@main_backup} is never clobbered and a pre-existing #{@keys_file} wins; " <>
+           "add the keys to #{@keys_file} or split it by hand"},
+      else: :ok
+  end
+
+  # Credentials collect_keys cannot key by profile name: a root-level
+  # apiKey, or a profile apiKey whose name is blank/unusable — both are
+  # deleted by de_secret, so with no fresh backup they would vanish.
+  defp uncollectable?(profiles, map) do
+    root_key?(map) or
+      Enum.any?(profiles, fn
+        %{"apiKey" => value} = entry -> usable?(value) and not usable?(entry["name"])
+        _entry -> false
+      end)
+  end
+
+  defp root_key?(map), do: usable?(map["apiKey"])
+
+  defp usable?(value), do: blank_to_nil(value) != nil
+
   # A pre-existing keys.json5 WINS over collected inline keys — it is the
-  # user's explicit new home, and the old values survive in the .bak. A
-  # malformed one is an error: never destroy unreadable data. (The regular?
-  # guard already kept non-regular files out of here.)
+  # user's explicit new home; ensure_no_loss refuses the states where that
+  # would actually drop a value. A malformed one is an error: never destroy
+  # unreadable data. (The regular? guard already kept non-regular files out
+  # of here.) The warning claims only what is true in every reachable
+  # state: the backup clause holds because a pre-existing .bak plus a
+  # losing keys.json5 is refused before this proceeds.
   defp read_existing_keys(keys_path) do
     if File.exists?(keys_path) do
       case JSON5.read_map(keys_path) do
-        {:ok, _keys} ->
+        {:ok, keys} ->
+          dir = Path.dirname(keys_path)
+          backup = Path.join(dir, @main_backup)
+
           Logger.warning(
-            "#{@keys_file} already exists — keeping it; inline keys survive in #{@main_backup}"
+            "#{@keys_file} already exists — keeping it" <>
+              backup_clause(File.exists?(backup))
           )
 
-          {:ok, true}
+          {:ok, keys}
 
         {:error, _message} = error ->
           error
       end
     else
-      {:ok, false}
+      {:ok, nil}
     end
   end
+
+  defp backup_clause(false), do: "; the current #{@main_file} is backed up first"
+  defp backup_clause(true), do: ""
 
   # No collected keys (every inline value was blank/unusable) → no keys file;
   # an existing keys.json5 is never rewritten (it wins over collected keys).
   defp render_collected_keys(collected) when map_size(collected) == 0, do: {:ok, nil}
   defp render_collected_keys(collected), do: render_doc(@keys_file, collected, "split it")
 
-  defp write_keys(_keys_path, _doc, true), do: :ok
-  defp write_keys(_keys_path, nil, false), do: :ok
-  defp write_keys(keys_path, doc, false), do: write_private(keys_path, doc <> "\n")
+  defp write_keys(_keys_path, _doc, existing) when existing != nil, do: :ok
+  defp write_keys(_keys_path, nil, nil), do: :ok
+  defp write_keys(keys_path, doc, nil), do: write_private(keys_path, doc <> "\n")
 
   # The credential always has its new home before the old one is emptied.
+  # The existing-.bak warning claims only the fact (kept, no new backup) —
+  # ensure_no_loss has already refused every state where a value would
+  # actually be lost here.
   defp backup_main(dir, raw) do
     backup = Path.join(dir, @main_backup)
 
     if File.exists?(backup) do
       Posture.tighten(backup, @main_backup)
-
-      Logger.warning(
-        "#{@main_backup} already exists — keeping it; the current #{@main_file} is split " <>
-          "without a new backup (only its pre-split formatting is lost)"
-      )
+      Logger.warning("#{@main_backup} already exists — keeping it; no new backup is written")
     else
       # Best effort: a failed backup is a warning, not an error — the keys
       # still land in keys.json5 before the settings file is emptied.
@@ -235,6 +298,13 @@ defmodule DashFloat.Config.Migration do
   ## Legacy migration (config.json → default profile + keys.json5)
 
   defp migrate_legacy(dir, legacy, main) do
+    # Tighten the legacy file BEFORE anything is written: it holds the
+    # credential NOW, and a crash between the settings write and the backup
+    # rename would otherwise leave a world-readable config.json beside a
+    # complete layout forever (re-runs see the marker and stand down) —
+    # hostile review P2-1.
+    Posture.tighten(legacy, legacy)
+
     with {:ok, map} <- read_legacy(legacy),
          {:ok, fields} <- legacy_fields(legacy, map),
          :ok <- representable(fields),
@@ -340,7 +410,7 @@ defmodule DashFloat.Config.Migration do
         case JSON5.read_map(keys_path) do
           {:ok, _keys} ->
             Logger.warning(
-              "#{@keys_file} already exists — keeping it; the legacy key stays in the backup"
+              "#{@keys_file} already exists — keeping it; the legacy key is not migrated"
             )
 
             :ok
@@ -366,19 +436,40 @@ defmodule DashFloat.Config.Migration do
   # backups of secrets-bearing files, is 0600 from its first byte. Contents
   # are written EXACTLY as given — rendered documents get their trailing
   # newline from the caller; the split's backup copies the raw bytes
-  # byte-exact.
+  # byte-exact. The tmp path is lstat-guarded like the destination: a
+  # pre-planted .tmp symlink would otherwise be chmod'd and written THROUGH,
+  # clobbering whatever it points at (hostile review P2-2).
   defp write_private(path, contents) do
     tmp = path <> @tmp_suffix
 
-    with :ok <- File.touch(tmp),
+    with :ok <- guard_tmp(path, tmp),
+         :ok <- File.touch(tmp),
          :ok <- File.chmod(tmp, @secret_mode),
          :ok <- File.write(tmp, contents),
          :ok <- File.rename(tmp, path) do
       :ok
     else
+      # guard_tmp's message is already user-shaped; filesystem reasons are
+      # wrapped. The tmp debris of a failed write is removed either way.
+      {:error, reason} when is_binary(reason) ->
+        {:error, reason}
+
       {:error, reason} when is_atom(reason) ->
         File.rm(tmp)
         {:error, "cannot write #{path}: #{:file.format_error(reason)}"}
+    end
+  end
+
+  defp guard_tmp(path, tmp) do
+    case File.lstat(tmp) do
+      {:ok, %File.Stat{type: :regular}} ->
+        :ok
+
+      {:ok, %File.Stat{type: other}} ->
+        {:error, "cannot write #{path}: #{tmp} is a #{other}, not a regular file"}
+
+      _missing ->
+        :ok
     end
   end
 
@@ -413,17 +504,20 @@ defmodule DashFloat.Config.Migration do
   end
 
   @doc """
-  Best-effort 0600 repair of leftover backups on the LOAD path (ADR 0008
-  posture, issue #28): beside an existing `settings.json5`, a `config.json.bak`
-  or `settings.json5.bak` is inert to the loader but may still hold a
-  credential — an already-migrated directory never runs the migration that
-  would have tightened it. Only regular files are repaired; symlinks are
-  never chmod'd through.
+  Best-effort 0600 repair of leftover secrets-bearing files on the LOAD path
+  (ADR 0008 posture, issue #28): beside an existing `settings.json5`, a
+  `config.json.bak`, `settings.json5.bak`, or an inert never-renamed
+  `config.json` (the legacy migration's crash window, or a #23-era partial
+  run) may still hold a credential — an already-migrated directory never
+  runs the migration that would have tightened it. Only regular files are
+  repaired; symlinks are never chmod'd through.
   """
   @spec repair_backup(Path.t()) :: :ok
   def repair_backup(dir) do
+    legacy = Path.join(dir, @legacy_file)
     backup = Path.join(dir, @backup_file)
     settings_backup = Path.join(dir, @main_backup)
+    Posture.tighten(legacy, @legacy_file)
     Posture.tighten(backup, @backup_file)
     Posture.tighten(settings_backup, @main_backup)
     :ok
@@ -432,8 +526,16 @@ defmodule DashFloat.Config.Migration do
   ## Split helpers
 
   defp de_secret(map) do
-    # split_pending? guarantees profiles is a non-empty list here.
-    Map.put(map, "profiles", Enum.map(profiles_list(map), &drop_api_key/1))
+    # split_pending? guarantees profiles is a non-empty list here; a
+    # ROOT-level apiKey is stripped too — nothing credential-shaped may ride
+    # into live v2 settings (hostile review P1-2), and ensure_no_loss
+    # guarantees it is preserved or the split refuses.
+    list = profiles_list(map)
+    profiles = Enum.map(list, &drop_api_key/1)
+
+    map
+    |> Map.delete("apiKey")
+    |> Map.put("profiles", profiles)
   end
 
   defp drop_api_key(entry) when is_map(entry), do: Map.delete(entry, "apiKey")

@@ -45,7 +45,9 @@ held a credential is 0600 wherever it lives:
     },
   ],
 }
+```
 
+```json5
 // keys.json5 — the only home for API keys
 { 'work': 'PLACEHOLDER', }
 ```

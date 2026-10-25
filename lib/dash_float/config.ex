@@ -113,10 +113,22 @@ defmodule DashFloat.Config do
          {:ok, main} <- JSON5.read_map(main_path),
          {:ok, keys} <- JSON5.read_map(keys_path) do
       check_version(main)
+      warn_stray_root_key(main)
 
       main
       |> parse_profiles()
       |> select(keys, env, cli)
+    end
+  end
+
+  # The profile-level stray warning's root twin (hostile review P1-2): a
+  # root-level apiKey is ignored exactly like a profile-level one — warned,
+  # never a fallback, never silently tolerated.
+  defp warn_stray_root_key(main) do
+    if Map.has_key?(main, "apiKey") do
+      Logger.warning(
+        "#{@main_file}: top-level apiKey is ignored — API keys live in #{@keys_file}, keyed by profile name"
+      )
     end
   end
 

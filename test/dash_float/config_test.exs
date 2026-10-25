@@ -894,6 +894,65 @@ defmodule DashFloat.ConfigTest do
       assert mode(keys) == 0o600
     end
 
+    # Hostile review P2-3: invalid UTF-8 raised FunctionClauseError out of
+    # Config.load instead of reaching the config-error path.
+    test "invalid UTF-8 in keys.json5 is an error, not a crash" do
+      dir = fleet_dir()
+      keys = Path.join(dir, "keys.json5")
+      File.write!(keys, "{'work': 'PLACE\xFFHOLDER',}")
+      File.chmod!(keys, 0o600)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message == "invalid JSON5 in #{keys}"
+      refute message =~ "PLACE"
+    end
+
+    # Hostile review P1-2, loader half: a root-level apiKey in settings is
+    # warned about and ignored exactly like a profile-level stray.
+    test "a stray top-level apiKey warns and is never used" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 2,
+          apiKey: 'PLACEHOLDER-stray-root',
+          profiles: [{
+            name: 'work',
+            baseUrl: 'https://provider.example/v1',
+            models: [{ nickname: 'Sol', model: 'glm-5.3' }],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ "top-level apiKey is ignored"
+      refute logs =~ "PLACEHOLDER"
+    end
+
+    # Hostile review P2-1, load-path half: the legacy migration's crash
+    # window leaves a 0644 config.json beside a complete layout — re-runs
+    # stand down, so the load itself must converge it to 0600.
+    test "load tightens a leftover world-readable config.json (legacy crash state)" do
+      dir = fleet_dir()
+      legacy = Path.join(dir, "config.json")
+      File.write!(legacy, ~s({"api_key": "PLACEHOLDER-legacy"}))
+      File.chmod!(legacy, 0o644)
+
+      logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
+
+      assert logs =~ "config.json is too permissive"
+      assert mode(legacy) == 0o600
+    end
+
     test "a symlinked keys.json5 warns and never chmods the target" do
       dir = fleet_dir()
       keys = Path.join(dir, "keys.json5")

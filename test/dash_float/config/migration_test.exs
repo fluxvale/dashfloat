@@ -74,6 +74,20 @@ defmodule DashFloat.Config.MigrationTest do
     dir
   end
 
+  defp write_keys_file!(dir, contents) do
+    keys = Path.join(dir, "keys.json5")
+    File.write!(keys, contents)
+    File.chmod!(keys, 0o600)
+    keys
+  end
+
+  defp write_backup!(dir, contents) do
+    backup = Path.join(dir, "settings.json5.bak")
+    File.write!(backup, contents)
+    File.chmod!(backup, 0o600)
+    backup
+  end
+
   defp paths(dir) do
     %{
       main: Path.join(dir, "settings.json5"),
@@ -201,7 +215,9 @@ defmodule DashFloat.Config.MigrationTest do
             refute message =~ "PLACEHOLDER"
           end)
 
-        assert logs == ""
+        # The legacy file is tightened BEFORE anything else (P2-1), so its
+        # repair warning is expected — but no value ever reaches a log.
+        refute logs =~ "PLACEHOLDER"
 
         %{main: main, keys: keys, legacy: legacy} = paths(dir)
         refute File.exists?(main)
@@ -589,6 +605,206 @@ defmodule DashFloat.Config.MigrationTest do
       refute File.exists?(paths(dir).settings_backup)
     end
 
+    # Hostile review P1-1: keys.json5 AND settings.json5.bak both pre-exist,
+    # the personal key's name is absent from the user's keys.json5, and the
+    # never-clobbered .bak means no fresh backup — pre-fix the split
+    # "succeeded" and the key vanished from every file on disk while two
+    # warnings claimed it survived.
+    test "the split refuses when a credential would land in NO file" do
+      dir = write_v1!(tmp_dir())
+      keys = write_keys_file!(dir, "{'work': 'PLACEHOLDER-user-key',}")
+      backup = write_backup!(dir, "// an older pre-split backup")
+
+      logs =
+        capture_log(fn ->
+          assert {:error, message} = @migration.maybe_migrate(dir)
+          assert message =~ "no home"
+          assert message =~ "split it by hand"
+          refute message =~ "PLACEHOLDER"
+        end)
+
+      # The existing-keys warning may fire before the refusal; no value
+      # ever reaches a log.
+      refute logs =~ "PLACEHOLDER"
+
+      # Nothing was written: BOTH inline keys are still in the live file,
+      # the user's keys.json5 and the old backup are untouched.
+      main = File.read!(paths(dir).main)
+      assert main =~ "PLACEHOLDER-work-key"
+      assert main =~ "PLACEHOLDER-personal-key"
+      assert File.read!(keys) =~ "PLACEHOLDER-user-key"
+      assert File.read!(backup) == "// an older pre-split backup"
+    end
+
+    test "a pre-existing keys.json5 with a DIFFERENT value refuses the same way" do
+      dir = write_v1!(tmp_dir())
+      write_keys_file!(dir, "{'work': 'PLACEHOLDER-other',}")
+      write_backup!(dir, "// older")
+
+      assert {:error, message} = @migration.maybe_migrate(dir)
+      assert message =~ "no home"
+      assert File.read!(paths(dir).main) =~ "PLACEHOLDER-work-key"
+    end
+
+    # The crash-recovery state must still converge: a partial run already
+    # wrote keys.json5 with IDENTICAL values and the backup exists.
+    test "identical pre-existing keys with an existing backup converge" do
+      dir = write_v1!(tmp_dir())
+
+      write_keys_file!(
+        dir,
+        "{'work': 'PLACEHOLDER-work-key', 'personal': 'PLACEHOLDER-personal-key',}"
+      )
+
+      write_backup!(dir, File.read!(paths(dir).main))
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      assert {:ok, decoded} =
+               paths(dir).main
+               |> File.read!()
+               |> JSON5.decode()
+
+      assert decoded["configVersion"] == 2
+      refute File.read!(paths(dir).main) =~ "PLACEHOLDER"
+    end
+
+    test "a blank-name profile's key refuses the split when no backup can be written" do
+      dir = tmp_dir()
+
+      # The no-apiKey entry walks uncollectable?'s false arm before the
+      # nameless key is found.
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 1,
+          profiles: [
+            { name: 'ok', baseUrl: 'https://provider.example/v1',
+              models: [{ model: 'glm-5.3' }] },
+            { name: '', baseUrl: 'https://provider.example/v1',
+              apiKey: 'PLACEHOLDER-nameless-key',
+              models: [{ model: 'glm-5.3' }] },
+          ],
+        }
+        """
+      )
+
+      write_backup!(dir, "// older")
+
+      assert {:error, message} = @migration.maybe_migrate(dir)
+      assert message =~ "no home"
+
+      # Pre-fix the nameless key was silently deleted from every file.
+      assert File.read!(paths(dir).main) =~ "PLACEHOLDER-nameless-key"
+
+      # With no pre-existing backup the fresh byte-exact copy preserves it.
+      other = tmp_dir()
+
+      write_v1!(
+        other,
+        """
+        {
+          configVersion: 1,
+          profiles: [
+            { name: '', baseUrl: 'https://provider.example/v1',
+              apiKey: 'PLACEHOLDER-nameless-key',
+              models: [{ model: 'glm-5.3' }] },
+          ],
+        }
+        """
+      )
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(other)
+      refute File.read!(paths(other).main) =~ "PLACEHOLDER-nameless-key"
+      assert File.read!(paths(other).settings_backup) =~ "PLACEHOLDER-nameless-key"
+    end
+
+    # Hostile review P1-2: a ROOT-level apiKey in a v1 file rode into the
+    # live v2 settings verbatim and unwarned.
+    test "a root-level apiKey is stripped by the split and preserved in the backup" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 1,
+          apiKey: 'PLACEHOLDER-root-key',
+          profiles: [
+            { name: 'work', baseUrl: 'https://provider.example/v1',
+              models: [{ nickname: 'Sol', model: 'glm-5.3' }] },
+          ],
+        }
+        """
+      )
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      main = File.read!(paths(dir).main)
+      refute main =~ "apiKey"
+      refute main =~ "PLACEHOLDER-root-key"
+
+      assert {:ok, decoded} = JSON5.decode(main)
+      assert decoded["configVersion"] == 2
+
+      assert File.read!(paths(dir).settings_backup) =~ "PLACEHOLDER-root-key"
+      assert mode(paths(dir).settings_backup) == 0o600
+    end
+
+    # Hostile review P2-1: the legacy crash window (settings written, backup
+    # rename never reached) left a 0644 config.json beside a complete layout
+    # forever. Tightening happens BEFORE any write, so the failure paths
+    # leave it private too.
+    test "the legacy file is tightened before the migration writes anything" do
+      dir = write_legacy!(tmp_dir(), Map.put(full_legacy(), "api_key", "back\\slash"))
+      legacy = Path.join(dir, "config.json")
+      File.chmod!(legacy, 0o644)
+
+      assert {:error, _message} = @migration.maybe_migrate(dir)
+      assert mode(legacy) == 0o600
+    end
+
+    # Hostile review P2-2: a pre-planted keys.json5.tmp symlink was chmod'd
+    # and written THROUGH — the victim lost its mode and content, and
+    # keys.json5 ended as the symlink itself.
+    test "a pre-planted .tmp symlink is refused, never written through" do
+      dir = write_v1!(tmp_dir())
+
+      victim = Path.join(dir, "user-notes.txt")
+      File.write!(victim, "keep me")
+      File.chmod!(victim, 0o644)
+      File.ln_s!(victim, Path.join(dir, "keys.json5.tmp"))
+
+      logs =
+        capture_log(fn ->
+          assert {:error, message} = @migration.maybe_migrate(dir)
+          assert message =~ "not a regular file"
+          assert message =~ "keys.json5.tmp"
+        end)
+
+      assert logs == ""
+      assert File.read!(victim) == "keep me"
+      assert mode(victim) == 0o644
+      refute File.exists?(paths(dir).keys)
+      assert File.read!(paths(dir).main) == v1_inline()
+    end
+
+    test "regular .tmp crash debris is replaced by the write" do
+      dir = write_v1!(tmp_dir())
+      tmp = Path.join(dir, "keys.json5.tmp")
+      File.write!(tmp, "// debris from an interrupted run")
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      assert {:ok, %{"work" => "PLACEHOLDER-work-key"}} =
+               paths(dir).keys
+               |> File.read!()
+               |> JSON5.decode()
+
+      refute File.exists?(tmp)
+    end
+
     test "an existing keys.json5 wins over collected inline keys" do
       dir = write_v1!(tmp_dir())
       keys = Path.join(dir, "keys.json5")
@@ -609,7 +825,11 @@ defmodule DashFloat.Config.MigrationTest do
 
       refute File.read!(paths(dir).main) =~ "PLACEHOLDER"
       assert File.read!(paths(dir).settings_backup) =~ "PLACEHOLDER-work-key"
+
+      # P3-3: the survival claim is TRUE in this state — no pre-existing
+      # .bak, so this split wrote the backup the warning mentions.
       assert logs =~ "already exists"
+      assert logs =~ "the current settings.json5 is backed up first"
     end
 
     test "a malformed existing keys.json5 is an error — never destroy unreadable data" do
@@ -628,6 +848,8 @@ defmodule DashFloat.Config.MigrationTest do
       refute File.exists?(paths(dir).settings_backup)
     end
 
+    # P3-3: the warning claims only what is true in this state — no new
+    # backup is written; the inline keys' home is the fresh keys.json5.
     test "an existing settings.json5.bak is never clobbered, just tightened" do
       dir = write_v1!(tmp_dir())
       settings_backup = Path.join(dir, "settings.json5.bak")
@@ -639,12 +861,12 @@ defmodule DashFloat.Config.MigrationTest do
           assert {:ok, :migrated} = @migration.maybe_migrate(dir)
         end)
 
+      assert logs =~ "no new backup is written"
       assert logs =~ "already exists"
       assert File.read!(settings_backup) == "// an older pre-split backup"
       assert mode(settings_backup) == 0o600
-      # The split itself still completes: unique data survives (keys →
-      # keys.json5, rest → rewritten settings), only the pre-split
-      # formatting of the CURRENT file is lost.
+      # The split itself still completes: the inline keys' home is the
+      # fresh keys.json5; the old backup keeps its own content.
       assert File.read!(paths(dir).keys) =~ "PLACEHOLDER-work-key"
       refute File.read!(paths(dir).main) =~ "PLACEHOLDER"
     end
