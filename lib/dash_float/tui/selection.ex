@@ -19,7 +19,7 @@ defmodule DashFloat.TUI.Selection do
   alias ExRatatui.Text.Span
 
   @type cell :: {row :: non_neg_integer(), col :: non_neg_integer()}
-  @type t :: %{anchor: cell(), head: cell()}
+  @type t :: %{anchor: cell(), head: cell(), base_rows: non_neg_integer()}
   @type columns :: {from :: non_neg_integer(), to :: non_neg_integer() | nil} | nil
 
   ## Range geometry
@@ -75,6 +75,50 @@ defmodule DashFloat.TUI.Selection do
     rows
     |> Enum.with_index(fn row, i -> slice_text(row, columns(selection, first_row + i)) end)
     |> Enum.map_join("\n", &String.trim_trailing/1)
+  end
+
+  @doc """
+  `extract/3` bounded by `cap` bytes: rows accumulate until the joined text
+  passes the cap, then the build STOPS — `{:ok, text}` under the cap,
+  `{:too_large, bytes}` at or beyond it, where bytes is the accumulated
+  size at the stop (the honest lower bound of the full copy). The build —
+  not merely the write — is bounded, so a monster span costs at most one
+  cap-sized pass before the decision (review P2a: materialising the whole
+  span froze the UI process).
+  """
+  @spec extract_capped(t(), [Line.t()], non_neg_integer(), pos_integer()) ::
+          {:ok, String.t()} | {:too_large, pos_integer()}
+  def extract_capped(selection, rows, first_row, cap) when is_integer(cap) and cap > 0 do
+    indexed = Enum.with_index(rows)
+
+    {verdict, size, rev} =
+      Enum.reduce_while(indexed, {:ok, 0, []}, fn {row, i}, {:ok, size, rev} ->
+        piece =
+          row
+          |> slice_text(columns(selection, first_row + i))
+          |> String.trim_trailing()
+
+        # One byte for the newline that joins this piece to the previous.
+        sep = if rev == [], do: 0, else: 1
+        size = size + byte_size(piece) + sep
+
+        if size > cap,
+          do: {:halt, {:too_large, size, rev}},
+          else: {:cont, {:ok, size, [piece | rev]}}
+      end)
+
+    case verdict do
+      :ok ->
+        text =
+          rev
+          |> Enum.reverse()
+          |> Enum.join("\n")
+
+        {:ok, text}
+
+      :too_large ->
+        {:too_large, size}
+    end
   end
 
   @doc """

@@ -932,4 +932,18 @@ defmodule DashFloat.ConfigTest do
     assert {:ok, %File.Stat{mode: mode}} = File.stat(target)
     assert Bitwise.band(mode, 0o777) == 0o644
   end
+
+  test "load warns about and never chmods a non-regular backup" do
+    dir = fleet_dir()
+    backup = Path.join(dir, "config.json.bak")
+    File.mkdir!(backup)
+    File.chmod!(backup, 0o700)
+
+    logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
+
+    assert logs =~ "not a regular file"
+
+    assert {:ok, %File.Stat{type: :directory, mode: mode}} = File.lstat(backup)
+    assert Bitwise.band(mode, 0o777) == 0o700
+  end
 end

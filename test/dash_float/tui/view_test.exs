@@ -397,6 +397,25 @@ defmodule DashFloat.TUI.ViewTest do
       assert Enum.map_join(row3.spans, "", & &1.content) == "beta"
       assert Enum.all?(row3.spans, &(:reversed in &1.style.modifiers))
     end
+
+    # Review cosmetic: a collapsed selection (press, not yet a drag)
+    # highlights nothing — one reversed cell under the pointer would read
+    # as a cursor artifact.
+    test "a collapsed selection highlights nothing" do
+      state =
+        new_state()
+        |> State.stream_message({:entry, :system, "alpha"})
+        |> Map.put(:selection, %{anchor: {1, 0}, head: {1, 0}})
+
+      {widget, _rect} =
+        state
+        |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+        |> Enum.at(1)
+
+      Enum.with_index(widget.text, fn row, i ->
+        refute Enum.any?(row.spans, &(:reversed in &1.style.modifiers)), "row #{i} reversed"
+      end)
+    end
   end
 
   describe "activity line" do

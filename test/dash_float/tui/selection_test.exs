@@ -133,6 +133,35 @@ defmodule DashFloat.TUI.SelectionTest do
     end
   end
 
+  describe "extract_capped/4" do
+    defp sel(first \\ 0) do
+      %{anchor: {first, 0}, head: {first + 3, 999}, base_rows: 0}
+    end
+
+    test "under the cap it is extract/3 exactly" do
+      rows = for i <- 1..4, do: line(["row #{i}"])
+
+      assert Selection.extract_capped(sel(), rows, 0, 100) ==
+               {:ok, Selection.extract(sel(), rows, 0)}
+    end
+
+    test "over the cap the build stops at the boundary" do
+      # Review P2a: the BUILD is bounded — the full span never
+      # materialises, and the reported bytes are the accumulated size at
+      # the stop (a lower bound of the full copy).
+      rows = for i <- 1..4, do: line(["row #{i}"])
+
+      assert {:too_large, bytes} = Selection.extract_capped(sel(), rows, 0, 10)
+
+      # "row 1" fits (5); joining "row 2" crosses the cap and stops there.
+      assert bytes == 11
+    end
+
+    test "empty rows yield the empty copy" do
+      assert Selection.extract_capped(sel(), [], 0, 100) == {:ok, ""}
+    end
+  end
+
   describe "highlight/2" do
     test "whole-row coverage reverses every span" do
       highlighted = highlight(["abc", "def"], {0, nil})

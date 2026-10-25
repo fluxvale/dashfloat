@@ -201,6 +201,12 @@ defmodule DashFloat.TUI.View do
 
   defp highlight_selection(rows, _offset, %State{selection: nil}), do: rows
 
+  # A collapsed selection (press without extension yet) highlights
+  # nothing: a single reversed cell under the pointer reads as a cursor
+  # artifact, not a selection (review cosmetic).
+  defp highlight_selection(rows, _offset, %State{selection: %{anchor: cell, head: cell}}),
+    do: rows
+
   defp highlight_selection(rows, offset, %State{selection: selection}) do
     Enum.with_index(rows, fn row, i ->
       Selection.highlight(row, Selection.columns(selection, offset + i))

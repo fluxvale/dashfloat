@@ -381,4 +381,32 @@ defmodule DashFloat.Config.MigrationTest do
     assert {:ok, %File.Stat{mode: main_mode}} = File.stat(main)
     assert Bitwise.band(main_mode, 0o777) == 0o600
   end
+
+  # Review finding: only REGULAR files are tightened. A directory named
+  # config.json.bak keeps its own semantics — chmod 0600 would strip its
+  # execute bit and make it untraversable.
+  test "a non-regular backup is warned about and left alone" do
+    dir = tmp_dir()
+    legacy = Path.join(dir, "config.json")
+    File.write!(legacy, Jason.encode!(full_legacy()))
+    backup = Path.join(dir, "config.json.bak")
+    File.mkdir(backup)
+    File.chmod!(backup, 0o700)
+
+    logs =
+      capture_log(fn ->
+        assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+      end)
+
+    assert logs =~ "not a regular file"
+
+    # The directory kept its traverse bit and its contents.
+    assert {:ok, %File.Stat{type: :directory, mode: mode}} = File.lstat(backup)
+    assert Bitwise.band(mode, 0o777) == 0o700
+  end
+
+  test "repair_backup/1 covers the missing case silently" do
+    empty = tmp_dir()
+    assert @migration.repair_backup(empty) == :ok
+  end
 end

@@ -284,7 +284,11 @@ defmodule DashFloat.TUI.StateTest do
       state = selected_state()
 
       {anchored, nil} = State.select_mouse(state, "down", 1, 3)
-      assert anchored.selection == %{anchor: {1, 0}, head: {1, 0}}
+      assert anchored.selection.anchor == {1, 0}
+      # The gesture snapshots the entries' display-row count as its base —
+      # the finalize boundary (review P1).
+      assert anchored.selection.base_rows == 4
+      assert anchored.selection.head == {1, 0}
 
       {extended, nil} = State.select_mouse(anchored, "drag", 6, 5)
       assert extended.selection.head == {3, 5}
@@ -380,26 +384,27 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "click jitter below the drag threshold clears instead of copying" do
-      # Review P2b: a 1-column wobble on a plain click must not clobber
-      # the clipboard with an OSC 52 write.
+      # Review contract: a deliberate 3-cell same-row selection MUST copy;
+      # a ≤2-cell wobble MUST NOT. The extent is inclusive (distance + 1).
       state = selected_state()
 
+      # Same cell (1-cell extent): a plain click.
       {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
-      {wobbled, action} = State.select_mouse(anchored, "up", 2, 3)
-
+      {same, action} = State.select_mouse(anchored, "up", 1, 3)
       assert action == nil
+      assert same.selection == nil
+
+      # Adjacent cell (2-cell extent): still wobble.
+      {anchored2, _nil} = State.select_mouse(state, "down", 1, 3)
+      {wobbled, action2} = State.select_mouse(anchored2, "up", 2, 3)
+      assert action2 == nil
       assert wobbled.selection == nil
 
-      # Two columns of wobble is still a click…
-      {anchored2, _nil} = State.select_mouse(state, "down", 1, 3)
-      {wobbled2, action2} = State.select_mouse(anchored2, "up", 3, 3)
-      assert action2 == nil
-      assert wobbled2.selection == nil
-
-      # …three is a real drag (same row) and copies.
+      # Two cells away (3-cell extent): a deliberate selection — copies.
       {anchored3, _nil} = State.select_mouse(state, "down", 1, 3)
-      {dragged3, {:copy, _text}} = State.select_mouse(anchored3, "up", 4, 3)
+      {dragged3, {:copy, text}} = State.select_mouse(anchored3, "up", 3, 3)
       assert dragged3.selection != nil
+      assert text == "alp"
     end
 
     test "shift-modified events are inert — native selection owns them" do
@@ -410,6 +415,40 @@ defmodule DashFloat.TUI.StateTest do
       for kind <- ["down", "drag", "up"] do
         {^state, nil} = State.select_mouse(state, kind, 1, 3, ["shift"])
       end
+    end
+
+    test "a gesture that starts shifted can never copy (latched at its down)" do
+      # Review P2b (delta): releasing Shift before the button used to leak
+      # a clipboard write from the stale anchor of an EARLIER selection.
+      # The shifted down dismisses the old selection, so the later plain
+      # up has nothing to copy from.
+      state = selected_state()
+
+      # An existing selection from a previous gesture…
+      {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
+      {dragged, _nil} = State.select_mouse(anchored, "drag", 6, 5)
+      {kept, {:copy, _text}} = State.select_mouse(dragged, "up", 6, 5)
+      assert kept.selection != nil
+
+      # …a native-selection gesture starts (shift+down): the old highlight
+      # goes away…
+      {native, nil} = State.select_mouse(kept, "down", 1, 3, ["shift"])
+      assert native.selection == nil
+
+      # …Shift is released, and the plain up at a distant cell still
+      # cannot copy from the stale anchor.
+      {leaked, action} = State.select_mouse(native, "up", 6, 5)
+      assert action == nil
+      assert leaked.selection == nil
+    end
+
+    test "shift mid-gesture only pauses extension; a plain-start gesture copies" do
+      state = selected_state()
+
+      {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
+      {paused, _nil} = State.select_mouse(anchored, "drag", 6, 5, ["shift"])
+      {resumed, {:copy, _text}} = State.select_mouse(paused, "up", 6, 5)
+      assert resumed.selection != nil
     end
 
     test "an over-cap selection reports its size instead of copying" do
@@ -433,13 +472,44 @@ defmodule DashFloat.TUI.StateTest do
       {selected, action} = State.select_mouse(dragged, "up", 1, 3)
 
       assert {:copy_too_large, bytes} = action
-      assert bytes > 64 * 1024
 
+      # The build stopped AT the cap: the reported bytes are the
+      # accumulated lower bound, not the full span's size (which never
+      # materialises — that was the freeze).
+      assert bytes > 64 * 1024
       text = State.selection_text(selected)
-      assert bytes == byte_size(text)
+      assert byte_size(text) > bytes
 
       # The highlight stays — the user sees what was too big to copy.
       assert selected.selection != nil
+    end
+
+    test "the Esc-cancel contract: a selection into the reply clears despite appended rows" do
+      # Review P1 (delta): the reply boundary must come from the gesture's
+      # own base, not a finalize-time recount — the cancel contract's
+      # system entry lands between the anchor and the idle, shifting the
+      # live block 2 rows and drifting any recount.
+      opened = new_state(test_mode: {20, 24})
+
+      streaming =
+        opened
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "one two three"}, 1_000)
+
+      {ticked, :cont} = State.tick(streaming, 1_100)
+
+      # Select into the live reply (rows 0-1; the base is 0 — no entries).
+      {anchored, _nil} = State.select_mouse(ticked, "down", 1, 2)
+      {dragged, _nil} = State.select_mouse(anchored, "drag", 10, 3)
+      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 10, 3)
+      assert selected.selection.base_rows == 0
+
+      cancelled =
+        selected
+        |> State.stream_message({:entry, :system, "[cancelled]"})
+        |> State.stream_message({:phase, :idle}, 1_200)
+
+      assert cancelled.selection == nil
     end
 
     test "a selection referencing rows beyond the content copies nothing" do

@@ -442,40 +442,52 @@ owns selection over the log.
 
 - **Geometry is display-row based.** A left-press anchors a range at
   `{display_row, column}` in the same wrapped-display-line space the scroll
-  math counts; a drag moves the head; both clamp into the log rect **in
-  screen space before the scroll mapping** — a click on the status bar or a
-  drag into the input pane selects the viewport's edge row, content under
-  the visible clamp, never rows beyond the viewport (a first cut clamped in
-  content space instead and anchored off-screen; caught in review).
+  math counts — and snapshots the entries' display-row count as the
+  gesture's **base**; a drag moves the head; both clamp into the log rect
+  **in screen space before the scroll mapping** — a click on the status bar
+  or a drag into the input pane selects the viewport's edge row, content
+  under the visible clamp, never rows beyond the viewport (a first cut
+  clamped in content space instead and anchored off-screen; caught in
+  review).
 - **Content-anchored, not viewport-anchored:** indices are absolute display
   rows, so a selection **survives scrolling** (wheel or page keys — the
   highlight translates with the content) and **survives appends** (indices
   are stable under append-at-end). It is **cleared** by a width-changing
   resize (re-wrap invalidates the geometry) and by an in-flight finalize
-  that the selection **reaches into** — judged by identity (position), not
-  row count: the live rows can be stale (tokens arrived since the last
-  tick) and equal in count while differing in content, so counts cannot
-  decide. A selection entirely above the reply survives the finalize;
-  appending cannot move the rows above it.
-- **Click-to-clear, with a jitter threshold:** a press+release is a click
-  unless the pointer crossed rows or wobbled further than a couple of
-  columns — mouse jitter on a plain click must not clobber the clipboard
-  with a copy. A completed drag-and-release keeps the highlight until the
-  next click/resize/drag replaces it (terminal convention).
+  that the selection **reaches into** — judged against the gesture's own
+  base, never a finalize-time recount: rows appended between the anchor
+  and the finalize (the Esc-cancel contract's system entry, late tokens)
+  shift the live block, and a recount drifts with them (a first cut
+  recounted and silently kept selections whose content had changed;
+  caught in review). A selection entirely below the base survives the
+  finalize; appending cannot move the rows below it.
+- **Click-to-clear, extent-based:** a press+release is a click unless the
+  release sits on a different row or at least **three cells** (inclusive
+  extent) from the anchor — a deliberate 3-cell same-row selection copies;
+  the 1–2 cell wobble of a shaky click does not (a first cut measured the
+  column distance strictly-greater and made 3-cell selections impossible;
+  caught in review). Known, deliberate edge: a drag that returns to its
+  anchor cell releases with a 1-cell extent and reads as a click — the
+  extent at release decides, not the path.
 - **Wide/emoji clusters are atomic:** a cluster is selected iff its *first*
   column is in range; slicing and highlighting never split a cluster
   (the wrap width tables do the measuring — one width vocabulary). Both
   endpoints select **through the cell they point at** — the range is
   half-open over cell edges, so the last column of a row is reachable (a
   first cut treated the pointed cell as exclusive and lost every row's
-  final character; caught in review).
-- **Copy is display-faithful:** interior rows copy their rendered text
-  verbatim (hanging indents included — exactly what a native terminal gives
-  you when selecting a wrapped region), first/last rows by column range,
-  rows joined with `\n`, per-row trailing blanks trimmed. The payload is
-  **capped** (64 KiB of text ≈ 86 KiB of base64 sequence, inside every
-  mainstream terminal's OSC 52 limit): past the cap the write is dropped
-  with a log line and the highlight stays.
+  final character; caught in review). A collapsed selection (press, not
+  yet a drag) highlights nothing — one reversed cell would read as a
+  cursor artifact.
+- **Copy is display-faithful and bounded at the BUILD:** interior rows copy
+  their rendered text verbatim (hanging indents included — exactly what a
+  native terminal gives you when selecting a wrapped region), first/last
+  rows by column range, rows joined with `\n`, per-row trailing blanks
+  trimmed. The payload is capped at 64 KiB of text and the *build* stops
+  at the cap — a monster span costs one cap-sized pass, never a full
+  materialisation (a first cut built the whole span and froze the UI
+  process on multi-megabyte logs; caught in review). Past the cap the
+  write is dropped with a log line, the highlight stays, and the reported
+  bytes are the accumulated size at the stop.
 - **OSC 52 delivery:** on release the UI process writes one bounded
   BEL-terminated `\e]52;c;<base64>\a` sequence to standard output — the
   **third one-shot exception** pattern (a bounded write on a user-paced
@@ -483,10 +495,13 @@ owns selection over the log.
   before the post-event frame draws, so bytes cannot interleave mid-frame).
   Live runs only; test mode never writes. Terminals that ignore OSC 52
   simply do nothing — degradation is silence, never a crash or block.
-- **Shift+drag is inert in-app:** a Shift-modified left event anchors,
-  extends, and copies nothing — Shift is the terminal's native-selection
-  bypass (the README documents it), and the app must not select or write
-  underneath the terminal's own selection.
+- **Shift is latched at gesture start:** a left-down with Shift is a
+  native-selection gesture — it dismisses any existing app selection, and
+  nothing in that gesture can select or copy (a later plain up after
+  releasing Shift has no anchor to copy from — a first cut was inert only
+  while Shift was held and leaked a clipboard write from a stale anchor;
+  caught in review). Shift mid-gesture merely pauses extension; a
+  plain-start gesture still copies at its release.
 - **Render discipline:** down/drag/up are user-paced events that may draw,
   like keys; pointer motion without a button stays render-suppressed, and
   the wheel routing amendment below is unchanged.
