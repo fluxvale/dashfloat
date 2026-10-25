@@ -18,26 +18,34 @@ defmodule DashFloat.ConfigTest do
   end
 
   defp write!(dir, contents) do
-    # settings.json5 carries secrets: every fixture starts 0600 (ADR 0008).
+    # settings.json5 is credential-free but stays 0600 — free hardening
+    # (ADR 0008 keys-split amendment).
     path = Path.join(dir, "settings.json5")
     File.write!(path, contents)
     File.chmod!(path, 0o600)
     path
   end
 
-  # The fleet-shaped file: two profiles on one provider (work/personal),
-  # inline credentials, per-profile menus, work defaulting to Flash via
-  # settings.
+  defp write_keys!(dir, contents) do
+    # keys.json5 holds the credentials: every fixture writes it 0600.
+    path = Path.join(dir, "keys.json5")
+    File.write!(path, contents)
+    File.chmod!(path, 0o600)
+    path
+  end
+
+  # The fleet-shaped layout: two profiles on one provider (work/personal),
+  # per-profile menus, work defaulting to Flash via settings. The API keys
+  # live in keys.json5, keyed by profile name.
   defp fleet_file do
     """
     {
-      configVersion: 1,
+      configVersion: 2,
       yourName: 'terry-placeholder',
       profiles: [
         {
           name: 'work',
           baseUrl: 'https://provider.example/v1',
-          apiKey: 'PLACEHOLDER-work-key',
           settings: { defaultModel: 'Flash' },
           models: [
             { nickname: 'Sol', model: 'glm-5.3', context: 524288 },
@@ -47,7 +55,6 @@ defmodule DashFloat.ConfigTest do
         {
           name: 'personal',
           baseUrl: 'https://provider.example/v1',
-          apiKey: 'PLACEHOLDER-personal-key',
           models: [{ nickname: 'Sol', model: 'glm-5.3', context: 262144 }],
         },
       ],
@@ -55,10 +62,20 @@ defmodule DashFloat.ConfigTest do
     """
   end
 
+  defp fleet_keys do
+    "{'work': 'PLACEHOLDER-work-key', 'personal': 'PLACEHOLDER-personal-key',}"
+  end
+
   defp fleet_dir do
     dir = tmp_dir()
     write!(dir, fleet_file())
+    write_keys!(dir, fleet_keys())
     dir
+  end
+
+  defp mode(path) do
+    {:ok, %File.Stat{mode: mode}} = File.stat(path)
+    Bitwise.band(mode, 0o777)
   end
 
   describe "loading the fleet layout" do
@@ -81,10 +98,10 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [{
             name: 'work',
             baseUrl: 'https://provider.example/v1',
-            apiKey: 'PLACEHOLDER-work-key',
             settings: { defaultModel: 'glm-5.3' },
             models: [
               { nickname: 'Flash', model: 'glm-5.3-flash' },
@@ -95,6 +112,8 @@ defmodule DashFloat.ConfigTest do
         """
       )
 
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+
       assert {:ok, %Config{model: "glm-5.3", nickname: "Sol"}} = Config.load(dir, %{}, [])
     end
 
@@ -102,6 +121,7 @@ defmodule DashFloat.ConfigTest do
       dir = tmp_dir()
       main = String.replace(fleet_file(), "defaultModel: 'Flash'", "defaultModel: 'Nope'")
       write!(dir, main)
+      write_keys!(dir, fleet_keys())
 
       logs =
         capture_log(fn ->
@@ -118,14 +138,16 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [{
             name: 'work',
             baseUrl: 'https://provider.example/v1',
-            apiKey: 'PLACEHOLDER-work-key',
           }],
         }
         """
       )
+
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
 
       assert {:error, "missing provider config: model"} = Config.load(dir, %{}, [])
 
@@ -134,7 +156,7 @@ defmodule DashFloat.ConfigTest do
     end
   end
 
-  describe "two profiles on one provider (the differentiator)" do
+  describe "two profiles on one provider across the two files (the differentiator)" do
     test "same baseUrl, distinct credentials: each profile selects its own key and menu" do
       dir = fleet_dir()
 
@@ -167,22 +189,23 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [
             { name: 'work', baseUrl: 'https://provider.example/v1',
-              apiKey: 'PLACEHOLDER-work-key',
               settings: { defaultModel: 'Sol' },
               models: [
                 { nickname: 'Sol', model: 'glm-5.3', context: 524288 },
                 { nickname: 'Flash', model: 'glm-5.3-flash', context: 196608 },
               ] },
             { name: 'personal', baseUrl: 'https://provider.example/v1',
-              apiKey: 'PLACEHOLDER-personal-key',
               settings: { defaultModel: 'Mini' },
               models: [{ nickname: 'Mini', model: 'glm-5.3-mini', context: 128000 }] },
           ],
         }
         """
       )
+
+      write_keys!(dir, fleet_keys())
 
       assert {:ok,
               %Config{
@@ -203,6 +226,14 @@ defmodule DashFloat.ConfigTest do
                 context_tokens: 128_000
               }} =
                Config.load(dir, %{}, profile: "personal")
+    end
+
+    test "a key for a missing profile name in keys.json5 is simply unused" do
+      dir = fleet_dir()
+      # keys.json5 with a stale extra entry: inert, never an error.
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key', 'ghost': 'PLACEHOLDER-x',}")
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
     end
   end
 
@@ -288,7 +319,7 @@ defmodule DashFloat.ConfigTest do
               }} = Config.load(dir, env, [])
     end
 
-    test "blank env vars count as absent and fall back to the file" do
+    test "blank env vars count as absent and fall back to the files" do
       dir = fleet_dir()
 
       env = %{
@@ -308,7 +339,7 @@ defmodule DashFloat.ConfigTest do
              } = config
     end
 
-    test "env alone works without a config file" do
+    test "env alone works without any config files" do
       env = %{
         "DASHFLOAT_BASE_URL" => "https://env.example/v1",
         "DASHFLOAT_MODEL" => "env-model",
@@ -323,6 +354,29 @@ defmodule DashFloat.ConfigTest do
                 nickname: nil,
                 profile: nil
               }} = Config.load(tmp_dir(), env, [])
+    end
+
+    test "an env key completes a settings-only directory (no keys.json5)" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 2,
+          profiles: [{
+            name: 'work',
+            baseUrl: 'https://provider.example/v1',
+            models: [{ nickname: 'Sol', model: 'glm-5.3' }],
+          }],
+        }
+        """
+      )
+
+      assert {:error, "missing provider config: api_key"} = Config.load(dir, %{}, [])
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-env-key", nickname: "Sol"}} =
+               Config.load(dir, %{"DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"}, [])
     end
 
     test "an unusable env context is nil, never an error; a blank one falls back" do
@@ -341,19 +395,89 @@ defmodule DashFloat.ConfigTest do
     end
   end
 
+  describe "keys.json5 resolution" do
+    test "an unusable key value is missing, never an error" do
+      dir = fleet_dir()
+      write_keys!(dir, "{'work': 3, 'personal': 'PLACEHOLDER-personal-key',}")
+
+      assert {:error, "missing provider config: api_key"} = Config.load(dir, %{}, [])
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-personal-key"}} =
+               Config.load(dir, %{}, profile: "personal")
+    end
+
+    test "a malformed keys.json5 is a load error naming the file" do
+      dir = fleet_dir()
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',")
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message == "invalid JSON5 in #{Path.join(dir, "keys.json5")}"
+      refute message =~ "PLACEHOLDER"
+    end
+
+    test "a keys.json5 that is not an object is a load error" do
+      dir = fleet_dir()
+      write_keys!(dir, "['nope']")
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "expected an object"
+    end
+
+    test "a stray inline apiKey is tolerated, warned, and ignored — never a fallback" do
+      stray_file = """
+      {
+        configVersion: 2,
+        profiles: [{
+          name: 'work',
+          baseUrl: 'https://provider.example/v1',
+          apiKey: 'PLACEHOLDER-stray',
+          models: [{ nickname: 'Sol', model: 'glm-5.3' }],
+        }],
+      }
+      """
+
+      dir = tmp_dir()
+      write!(dir, stray_file)
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ ~s(profile "work": apiKey is ignored — API keys live in keys.json5)
+      refute logs =~ "PLACEHOLDER"
+
+      # Without a keys entry the stray value is NOT used — the error names
+      # the field, never the value.
+      bare_dir = tmp_dir()
+      write!(bare_dir, stray_file)
+
+      error_logs =
+        capture_log(fn ->
+          assert {:error, message} = Config.load(bare_dir, %{}, [])
+          assert message =~ "api_key"
+          refute message =~ "PLACEHOLDER"
+        end)
+
+      assert error_logs =~ "apiKey is ignored"
+    end
+  end
+
   describe "missing pieces degrade to field-name errors" do
     test "no file and no env names exactly the missing fields" do
       assert {:error, "missing provider config: base_url, model, api_key"} =
                Config.load(tmp_dir(), %{}, [])
     end
 
-    test "a profile without baseUrl or apiKey names exactly those fields" do
+    test "a profile without baseUrl or a keys entry names exactly those fields" do
       dir = tmp_dir()
 
       write!(
         dir,
         """
         {
+          configVersion: 2,
           profiles: [{
             name: 'work',
             models: [{ nickname: 'Sol', model: 'glm-5.3', profile: 'work' }],
@@ -389,15 +513,18 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [
             { name: 'work', baseUrl: 'https://first.example/v1',
-              apiKey: 'PLACEHOLDER-first', models: [{ model: 'm1' }] },
+              models: [{ model: 'm1' }] },
             { name: 'work', baseUrl: 'https://second.example/v1',
-              apiKey: 'PLACEHOLDER-second', models: [{ model: 'm2' }] },
+              models: [{ model: 'm2' }] },
           ],
         }
         """
       )
+
+      write_keys!(dir, "{'work': 'PLACEHOLDER-first',}")
 
       logs =
         capture_log(fn ->
@@ -421,10 +548,10 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [{
             name: 'work',
             baseUrl: 'https://provider.example/v1',
-            apiKey: 'PLACEHOLDER-work-key',
             models: [
               { nickname: 'alpha', model: 'beta' },
               { nickname: 'beta', model: 'gamma' },
@@ -433,6 +560,8 @@ defmodule DashFloat.ConfigTest do
         }
         """
       )
+
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
 
       # "beta" is BOTH entry one's model id and entry two's nickname: the
       # nickname is the user-facing address and wins.
@@ -465,14 +594,16 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [{
             name: 'work',
             baseUrl: 'https://provider.example/v1',
-            apiKey: 'PLACEHOLDER-work-key',
           }],
         }
         """
       )
+
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
 
       logs =
         capture_log(fn ->
@@ -489,16 +620,18 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [{
             name: 'work',
             baseUrl: 'https://provider.example/v1',
-            apiKey: 'PLACEHOLDER-work-key',
             settings: { defaultModel: 3 },
             models: [{ nickname: 'Sol', model: 'glm-5.3' }, { nickname: 'Flash', model: 'glm-5.3-flash' }],
           }],
         }
         """
       )
+
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
 
       logs =
         capture_log(fn ->
@@ -539,6 +672,7 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [
             'not-a-map',
             { baseUrl: 'https://no-name.example' },
@@ -578,15 +712,17 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [{
             name: 'work',
             baseUrl: 'https://provider.example/v1',
-            apiKey: 'PLACEHOLDER-work-key',
             models: 3,
           }],
         }
         """
       )
+
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
 
       logs =
         capture_log(fn ->
@@ -603,10 +739,10 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [{
             name: 'work',
             baseUrl: 'https://provider.example/v1',
-            apiKey: 'PLACEHOLDER-work-key',
             models: [
               { nickname: 'Sol', model: 'glm-5.3', context: 524288 },
               { nickname: 'NoModel' },
@@ -616,6 +752,8 @@ defmodule DashFloat.ConfigTest do
         }
         """
       )
+
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
 
       logs =
         capture_log(fn ->
@@ -633,16 +771,18 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [{
             name: 'work',
             baseUrl: 'https://provider.example/v1',
-            apiKey: 'PLACEHOLDER-work-key',
             settings: 'nope',
             models: [{ nickname: 'Sol', model: 'glm-5.3' }],
           }],
         }
         """
       )
+
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
 
       logs =
         capture_log(fn ->
@@ -663,6 +803,7 @@ defmodule DashFloat.ConfigTest do
         )
 
       write!(dir, main)
+      write_keys!(dir, fleet_keys())
 
       logs =
         capture_log(fn ->
@@ -675,10 +816,10 @@ defmodule DashFloat.ConfigTest do
     end
 
     test "a newer configVersion warns; an older or absent one is silent" do
-      dir = fleet_dir()
-
-      main = String.replace(fleet_file(), "configVersion: 1", "configVersion: 9")
+      dir = tmp_dir()
+      main = String.replace(fleet_file(), "configVersion: 2", "configVersion: 9")
       write!(dir, main)
+      write_keys!(dir, fleet_keys())
 
       logs =
         capture_log(fn ->
@@ -702,8 +843,7 @@ defmodule DashFloat.ConfigTest do
       assert {:error, message} = Config.load(dir, %{}, [])
       assert message =~ "invalid JSON5"
 
-      assert {:ok, %File.Stat{mode: mode}} = File.stat(main)
-      assert Bitwise.band(mode, 0o777) == 0o600
+      assert mode(main) == 0o600
     end
 
     test "a symlinked settings.json5 warns and never chmods the target" do
@@ -712,6 +852,7 @@ defmodule DashFloat.ConfigTest do
       File.write!(target, fleet_file())
       File.chmod!(target, 0o644)
       File.ln_s!(target, Path.join(dir, "settings.json5"))
+      write_keys!(dir, fleet_keys())
 
       logs =
         capture_log(fn ->
@@ -721,15 +862,7 @@ defmodule DashFloat.ConfigTest do
       assert logs =~ "is a symlink"
 
       # The loader does not own the target file — its mode is untouched.
-      assert {:ok, %File.Stat{mode: mode}} = File.stat(target)
-      assert Bitwise.band(mode, 0o777) == 0o644
-    end
-
-    test "a UTF-8 BOM is stripped before decoding" do
-      dir = tmp_dir()
-      write!(dir, "\xEF\xBB\xBF" <> fleet_file())
-
-      assert {:ok, %Config{nickname: "Flash", profile: "work"}} = Config.load(dir, %{}, [])
+      assert mode(target) == 0o644
     end
 
     test "a too-permissive settings.json5 is repaired to 0600 with a warning" do
@@ -744,8 +877,103 @@ defmodule DashFloat.ConfigTest do
 
       assert logs =~ "repairing to 0600"
 
-      assert {:ok, %File.Stat{mode: mode}} = File.stat(main)
-      assert Bitwise.band(mode, 0o777) == 0o600
+      assert mode(main) == 0o600
+    end
+
+    test "a too-permissive keys.json5 is repaired to 0600 with a warning" do
+      dir = fleet_dir()
+      keys = Path.join(dir, "keys.json5")
+      File.chmod!(keys, 0o644)
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ "keys.json5 is too permissive"
+      assert mode(keys) == 0o600
+    end
+
+    test "a symlinked keys.json5 warns and never chmods the target" do
+      dir = fleet_dir()
+      keys = Path.join(dir, "keys.json5")
+      File.rm!(keys)
+
+      target = Path.join(dir, "real-keys")
+      File.write!(target, fleet_keys())
+      File.chmod!(target, 0o644)
+      File.ln_s!(target, keys)
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ "keys.json5 is a symlink"
+      assert mode(target) == 0o644
+    end
+
+    test "a non-regular keys.json5 is warned about, left alone, and unreadable" do
+      dir = fleet_dir()
+      keys = Path.join(dir, "keys.json5")
+      File.rm!(keys)
+      File.mkdir!(keys)
+      File.chmod!(keys, 0o700)
+
+      logs =
+        capture_log(fn ->
+          assert {:error, message} = Config.load(dir, %{}, [])
+          assert message =~ "cannot read"
+          assert message =~ "keys.json5"
+        end)
+
+      assert logs =~ "not a regular file"
+      assert File.lstat!(keys).type == :directory
+    end
+
+    test "oauth.json5 is posture-only: repaired when present, silent when absent, never read" do
+      dir = fleet_dir()
+      oauth = Path.join(dir, "oauth.json5")
+
+      # Absent: silent.
+      assert capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end) == ""
+
+      # Present, too permissive, and garbage — repaired, never parsed, and
+      # the load does not care.
+      File.write!(oauth, "{ this is not json5 at all")
+      File.chmod!(oauth, 0o644)
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ "oauth.json5 is too permissive"
+      assert mode(oauth) == 0o600
+    end
+
+    test "a leftover too-permissive settings.json5.bak is repaired to 0600" do
+      dir = fleet_dir()
+      backup = Path.join(dir, "settings.json5.bak")
+      File.write!(backup, "// pre-split backup")
+      File.chmod!(backup, 0o644)
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{}} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ "settings.json5.bak"
+      assert logs =~ "too permissive"
+      assert mode(backup) == 0o600
+    end
+
+    test "a UTF-8 BOM is stripped before decoding" do
+      dir = tmp_dir()
+      write!(dir, "\xEF\xBB\xBF" <> fleet_file())
+      write_keys!(dir, fleet_keys())
+
+      assert {:ok, %Config{nickname: "Flash", profile: "work"}} = Config.load(dir, %{}, [])
     end
 
     test "error messages never contain values that were present" do
@@ -755,6 +983,7 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [{ name: 'work', baseUrl: 'https://file.example/v1' }],
         }
         """
@@ -780,15 +1009,17 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [{
             name: 'work',
             baseUrl: 'https://provider.example/v1',
-            apiKey: 'PLACEHOLDER-work-key',
             models: [{ model: 'glm-5.3' }],
           }],
         }
         """
       )
+
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
 
       assert {:ok, %Config{nickname: "glm-5.3", context_tokens: nil}} = Config.load(dir, %{}, [])
     end
@@ -800,15 +1031,17 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
+          configVersion: 2,
           profiles: [{
             name: 'work',
             baseUrl: 'https://provider.example/v1',
-            apiKey: 'PLACEHOLDER-work-key',
             models: [{ model: 'a', context: 0 }],
           }],
         }
         """
       )
+
+      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
 
       assert {:ok, %Config{model: "a", context_tokens: nil}} = Config.load(dir, %{}, [])
     end
@@ -841,15 +1074,113 @@ defmodule DashFloat.ConfigTest do
       backup = Path.join(dir, "config.json.bak")
       assert File.exists?(backup)
 
+      # The live settings file never holds the credential; keys.json5 does.
       main = Path.join(dir, "settings.json5")
-      assert {:ok, %File.Stat{mode: mode}} = File.stat(main)
-      assert Bitwise.band(mode, 0o777) == 0o600
+      keys = Path.join(dir, "keys.json5")
+      refute File.read!(main) =~ "PLACEHOLDER-legacy-key"
+      assert File.read!(keys) =~ "PLACEHOLDER-legacy-key"
+      assert mode(main) == 0o600
+      assert mode(keys) == 0o600
 
       # The second load does not migrate again — the marker file exists.
       assert {:ok, %Config{profile: "default"}} = Config.load(dir, %{}, [])
 
       files = File.ls!(dir)
       assert Enum.count(files, &String.starts_with?(&1, "config.json")) == 1
+    end
+
+    test "a v1 inline-keys settings.json5 splits in place on load" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 1,
+          profiles: [{
+            name: 'work',
+            baseUrl: 'https://provider.example/v1',
+            apiKey: 'PLACEHOLDER-work-key',
+            models: [{ nickname: 'Sol', model: 'glm-5.3' }],
+          }],
+        }
+        """
+      )
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-work-key", nickname: "Sol", profile: "work"}} =
+               Config.load(dir, %{}, [])
+
+      main = Path.join(dir, "settings.json5")
+      refute File.read!(main) =~ "PLACEHOLDER-work-key"
+      assert mode(Path.join(dir, "keys.json5")) == 0o600
+      assert mode(Path.join(dir, "settings.json5.bak")) == 0o600
+    end
+
+    test "no credential material ever lands in the live settings.json5 (both paths)" do
+      # Legacy path.
+      legacy_dir = tmp_dir()
+      legacy_main = Path.join(legacy_dir, "settings.json5")
+      legacy_backup = Path.join(legacy_dir, "config.json.bak")
+      legacy_source = Path.join(legacy_dir, "config.json")
+
+      File.write!(
+        legacy_source,
+        Jason.encode!(%{
+          base_url: "https://legacy.example/v1",
+          model: "legacy-model",
+          api_key: "PLACEHOLDER-legacy-key"
+        })
+      )
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-legacy-key"}} =
+               Config.load(legacy_dir, %{}, [])
+
+      refute File.read!(legacy_main) =~ "PLACEHOLDER-legacy-key"
+      assert File.read!(legacy_backup) =~ "PLACEHOLDER-legacy-key"
+      assert mode(legacy_backup) == 0o600
+
+      # In-place split path (the realistic v1-migrated directory).
+      split_dir = tmp_dir()
+      split_main = Path.join(split_dir, "settings.json5")
+      split_keys = Path.join(split_dir, "keys.json5")
+      split_backup = Path.join(split_dir, "settings.json5.bak")
+      old_backup = Path.join(split_dir, "config.json.bak")
+
+      write!(
+        split_dir,
+        """
+        {
+          configVersion: 1,
+          profiles: [
+            { name: 'work', baseUrl: 'https://provider.example/v1',
+              apiKey: 'PLACEHOLDER-work-key',
+              models: [{ nickname: 'Sol', model: 'glm-5.3' }] },
+            { name: 'personal', baseUrl: 'https://provider.example/v1',
+              apiKey: 'PLACEHOLDER-personal-key',
+              models: [{ nickname: 'Sol', model: 'glm-5.3' }] },
+          ],
+        }
+        """
+      )
+
+      File.write!(old_backup, ~s({"api_key": "PLACEHOLDER-old"}))
+      File.chmod!(old_backup, 0o644)
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(split_dir, %{}, [])
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-personal-key"}} =
+               Config.load(split_dir, %{}, profile: "personal")
+
+      # The LIVE settings file is credential-free...
+      refute File.read!(split_main) =~ "PLACEHOLDER"
+      # ...while the keys live in keys.json5 and the BY-DESIGN backups hold
+      # the old values at 0600 (backups inherit sensitivity — that IS the
+      # principle, not a leak).
+      assert File.read!(split_keys) =~ "PLACEHOLDER-work-key"
+      assert mode(split_keys) == 0o600
+      assert mode(split_backup) == 0o600
+      assert mode(old_backup) == 0o600
+      assert File.read!(split_backup) =~ "PLACEHOLDER-work-key"
     end
   end
 
@@ -900,8 +1231,7 @@ defmodule DashFloat.ConfigTest do
     assert logs =~ "config.json.bak"
     assert logs =~ "too permissive"
 
-    assert {:ok, %File.Stat{mode: mode}} = File.stat(backup)
-    assert Bitwise.band(mode, 0o777) == 0o600
+    assert mode(backup) == 0o600
   end
 
   test "load leaves a 0600 backup alone and a missing one unmentioned" do
@@ -929,8 +1259,7 @@ defmodule DashFloat.ConfigTest do
     assert logs =~ "symlink"
 
     # The target kept its mode — chmod did not follow the link out.
-    assert {:ok, %File.Stat{mode: mode}} = File.stat(target)
-    assert Bitwise.band(mode, 0o777) == 0o644
+    assert mode(target) == 0o644
   end
 
   test "load warns about and never chmods a non-regular backup" do
