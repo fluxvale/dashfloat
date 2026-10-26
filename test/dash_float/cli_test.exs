@@ -27,6 +27,18 @@ defmodule DashFloat.CLITest do
     assert CLI.parse([]) == []
   end
 
+  test "version?/1 detects the version flag anywhere in argv" do
+    refute CLI.version?([])
+    refute CLI.version?(["--profile", "work"])
+    assert CLI.version?(["--version"])
+    assert CLI.version?(["--profile", "work", "--version"])
+  end
+
+  test "a version query is never parsed as a selection and never warns" do
+    logs = capture_log(fn -> assert CLI.parse(["--version"]) == [] end)
+    assert logs == ""
+  end
+
   test "a switch without a value warns and is ignored" do
     logs =
       capture_log(fn ->

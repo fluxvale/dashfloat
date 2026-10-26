@@ -27,7 +27,7 @@ workloads (streaming, tool execution, session management).
 | TUI | `ex_ratatui` | `~> 0.17.1` | Rustler-backed ratatui bindings; precompiled NIFs for OTP 26–29 (ABI 2.17 loads on OTP 29) |
 | HTTP + SSE | `req` | `~> 0.7.5` | stable line (0.8 is release-candidate only) |
 | JSON | `jason` | `~> 1.4` | 1.4.5 is the latest stable |
-| Distribution | `burrito` | `~> 1.6` | single-binary releases; musl precompiled NIFs are a supported payload |
+| Distribution | core `mix release` | built into Elixir | per-platform tarballs + installer + Homebrew; see [ADR 0010](0010-release-packaging.md) |
 
 ### Process architecture
 

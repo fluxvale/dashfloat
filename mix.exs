@@ -4,12 +4,23 @@ defmodule DashFloat.MixProject do
   def project do
     [
       app: :dash_float,
-      version: "0.0.0",
+      version: "0.1.0",
       elixir: "~> 1.20.0",
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
       aliases: aliases(),
       deps: deps(),
+      # One release, named for the binary users type (the OTP app stays
+      # :dash_float). Release packaging is core `mix release` per ADR 0010.
+      # The step after :assemble forwards CLI arguments on `start` — the
+      # generated launcher drops them, which would silently break --version
+      # and the --profile/--model selection flags (see the function below).
+      releases: [
+        dashfloat: [
+          include_executables_for: [:unix],
+          steps: [:assemble, &patch_launcher/1]
+        ]
+      ],
       # coveralls.multiple writes cover/excoveralls.json (Codecov) and
       # cover/excoveralls.html (CI artifact) from one suite run
       test_coverage: [tool: ExCoveralls],
@@ -48,7 +59,6 @@ defmodule DashFloat.MixProject do
 
   defp deps do
     [
-      {:burrito, "~> 1.6"},
       {:earmark_parser, "~> 1.4"},
       {:ex_ratatui, "~> 0.17.1"},
       {:jason, "~> 1.4"},
@@ -83,7 +93,49 @@ defmodule DashFloat.MixProject do
     ]
   end
 
-  # Test support modules (the loopback SSE server) compile only under :test.
+  # Test support modules (the loopback test seam) compile only under :test.
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_env), do: ["lib"]
+
+  # The generated `bin/<name>` launcher is operator-shaped: every argument is
+  # a release command, `start` drops its own arguments, and a bare invocation
+  # prints a command list. DashFloat's binary is user-shaped: `dashfloat`
+  # starts the TUI, `dashfloat --version` answers, and the selection flags
+  # reach the app. Two text edits to Elixir's own launcher do that, with the
+  # build failing loudly if the template moves under us, instead of shipping a
+  # binary that silently ignores what the user typed (ADR 0010).
+  defp patch_launcher(release) do
+    launcher = Path.join(release.path, "bin/#{release.name}")
+    contents = File.read!(launcher)
+
+    contents =
+      replace_launcher!(
+        launcher,
+        contents,
+        ~s{  start)\n    start "elixir" --no-halt\n},
+        ~s{  start)\n    shift\n    start "elixir" --no-halt "$@"\n}
+      )
+
+    contents =
+      replace_launcher!(
+        launcher,
+        contents,
+        ~s{case $1 in\n  start)},
+        ~s{case $1 in\n  "" | -*) set -- start "$@" ;;\nesac\n\ncase $1 in\n  start)}
+      )
+
+    File.write!(launcher, contents)
+    release
+  end
+
+  defp replace_launcher!(launcher, contents, from, to) do
+    if String.contains?(contents, from) do
+      String.replace(contents, from, to)
+    else
+      Mix.raise(
+        "release launcher #{launcher} does not contain the expected fragment — " <>
+          "Elixir's launcher template changed; update patch_launcher/1 in mix.exs (ADR 0010)"
+      )
+    end
+  end
 end

@@ -182,4 +182,117 @@ defmodule DashFloat.ApplicationTest do
                interactive?: false
              )
   end
+
+  # ADR 0010: `--version` answers from the boot, before config load and
+  # terminal setup, and exits. The exit is injected (`halt:`) because a real
+  # `System.halt/1` would take the test VM with it; the rest of the path —
+  # the NIF load, the write to stdout, the code — is the production code.
+  describe "--version at boot (ADR 0010)" do
+    test "writes the version to stdout and halts 0, before any config work" do
+      parent = self()
+
+      halt = fn code -> send(parent, {:halted, code}) end
+
+      out =
+        capture_io(fn ->
+          # A config_dir that does not exist: classification would raise or
+          # print setup instructions if the version path did NOT exit first.
+          Application.start(:normal,
+            test?: false,
+            config_dir: "/nonexistent-dashfloat-version-#{System.unique_integer([:positive])}",
+            env: %{},
+            argv: ["--version"],
+            interactive?: false,
+            halt: halt
+          )
+        end)
+
+      assert_received {:halted, 0}
+      assert out == "dashfloat #{DashFloat.version()}\n"
+    end
+
+    test "a version query anywhere in argv still exits before config work" do
+      parent = self()
+      halt = fn code -> send(parent, {:halted, code}) end
+
+      capture_io(fn ->
+        Application.start(:normal,
+          test?: false,
+          config_dir: "/nonexistent-dashfloat-version-#{System.unique_integer([:positive])}",
+          env: %{},
+          argv: ["--profile", "work", "--version"],
+          interactive?: false,
+          halt: halt
+        )
+      end)
+
+      assert_received {:halted, 0}
+    end
+
+    test "no version flag means no halt and the normal boot proceeds" do
+      dir = v3_dir()
+      parent = self()
+      halt = fn code -> send(parent, {:halted, code}) end
+
+      refute_received {:halted, _}
+
+      Application.start(:normal,
+        test?: false,
+        config_dir: dir,
+        env: %{},
+        argv: [],
+        interactive?: true,
+        halt: halt
+      )
+
+      # The boot reached the supervisor and not the version exit.
+      refute_received {:halted, _}
+    end
+  end
+
+  # A release boots applications before Elixir parses `-extra` into
+  # System.argv/0, so the plain init arguments are where the user's flags
+  # actually appear (ADR 0010). Exercised through the plain_argv seam, which
+  # stands in for them.
+  describe "boot argv in a release (ADR 0010)" do
+    test "the plain init arguments reach argv, so --version is seen" do
+      parent = self()
+      halt = fn code -> send(parent, {:halted, code}) end
+
+      capture_io(fn ->
+        Application.start(:normal,
+          test?: false,
+          config_dir: "/nonexistent-dashfloat-version-#{System.unique_integer([:positive])}",
+          env: %{},
+          plain_argv: ["--version"],
+          system_argv: [],
+          interactive?: false,
+          halt: halt
+        )
+      end)
+
+      assert_received {:halted, 0}
+    end
+
+    test "the launcher's own --no-halt is stripped from the plain arguments" do
+      parent = self()
+      halt = fn code -> send(parent, {:halted, code}) end
+
+      capture_io(fn ->
+        Application.start(:normal,
+          test?: false,
+          config_dir: "/nonexistent-dashfloat-version-#{System.unique_integer([:positive])}",
+          env: %{},
+          plain_argv: ["--no-halt", "--version"],
+          system_argv: [],
+          interactive?: false,
+          halt: halt
+        )
+      end)
+
+      # Reaching the version exit at all proves the plain arguments were
+      # used; --no-halt was stripped rather than treated as a user flag.
+      assert_received {:halted, 0}
+    end
+  end
 end

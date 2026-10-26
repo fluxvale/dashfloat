@@ -226,7 +226,8 @@ The terminal must never be left broken:
   explicit user quit (`:normal`); `1` for everything else, including
   supervisor-driven `:shutdown` (a sibling crash-loop arrives as `:shutdown`
   and must not masquerade as success). SIGTERM-to-exit-code mapping is
-  deferred to the burrito release work. This runs only when mounted against
+  deferred to the release work ([ADR 0010](0010-release-packaging.md)). This
+  runs only when mounted against
   a real terminal — under `test_mode` it does nothing. It makes
   `mix run --no-halt` (and the future binary) exit when the TUI quits,
   without breaking tests.
