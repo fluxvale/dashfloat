@@ -96,11 +96,63 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
 
+  # Path filter for the website job: it builds only when website/** or this
+  # workflow changes, and skips otherwise — the umbrella below accepts
+  # "skipped", so unrelated PRs stay green without building the site.
+  changes:
+    name: detect website changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      website: ${{ steps.filter.outputs.website }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # paths-filter diffs push events against the previous commit; a
+          # shallow clone truncates that history.
+          fetch-depth: 0
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            website:
+              - 'website/**'
+              - '.github/workflows/ci.yml'
+
+  website:
+    name: build website
+    needs: changes
+    if: needs.changes.outputs.website == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      # Deps are exact-pinned in package.json + package-lock.json; npm ci
+      # refuses to touch them, so no floating versions reach the build.
+      - run: npm ci
+        working-directory: website
+      - run: npm run build
+        working-directory: website
+
   # The umbrella: branch protection requires THIS check. Runs regardless of
   # the gate's outcome — "skipped" is accepted for future path-gated jobs.
   wait-for-ci:
     name: Wait for CI
-    needs: [ci]
+    needs: [ci, website]
     if: always()
     runs-on: ubuntu-latest
     steps:
