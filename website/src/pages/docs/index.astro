@@ -1,0 +1,51 @@
+---
+import Base from "../../layouts/Base.astro";
+import { listAdrs } from "../../lib/docs";
+
+const adrs = listAdrs();
+---
+
+<Base title="Docs · DashFloat" description="DashFloat documentation — README and architecture decision records.">
+  <div class="doc-header">
+    <div class="breadcrumb"><a href="/">DashFloat</a> / Docs</div>
+    <h1>Docs</h1>
+    <p>
+      Everything here is rendered from the repository at build time — the
+      <a href="/docs/readme">README</a> and the architecture decision records
+      under <code>docs/decisions/</code>.
+    </p>
+  </div>
+
+  <section class="section">
+    <h2>README</h2>
+    <ul>
+      <li><a href="/docs/readme">DashFloat — README</a> — overview, setup, and development</li>
+    </ul>
+  </section>
+
+  <section class="section">
+    <h2>Architecture decision records</h2>
+    <table class="adr-table">
+      <thead>
+        <tr>
+          <th>ADR</th>
+          <th>Title</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {
+          adrs.map((adr) => (
+            <tr>
+              <td class="num">{adr.number}</td>
+              <td>
+                <a href={`/docs/decisions/${adr.slug}`}>{adr.title}</a>
+              </td>
+              <td class="status">{adr.status}</td>
+            </tr>
+          ))
+        }
+      </tbody>
+    </table>
+  </section>
+</Base>

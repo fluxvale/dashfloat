@@ -1,0 +1,31 @@
+---
+import Base from "../../../layouts/Base.astro";
+import { listAdrs, readAdr, renderMarkdown } from "../../../lib/docs";
+
+export function getStaticPaths() {
+  return listAdrs().map((adr) => ({ params: { slug: adr.slug } }));
+}
+
+const { slug } = Astro.params;
+const adr = listAdrs().find((a) => a.slug === slug)!;
+const html = renderMarkdown(readAdr(slug!) ?? "");
+---
+
+<Base
+  title={`ADR ${adr.number} — ${adr.title} · DashFloat`}
+  description={`ADR ${adr.number}: ${adr.title} (${adr.status}).`}
+>
+  <div class="breadcrumb">
+    <a href="/">DashFloat</a> / <a href="/docs">Docs</a> / ADR {adr.number}
+  </div>
+  <article class="md">
+    <Fragment set:html={html} />
+  </article>
+  <p class="source-link">
+    Source:
+    <a href={`https://github.com/fluxvale/dashfloat/blob/main/docs/decisions/${slug}.md`}>
+      docs/decisions/{slug}.md
+    </a>
+    in the repository.
+  </p>
+</Base>

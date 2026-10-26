@@ -1,0 +1,73 @@
+---
+import Base from "../layouts/Base.astro";
+---
+
+<Base
+  title="DashFloat — a fast, robust CLI AI coding harness in Elixir"
+  description="DashFloat streams LLM responses, executes structured tool calls, and manages coding sessions from the terminal. Built in Elixir on OTP."
+>
+  <section class="hero">
+    <h1>DashFloat</h1>
+    <p class="tagline">A fast, robust CLI AI coding harness in Elixir.</p>
+    <p class="sub">
+      Streams LLM responses, executes structured tool calls, and manages coding
+      sessions — from the terminal.
+    </p>
+    <div class="cta-row">
+      <a class="cta primary" href="/docs/readme">Get started</a>
+      <a class="cta" href="https://github.com/fluxvale/dashfloat">GitHub</a>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>What it is</h2>
+    <ul class="cards">
+      <li>
+        <h3>Built on OTP</h3>
+        <p>
+          A pure render-loop UI process, an agent-manager GenServer, stream-handler
+          tasks, and isolated subprocess execution — I/O never blocks rendering.
+        </p>
+      </li>
+      <li>
+        <h3>Terminal-native</h3>
+        <p>
+          An ex_ratatui TUI: a streaming markdown log, a live status bar, and a
+          multi-line input with history, mouse selection, and clipboard copy.
+        </p>
+      </li>
+      <li>
+        <h3>Ships as one binary</h3>
+        <p>
+          burrito single-binary releases — no runtime to install, no bundles to
+          untangle.
+        </p>
+      </li>
+    </ul>
+  </section>
+
+  <section class="section quickstart">
+    <h2>Quickstart</h2>
+    <p class="status-note">
+      Pre-alpha. Requires Elixir 1.20 and Erlang/OTP 29.
+    </p>
+    <pre><code>git clone https://github.com/fluxvale/dashfloat.git
+cd dashfloat
+mix run --no-halt</code></pre>
+    <p>
+      Point it at any OpenAI-compatible provider in
+      <code>~/.config/dashfloat/settings.json5</code> (API keys live in a sibling
+      <code>keys.json5</code>, never in the settings file) — the
+      <a href="/docs/readme">README</a> has the full setup guide.
+    </p>
+  </section>
+
+  <section class="section">
+    <h2>Docs</h2>
+    <p>
+      The <a href="/docs/readme">README</a> and every
+      <a href="/docs">architecture decision record</a> are rendered straight from
+      the repository.
+    </p>
+  </section>
+</Base>
