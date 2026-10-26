@@ -77,6 +77,14 @@ initialization, and forces the `ex_ratatui` NIF to load first: a version query
 is also the cheapest packaging smoke, so a NIF/host mismatch must fail loudly
 instead of printing a version.
 
+That path ends in `System.halt/1`, which would take the test VM down with it, so
+the boot takes the halt function and the argument sources through its existing
+`args` seam (`halt:`, `plain_argv:`, `system_argv:`). Production passes none of
+them and gets `System.halt/1` and the real sources; the tests pass a function
+that reports the exit code, which is what lets the version arm, its stdout
+write, and both branches of the argv fallback be covered rather than excluded
+from the coverage floor.
+
 ### Platforms and the glibc floor
 
 | Target | Runner | Produces |
