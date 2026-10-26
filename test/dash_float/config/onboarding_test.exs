@@ -140,7 +140,7 @@ defmodule DashFloat.Config.OnboardingTest do
     end
 
     test "skip lands in the loop menu with a provider-less profile" do
-      {state, actions} =
+      {state, _actions} =
         drive(Onboarding.new(), ["enter", "enter", "down", "down", "down", "enter"])
 
       assert state.step == :loop
@@ -474,7 +474,7 @@ defmodule DashFloat.Config.OnboardingTest do
       {welcome, nil} = Onboarding.handle_key(base, "x")
       assert welcome.step == :welcome
 
-      named = press(base, ["enter", "enter", "enter", "enter", "k", "enter"])
+      _named = press(base, ["enter", "enter", "enter", "enter", "k", "enter"])
 
       # selection steps: up wraps, noise is inert
       provider = press(base, ["enter", "enter"])

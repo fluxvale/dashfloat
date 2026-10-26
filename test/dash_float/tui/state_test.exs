@@ -295,7 +295,7 @@ defmodule DashFloat.TUI.StateTest do
       assert extended.selection.head == {3, 5}
 
       {released, {:copy, text}} = State.select_mouse(extended, "up", 6, 5)
-      assert released.selection != nil
+      assert match?(%{head: _}, released.selection)
       # Last row slices through col 5's cell ("beta l" — the pointed cell
       # is included; review P2a).
       assert text == "alpha line\n\nbeta l"
@@ -404,7 +404,7 @@ defmodule DashFloat.TUI.StateTest do
       # Two cells away (3-cell extent): a deliberate selection — copies.
       {anchored3, _nil} = State.select_mouse(state, "down", 1, 3)
       {dragged3, {:copy, text}} = State.select_mouse(anchored3, "up", 3, 3)
-      assert dragged3.selection != nil
+      assert match?(%{head: _}, dragged3.selection)
       assert text == "alp"
     end
 
@@ -429,7 +429,7 @@ defmodule DashFloat.TUI.StateTest do
       {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
       {dragged, _nil} = State.select_mouse(anchored, "drag", 6, 5)
       {kept, {:copy, _text}} = State.select_mouse(dragged, "up", 6, 5)
-      assert kept.selection != nil
+      assert match?(%{head: _}, kept.selection)
 
       # …a native-selection gesture starts (shift+down): the old highlight
       # goes away…
@@ -449,7 +449,7 @@ defmodule DashFloat.TUI.StateTest do
       {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
       {paused, _nil} = State.select_mouse(anchored, "drag", 6, 5, ["shift"])
       {resumed, {:copy, _text}} = State.select_mouse(paused, "up", 6, 5)
-      assert resumed.selection != nil
+      assert match?(%{head: _}, resumed.selection)
     end
 
     test "an over-cap selection reports its size instead of copying" do
@@ -575,7 +575,7 @@ defmodule DashFloat.TUI.StateTest do
       {into, _no_copy} = State.select_mouse(dirty, "down", 1, 4)
       {into_drag, _no_copy} = State.select_mouse(into, "drag", 6, 5)
       {into_selected, {:copy, _reply_text}} = State.select_mouse(into_drag, "up", 6, 5)
-      assert into_selected.selection != nil
+      assert match?(%{head: _}, into_selected.selection)
 
       replaced = State.stream_message(into_selected, {:phase, :idle}, 1_400)
       assert replaced.selection == nil
@@ -1503,7 +1503,7 @@ defmodule DashFloat.TUI.StateTest do
         |> Map.put(:agent_ref, ref)
         |> State.stream_message({:confirm, make_ref(), confirm_request(["+ x"])})
 
-      assert state.confirm != nil
+      assert match?(%{ref: _}, state.confirm)
 
       {after_down, :handled} = State.agent_down(state, ref, :killed)
       assert after_down.confirm == nil

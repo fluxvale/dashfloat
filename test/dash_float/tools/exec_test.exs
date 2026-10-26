@@ -128,16 +128,27 @@ defmodule DashFloat.Tools.ExecTest do
   end
 
   # pgrep exits 1 on no matches — which is exactly what we want to see.
-  defp assert_eventually_gone(marker) do
+  # A deadline loop, not a single retry: under CI runner contention the
+  # child IS reaped, just later than any fixed window — poll to a bound and
+  # fail with the survivors named when the deadline hits (self-diagnosing).
+  defp assert_eventually_gone(marker, deadline_ms \\ 5_000) do
+    deadline = System.monotonic_time(:millisecond) + deadline_ms
+
+    do_assert_eventually_gone(marker, deadline)
+  end
+
+  defp do_assert_eventually_gone(marker, deadline) do
     {matches, _status} = System.cmd("pgrep", ["-f", marker])
 
     if matches == "" do
       assert true
     else
-      :timer.sleep(50)
-
-      {matches, _status} = System.cmd("pgrep", ["-f", marker])
-      assert matches == ""
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("process matching #{inspect(marker)} still alive at the deadline: #{matches}")
+      else
+        :timer.sleep(100)
+        do_assert_eventually_gone(marker, deadline)
+      end
     end
   end
 
