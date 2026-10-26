@@ -90,8 +90,10 @@ and ignored — never a fallback. The status bar names the active model
 `nickname (profile)`. Put your provider's own base URL in `baseUrl`;
 DashFloat appends `/chat/completions`. At startup DashFloat also refreshes
 the model catalog from each of the active profile's providers (`GET
-{baseUrl}/models`, fail-open, in-memory: your explicit entries always win,
-new models are added) — nothing is written back to your config.
+{baseUrl}/models`, fail-open, in-memory): its one visible effect today is
+the status bar's context denominator filling in for a selected model whose
+entry carried no `context` — fetched models are not added to your menus,
+and nothing is written back to your config.
 
 Damaged configs degrade with warnings, never crashes: a deleted
 `defaultProfile`, a mistyped `profiles` list, junk entries — each names the

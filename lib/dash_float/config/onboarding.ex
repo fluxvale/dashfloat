@@ -77,7 +77,10 @@ defmodule DashFloat.Config.Onboarding do
             mcp: [],
             mcp_name: nil,
             mcp_command: nil,
-            mcp_args: []
+            mcp_args: [],
+            # A refused write's message, shown at the step that issued the
+            # write (issue #39): paths and remedies only, never values.
+            error: nil
 
   @doc "The initial wizard state."
   @spec new() :: t()
@@ -348,6 +351,39 @@ defmodule DashFloat.Config.Onboarding do
   def models_arrived(%__MODULE__{} = state, _result), do: state
 
   @doc """
+  A wizard write refused (issue #39): the TUI runner feeds the config layer's
+  error message back, and the wizard bounces to the step that issued the
+  write — the key step re-takes its draft (masked on screen) so the value can
+  be edited and retried, and `pending.key` resets: the fetch offer must not
+  appear for a key that is not on disk. The settings write lands back at
+  `:loop`, so `:done` and its handoff are reachable only by a write that
+  actually succeeded. Stale feedback (the wizard moved on) is inert.
+  """
+  @spec write_failed(t(), String.t()) :: t()
+  def write_failed(
+        %__MODULE__{step: :model_choice, pending: %{key: value} = pending} = state,
+        message
+      )
+      when is_binary(value),
+      do: %{step(state, :key, value) | pending: %{pending | key: nil}, error: message}
+
+  def write_failed(%__MODULE__{step: :done} = state, message) do
+    # The highlight stays on Done, the option that refused: Enter retries
+    # the write, exactly what the hint offers.
+    bounced = step(state, :loop, "")
+    %{bounced | error: message, choice: done_index(bounced)}
+  end
+
+  def write_failed(%__MODULE__{} = state, _message), do: state
+
+  defp done_index(state) do
+    state
+    |> options()
+    |> Enum.find_index(&(&1 == :done))
+    |> Kernel.||(0)
+  end
+
+  @doc """
   The wizard's final settings document (ADR 0009 shape): one profile — the
   named one, `defaultProfile` by construction — with its providers and MCP
   entries. Labels are written explicitly: they are what the user confirmed.
@@ -429,7 +465,10 @@ defmodule DashFloat.Config.Onboarding do
     if count == 0, do: state, else: %{state | choice: rem(state.choice + delta + count, count)}
   end
 
-  defp step(state, step, draft), do: %{state | step: step, draft: draft, choice: 0}
+  # Every transition clears the step's error: the message belongs to the step
+  # that produced it (issue #39).
+  defp step(state, step, draft),
+    do: %{state | step: step, draft: draft, choice: 0, error: nil}
 
   defp edit(state, code) do
     cond do

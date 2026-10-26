@@ -412,7 +412,7 @@ defmodule DashFloat.TUI do
 
       {:error, message} ->
         Logger.warning(message)
-        state
+        State.setup_write_failed(state, message)
     end
   end
 
@@ -423,7 +423,7 @@ defmodule DashFloat.TUI do
 
       {:error, message} ->
         Logger.warning(message)
-        state
+        State.setup_write_failed(state, message)
     end
   end
 

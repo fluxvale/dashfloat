@@ -96,7 +96,7 @@ defmodule DashFloat.TUI.View do
       when setup != nil do
     # The startup phase (ADR 0009) replaces the chat UI with one setup box:
     # the forced-selection modal or the onboarding wizard.
-    [{setup_widget(setup), inset_area(width, height)}]
+    [{setup_widget(setup, width), inset_area(width, height)}]
   end
 
   def render(%State{} = state, %ExRatatui.Frame{width: width, height: height}) do
@@ -114,7 +114,10 @@ defmodule DashFloat.TUI.View do
 
   ## Setup screens (ADR 0009: forced selection + onboarding wizard)
 
-  defp wizard_lines(%{step: :welcome}) do
+  # wizard_lines/2 takes the frame width: a refused write's message wraps to
+  # the box so its remedy is never clipped (issue #39).
+
+  defp wizard_lines(%{step: :welcome}, _width) do
     [
       {"Welcome to DashFloat.", :assistant},
       {"Set up your first profile — every step is skippable.", :dim},
@@ -123,7 +126,7 @@ defmodule DashFloat.TUI.View do
     ]
   end
 
-  defp wizard_lines(%{step: :profile_name, draft: draft}) do
+  defp wizard_lines(%{step: :profile_name, draft: draft}, _width) do
     [
       {"Name your first profile — it becomes the default.", :assistant},
       blank(),
@@ -132,14 +135,14 @@ defmodule DashFloat.TUI.View do
     ]
   end
 
-  defp wizard_lines(%{step: :provider} = wizard) do
+  defp wizard_lines(%{step: :provider} = wizard, _width) do
     [
       {"Add a provider.", :assistant},
       blank() | option_lines(wizard, &provider_option/2)
     ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
   end
 
-  defp wizard_lines(%{step: :custom_url, draft: draft}) do
+  defp wizard_lines(%{step: :custom_url, draft: draft}, _width) do
     [
       {"The provider's base URL (OpenAI-compatible).", :assistant},
       blank(),
@@ -148,7 +151,7 @@ defmodule DashFloat.TUI.View do
     ]
   end
 
-  defp wizard_lines(%{step: :label, draft: draft}) do
+  defp wizard_lines(%{step: :label, draft: draft}, _width) do
     [
       {"Label this provider (optional — defaults to the URL host).", :assistant},
       blank(),
@@ -156,7 +159,9 @@ defmodule DashFloat.TUI.View do
     ]
   end
 
-  defp wizard_lines(%{step: :key, draft: draft}) do
+  # No refused write pending: Enter's promise is the immediate 0600 write.
+
+  defp wizard_lines(%{step: :key, draft: draft, error: nil}, _width) do
     [
       {"The API key: paste it, type $ENV_VAR to use a reference,", :assistant},
       {"or leave it empty to skip.", :assistant},
@@ -166,14 +171,29 @@ defmodule DashFloat.TUI.View do
     ]
   end
 
-  defp wizard_lines(%{step: :model_choice} = wizard) do
+  # A refused write pending: the hint matches file state — nothing was
+  # written, and the screen says so instead of repeating the promise
+  # (issue #39's hint contract).
+
+  defp wizard_lines(%{step: :key, draft: draft, error: error}, width) do
+    [
+      {"The API key: paste it, type $ENV_VAR to use a reference,", :assistant},
+      {"or leave it empty to skip.", :assistant},
+      blank(),
+      input_line(draft, true)
+    ] ++
+      error_lines(error, width) ++
+      [blank(), hint("fix or empty the value · ⏎ retries the write")]
+  end
+
+  defp wizard_lines(%{step: :model_choice} = wizard, _width) do
     [
       {"Pick a model.", :assistant},
       blank() | option_lines(wizard, &model_choice_option/2)
     ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
   end
 
-  defp wizard_lines(%{step: :fetching}) do
+  defp wizard_lines(%{step: :fetching}, _width) do
     [
       {"Fetching models…", :assistant},
       blank(),
@@ -181,14 +201,14 @@ defmodule DashFloat.TUI.View do
     ]
   end
 
-  defp wizard_lines(%{step: :model_pick} = wizard) do
+  defp wizard_lines(%{step: :model_pick} = wizard, _width) do
     [
       {"Pick a model.", :assistant},
       blank() | option_lines(wizard, &model_pick_option/2)
     ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
   end
 
-  defp wizard_lines(%{step: :model_manual, draft: draft}) do
+  defp wizard_lines(%{step: :model_manual, draft: draft}, _width) do
     [
       {"The model id.", :assistant},
       blank(),
@@ -197,14 +217,26 @@ defmodule DashFloat.TUI.View do
     ]
   end
 
-  defp wizard_lines(%{step: :loop} = wizard) do
+  defp wizard_lines(%{step: :loop, error: nil} = wizard, _width) do
     [
       {"Anything else? The profile works as-is.", :assistant},
       blank() | option_lines(wizard, &loop_option/2)
     ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
   end
 
-  defp wizard_lines(%{step: :mcp_name, draft: draft}) do
+  # A refused settings write lands here: the remedy is on screen, and picking
+  # done again retries the write in place (issue #39).
+
+  defp wizard_lines(%{step: :loop, error: error} = wizard, width) do
+    [
+      {"Anything else? The profile works as-is.", :assistant},
+      blank() | error_lines(error, width)
+    ] ++
+      [blank() | option_lines(wizard, &loop_option/2)] ++
+      [blank(), hint("apply the remedy · ⏎ on done retries the write")]
+  end
+
+  defp wizard_lines(%{step: :mcp_name, draft: draft}, _width) do
     [
       {"MCP server name.", :assistant},
       blank(),
@@ -213,7 +245,7 @@ defmodule DashFloat.TUI.View do
     ]
   end
 
-  defp wizard_lines(%{step: :mcp_command, draft: draft}) do
+  defp wizard_lines(%{step: :mcp_command, draft: draft}, _width) do
     [
       {"MCP command (e.g. uvx).", :assistant},
       blank(),
@@ -222,7 +254,7 @@ defmodule DashFloat.TUI.View do
     ]
   end
 
-  defp wizard_lines(%{step: :mcp_args, draft: draft}) do
+  defp wizard_lines(%{step: :mcp_args, draft: draft}, _width) do
     [
       {"MCP arguments (space-separated, optional).", :assistant},
       blank(),
@@ -230,7 +262,7 @@ defmodule DashFloat.TUI.View do
     ]
   end
 
-  defp wizard_lines(%{step: :mcp_token, draft: draft}) do
+  defp wizard_lines(%{step: :mcp_token, draft: draft}, _width) do
     [
       {"Token environment variable (optional).", :assistant},
       blank(),
@@ -239,7 +271,7 @@ defmodule DashFloat.TUI.View do
     ]
   end
 
-  defp wizard_lines(%{step: :done}) do
+  defp wizard_lines(%{step: :done}, _width) do
     [
       {"All set — config written.", :assistant},
       {"DashFloat is starting under your new profile.", :dim},
@@ -250,7 +282,7 @@ defmodule DashFloat.TUI.View do
 
   # A typing line: the draft (masked for secrets) with a block cursor.
 
-  defp setup_widget({:select, names, index}) do
+  defp setup_widget({:select, names, index}, _width) do
     setup_box(
       "DashFloat — select a profile",
       [
@@ -261,9 +293,8 @@ defmodule DashFloat.TUI.View do
     )
   end
 
-  defp setup_widget(%Onboarding{} = wizard) do
-    setup_box("DashFloat — first run", wizard_lines(wizard))
-  end
+  defp setup_widget(%Onboarding{} = wizard, width),
+    do: setup_box("DashFloat — first run", wizard_lines(wizard, width))
 
   defp setup_box(title, lines) do
     %Paragraph{
@@ -327,6 +358,29 @@ defmodule DashFloat.TUI.View do
   defp blank, do: {"", :dim}
 
   defp hint(text), do: {text, :hint}
+
+  # A refused write's message (issue #39): error and remedy, word-wrapped to
+  # the setup box's inner width (frame minus margin and borders) so the
+  # remedy is never clipped — floored at 1 for degenerate frames, never above
+  # the true inner width.
+  defp error_lines(message, width) do
+    message
+    |> wrap_words(max(width - 4, 1))
+    |> Enum.map(&{&1, :error})
+  end
+
+  defp wrap_words(text, width) do
+    text
+    |> String.split(" ")
+    |> Enum.reduce([""], fn word, [line | rest] ->
+      candidate = if line == "", do: word, else: line <> " " <> word
+
+      if String.length(candidate) <= width,
+        do: [candidate | rest],
+        else: [word, line | rest]
+    end)
+    |> Enum.reverse()
+  end
 
   defp setup_line({:option, true, text}),
     do: Line.new([Span.new("❯ " <> text, style: Theme.style(:accent))])

@@ -1812,6 +1812,51 @@ defmodule DashFloat.ConfigTest do
       assert File.read!(keys) == before
     end
 
+    test "write_keys_entry refuses an unquotable value with the remedy, never the value (issue #39)" do
+      dir = tmp_dir()
+
+      for value <- ["k\\1", "both'kinds\"k"] do
+        assert {:error, message} = Config.write_keys_entry(dir, "personal", @base_url, value)
+        assert message =~ "cannot store that key"
+        assert message =~ "backslash or both quote kinds"
+        assert message =~ "$ENV_VAR"
+        refute message =~ value
+      end
+
+      keys = keys_path(dir)
+      refute File.exists?(keys)
+    end
+
+    test "write_keys_entry names the profile or endpoint when one of those is unquotable (review)" do
+      # A quotable value under an unquotable profile name: the remedy must
+      # blame the name, not the key the user just typed.
+      dir = tmp_dir()
+
+      assert {:error, message} =
+               Config.write_keys_entry(dir, "bad\\name", @base_url, "PLACEHOLDER-k")
+
+      assert message =~ "cannot store the profile name or endpoint"
+      assert message =~ "backslash or both quote kinds"
+      refute message =~ "PLACEHOLDER-k"
+      keys = keys_path(dir)
+      refute File.exists?(keys)
+    end
+
+    test "write_settings refuses an unquotable document with the remedy (issue #39)" do
+      dir = tmp_dir()
+
+      assert {:error, message} =
+               Config.write_settings(dir, %{
+                 "configVersion" => 3,
+                 "profiles" => [%{"name" => "bad\\name", "providers" => []}]
+               })
+
+      assert message =~ "cannot store that text"
+      assert message =~ "backslash or both quote kinds"
+      settings = settings_path(dir)
+      refute File.exists?(settings)
+    end
+
     test "P2-1 regression: write_settings refuses a non-empty existing settings.json5" do
       # The wizard must never clobber what it did not write — an
       # unparseable or hand-made file is the user's to move aside (#31's

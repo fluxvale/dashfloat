@@ -313,6 +313,19 @@ defmodule DashFloat.TUI.State do
   def models_arrived(%__MODULE__{} = state, _result), do: state
 
   @doc """
+  A wizard write refused (issue #39): the runner's error message lands on the
+  wizard surface — the machine bounces to the step that issued the write
+  (key → `:key` with the draft restored, settings → `:loop`), which gates
+  `:done` on real write success.
+  """
+  @spec setup_write_failed(t(), String.t()) :: t()
+  def setup_write_failed(%__MODULE__{setup: %Onboarding{} = wizard} = state, message)
+      when is_binary(message),
+      do: %{state | setup: Onboarding.write_failed(wizard, message)}
+
+  def setup_write_failed(%__MODULE__{} = state, _message), do: state
+
+  @doc """
   The standing catalog refresh landed (ADR 0009): per-provider entries are
   stored in memory — the one observable effect today is the status bar's
   context denominator filling in for a selected model whose config entry

@@ -233,7 +233,7 @@ defmodule DashFloat.TUITest do
     assert Bitwise.band(settings_mode, 0o777) == 0o600
   end
 
-  test "a failing settings write at wizard-done warns and continues" do
+  test "a failing settings write at wizard-done surfaces the refusal and gates :done (issue #39)" do
     dir = wizard_dir("dashfloat-tui-swf")
     keys_file = Path.join(dir, "keys.json5")
     File.write!(keys_file, "{}")
@@ -260,9 +260,79 @@ defmodule DashFloat.TUITest do
     press(pid, "down")
     press(pid, "enter")
 
+    # The refusal bounced the wizard off :done — the error and remedy are on
+    # screen, the done screen's copy never rendered, no file appeared.
     settings_path = Path.join(dir, "settings.json5")
-    eventually(pid, fn s -> s.setup.step == :done end)
+
+    bounced =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :loop and s.setup.error != nil
+      end)
+
+    assert bounced.setup.error =~ "cannot write"
+    assert screen_text(bounced) =~ "cannot write"
+    refute screen_text(bounced) =~ "All set"
     refute File.exists?(settings_path)
+  end
+
+  test "P2-1 regression: a non-empty zero-profile settings.json5 refuses on the wizard surface, never lies (issue #39)" do
+    # The exact shape whose :onboard classification boots the wizard. The
+    # refusal (mv-aside remedy) must be ON SCREEN, :done must never render,
+    # and the remedy must work in place: re-pick done after moving the file.
+    dir = wizard_dir("dashfloat-tui-p21")
+    settings_file = Path.join(dir, "settings.json5")
+    File.write!(settings_file, "{configVersion: 3, profiles: []}")
+
+    resolver = fn _name -> DashFloat.Config.load(dir, %{}, []) end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile configured"},
+        setup: Onboarding.new(),
+        config_dir: dir,
+        resolve: resolver
+      )
+
+    # Skip everything straight to done: welcome → name → provider skip → done.
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+
+    bounced =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :loop and s.setup.error != nil
+      end)
+
+    # The mv-aside remedy, on the wizard surface, file byte-unchanged.
+    assert bounced.setup.error =~ "already exists and is not empty"
+    assert bounced.setup.error =~ "settings.json5.old"
+
+    screen = screen_text(bounced)
+    assert screen =~ "not empty"
+    assert screen =~ "retries the write"
+    # The highlight stays on Done — Enter retries the write.
+    assert screen =~ "❯ Done"
+    refute screen =~ "All set"
+    assert File.read!(settings_file) == "{configVersion: 3, profiles: []}"
+
+    # No handoff reached the agent: finish is unreachable off a refused write.
+    refute_receive {:set_provider, _classification}, 50
+
+    # The remedy works in place: move the file aside, re-pick done — the
+    # retry writes, the wizard reaches :done for real, and the handoff runs.
+    File.rename!(settings_file, settings_file <> ".old")
+    press(pid, "enter")
+
+    eventually(pid, fn s -> s.setup != nil and s.setup.step == :done end)
+    press(pid, "enter")
+
+    assert_receive {:set_provider, _classification}, 2_000
   end
 
   test "P1-2 regression: a bracketed paste at the key step feeds the wizard, never the composer" do
@@ -470,7 +540,7 @@ defmodule DashFloat.TUITest do
     assert keys["personal"][base] == "$" <> var
   end
 
-  test "wizard writes refuse safely and a missing resolver still clears setup" do
+  test "a refused key write surfaces at the key step; the damaged file is never clobbered (issue #39)" do
     dir = wizard_dir("dashfloat-tui-wizard")
     # Hand damage: an unparseable keys.json5 must be refused, never clobbered.
     keys_file = Path.join(dir, "keys.json5")
@@ -490,12 +560,72 @@ defmodule DashFloat.TUITest do
     for ch <- String.codepoints("k"), do: press(pid, ch)
     press(pid, "enter")
 
-    # The write failed with a warning; the damaged file is untouched.
-    eventually(pid, fn s -> s.setup.step == :model_choice end)
+    # The write refused: the wizard is back at :key with the refusal on
+    # screen and the draft restored for editing; the damaged file is intact.
+    refused =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :key and s.setup.error != nil
+      end)
+
+    assert refused.setup.error =~ "invalid JSON5"
+    assert refused.setup.draft == "k"
+    assert screen_text(refused) =~ "retries the write"
     assert File.read!(keys_file) == "{ broken"
 
-    # A selection with no resolver wired: setup clears, nothing crashes.
+    # A config dir in this state still loads to an error arm, never a crash.
     assert {:error, _load_error} = DashFloat.Config.load(dir, %{"DASHFLOAT_API_KEY" => "k"}, [])
+  end
+
+  test "P3-3 regression: an unquotable key surfaces its refusal; the hint matches file state (issue #39)" do
+    # A backslash (or both quote kinds) cannot be stored in the JSON5
+    # dialect: write_keys_entry refuses, keys.json5 stays absent, and the
+    # wizard shows the refusal AT the key step — the draft restored (masked),
+    # the hint no longer promising a write that did not happen.
+    dir = wizard_dir("dashfloat-tui-p33")
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no provider configured"},
+        setup: Onboarding.new(),
+        config_dir: dir
+      )
+
+    # To the key step (zai preset, suggested label), then a backslash key.
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("k-1\\9"), do: press(pid, ch)
+    press(pid, "enter")
+
+    refused =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :key and s.setup.error != nil
+      end)
+
+    assert refused.setup.error =~ "backslash or both quote kinds"
+    assert refused.setup.error =~ "$ENV_VAR"
+
+    # File state matches the screen: nothing was written, and the on-screen
+    # hint is the retry wording — not the write promise.
+    keys_file = Path.join(dir, "keys.json5")
+    refute File.exists?(keys_file)
+
+    screen = screen_text(refused)
+    assert screen =~ "retries the write"
+    refute screen =~ "immediately"
+    refute screen =~ "k-1"
+
+    # Fix in place: backspace out the backslash, re-accept — the retry writes.
+    press(pid, "backspace")
+    press(pid, "backspace")
+    press(pid, "9")
+    press(pid, "enter")
+
+    eventually(pid, fn s -> s.setup != nil and s.setup.step == :model_choice end)
+
+    zai = "https://api.z.ai/api/coding/paas/v4"
+    assert {:ok, %{"personal" => %{^zai => "k-19"}}} = JSON5.read_map(keys_file)
   end
 
   defp wizard_dir(prefix) do
@@ -1731,6 +1861,15 @@ defmodule DashFloat.TUITest do
 
     [line] = widget.text
     Enum.map_join(line.spans, "", & &1.content)
+  end
+
+  # The full drawn frame as text (issue #39: the on-screen evidence for
+  # wizard-surface assertions).
+  defp screen_text(state) do
+    term = ExRatatui.init_test_terminal(80, 24)
+    widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+    assert :ok = ExRatatui.draw(term, widgets)
+    ExRatatui.get_buffer_content(term)
   end
 
   defp flatten_lines(lines),

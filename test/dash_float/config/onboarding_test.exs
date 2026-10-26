@@ -186,6 +186,80 @@ defmodule DashFloat.Config.OnboardingTest do
     end
   end
 
+  describe "write refusals bounce back (issue #39)" do
+    test "a refused key write returns to :key with the draft restored and the fetch offer off" do
+      at_key = press(Onboarding.new(), ["enter", "enter", "enter", "enter"])
+
+      {advanced, actions} = drive(at_key, String.codepoints("k-1\\9") ++ ["enter"])
+      assert advanced.step == :model_choice
+      assert [{:write_key, {"personal", @zai_url, "k-1\\9"}}] = actions
+
+      bounced = Onboarding.write_failed(advanced, "keys.json5 cannot store that value")
+
+      assert bounced.step == :key
+      assert bounced.draft == "k-1\\9"
+      assert bounced.pending.key == nil
+      assert bounced.error == "keys.json5 cannot store that value"
+
+      # Editing keeps the refusal on screen; a step transition clears it.
+      {editing, nil} = Onboarding.handle_key(bounced, "backspace")
+      assert editing.error != nil
+
+      skipped = press(bounced, ["esc"])
+      assert skipped.step == :model_choice
+      assert skipped.error == nil
+      assert Onboarding.options(skipped) == [:manual, :skip]
+
+      # The retry re-emits the write for the edited draft.
+      {retry, retry_actions} = drive(bounced, ["backspace", "backspace", "9", "enter"])
+      assert retry.step == :model_choice
+      assert retry.error == nil
+      assert [{:write_key, {"personal", @zai_url, "k-19"}}] = retry_actions
+    end
+
+    test "a refused settings write returns to :loop with done highlighted; done retries the write" do
+      {at_done, actions} =
+        drive(Onboarding.new(), [
+          "enter",
+          "enter",
+          "down",
+          "down",
+          "down",
+          "enter",
+          "down",
+          "down",
+          "enter"
+        ])
+
+      assert at_done.step == :done
+      assert {:write_settings, doc} = List.last(actions)
+      assert doc["configVersion"] == 3
+
+      bounced = Onboarding.write_failed(at_done, "settings.json5 already exists")
+      assert bounced.step == :loop
+      assert bounced.error == "settings.json5 already exists"
+      # The highlight stays on Done: Enter retries, what the hint offers.
+      done_at =
+        bounced
+        |> Onboarding.options()
+        |> Enum.find_index(&(&1 == :done))
+
+      assert bounced.choice == done_at
+
+      # The retry re-emits the settings write for the same document.
+      {retry, retry_actions} = drive(bounced, ["enter"])
+      assert retry.step == :done
+      assert retry.error == nil
+      assert {:write_settings, retry_doc} = List.last(retry_actions)
+      assert retry_doc == doc
+    end
+
+    test "stale feedback is inert" do
+      welcome = Onboarding.new()
+      assert Onboarding.write_failed(welcome, "late") == welcome
+    end
+  end
+
   describe "the model step (ADR 0009: fetch, failure-soft)" do
     defp at_model_choice do
       press(Onboarding.new(), ["enter", "enter", "enter", "enter", "k", "enter"])
