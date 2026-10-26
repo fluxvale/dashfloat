@@ -102,6 +102,11 @@ jobs:
       # tarball ships. --version forces the NIF to load.
       - name: Smoke the assembled release
         run: |
+          # The build image is minimal: objdump/readelf live in binutils, which
+          # the image does not carry. Installed here so the build environment
+          # stays untouched and the floor check runs against the real artifact.
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends binutils >/dev/null
           ./_build/prod/rel/dashfloat/bin/dashfloat --version
           ./_build/prod/rel/dashfloat/bin/dashfloat eval \
             'IO.puts(Base.encode16(:crypto.hash(:sha256, "dashfloat")))'
