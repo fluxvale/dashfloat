@@ -2,6 +2,7 @@ defmodule DashFloat.TUI.StateTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  alias DashFloat.Config.Onboarding
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
@@ -1749,6 +1750,106 @@ defmodule DashFloat.TUI.StateTest do
   defp assert_words_survive(pieces, text) do
     joined = Enum.join(pieces, " ")
     assert String.split(joined) == String.split(text)
+  end
+
+  describe "the startup phase (ADR 0009)" do
+    defp setup_state(opts \\ []) do
+      [test_mode: {80, 24}]
+      |> Keyword.merge(opts)
+      |> State.new()
+    end
+
+    test "the forced-selection modal moves with up/down and commits with Enter" do
+      state = setup_state(setup: {:select, ["a", "b"], 0})
+
+      moved_state = state
+
+      {up, nil} = State.handle_key(moved_state, "up", [])
+      assert up.setup == {:select, ["a", "b"], 1}
+
+      {moved, nil} = State.handle_key(moved_state, "down", [])
+      assert moved.setup == {:select, ["a", "b"], 1}
+
+      {wrapped, nil} = State.handle_key(moved, "down", [])
+      assert wrapped.setup == {:select, ["a", "b"], 0}
+
+      {chosen, {:select_profile, "b"}} = State.handle_key(moved, "enter", [])
+      assert chosen.setup == {:select, ["a", "b"], 1}
+    end
+
+    defp step_wizard(key, wizard) do
+      {wizard, _action} = Onboarding.handle_key(wizard, key)
+      wizard
+    end
+
+    test "the wizard routes through the setup branch: typing and stepping" do
+      state = setup_state(setup: Onboarding.new())
+
+      {welcome, nil} = State.handle_key(state, "enter", [])
+      assert welcome.setup.step == :profile_name
+
+      {named, nil} = State.handle_key(welcome, "w", [])
+      assert named.setup.draft =~ "w"
+    end
+
+    test "other keys fall through the setup branch untouched" do
+      state = setup_state(setup: {:select, ["a"], 0})
+      {same, nil} = State.handle_key(state, "x", [])
+      assert same.setup == {:select, ["a"], 0}
+    end
+
+    test "provider_resolved clears setup, sets the provider, and emits the agent handoff" do
+      state = setup_state(setup: {:select, ["a"], 0})
+      config = %DashFloat.Config{base_url: "https://x.example", model: "m", api_key: "k"}
+
+      {resolved, {:agent_provider, {:ok, ^config}}} =
+        State.provider_resolved(state, {:ok, config})
+
+      assert resolved.setup == nil
+      assert resolved.provider == {:ok, config}
+    end
+
+    test "models_arrived feeds a waiting wizard and ignores stale results" do
+      start = Onboarding.new()
+      keys = ["enter", "enter", "enter", "enter", "k", "enter", "enter"]
+
+      wizard = Enum.reduce(keys, start, &step_wizard/2)
+
+      state = setup_state(setup: wizard)
+
+      fed = State.models_arrived(state, {:ok, [%{model: "m1", context: nil}]})
+      assert fed.setup.step == :model_pick
+
+      stale = State.models_arrived(setup_state(), {:ok, [%{model: "late"}]})
+      assert stale.setup == nil
+    end
+
+    test "catalog_arrived stores the sweep and fills the context denominator (ADR 0009)" do
+      base = "https://provider.example/v1"
+
+      config = %DashFloat.Config{
+        base_url: base,
+        model: "glm-5.3",
+        api_key: "k",
+        context_tokens: nil
+      }
+
+      state = setup_state(provider: {:ok, config})
+      assert State.provider_context_tokens(state) == nil
+
+      landed = State.catalog_arrived(state, %{base => [%{model: "glm-5.3", context: 128_000}]})
+
+      assert State.provider_context_tokens(landed) == 128_000
+      assert landed.catalog == %{base => [%{model: "glm-5.3", context: 128_000}]}
+
+      # A configured context always wins over the catalog's metadata.
+      configured = setup_state(provider: {:ok, %{config | context_tokens: 64_000}})
+
+      filled =
+        State.catalog_arrived(configured, %{base => [%{model: "glm-5.3", context: 128_000}]})
+
+      assert State.provider_context_tokens(filled) == 64_000
+    end
   end
 
   # Runs one animation tick (rendering dirty in-flight lines), keeping state.

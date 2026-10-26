@@ -1,32 +1,44 @@
 defmodule DashFloat.Config do
   @moduledoc """
-  Provider configuration for the LLM streaming engine: JSON5 files,
+  Provider configuration for the LLM streaming engine: JSON5 files, persona
   profiles, and per-field env overrides
-  ([ADR 0008](../decisions/0008-config-layout-profiles-json5.md) and its
-  keys-split amendment).
+  ([ADR 0009](../decisions/0009-config-v3-persona-profiles.md)).
 
   Reads `~/.config/dashfloat/settings.json5` (`XDG_CONFIG_HOME` respected) —
-  profiles with their endpoint, optional open settings map, and model menu.
-  The settings file is credential-free by construction: API keys live in a
-  sibling `keys.json5`, keyed by PROFILE NAME, 0600 always; `oauth.json5` is
-  reserved for a future OAuth flow (absence-tolerant; 0600 when present, and
-  never read). settings.json5 stays 0600 as well — free hardening. A legacy
-  `config.json` or a v1 inline-keys `settings.json5` is migrated once,
-  automatically, with 0600 backups (backups inherit the source's
-  sensitivity: anything that ever held credentials backs up at 0600).
+  profiles are personas bundling several providers (each an endpoint with its
+  own model menu) and their own MCP setup; `defaultProfile` names the
+  startup default. The settings file is credential-free by construction:
+  API keys live in a sibling `keys.json5`, nested per profile and keyed by
+  the provider's `baseUrl` — a provider finds its key at
+  `keys[profile][baseUrl]`; a value may instead be a `$ENV_VAR` reference
+  resolved at load. `oauth.json5` is reserved for a future OAuth flow
+  (absence-tolerant; 0600 when present, never read). settings.json5 stays
+  0600 as free hardening. Legacy layouts (v1 `config.json`, v1 inline keys,
+  v2 flat keys) migrate once, automatically, with 0600 backups under the
+  no-loss invariant (backups inherit the source's sensitivity).
 
-  The active profile is the `--profile` flag, else `DASHFLOAT_PROFILE`, else
-  the first profile. The selected model is the `--model` flag's entry (by
-  nickname, then id), else the profile's `settings.defaultModel`, else the
-  first menu entry. Environment variables overlay per field — file < env,
-  blank env = absent; the effective API key is `DASHFLOAT_API_KEY`, else
-  `keys[profile.name]`. A stray inline `apiKey` in settings.json5 is
-  tolerated with a warning and IGNORED — never a fallback; the structural
-  guarantee that settings cannot hold a credential would otherwise be
-  cosmetic. Loading happens once in `DashFloat.Application` and rides into
-  the TUI as a mount opt; the UI process performs no file I/O (ADR 0005's
-  contract, unchanged). The status bar shows the selected entry's nickname
-  and profile via `DashFloat.TUI.State.provider_label/1`.
+  Profile selection is deliberate (ADR 0009): the `--profile` flag, else
+  `DASHFLOAT_PROFILE`, else `defaultProfile`; an explicit name matching no
+  profile is a hard error listing the valid names; with no explicit name and
+  no usable default, one profile auto-selects, two or more force a selection
+  modal (`{:select, names}`), and zero profiles hand off to the onboarding
+  wizard (`:onboard`) unless env vars complete the config. Within the active
+  profile, the provider is `defaultProvider`, else the first; the selected
+  model is the `--model` flag's entry (by nickname, then id), else the
+  profile's `settings.defaultModel`, else the provider's first menu entry.
+  Environment variables overlay per field — file < env, blank env = absent;
+  the effective API key is `DASHFLOAT_API_KEY`, else `keys[profile]
+  [baseUrl]` after `$REF` resolution. Loading happens once in
+  `DashFloat.Application` and rides into the TUI as a mount opt; the UI
+  process performs no file I/O (ADR 0005's contract, unchanged — the
+  startup wizard/modal is the sanctioned exception, ADR 0009). The status
+  bar shows the selected entry's nickname and profile via
+  `DashFloat.TUI.State.provider_label/1`.
+
+  Malformed config degrades to the least-surprising working state with a
+  warning naming the field or profile — never a crash, never silent
+  misbehavior (ADR 0009's tolerance principle). A file unparseable as JSON5
+  is a loud error naming the path; it is never auto-overwritten.
   """
 
   alias DashFloat.Config.JSON5
@@ -47,15 +59,25 @@ defmodule DashFloat.Config do
   @main_file "settings.json5"
   @keys_file "keys.json5"
   @oauth_file "oauth.json5"
-  @main_version 2
+  @main_version 3
   # The one settings key selection reads today; everything else is tolerated
   # with a warning so future dimensions need no migration (ADR 0008).
   @known_settings ["defaultModel"]
+  # keys.json5 values and mcp tokens may be env references instead of
+  # literals — the strict shape is what disambiguates a literal key that
+  # merely starts with `$` (ADR 0009).
+  @env_ref ~r/\A\$[A-Z_][A-Z0-9_]*\z/
 
   # The provider rides in the TUI state, and a UI crash logs that state: never
-  # let the key into a log line (ADR 0005).
-  @derive {Inspect, except: [:api_key]}
-  defstruct [:base_url, :model, :api_key, :context_tokens, :nickname, :profile]
+  # let a key into a log line (ADR 0005) — including the per-provider keys.
+  @derive {Inspect, except: [:api_key, :providers]}
+  defstruct [:base_url, :model, :api_key, :context_tokens, :nickname, :profile, providers: []]
+
+  @type provider :: %{
+          label: String.t(),
+          base_url: String.t(),
+          api_key: String.t() | nil
+        }
 
   @type t :: %__MODULE__{
           base_url: String.t(),
@@ -63,14 +85,24 @@ defmodule DashFloat.Config do
           api_key: String.t(),
           context_tokens: pos_integer() | nil,
           nickname: String.t() | nil,
-          profile: String.t() | nil
+          profile: String.t() | nil,
+          providers: [provider()]
         }
+
+  @typedoc """
+  The load outcome: a resolved config, an error (never echoing values), the
+  forced-selection modal state (no explicit choice, no usable default, two or
+  more profiles), or the onboarding wizard (zero profiles and env cannot
+  complete the config) — ADR 0009's classification.
+  """
+  @type classification ::
+          {:ok, t()} | {:error, String.t()} | {:select, [String.t()]} | :onboard
 
   @doc """
   Loads the config from the default directory, the real environment, and CLI
   overrides parsed by `DashFloat.CLI.parse/1`.
   """
-  @spec load(keyword()) :: {:ok, t()} | {:error, String.t()}
+  @spec load(keyword()) :: classification()
   def load(cli \\ []) do
     load(config_dir(), System.get_env(), cli)
   end
@@ -81,18 +113,82 @@ defmodule DashFloat.Config do
     :filename.basedir(:user_config, "dashfloat")
   end
 
+  ## Onboarding writes (ADR 0009: the startup wizard's sanctioned writers)
+
+  # All writes ride the migration machinery's posture: atomic tmp-0600+
+  # rename through DashFloat.Config.Posture, merges never clobber. The
+  # directory is created on demand — a first run has no config dir yet.
+  @doc """
+  Merges one credential into `keys.json5` at `keys[profile][baseUrl]`,
+  atomically at 0600 (ADR 0009 — the wizard writes each key IMMEDIATELY, so
+  an aborted run resumes with its keys already homed). An existing
+  unparseable keys.json5 refuses: never clobber what might hold keys. A
+  `$ENV_VAR`-shaped `value` is stored verbatim as a reference.
+  """
+  @spec write_keys_entry(Path.t(), String.t(), String.t(), String.t()) ::
+          :ok | {:error, String.t()}
+  def write_keys_entry(dir, profile, base_url, value)
+      when is_binary(dir) and is_binary(profile) and is_binary(base_url) and is_binary(value) do
+    keys_path = Path.join(dir, @keys_file)
+
+    with :ok <- ensure_dir(dir),
+         {:ok, keys} <- JSON5.read_map(keys_path),
+         {:ok, merged} <- nest_key(keys, profile, base_url, value),
+         {:ok, doc} <- JSON5.render(merged) do
+      Posture.write_private(keys_path, doc <> "\n")
+    end
+  end
+
+  # A profile slot that is not an object is pre-v3 damage holding who-knows-
+  # what — refuse rather than clobber it; nil and nested maps merge cleanly.
+  defp nest_key(keys, profile, base_url, value) do
+    case keys[profile] do
+      nil ->
+        {:ok, Map.put(keys, profile, %{base_url => value})}
+
+      %{} = nested ->
+        {:ok, Map.put(keys, profile, Map.put(nested, base_url, value))}
+
+      _other ->
+        {:error,
+         ~s(#{@keys_file}: "#{profile}" holds a bare value instead of an object ) <>
+           "— fix or remove it by hand, then re-enter the key"}
+    end
+  end
+
+  @doc """
+  Writes the wizard's settings document to `settings.json5`, atomically at
+  0600 (ADR 0009 — settings land once, at done; keys landed per step).
+  """
+  @spec write_settings(Path.t(), map()) :: :ok | {:error, String.t()}
+  def write_settings(dir, document) when is_binary(dir) and is_map(document) do
+    main_path = Path.join(dir, @main_file)
+
+    with :ok <- ensure_dir(dir),
+         {:ok, doc} <- JSON5.render(document) do
+      Posture.write_private(main_path, doc <> "\n")
+    end
+  end
+
+  defp ensure_dir(dir) do
+    case File.mkdir_p(dir) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "cannot create #{dir}: #{:file.format_error(reason)}"}
+    end
+  end
+
   @doc """
   Testable core: loads `settings.json5` + `keys.json5` in `dir` (a missing
-  file = empty map), overlaid with `env` (a map of variable names to values)
-  and `cli` (the `profile:`/`model:` keywords from `DashFloat.CLI.parse/1`;
-  flag beats env, env beats file). The effective API key is
-  `DASHFLOAT_API_KEY`, else `keys[active profile name]`. Blank fields after
-  the merge yield an error naming only the missing field names — values are
-  never echoed. `context_tokens` is optional: env wins over the file, and
-  anything that is not a positive integer is nil — never an error
+  or empty file = empty map), overlaid with `env` (a map of variable names
+  to values) and `cli` (the `profile:`/`model:` keywords from
+  `DashFloat.CLI.parse/1`; flag beats env, env beats file). See the module
+  doc for the selection semantics and the classification arms. Blank fields
+  after the merge yield an error naming only the missing field names —
+  values are never echoed. `context_tokens` is optional: env wins over the
+  file, and anything that is not a positive integer is nil — never an error
   (ADR 0006).
   """
-  @spec load(Path.t(), map(), keyword()) :: {:ok, t()} | {:error, String.t()}
+  @spec load(Path.t(), map(), keyword()) :: classification()
   def load(dir, env, cli) when is_binary(dir) and is_map(env) and is_list(cli) do
     main_path = Path.join(dir, @main_file)
     keys_path = Path.join(dir, @keys_file)
@@ -117,72 +213,334 @@ defmodule DashFloat.Config do
 
       profiles = parse_profiles(main)
       warn_unkeyed_profiles(profiles, keys, keys_path, env)
-      select(profiles, keys, env, cli)
+      classify(main, profiles, keys, env, cli)
     end
+  end
+
+  ## Classification — the deliberate-selection state machine (ADR 0009)
+
+  defp classify(main, profiles, keys, env, cli) do
+    explicit = cli_value(cli, :profile) || env_value(env, @profile_var)
+
+    if is_binary(explicit) do
+      explicit_profile(explicit, profiles, keys, env, cli)
+    else
+      case default_profile_name(main, profiles) do
+        nil -> implicit_classification(profiles, keys, env, cli)
+        name -> default_result(profiles, name, keys, env, cli)
+      end
+    end
+  end
+
+  defp default_result(profiles, name, keys, env, cli) do
+    profile = Enum.find(profiles, fn parsed -> parsed.name == name end)
+    build_result(profiles, profile, keys, env, cli)
+  end
+
+  # An explicit --profile/DASHFLOAT_PROFILE that matches nothing is a HARD
+  # ERROR listing the valid names (ADR 0009): deliberate selection means a
+  # typo must not silently boot the wrong persona. The one survivor of v2's
+  # warn-and-continue is the zero-profiles env-only regime, where there is
+  # nothing to mistype into and the env vars complete everything.
+  defp explicit_profile(name, profiles, keys, env, cli) do
+    case Enum.find(profiles, fn profile -> profile.name == name end) do
+      nil when profiles == [] ->
+        Logger.warning(
+          "profile \"#{name}\" (flag or DASHFLOAT_PROFILE) matches no profile in #{@main_file}"
+        )
+
+        build_result(profiles, nil, keys, env, cli)
+
+      nil ->
+        {:error, unknown_profile_error(name, profiles)}
+
+      profile ->
+        build_result(profiles, profile, keys, env, cli)
+    end
+  end
+
+  defp implicit_classification(profiles, keys, env, cli) do
+    case profiles do
+      [only] ->
+        build_result(profiles, only, keys, env, cli)
+
+      [_head | _tail] ->
+        {:select, Enum.map(profiles, & &1.name)}
+
+      [] ->
+        case build_result([], nil, keys, env, cli) do
+          {:ok, _config} = ok -> ok
+          {:error, _missing} -> :onboard
+        end
+    end
+  end
+
+  defp unknown_profile_error(name, profiles) do
+    valid = Enum.map_join(profiles, ", ", & &1.name)
+    "profile \"#{name}\" matches no profile in #{@main_file} — valid profiles: #{valid}"
+  end
+
+  # defaultProfile is optional: absent is silent. Present but unusable — a
+  # non-string, blank, or unknown name — warns and counts as unset, landing
+  # in the classification arms (ADR 0009's tolerance principle: Terence's
+  # deleted-defaultProfile scenario).
+  defp default_profile_name(main, profiles) do
+    case main["defaultProfile"] do
+      nil -> nil
+      name when is_binary(name) -> named_default(name, profiles)
+      _other -> non_string_default()
+    end
+  end
+
+  defp named_default(name, profiles) do
+    case value(name) do
+      nil -> blank_default()
+      trimmed -> known_default(trimmed, profiles)
+    end
+  end
+
+  defp known_default(trimmed, profiles) do
+    if Enum.any?(profiles, &(&1.name == trimmed)) do
+      trimmed
+    else
+      unknown_default_warning(trimmed)
+    end
+  end
+
+  defp blank_default do
+    Logger.warning("defaultProfile is blank — ignoring it")
+    nil
+  end
+
+  defp non_string_default do
+    Logger.warning("defaultProfile is not a string — ignoring it")
+    nil
+  end
+
+  defp unknown_default_warning(trimmed) do
+    Logger.warning(
+      ~s(defaultProfile "#{trimmed}" matches no profile in #{@main_file} — ignoring it)
+    )
+
+    nil
   end
 
   # Surfaces HISTORICAL loss at startup (hostile review, incident-hiding
-  # note): a settings profile with no key under its name in an existing
-  # keys.json5 is exactly the shape a lost credential leaves behind — and
-  # the dead-key mirror. The warning respects the loader's own precedence
-  # (env > keys[profile]): a profile completed by DASHFLOAT_API_KEY is keyed
-  # and stays silent (delta-2 P3a). Profile NAMES only, never values;
-  # silent when keys.json5 is absent (env-keyed setups are legitimate).
+  # note): a provider with no key under its endpoint in an existing
+  # keys.json5 is exactly the shape a lost credential leaves behind. The
+  # warning respects the loader's own precedence (DASHFLOAT_API_KEY keys the
+  # active provider); profile and provider NAMES only, never values or
+  # endpoints; silent when keys.json5 is absent (env-keyed setups are
+  # legitimate). An unset $ENV_VAR reference names the variable — env var
+  # names are addresses, not secrets (ADR 0009).
   defp warn_unkeyed_profiles(profiles, keys, keys_path, env) do
     for profile <- profiles,
         File.exists?(keys_path),
-        is_nil(env_value(env, @fields[:api_key])),
-        is_nil(value(keys[profile.name])) do
-      Logger.warning(~s(profile "#{profile.name}" has no key in #{@keys_file}))
+        not env_key?(env),
+        provider <- profile.providers do
+      # A binding inside a `for` clause list would act as a FILTER (a nil
+      # raw key would silently stop iteration) — compute in the body.
+      raw = raw_key(keys, profile, provider)
+
+      if resolve_key(raw, env) == nil do
+        warn_unkeyed_provider(profile, provider, raw, env)
+      end
+    end
+
+    :ok
+  end
+
+  defp warn_unkeyed_provider(profile, provider, raw, env) do
+    case unset_ref(raw, env) do
+      nil ->
+        Logger.warning(
+          ~s(provider "#{provider.label}" in profile "#{profile.name}" has no key in #{@keys_file})
+        )
+
+      var ->
+        Logger.warning(
+          ~s(provider "#{provider.label}" in profile "#{profile.name}" references ) <>
+            "unset environment variable #{var}"
+        )
     end
   end
 
-  # The profile-level stray warning's root twin (hostile review P1-2): a
-  # root-level apiKey is ignored exactly like a profile-level one — warned,
-  # never a fallback, never silently tolerated.
-  defp warn_stray_root_key(main) do
-    if Map.has_key?(main, "apiKey") do
-      Logger.warning(
-        "#{@main_file}: top-level apiKey is ignored — API keys live in #{@keys_file}, keyed by profile name"
-      )
+  defp raw_key(keys, profile, provider) do
+    keys
+    |> profile_keys_quiet(profile.name)
+    |> Map.get(provider.base_url)
+  end
+
+  defp profile_keys_quiet(keys, name) do
+    case keys[name] do
+      %{} = nested -> nested
+      _other -> %{}
     end
   end
 
-  ## Selection (ADR 0008: profiles, menus, first-entry default)
+  # The variable name when raw is a strict $REF the environment lacks.
+  defp unset_ref(raw, env) do
+    case value(raw) do
+      trimmed when is_binary(trimmed) ->
+        var = String.slice(trimmed, 1..-1//1)
 
-  defp select(profiles, keys, env, cli) do
-    active = active_profile(profiles, env, cli)
-    profile = Enum.find(profiles, fn parsed -> parsed.name == active end)
-    warn_unknown_profile(active, profiles, env, cli)
-    entry = select_entry(entry_menu(profile), profile_settings(profile), cli)
+        if Regex.match?(@env_ref, trimmed) and is_nil(value(Map.get(env, var))) do
+          var
+        else
+          nil
+        end
+
+      _other ->
+        nil
+    end
+  end
+
+  ## Selection (ADR 0009: profiles → providers → models)
+
+  # The build used when no profile matched at all (the env-only regime):
+  # every effective field comes from env; the provider set is empty.
+  defp build_result(_profiles, nil, _keys, env, cli) do
+    entry = select_entry([], nil, cli)
+
+    build(effective(nil, nil, nil, nil, env), context(env, entry), nil, nil, [])
+  end
+
+  defp build_result(_profiles, profile, keys, env, cli) do
+    provider = select_provider(profile)
+    entry = select_entry(entry_menu(provider), profile.settings, cli)
+    providers = resolved_providers(profile, keys, env, provider)
 
     build(
-      effective(profile, entry, keys, env),
+      effective(provider, entry, keys, profile, env),
       context(env, entry),
       entry && entry.nickname,
-      active
+      profile.name,
+      providers
     )
   end
 
   defp entry_menu(nil), do: []
-  defp entry_menu(profile), do: profile.models
 
-  defp profile_settings(nil), do: nil
-  defp profile_settings(profile), do: profile.settings
+  defp entry_menu(provider), do: provider.models
 
-  # Effective fields: the file's source (profile, selected entry) under
-  # per-field env overrides (file < env, ADR 0008). The key's file source is
-  # keys.json5 BY PROFILE NAME — settings.json5 cannot supply one.
-  defp effective(profile, entry, keys, env) do
+  # The active provider: the profile's defaultProvider label, else the
+  # first. An unknown label warns and falls back to the first; duplicate
+  # labels resolve first-wins (Enum.find) like duplicate profile names.
+  defp select_provider(profile) do
+    case profile.providers do
+      [] -> nil
+      providers -> named_or_first(profile, providers)
+    end
+  end
+
+  defp named_or_first(profile, providers) do
+    case profile.default_provider do
+      nil ->
+        hd(providers)
+
+      wanted ->
+        find_named(profile, wanted, providers)
+    end
+  end
+
+  defp find_named(profile, wanted, providers) do
+    case Enum.find(providers, fn provider -> provider.label == wanted end) do
+      nil ->
+        Logger.warning(
+          ~s(#{@main_file}: defaultProvider "#{wanted}" matches no provider in profile ) <>
+            ~s("#{profile.name}" — using the first)
+        )
+
+        hd(providers)
+
+      found ->
+        found
+    end
+  end
+
+  # Effective fields: the file's source (active provider, selected entry)
+  # under per-field env overrides (file < env, ADR 0009). The key's file
+  # source is keys.json5 BY ENDPOINT — settings.json5 cannot supply one.
+  defp effective(provider, entry, keys, profile, env) do
     %{
-      base_url: env_value(env, @fields[:base_url]) || (profile && profile.base_url),
+      base_url: env_value(env, @fields[:base_url]) || (provider && provider.base_url),
       model: env_value(env, @fields[:model]) || (entry && entry.model),
-      api_key: env_value(env, @fields[:api_key]) || profile_key(keys, profile)
+      api_key: env_value(env, @fields[:api_key]) || provider_key(keys, profile, provider, env)
     }
   end
 
-  defp profile_key(_keys, nil), do: nil
-  defp profile_key(keys, profile), do: value(keys[profile.name])
+  # keys[profile][baseUrl] with $ENV_REF resolution. Hand damage degrades to
+  # a missing key with a warning (ADR 0009 tolerance): a profile's entry
+  # that is not an object, or an endpoint's value that is not a string, is
+  # never a crash and never a refusal of the whole file — keys.json5 only
+  # refuses when unparseable.
+  defp provider_key(_keys, _profile, nil, _env), do: nil
+
+  defp provider_key(keys, profile, provider, env) do
+    keys
+    |> profile_keys(profile.name)
+    |> Map.get(provider.base_url)
+    |> resolve_key(env)
+  end
+
+  defp profile_keys(keys, name) do
+    case keys[name] do
+      %{} = nested ->
+        nested
+
+      nil ->
+        %{}
+
+      _other ->
+        Logger.warning(~s(#{@keys_file}: "#{name}" is not an object — its keys are unusable))
+
+        %{}
+    end
+  end
+
+  # A strict-shape `$ENV_VAR` value resolves from the environment; anything
+  # else (including a literal that merely starts with `$`) is the literal
+  # key. An unset reference resolves to nil — the field reads as missing and
+  # the unkeyed warning names the variable.
+  defp resolve_key(nil, _env), do: nil
+
+  defp resolve_key(raw, env) do
+    case value(raw) do
+      nil ->
+        nil
+
+      trimmed when is_binary(trimmed) ->
+        if Regex.match?(@env_ref, trimmed) do
+          trimmed
+          |> String.slice(1..-1//1)
+          |> then(&Map.get(env, &1))
+          |> value()
+        else
+          trimmed
+        end
+    end
+  end
+
+  defp env_key?(env), do: env_value(env, @fields[:api_key]) != nil
+
+  # The active profile's providers with each provider's EFFECTIVE key
+  # (DASHFLOAT_API_KEY applies to the active provider; the others read
+  # keys[profile][baseUrl]) — the catalog refresh's fetch set (ADR 0009).
+  defp resolved_providers(profile, keys, env, active) do
+    nested = profile_keys_quiet(keys, profile.name)
+
+    for provider <- profile.providers do
+      key =
+        if active && provider.base_url == active.base_url do
+          env_value(env, @fields[:api_key]) ||
+            resolve_key(Map.get(nested, provider.base_url), env)
+        else
+          resolve_key(Map.get(nested, provider.base_url), env)
+        end
+
+      %{label: provider.label, base_url: provider.base_url, api_key: key}
+    end
+  end
 
   # Env wins over the file; a blank env var counts as absent (like every other
   # field), but a value present and unusable is simply nil (ADR 0006).
@@ -193,7 +551,7 @@ defmodule DashFloat.Config do
     end
   end
 
-  defp build(values, context_tokens, nickname, profile) do
+  defp build(values, context_tokens, nickname, profile, providers) do
     case Enum.reject(@fields, fn {field, _var} -> value(values[field]) end) do
       [] ->
         config =
@@ -203,37 +561,20 @@ defmodule DashFloat.Config do
           )
 
         {:ok,
-         %{config | context_tokens: context_tokens, nickname: value(nickname), profile: profile}}
+         %{
+           config
+           | context_tokens: context_tokens,
+             nickname: value(nickname),
+             profile: profile,
+             providers: providers
+         }}
 
       missing ->
         {:error, "missing provider config: " <> field_names(missing)}
     end
   end
 
-  ## Active profile and entry selection (flag > env > file)
-
-  defp active_profile(profiles, env, cli) do
-    case cli_value(cli, :profile) || env_value(env, @profile_var) do
-      name when is_binary(name) -> name
-      nil -> first_profile_name(profiles)
-    end
-  end
-
-  defp first_profile_name([profile | _rest]), do: profile.name
-  defp first_profile_name([]), do: nil
-
-  # A flag/env profile that matches no definition warns and is used anyway —
-  # the other env vars can still complete the config.
-  defp warn_unknown_profile(active, profiles, env, cli) do
-    chosen = cli_value(cli, :profile) || env_value(env, @profile_var)
-
-    if is_binary(chosen) and chosen == active and
-         not Enum.any?(profiles, fn profile -> profile.name == chosen end) do
-      Logger.warning(
-        "profile \"#{chosen}\" (flag or DASHFLOAT_PROFILE) matches no profile in #{@main_file}"
-      )
-    end
-  end
+  ## Model selection (v2 rules, scoped to the active provider's menu)
 
   defp select_entry([], _settings, cli) do
     warn_dropped_model(cli)
@@ -301,7 +642,7 @@ defmodule DashFloat.Config do
     fallback.()
   end
 
-  ## File schema
+  ## File schema (ADR 0009)
 
   defp parse_profiles(main) do
     case main["profiles"] do
@@ -347,12 +688,15 @@ defmodule DashFloat.Config do
 
       name ->
         warn_stray_key(name, entry)
+        warn_stray_base_url(name, entry)
 
         %{
           name: name,
-          base_url: value(entry["baseUrl"]),
+          default_provider: value(entry["defaultProvider"]),
+          providers: parse_providers(name, entry["providers"]),
           settings: parse_settings(name, entry["settings"]),
-          models: parse_models(name, entry["models"])
+          mcp: parse_mcp(name, entry["mcp"]),
+          models: []
         }
     end
   end
@@ -369,10 +713,153 @@ defmodule DashFloat.Config do
     if Map.has_key?(entry, "apiKey") do
       Logger.warning(
         ~s(#{@main_file}: profile "#{name}": apiKey is ignored ) <>
-          "— API keys live in #{@keys_file}, keyed by profile name"
+          "— API keys live in #{@keys_file}, keyed by provider baseUrl"
       )
     end
   end
+
+  # A v3 file with a v2-shaped profile baseUrl can only be hand damage; the
+  # profile would otherwise silently degrade to provider-less (ADR 0009
+  # tolerance: name the field, never silent misbehavior).
+  defp warn_stray_base_url(name, entry) do
+    if Map.has_key?(entry, "baseUrl") do
+      Logger.warning(
+        ~s(#{@main_file}: profile "#{name}": baseUrl at the profile level is v2 shape ) <>
+          "— move it into a providers[] entry"
+      )
+    end
+  end
+
+  defp parse_providers(_name, nil), do: []
+
+  defp parse_providers(_name, entries) when is_list(entries) do
+    entries
+    |> Enum.map(&parse_provider/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp parse_providers(name, _other) do
+    Logger.warning(~s(#{@main_file}: profile "#{name}": providers must be a list — ignored))
+    []
+  end
+
+  # Label optional, defaulting to the URL host (ADR 0009); extras tolerated
+  # silently for forward compatibility.
+  defp parse_provider(entry) when is_map(entry) do
+    case value(entry["baseUrl"]) do
+      nil ->
+        Logger.warning("#{@main_file}: a providers entry without a baseUrl is ignored")
+        nil
+
+      base_url ->
+        %{
+          label: value(entry["label"]) || host_label(base_url),
+          base_url: base_url,
+          models: parse_models(entry["models"])
+        }
+    end
+  end
+
+  defp parse_provider(_other) do
+    Logger.warning("#{@main_file}: a providers entry that is not an object is ignored")
+    nil
+  end
+
+  defp host_label(base_url) do
+    case URI.parse(base_url) do
+      %URI{host: nil} -> base_url
+      %URI{host: host} -> host
+    end
+  end
+
+  defp parse_models(nil), do: []
+
+  defp parse_models(entries) when is_list(entries) do
+    entries
+    |> Enum.map(&parse_model/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp parse_models(_other) do
+    Logger.warning("#{@main_file}: models must be a list — ignored")
+    []
+  end
+
+  # Extra keys (octofriend files carry modalities/reasoning/type) are
+  # tolerated silently: forward compatibility by design (ADR 0008).
+  defp parse_model(entry) when is_map(entry) do
+    case value(entry["model"]) do
+      nil ->
+        Logger.warning("#{@main_file}: a models entry without a model id is ignored")
+        nil
+
+      model ->
+        %{
+          nickname: value(entry["nickname"]) || model,
+          model: model,
+          context: entry["context"]
+        }
+    end
+  end
+
+  defp parse_model(_other) do
+    Logger.warning("#{@main_file}: a models entry that is not an object is ignored")
+    nil
+  end
+
+  # MCP entries are storage shape only (no client yet, ADR 0009): name and
+  # command are required, token must be a strict $ENV_REF — a literal token
+  # would put a secret into the secret-free settings file, so the entry is
+  # ignored with a warning instead.
+  defp parse_mcp(_name, nil), do: []
+
+  defp parse_mcp(name, entries) when is_list(entries) do
+    entries
+    |> Enum.map(&parse_mcp_entry(name, &1))
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp parse_mcp(name, _other) do
+    Logger.warning(~s(#{@main_file}: profile "#{name}": mcp must be a list — ignored))
+    []
+  end
+
+  defp parse_mcp_entry(_name, entry) when is_map(entry) do
+    with name when is_binary(name) <- value(entry["name"]) || :missing,
+         command when is_binary(command) <- value(entry["command"]) || :missing,
+         token when token in [nil, :ref] <- mcp_token(entry["token"]) do
+      %{name: name, command: command, args: args(entry["args"]), token: token}
+    else
+      :missing ->
+        Logger.warning("#{@main_file}: an mcp entry without a name or command is ignored")
+        nil
+
+      :literal_token ->
+        Logger.warning(
+          "#{@main_file}: an mcp entry with a literal token is ignored — " <>
+            "token must be a $ENV_VAR reference"
+        )
+
+        nil
+    end
+  end
+
+  defp parse_mcp_entry(_name, _other) do
+    Logger.warning("#{@main_file}: an mcp entry that is not an object is ignored")
+    nil
+  end
+
+  defp mcp_token(nil), do: nil
+
+  defp mcp_token(token) when is_binary(token) do
+    if Regex.match?(@env_ref, token), do: :ref, else: :literal_token
+  end
+
+  defp mcp_token(_other), do: :literal_token
+
+  defp args(nil), do: []
+  defp args(list) when is_list(list), do: Enum.map(list, &to_string/1)
+  defp args(_other), do: []
 
   defp parse_settings(_name, nil), do: nil
 
@@ -398,39 +885,15 @@ defmodule DashFloat.Config do
     end
   end
 
-  defp parse_models(_name, nil), do: []
-
-  defp parse_models(_name, entries) when is_list(entries) do
-    entries
-    |> Enum.map(&parse_model/1)
-    |> Enum.reject(&is_nil/1)
-  end
-
-  defp parse_models(name, _other) do
-    Logger.warning(~s(#{@main_file}: profile "#{name}": models must be a list — ignored))
-    []
-  end
-
-  # Extra keys (octofriend files carry modalities/reasoning/type) are
-  # tolerated silently: forward compatibility by design (ADR 0008).
-  defp parse_model(entry) when is_map(entry) do
-    case value(entry["model"]) do
-      nil ->
-        Logger.warning("#{@main_file}: a models entry without a model id is ignored")
-        nil
-
-      model ->
-        %{
-          nickname: value(entry["nickname"]) || model,
-          model: model,
-          context: entry["context"]
-        }
+  # The profile-level stray warning's root twin (hostile review P1-2): a
+  # root-level apiKey is ignored exactly like a profile-level one — warned,
+  # never a fallback, never silently tolerated.
+  defp warn_stray_root_key(main) do
+    if Map.has_key?(main, "apiKey") do
+      Logger.warning(
+        "#{@main_file}: top-level apiKey is ignored — API keys live in #{@keys_file}"
+      )
     end
-  end
-
-  defp parse_model(_other) do
-    Logger.warning("#{@main_file}: a models entry that is not an object is ignored")
-    nil
   end
 
   ## Version check

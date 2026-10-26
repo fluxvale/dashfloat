@@ -2,11 +2,14 @@ defmodule DashFloat.ConfigTest do
   @moduledoc false
   # Not async: the load/1 test manipulates process-wide env vars.
   # Placeholders only — never a real key anywhere in this file.
+  # ADR 0009: persona profiles, endpoint-keyed keys.json5, deliberate
+  # selection, $ENV_REF values, malformed-config tolerance.
   use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
 
   alias DashFloat.Config
+  alias DashFloat.Config.JSON5
 
   @tmp_root "/tmp/opencode"
 
@@ -34,28 +37,42 @@ defmodule DashFloat.ConfigTest do
     path
   end
 
-  # The fleet-shaped layout: two profiles on one provider (work/personal),
-  # per-profile menus, work defaulting to Flash via settings. The API keys
-  # live in keys.json5, keyed by profile name.
+  @base_url "https://provider.example/v1"
+
+  # The fleet-shaped layout (ADR 0009): two personas on one provider — the
+  # v1/v2 differentiator, now expressed as two profiles whose keys nest
+  # under the SAME endpoint inside their own names. Work defaults via
+  # defaultProfile + defaultProvider + settings.defaultModel.
   defp fleet_file do
     """
     {
-      configVersion: 2,
+      configVersion: 3,
+      defaultProfile: 'work',
       yourName: 'terry-placeholder',
       profiles: [
         {
           name: 'work',
-          baseUrl: 'https://provider.example/v1',
-          settings: { defaultModel: 'Flash' },
-          models: [
-            { nickname: 'Sol', model: 'glm-5.3', context: 524288 },
-            { nickname: 'Flash', model: 'glm-5.3-flash', context: 196608 },
+          defaultProvider: 'zai',
+          providers: [
+            {
+              label: 'zai',
+              baseUrl: '#{@base_url}',
+              models: [
+                { nickname: 'Sol', model: 'glm-5.3', context: 524288 },
+                { nickname: 'Flash', model: 'glm-5.3-flash', context: 196608 },
+              ],
+            },
           ],
+          settings: { defaultModel: 'Flash' },
         },
         {
           name: 'personal',
-          baseUrl: 'https://provider.example/v1',
-          models: [{ nickname: 'Sol', model: 'glm-5.3', context: 262144 }],
+          providers: [
+            {
+              baseUrl: '#{@base_url}',
+              models: [{ nickname: 'Sol', model: 'glm-5.3', context: 262144 }],
+            },
+          ],
         },
       ],
     }
@@ -63,7 +80,12 @@ defmodule DashFloat.ConfigTest do
   end
 
   defp fleet_keys do
-    "{'work': 'PLACEHOLDER-work-key', 'personal': 'PLACEHOLDER-personal-key',}"
+    """
+    {
+      work: { '#{@base_url}': 'PLACEHOLDER-work-key' },
+      personal: { '#{@base_url}': 'PLACEHOLDER-personal-key' },
+    }
+    """
   end
 
   defp fleet_dir do
@@ -73,21 +95,43 @@ defmodule DashFloat.ConfigTest do
     dir
   end
 
+  defp settings_path(dir), do: Path.join(dir, "settings.json5")
+  defp keys_path(dir), do: Path.join(dir, "keys.json5")
+
+  defp read_settings(dir) do
+    path = settings_path(dir)
+    JSON5.read_map(path)
+  end
+
+  defp read_keys(dir) do
+    path = keys_path(dir)
+    JSON5.read_map(path)
+  end
+
   defp mode(path) do
     {:ok, %File.Stat{mode: mode}} = File.stat(path)
     Bitwise.band(mode, 0o777)
   end
 
+  defp snapshot(dir) do
+    for name <- ["settings.json5", "keys.json5"],
+        path = Path.join(dir, name),
+        File.exists?(path),
+        into: %{},
+        do: {name, File.read!(path)}
+  end
+
   describe "loading the fleet layout" do
-    test "first profile is active; its first model is the default; label fields ride along" do
+    test "defaultProfile is active; its defaultProvider's first model is the default; the provider set rides along" do
       assert {:ok,
               %Config{
-                base_url: "https://provider.example/v1",
+                base_url: @base_url,
                 model: "glm-5.3-flash",
                 api_key: "PLACEHOLDER-work-key",
                 context_tokens: 196_608,
                 nickname: "Flash",
-                profile: "work"
+                profile: "work",
+                providers: [%{label: "zai", base_url: @base_url, api_key: "PLACEHOLDER-work-key"}]
               }} = Config.load(fleet_dir(), %{}, [])
     end
 
@@ -98,248 +142,476 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
-          configVersion: 2,
+          configVersion: 3,
+          defaultProfile: 'work',
           profiles: [{
             name: 'work',
-            baseUrl: 'https://provider.example/v1',
+            providers: [{
+              baseUrl: '#{@base_url}',
+              models: [
+                { nickname: 'Flash', model: 'glm-5.3-flash' },
+                { nickname: 'Sol', model: 'glm-5.3' },
+              ],
+            }],
             settings: { defaultModel: 'glm-5.3' },
-            models: [
-              { nickname: 'Flash', model: 'glm-5.3-flash' },
-              { nickname: 'Sol', model: 'glm-5.3' },
-            ],
           }],
         }
         """
       )
 
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
 
       assert {:ok, %Config{model: "glm-5.3", nickname: "Sol"}} = Config.load(dir, %{}, [])
     end
 
     test "a defaultModel that matches nothing warns and falls back to the first entry" do
       dir = tmp_dir()
-      main = String.replace(fleet_file(), "defaultModel: 'Flash'", "defaultModel: 'Nope'")
-      write!(dir, main)
-      write_keys!(dir, fleet_keys())
-
-      logs =
-        capture_log(fn ->
-          assert {:ok, %Config{nickname: "Sol", model: "glm-5.3"}} = Config.load(dir, %{}, [])
-        end)
-
-      assert logs =~ "defaultModel \"Nope\" matches no model in this profile"
-    end
-
-    test "a profile with no models yields nothing but its endpoint; env completes the rest" do
-      dir = tmp_dir()
 
       write!(
         dir,
         """
         {
-          configVersion: 2,
+          configVersion: 3,
+          defaultProfile: 'work',
           profiles: [{
             name: 'work',
-            baseUrl: 'https://provider.example/v1',
+            providers: [{
+              baseUrl: '#{@base_url}',
+              models: [
+                { nickname: 'Flash', model: 'glm-5.3-flash' },
+                { nickname: 'Sol', model: 'glm-5.3' },
+              ],
+            }],
+            settings: { defaultModel: 'Nope' },
           }],
         }
         """
       )
 
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
 
-      assert {:error, "missing provider config: model"} = Config.load(dir, %{}, [])
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{model: "glm-5.3-flash", nickname: "Flash"}} =
+                   Config.load(dir, %{}, [])
+        end)
 
-      assert {:ok, %Config{model: "env-model", profile: "work"}} =
-               Config.load(dir, %{"DASHFLOAT_MODEL" => "env-model"}, [])
-    end
-  end
-
-  describe "two profiles on one provider across the two files (the differentiator)" do
-    test "same baseUrl, distinct credentials: each profile selects its own key and menu" do
-      dir = fleet_dir()
-
-      assert {:ok, work} = Config.load(dir, %{}, [])
-      assert {:ok, personal} = Config.load(dir, %{}, profile: "personal")
-
-      assert %Config{
-               base_url: "https://provider.example/v1",
-               model: "glm-5.3-flash",
-               api_key: "PLACEHOLDER-work-key",
-               nickname: "Flash",
-               profile: "work",
-               context_tokens: 196_608
-             } = work
-
-      assert %Config{
-               base_url: "https://provider.example/v1",
-               model: "glm-5.3",
-               api_key: "PLACEHOLDER-personal-key",
-               nickname: "Sol",
-               profile: "personal",
-               context_tokens: 262_144
-             } = personal
+      assert logs =~
+               ~s(defaultModel "Nope" matches no model in this profile — using the profile default)
     end
 
-    test "two profiles with different settings maps select the right setup end to end" do
+    test "a provider with no models yields nothing but its endpoint; env completes the rest" do
       dir = tmp_dir()
 
       write!(
         dir,
         """
         {
-          configVersion: 2,
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{ name: 'work', providers: [{ baseUrl: '#{@base_url}' }] }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      env = %{"DASHFLOAT_MODEL" => "env-model"}
+
+      assert {:ok,
+              %Config{base_url: @base_url, model: "env-model", api_key: "PLACEHOLDER-work-key"}} =
+               Config.load(dir, env, [])
+    end
+  end
+
+  describe "two personas on one provider (the differentiator)" do
+    test "same baseUrl, distinct credentials: each profile selects its own key and menu" do
+      assert {:ok, %Config{api_key: "PLACEHOLDER-work-key", context_tokens: 196_608}} =
+               Config.load(fleet_dir(), %{}, profile: "work")
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-personal-key", context_tokens: 262_144}} =
+               Config.load(fleet_dir(), %{}, profile: "personal")
+    end
+
+    test "two providers in one profile: defaultProvider addresses the label, menus scope to it" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'personal',
           profiles: [
-            { name: 'work', baseUrl: 'https://provider.example/v1',
-              settings: { defaultModel: 'Sol' },
-              models: [
-                { nickname: 'Sol', model: 'glm-5.3', context: 524288 },
-                { nickname: 'Flash', model: 'glm-5.3-flash', context: 196608 },
-              ] },
-            { name: 'personal', baseUrl: 'https://provider.example/v1',
-              settings: { defaultModel: 'Mini' },
-              models: [{ nickname: 'Mini', model: 'glm-5.3-mini', context: 128000 }] },
+            {
+              name: 'personal',
+              defaultProvider: 'synthetic',
+              providers: [
+                { label: 'zai', baseUrl: 'https://zai.example/api',
+                  models: [{ nickname: 'Sol', model: 'glm-5.3' }] },
+                { label: 'synthetic', baseUrl: 'https://synthetic.example/openai/v1',
+                  models: [{ nickname: 'Deep', model: 'hf:deepseek' }] },
+              ],
+            },
           ],
         }
         """
       )
 
-      write_keys!(dir, fleet_keys())
+      write_keys!(
+        dir,
+        """
+        {
+          personal: {
+            'https://zai.example/api': 'PLACEHOLDER-zai-key',
+            'https://synthetic.example/openai/v1': 'PLACEHOLDER-synthetic-key',
+          },
+        }
+        """
+      )
 
       assert {:ok,
               %Config{
-                model: "glm-5.3",
-                api_key: "PLACEHOLDER-work-key",
-                nickname: "Sol",
-                profile: "work",
-                context_tokens: 524_288
-              }} =
-               Config.load(dir, %{}, [])
+                base_url: "https://synthetic.example/openai/v1",
+                model: "hf:deepseek",
+                nickname: "Deep",
+                api_key: "PLACEHOLDER-synthetic-key",
+                providers: providers
+              }} = Config.load(dir, %{}, [])
 
-      assert {:ok,
-              %Config{
-                model: "glm-5.3-mini",
-                api_key: "PLACEHOLDER-personal-key",
-                nickname: "Mini",
-                profile: "personal",
-                context_tokens: 128_000
-              }} =
-               Config.load(dir, %{}, profile: "personal")
+      assert [
+               %{label: "zai", api_key: "PLACEHOLDER-zai-key"},
+               %{label: "synthetic", api_key: "PLACEHOLDER-synthetic-key"}
+             ] = providers
+
+      assert {:ok, %Config{base_url: "https://zai.example/api", model: "glm-5.3"}} =
+               Config.load(
+                 dir,
+                 %{
+                   "DASHFLOAT_BASE_URL" => "https://zai.example/api",
+                   "DASHFLOAT_MODEL" => "glm-5.3"
+                 },
+                 []
+               )
     end
 
-    test "a key for a missing profile name in keys.json5 is simply unused" do
-      dir = fleet_dir()
-      # keys.json5 with a stale extra entry: inert, never an error.
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key', 'ghost': 'PLACEHOLDER-x',}")
+    test "an unknown defaultProvider warns and falls back to the first provider" do
+      dir = tmp_dir()
 
-      assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            defaultProvider: 'nope',
+            providers: [
+              { label: 'first', baseUrl: 'https://first.example/v1', models: [{ model: 'm1' }] },
+              { label: 'second', baseUrl: 'https://second.example/v1', models: [{ model: 'm2' }] },
+            ],
+          }],
+        }
+        """
+      )
+
+      write_keys!(
+        dir,
+        "{work: {'https://first.example/v1': 'K1', 'https://second.example/v1': 'K2'}}"
+      )
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{base_url: "https://first.example/v1", model: "m1"}} =
+                   Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~
+               ~s(defaultProvider "nope" matches no provider in profile "work" — using the first)
+    end
+
+    test "a provider label defaults to the URL host" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [
+              { baseUrl: 'https://api.z.ai/api/coding/paas/v4', models: [{ model: 'glm-5.3' }] },
+            ],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'https://api.z.ai/api/coding/paas/v4': 'PLACEHOLDER'}}")
+
+      assert {:ok, %Config{providers: [%{label: "api.z.ai"}]}} = Config.load(dir, %{}, [])
+    end
+
+    test "a key for a profile that no longer exists in settings is simply unused" do
+      dir = fleet_dir()
+
+      # The dead-key mirror of the unkeyed warning: silent for settings
+      # truth, surfaced nowhere as an error.
+      write_keys!(
+        dir,
+        """
+        {
+          work: { '#{@base_url}': 'PLACEHOLDER-work-key' },
+          personal: { '#{@base_url}': 'PLACEHOLDER-personal-key' },
+          ghost: { '#{@base_url}': 'PLACEHOLDER-ghost-key' },
+        }
+        """
+      )
+
+      assert {:ok, %Config{profile: "work"}} = Config.load(dir, %{}, [])
     end
   end
 
-  describe "selection precedence: flag > env > file" do
-    test "the --profile flag beats DASHFLOAT_PROFILE, which beats the first profile" do
-      dir = fleet_dir()
+  describe "deliberate profile selection (ADR 0009)" do
+    test "--profile beats DASHFLOAT_PROFILE, which beats defaultProfile" do
+      env = %{"DASHFLOAT_PROFILE" => "personal"}
 
-      assert {:ok, %Config{profile: "work"}} = Config.load(dir, %{}, [])
-
-      assert {:ok, %Config{profile: "personal"}} =
-               Config.load(dir, %{"DASHFLOAT_PROFILE" => "personal"}, [])
-
-      assert {:ok, %Config{profile: "personal"}} =
-               Config.load(dir, %{"DASHFLOAT_PROFILE" => "work"}, profile: "personal")
+      assert {:ok, %Config{profile: "personal"}} = Config.load(fleet_dir(), env, [])
+      assert {:ok, %Config{profile: "work"}} = Config.load(fleet_dir(), env, profile: "work")
+      assert {:ok, %Config{profile: "work"}} = Config.load(fleet_dir(), %{}, [])
     end
 
-    test "the --model flag selects by nickname, then by model id, under the active profile" do
-      dir = fleet_dir()
+    test "--profile <unknown> is a hard error listing the valid profile names" do
+      assert {:error, message} = Config.load(fleet_dir(), %{}, profile: "nope")
+      assert message =~ ~s(profile "nope" matches no profile in settings.json5)
+      assert message =~ "valid profiles: work, personal"
+      assert is_binary(message)
+    end
 
-      assert {:ok, %Config{model: "glm-5.3", nickname: "Sol", api_key: "PLACEHOLDER-work-key"}} =
-               Config.load(dir, %{}, model: "Sol")
+    test "DASHFLOAT_PROFILE <unknown> errors the same way" do
+      assert {:error, message} = Config.load(fleet_dir(), %{"DASHFLOAT_PROFILE" => "ghost"}, [])
+      assert message =~ "valid profiles: work, personal"
+    end
 
-      assert {:ok, %Config{model: "glm-5.3-flash", nickname: "Flash"}} =
-               Config.load(dir, %{}, model: "glm-5.3-flash")
+    test "no defaultProfile, one profile: auto-selected (no modal)" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          profiles: [{
+            name: 'solo',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{solo: {'#{@base_url}': 'PLACEHOLDER-solo'}}")
+
+      assert {:ok, %Config{profile: "solo"}} = Config.load(dir, %{}, [])
+    end
+
+    test "no defaultProfile, two profiles: the forced-selection classification" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          profiles: [
+            { name: 'a', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }] },
+            { name: 'b', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm2' }] }] },
+          ],
+        }
+        """
+      )
+
+      assert {:select, ["a", "b"]} = Config.load(dir, %{}, [])
+    end
+
+    test "an explicit profile still wins over the forced-selection state" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          profiles: [
+            { name: 'a', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }] },
+            { name: 'b', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm2' }] }] },
+          ],
+        }
+        """
+      )
+
+      write_keys!(dir, "{b: {'#{@base_url}': 'PLACEHOLDER-b'}}")
+
+      assert {:ok, %Config{profile: "b", model: "m2"}} = Config.load(dir, %{}, profile: "b")
+    end
+
+    test "zero profiles and incomplete env: the onboarding classification" do
+      emptied = tmp_dir()
+      write!(emptied, "{configVersion: 3, profiles: []}")
+      assert :onboard = Config.load(emptied, %{}, [])
+
+      bare = tmp_dir()
+      assert :onboard = Config.load(bare, %{}, [])
+    end
+
+    test "zero profiles with a complete env boots env-only — never the wizard" do
+      env = %{
+        "DASHFLOAT_BASE_URL" => @base_url,
+        "DASHFLOAT_MODEL" => "env-model",
+        "DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"
+      }
 
       assert {:ok,
-              %Config{model: "glm-5.3", nickname: "Sol", api_key: "PLACEHOLDER-personal-key"}} =
-               Config.load(dir, %{}, profile: "personal", model: "Sol")
+              %Config{
+                base_url: @base_url,
+                model: "env-model",
+                api_key: "PLACEHOLDER-env-key",
+                providers: []
+              }} = Config.load(tmp_dir(), env, [])
+    end
+
+    test "an explicit profile with zero profiles stays the env-only regime (v2 parity)" do
+      env = %{
+        "DASHFLOAT_BASE_URL" => @base_url,
+        "DASHFLOAT_MODEL" => "env-model",
+        "DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"
+      }
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{model: "env-model"}} =
+                   Config.load(tmp_dir(), env, profile: "ghost")
+        end)
+
+      assert logs =~ ~s(profile "ghost" \(flag or DASHFLOAT_PROFILE\) matches no profile)
+    end
+  end
+
+  describe "model selection within the active provider" do
+    test "the --model flag selects by nickname, then by model id" do
+      assert {:ok, %Config{model: "glm-5.3", nickname: "Sol"}} =
+               Config.load(fleet_dir(), %{}, profile: "work", model: "Sol")
+
+      assert {:ok, %Config{model: "glm-5.3", nickname: "Sol"}} =
+               Config.load(fleet_dir(), %{}, profile: "work", model: "glm-5.3")
     end
 
     test "a --model miss warns and falls back to the profile default" do
-      dir = fleet_dir()
-
       logs =
         capture_log(fn ->
-          assert {:ok, %Config{nickname: "Flash"}} = Config.load(dir, %{}, model: "Ghost")
+          assert {:ok, %Config{model: "glm-5.3-flash"}} =
+                   Config.load(fleet_dir(), %{}, profile: "work", model: "Nope")
         end)
 
-      assert logs =~ "--model \"Ghost\" matches no model in this profile"
+      assert logs =~
+               ~s(--model "Nope" matches no model in this profile — using the profile default)
     end
 
-    test "a flag or env profile that matches no definition warns and is used anyway" do
-      dir = fleet_dir()
+    test "a --model flag with a blank value counts as absent" do
+      assert {:ok, %Config{model: "glm-5.3-flash"}} =
+               Config.load(fleet_dir(), %{}, profile: "work", model: "  ")
+    end
+
+    test "--model resolves nickname-then-id when they collide across entries" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{
+              baseUrl: '#{@base_url}',
+              models: [
+                { nickname: 'A', model: 'id-one' },
+                { nickname: 'id-one', model: 'id-two' },
+              ],
+            }],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      assert {:ok, %Config{model: "id-two", nickname: "id-one"}} =
+               Config.load(dir, %{}, model: "id-one")
+    end
+
+    test "a --model flag on a provider with no models warns it was discarded" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{ name: 'work', providers: [{ baseUrl: '#{@base_url}' }] }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
 
       logs =
         capture_log(fn ->
-          assert {:error, "missing provider config: base_url, model, api_key"} =
-                   Config.load(dir, %{"DASHFLOAT_PROFILE" => "ghost"}, [])
+          assert {:ok, %Config{model: "env-model"}} =
+                   Config.load(dir, %{"DASHFLOAT_MODEL" => "env-model"}, model: "dropped")
         end)
 
-      assert logs =~ "profile \"ghost\" (flag or DASHFLOAT_PROFILE) matches no profile"
+      assert logs =~ ~s(--model "dropped" has no models to select from — ignored)
+    end
 
-      flag_logs =
+    test "a present-but-unusable defaultModel warns and uses the first entry" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{
+              baseUrl: '#{@base_url}',
+              models: [{ nickname: 'Flash', model: 'glm-5.3-flash' }],
+            }],
+            settings: { defaultModel: 42 },
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      logs =
         capture_log(fn ->
-          assert {:error, "missing provider config: base_url, model, api_key"} =
-                   Config.load(dir, %{}, profile: "ghost")
+          assert {:ok, %Config{model: "glm-5.3-flash"}} = Config.load(dir, %{}, [])
         end)
 
-      assert flag_logs =~ "profile \"ghost\" (flag or DASHFLOAT_PROFILE) matches no profile"
+      assert logs =~ "defaultModel is not a usable nickname — using the first entry"
     end
   end
 
   describe "field precedence: file < env, per field" do
     test "each env var overrides only its field" do
-      dir = fleet_dir()
-
-      env = %{
-        "DASHFLOAT_BASE_URL" => "https://env.example/v1",
-        "DASHFLOAT_MODEL" => "env-model",
-        "DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key",
-        "DASHFLOAT_CONTEXT_TOKENS" => "100000"
-      }
-
-      assert {:ok,
-              %Config{
-                base_url: "https://env.example/v1",
-                model: "env-model",
-                api_key: "PLACEHOLDER-env-key",
-                context_tokens: 100_000,
-                # File vocabulary stays: the entry is still Flash of work.
-                nickname: "Flash",
-                profile: "work"
-              }} = Config.load(dir, env, [])
-    end
-
-    test "blank env vars count as absent and fall back to the files" do
-      dir = fleet_dir()
-
-      env = %{
-        "DASHFLOAT_MODEL" => "   ",
-        "DASHFLOAT_API_KEY" => "",
-        "DASHFLOAT_CONTEXT_TOKENS" => "  ",
-        "DASHFLOAT_PROFILE" => ""
-      }
-
-      assert {:ok, config} = Config.load(dir, env, [])
-
-      assert %Config{
-               model: "glm-5.3-flash",
-               api_key: "PLACEHOLDER-work-key",
-               context_tokens: 196_608,
-               profile: "work"
-             } = config
-    end
-
-    test "env alone works without any config files" do
       env = %{
         "DASHFLOAT_BASE_URL" => "https://env.example/v1",
         "DASHFLOAT_MODEL" => "env-model",
@@ -351,161 +623,209 @@ defmodule DashFloat.ConfigTest do
                 base_url: "https://env.example/v1",
                 model: "env-model",
                 api_key: "PLACEHOLDER-env-key",
-                nickname: nil,
-                profile: nil
-              }} = Config.load(tmp_dir(), env, [])
+                nickname: "Flash",
+                profile: "work"
+              }} =
+               Config.load(fleet_dir(), env, [])
+    end
+
+    test "blank env vars count as absent and fall back to the files" do
+      env = %{"DASHFLOAT_BASE_URL" => " ", "DASHFLOAT_MODEL" => "", "DASHFLOAT_API_KEY" => ""}
+
+      assert {:ok,
+              %Config{
+                base_url: @base_url,
+                model: "glm-5.3-flash",
+                api_key: "PLACEHOLDER-work-key"
+              }} = Config.load(fleet_dir(), env, [])
     end
 
     test "an env key completes a settings-only directory (no keys.json5)" do
+      dir = tmp_dir()
+      write!(dir, fleet_file())
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-env-key"}} =
+               Config.load(dir, %{"DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"}, [])
+    end
+
+    test "an unusable env context is nil, never an error; a blank one falls back" do
+      assert {:ok, %Config{context_tokens: nil}} =
+               Config.load(fleet_dir(), %{"DASHFLOAT_CONTEXT_TOKENS" => "garbage"}, [])
+
+      assert {:ok, %Config{context_tokens: 196_608}} =
+               Config.load(fleet_dir(), %{"DASHFLOAT_CONTEXT_TOKENS" => " "}, [])
+    end
+  end
+
+  describe "keys.json5 resolution (endpoint-keyed, ADR 0009)" do
+    test "a $ENV_VAR value resolves from the environment" do
+      dir = fleet_dir()
+
+      write_keys!(
+        dir,
+        "{work: {'#{@base_url}': '$PLACEHOLDER_WORK_KEY'}}"
+      )
+
+      env = %{"PLACEHOLDER_WORK_KEY" => "PLACEHOLDER-work-key"}
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, env, [])
+    end
+
+    test "an unset $ENV_VAR warns naming the variable and the field errors as missing" do
+      dir = fleet_dir()
+
+      write_keys!(
+        dir,
+        "{work: {'#{@base_url}': '$PLACEHOLDER_UNSET_KEY'}}"
+      )
+
+      logs =
+        capture_log(fn ->
+          assert {:error, "missing provider config: api_key"} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ "references unset environment variable PLACEHOLDER_UNSET_KEY"
+      refute logs =~ "PLACEHOLDER_UNSET_KEY="
+    end
+
+    test "a literal that merely starts with $ is not a reference" do
+      dir = fleet_dir()
+
+      write_keys!(
+        dir,
+        ~s({work: {'#{@base_url}': '$2a$10$placeholder-literally-a-bcrypt-shape'}})
+      )
+
+      assert {:ok, %Config{api_key: "$2a$10$placeholder-literally-a-bcrypt-shape"}} =
+               Config.load(dir, %{}, [])
+    end
+
+    test "an unusable key value is missing, never an error" do
+      dir = fleet_dir()
+
+      write_keys!(
+        dir,
+        "{work: {'#{@base_url}': 123}}"
+      )
+
+      assert {:error, "missing provider config: api_key"} = Config.load(dir, %{}, [])
+    end
+
+    test "a stray inline apiKey is tolerated, warned, and ignored — never a fallback" do
       dir = tmp_dir()
 
       write!(
         dir,
         """
         {
-          configVersion: 2,
+          configVersion: 3,
+          defaultProfile: 'work',
           profiles: [{
             name: 'work',
-            baseUrl: 'https://provider.example/v1',
-            models: [{ nickname: 'Sol', model: 'glm-5.3' }],
+            apiKey: 'PLACEHOLDER-stray',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
           }],
         }
         """
       )
 
-      assert {:error, "missing provider config: api_key"} = Config.load(dir, %{}, [])
-
-      assert {:ok, %Config{api_key: "PLACEHOLDER-env-key", nickname: "Sol"}} =
-               Config.load(dir, %{"DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"}, [])
-    end
-
-    test "an unusable env context is nil, never an error; a blank one falls back" do
-      dir = fleet_dir()
-
-      assert {:ok, %Config{context_tokens: nil}} =
-               Config.load(dir, %{"DASHFLOAT_CONTEXT_TOKENS" => "nope"}, [])
-
-      assert {:ok, %Config{context_tokens: 196_608}} =
-               Config.load(dir, %{"DASHFLOAT_CONTEXT_TOKENS" => ""}, [])
-    end
-
-    test "a --model flag with a blank value counts as absent" do
-      dir = fleet_dir()
-      assert {:ok, %Config{nickname: "Flash"}} = Config.load(dir, %{}, model: "   ")
-    end
-  end
-
-  describe "keys.json5 resolution" do
-    test "an unusable key value is missing, never an error" do
-      dir = fleet_dir()
-      write_keys!(dir, "{'work': 3, 'personal': 'PLACEHOLDER-personal-key',}")
-
-      assert {:error, "missing provider config: api_key"} = Config.load(dir, %{}, [])
-
-      assert {:ok, %Config{api_key: "PLACEHOLDER-personal-key"}} =
-               Config.load(dir, %{}, profile: "personal")
-    end
-
-    test "a malformed keys.json5 is a load error naming the file" do
-      dir = fleet_dir()
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',")
-
-      assert {:error, message} = Config.load(dir, %{}, [])
-      assert message == "invalid JSON5 in #{Path.join(dir, "keys.json5")}"
-      refute message =~ "PLACEHOLDER"
-    end
-
-    test "a keys.json5 that is not an object is a load error" do
-      dir = fleet_dir()
-      write_keys!(dir, "['nope']")
-
-      assert {:error, message} = Config.load(dir, %{}, [])
-      assert message =~ "expected an object"
-    end
-
-    test "a stray inline apiKey is tolerated, warned, and ignored — never a fallback" do
-      stray_file = """
-      {
-        configVersion: 2,
-        profiles: [{
-          name: 'work',
-          baseUrl: 'https://provider.example/v1',
-          apiKey: 'PLACEHOLDER-stray',
-          models: [{ nickname: 'Sol', model: 'glm-5.3' }],
-        }],
-      }
-      """
-
-      dir = tmp_dir()
-      write!(dir, stray_file)
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
 
       logs =
         capture_log(fn ->
           assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
         end)
 
-      assert logs =~ ~s(profile "work": apiKey is ignored — API keys live in keys.json5)
-      refute logs =~ "PLACEHOLDER"
-
-      # Without a keys entry the stray value is NOT used — the error names
-      # the field, never the value.
-      bare_dir = tmp_dir()
-      write!(bare_dir, stray_file)
-
-      error_logs =
-        capture_log(fn ->
-          assert {:error, message} = Config.load(bare_dir, %{}, [])
-          assert message =~ "api_key"
-          refute message =~ "PLACEHOLDER"
-        end)
-
-      assert error_logs =~ "apiKey is ignored"
+      assert logs =~ ~s(profile "work": apiKey is ignored)
     end
   end
 
-  describe "missing pieces degrade to field-name errors" do
-    test "no file and no env names exactly the missing fields" do
-      assert {:error, "missing provider config: base_url, model, api_key"} =
-               Config.load(tmp_dir(), %{}, [])
-    end
-
-    test "a profile without baseUrl or a keys entry names exactly those fields" do
+  describe "mcp entries (storage shape, ADR 0009)" do
+    test "a literal token warns and the entry is ignored; a $REF shape is accepted" do
       dir = tmp_dir()
 
       write!(
         dir,
         """
         {
-          configVersion: 2,
+          configVersion: 3,
+          defaultProfile: 'work',
           profiles: [{
             name: 'work',
-            models: [{ nickname: 'Sol', model: 'glm-5.3', profile: 'work' }],
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
+            mcp: [
+              { name: 'good', command: 'uvx', args: ['mcp-server-fetch'], token: '$FETCH_TOKEN' },
+              { name: 'bad', command: 'uvx', token: 'a-literal-secret' },
+            ],
           }],
         }
         """
       )
 
-      assert {:error, "missing provider config: base_url, api_key"} = Config.load(dir, %{}, [])
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
 
-      assert {:ok,
-              %Config{
-                base_url: "https://env.example/v1",
-                api_key: "PLACEHOLDER-env-key",
-                nickname: "Sol"
-              }} =
-               Config.load(
-                 dir,
-                 %{
-                   "DASHFLOAT_BASE_URL" => "https://env.example/v1",
-                   "DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"
-                 },
-                 []
-               )
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{}} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ "an mcp entry with a literal token is ignored"
+    end
+
+    test "an mcp entry without a name or command warns and is ignored" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
+            mcp: [{ command: 'uvx' }, { name: 'fetch' }, "not-an-object", 7],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      logs =
+        capture_log(fn -> Config.load(dir, %{}, []) end)
+
+      assert logs =~ "an mcp entry without a name or command is ignored"
+      assert logs =~ "an mcp entry that is not an object is ignored"
     end
   end
 
-  describe "profile and model addressing edge cases (hostile review)" do
+  describe "missing pieces degrade to field-name errors" do
+    test "no file and no env names exactly the missing fields" do
+      assert {:error, "missing provider config: base_url, model, api_key"} =
+               Config.load(tmp_dir(), %{}, profile: "ghost")
+    end
+
+    test "a provider without a baseUrl or a keys entry names exactly those fields" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{ name: 'work', providers: [{}] }],
+        }
+        """
+      )
+
+      assert {:error, "missing provider config: base_url, model, api_key"} =
+               Config.load(dir, %{}, [])
+    end
+  end
+
+  describe "profile addressing edge cases" do
     test "duplicate profile names warn and the first definition wins" do
       dir = tmp_dir()
 
@@ -513,158 +833,29 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
-          configVersion: 2,
+          configVersion: 3,
+          defaultProfile: 'work',
           profiles: [
-            { name: 'work', baseUrl: 'https://first.example/v1',
-              models: [{ model: 'm1' }] },
-            { name: 'work', baseUrl: 'https://second.example/v1',
-              models: [{ model: 'm2' }] },
+            { name: 'work', providers: [{ baseUrl: 'https://first.example/v1', models: [{ model: 'first' }] }] },
+            { name: 'work', providers: [{ baseUrl: 'https://second.example/v1', models: [{ model: 'second' }] }] },
           ],
         }
         """
       )
 
-      write_keys!(dir, "{'work': 'PLACEHOLDER-first',}")
+      write_keys!(dir, "{work: {'https://first.example/v1': 'PLACEHOLDER-work-key'}}")
 
       logs =
         capture_log(fn ->
-          assert {:ok,
-                  %Config{
-                    base_url: "https://first.example/v1",
-                    api_key: "PLACEHOLDER-first",
-                    model: "m1"
-                  }} =
+          assert {:ok, %Config{base_url: "https://first.example/v1", model: "first"}} =
                    Config.load(dir, %{}, [])
         end)
 
       assert logs =~ ~s(duplicate profile "work" — keeping the first)
-      refute logs =~ "PLACEHOLDER"
-    end
-
-    test "--model resolves nickname-then-id when they collide across entries" do
-      dir = tmp_dir()
-
-      write!(
-        dir,
-        """
-        {
-          configVersion: 2,
-          profiles: [{
-            name: 'work',
-            baseUrl: 'https://provider.example/v1',
-            models: [
-              { nickname: 'alpha', model: 'beta' },
-              { nickname: 'beta', model: 'gamma' },
-            ],
-          }],
-        }
-        """
-      )
-
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
-
-      # "beta" is BOTH entry one's model id and entry two's nickname: the
-      # nickname is the user-facing address and wins.
-      assert {:ok, %Config{model: "gamma", nickname: "beta"}} =
-               Config.load(dir, %{}, model: "beta")
-    end
-
-    test "a flag/env profile matching nothing warns even with no profiles defined" do
-      dir = tmp_dir()
-
-      logs =
-        capture_log(fn ->
-          env = %{
-            "DASHFLOAT_PROFILE" => "ghost",
-            "DASHFLOAT_BASE_URL" => "https://env.example/v1",
-            "DASHFLOAT_MODEL" => "env-model",
-            "DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"
-          }
-
-          assert {:ok, %Config{profile: "ghost"}} = Config.load(dir, env, [])
-        end)
-
-      assert logs =~ "profile \"ghost\" (flag or DASHFLOAT_PROFILE) matches no profile"
-    end
-
-    test "a --model flag on a profile with no models warns it was discarded" do
-      dir = tmp_dir()
-
-      write!(
-        dir,
-        """
-        {
-          configVersion: 2,
-          profiles: [{
-            name: 'work',
-            baseUrl: 'https://provider.example/v1',
-          }],
-        }
-        """
-      )
-
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
-
-      logs =
-        capture_log(fn ->
-          assert {:error, "missing provider config: model"} = Config.load(dir, %{}, model: "Sol")
-        end)
-
-      assert logs =~ ~s(--model "Sol" has no models to select from)
-    end
-
-    test "a present-but-unusable defaultModel warns and uses the first entry" do
-      dir = tmp_dir()
-
-      write!(
-        dir,
-        """
-        {
-          configVersion: 2,
-          profiles: [{
-            name: 'work',
-            baseUrl: 'https://provider.example/v1',
-            settings: { defaultModel: 3 },
-            models: [{ nickname: 'Sol', model: 'glm-5.3' }, { nickname: 'Flash', model: 'glm-5.3-flash' }],
-          }],
-        }
-        """
-      )
-
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
-
-      logs =
-        capture_log(fn ->
-          assert {:ok, %Config{nickname: "Sol"}} = Config.load(dir, %{}, [])
-        end)
-
-      assert logs =~ "defaultModel is not a usable nickname"
     end
   end
 
   describe "malformed and unusual files" do
-    test "invalid JSON5 is reported without echoing the file contents" do
-      dir = tmp_dir()
-      write!(dir, ~s({"apiKey": "PLACEHOLDER-secret",))
-
-      assert {:error, message} = Config.load(dir, %{}, [])
-      assert message == "invalid JSON5 in #{Path.join(dir, "settings.json5")}"
-      refute message =~ "PLACEHOLDER"
-    end
-
-    test "a file that is not an object is reported as invalid" do
-      dir = tmp_dir()
-      write!(dir, "[1, 2, 3]")
-
-      assert {:error, message} = Config.load(dir, %{}, [])
-      assert message =~ "expected an object"
-    end
-
-    test "an unreadable path is reported, not raised" do
-      assert {:error, message} = Config.load("/proc/self/mem", %{}, [])
-      assert message =~ "cannot read"
-    end
-
     test "bad entries inside a valid document warn and are skipped" do
       dir = tmp_dir()
 
@@ -672,96 +863,104 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
-          configVersion: 2,
+          configVersion: 3,
+          defaultProfile: 'work',
           profiles: [
-            'not-a-map',
-            { baseUrl: 'https://no-name.example' },
+            "not-an-object",
+            42,
+            { providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }] },
+            { name: 'work', providers: ["nope", 3, {}, { baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }] },
           ],
         }
         """
       )
 
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
       logs =
         capture_log(fn ->
-          assert {:error, "missing provider config: base_url, model, api_key"} =
-                   Config.load(dir, %{}, [])
+          assert {:ok, %Config{model: "m1"}} = Config.load(dir, %{}, [])
         end)
 
       assert logs =~ "a profile entry that is not an object is ignored"
       assert logs =~ "a profile without a name is ignored"
-      refute logs =~ "PLACEHOLDER"
+      assert logs =~ "a providers entry that is not an object is ignored"
+      assert logs =~ "a providers entry without a baseUrl is ignored"
     end
 
-    test "profiles or models that are not lists warn and are ignored" do
-      dir = tmp_dir()
-      write!(dir, "{ profiles: 'nope' }")
-
-      logs =
-        capture_log(fn ->
-          assert {:error, "missing provider config: base_url, model, api_key"} =
-                   Config.load(dir, %{}, [])
-        end)
-
-      assert logs =~ "profiles must be a list"
-    end
-
-    test "a models list that is not a list warns and is ignored for that profile" do
+    test "profiles or providers that are not lists warn and are ignored" do
       dir = tmp_dir()
 
       write!(
         dir,
         """
         {
-          configVersion: 2,
+          configVersion: 3,
+          profiles: 'nope',
+        }
+        """
+      )
+
+      logs =
+        capture_log(fn -> assert :onboard = Config.load(dir, %{}, []) end)
+
+      assert logs =~ "profiles must be a list — ignored"
+    end
+
+    test "a models list that is not a list warns and is ignored for that provider" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
           profiles: [{
             name: 'work',
-            baseUrl: 'https://provider.example/v1',
-            models: 3,
+            providers: [{ baseUrl: '#{@base_url}', models: 'nope' }],
           }],
         }
         """
       )
 
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
 
       logs =
         capture_log(fn ->
-          assert {:error, "missing provider config: model"} = Config.load(dir, %{}, [])
+          assert {:ok, %Config{model: "env-model"}} =
+                   Config.load(dir, %{"DASHFLOAT_MODEL" => "env-model"}, [])
         end)
 
       assert logs =~ "models must be a list — ignored"
     end
 
-    test "bad models entries inside a valid profile warn and are skipped" do
+    test "bad models entries inside a valid provider warn and are skipped" do
       dir = tmp_dir()
 
       write!(
         dir,
         """
         {
-          configVersion: 2,
+          configVersion: 3,
+          defaultProfile: 'work',
           profiles: [{
             name: 'work',
-            baseUrl: 'https://provider.example/v1',
-            models: [
-              { nickname: 'Sol', model: 'glm-5.3', context: 524288 },
-              { nickname: 'NoModel' },
-              'not-a-map',
-            ],
+            providers: [{ baseUrl: '#{@base_url}', models: ["nope", {}, { model: 'm1' }] }],
           }],
         }
         """
       )
 
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
 
       logs =
         capture_log(fn ->
-          assert {:ok, %Config{model: "glm-5.3", nickname: "Sol"}} = Config.load(dir, %{}, [])
+          assert {:ok, %Config{model: "m1"}} = Config.load(dir, %{}, [])
         end)
 
-      assert logs =~ "a models entry without a model id is ignored"
       assert logs =~ "a models entry that is not an object is ignored"
+      assert logs =~ "a models entry without a model id is ignored"
     end
 
     test "an invalid settings map warns and is ignored" do
@@ -771,144 +970,325 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
-          configVersion: 2,
+          configVersion: 3,
+          defaultProfile: 'work',
           profiles: [{
             name: 'work',
-            baseUrl: 'https://provider.example/v1',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
             settings: 'nope',
-            models: [{ nickname: 'Sol', model: 'glm-5.3' }],
           }],
         }
         """
       )
 
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
 
       logs =
-        capture_log(fn ->
-          assert {:ok, %Config{model: "glm-5.3", nickname: "Sol"}} = Config.load(dir, %{}, [])
-        end)
+        capture_log(fn -> assert {:ok, %Config{model: "m1"}} = Config.load(dir, %{}, []) end)
 
-      assert logs =~ "settings must be an object — ignored"
+      assert logs =~ ~s(profile "work": settings must be an object — ignored)
     end
 
     test "unknown settings keys warn by name; values are never logged" do
       dir = tmp_dir()
 
-      main =
-        String.replace(
-          fleet_file(),
-          "settings: { defaultModel: 'Flash' }",
-          "settings: { defaultModel: 'Flash', tools: 'dangerous-value' }"
-        )
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
+            settings: { defaultModel: 'm1', secretLooking: 'should-not-print' },
+          }],
+        }
+        """
+      )
 
-      write!(dir, main)
-      write_keys!(dir, fleet_keys())
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
 
       logs =
-        capture_log(fn ->
-          assert {:ok, %Config{model: "glm-5.3-flash"}} = Config.load(dir, %{}, [])
-        end)
+        capture_log(fn -> assert {:ok, %Config{model: "m1"}} = Config.load(dir, %{}, []) end)
 
-      assert logs =~ "unknown profile settings ignored: tools"
-      refute logs =~ "dangerous-value"
-      refute logs =~ "PLACEHOLDER"
+      assert logs =~ "unknown profile settings ignored: secretLooking"
+      refute logs =~ "should-not-print"
     end
 
-    test "a newer configVersion warns; an older or absent one is silent" do
+    test "a newer configVersion warns; an older one is silent" do
       dir = tmp_dir()
-      main = String.replace(fleet_file(), "configVersion: 2", "configVersion: 9")
-      write!(dir, main)
+      write!(dir, String.replace(fleet_file(), "configVersion: 3", "configVersion: 9"))
       write_keys!(dir, fleet_keys())
 
       logs =
+        capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
+
+      assert logs =~ "configVersion 9 is newer than supported 3 — fields may be misread"
+    end
+
+    test "a v3 file with a v2-shaped profile baseUrl warns" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            baseUrl: '#{@base_url}',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      logs =
+        capture_log(fn -> assert {:ok, %Config{model: "m1"}} = Config.load(dir, %{}, []) end)
+
+      assert logs =~ ~s(profile "work": baseUrl at the profile level is v2 shape)
+    end
+  end
+
+  describe "hand-vandalized configs degrade, never crash (ADR 0009 tolerance)" do
+    test "defaultProfile missing is silent and falls to the classification" do
+      # One profile: auto-select. Two: forced selection. Missing is OPTIONAL —
+      # no warning (that is Terence's scenario minus the deletion mistake).
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          profiles: [
+            { name: 'a', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }] },
+            { name: 'b', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm2' }] }] },
+          ],
+        }
+        """
+      )
+
+      logs = capture_log(fn -> assert {:select, ["a", "b"]} = Config.load(dir, %{}, []) end)
+      refute logs =~ "defaultProfile"
+    end
+
+    test "defaultProfile not-a-string warns and both classification arms still work" do
+      one = tmp_dir()
+
+      write!(
+        one,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 42,
+          profiles: [{ name: 'solo', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }] }],
+        }
+        """
+      )
+
+      write_keys!(one, "{solo: {'#{@base_url}': 'PLACEHOLDER-solo'}}")
+
+      logs =
+        capture_log(fn -> assert {:ok, %Config{profile: "solo"}} = Config.load(one, %{}, []) end)
+
+      assert logs =~ "defaultProfile is not a string — ignoring it"
+
+      two = tmp_dir()
+
+      write!(
+        two,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: ['work'],
+          profiles: [
+            { name: 'a', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }] },
+            { name: 'b', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm2' }] }] },
+          ],
+        }
+        """
+      )
+
+      logs_two = capture_log(fn -> assert {:select, ["a", "b"]} = Config.load(two, %{}, []) end)
+      assert logs_two =~ "defaultProfile is not a string — ignoring it"
+    end
+
+    test "defaultProfile unknown warns in both arms (Terence's deleted-key scenario)" do
+      # The exact scenario: the default profile name was edited away. The
+      # warning says so, and the state machine recovers.
+      one = tmp_dir()
+
+      write!(
+        one,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'ghost',
+          profiles: [{ name: 'solo', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }] }],
+        }
+        """
+      )
+
+      write_keys!(one, "{solo: {'#{@base_url}': 'PLACEHOLDER-solo'}}")
+
+      logs =
+        capture_log(fn -> assert {:ok, %Config{profile: "solo"}} = Config.load(one, %{}, []) end)
+
+      assert logs =~ ~s(defaultProfile "ghost" matches no profile in settings.json5 — ignoring it)
+
+      two = tmp_dir()
+
+      write!(
+        two,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'ghost',
+          profiles: [
+            { name: 'a', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }] },
+            { name: 'b', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm2' }] }] },
+          ],
+        }
+        """
+      )
+
+      logs_two = capture_log(fn -> assert {:select, ["a", "b"]} = Config.load(two, %{}, []) end)
+
+      assert logs_two =~
+               ~s(defaultProfile "ghost" matches no profile in settings.json5 — ignoring it)
+    end
+
+    test "a blank defaultProfile warns" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: '  ',
+          profiles: [{ name: 'solo', providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }] }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{solo: {'#{@base_url}': 'PLACEHOLDER-solo'}}")
+
+      logs =
+        capture_log(fn -> assert {:ok, %Config{profile: "solo"}} = Config.load(dir, %{}, []) end)
+
+      assert logs =~ "defaultProfile is blank — ignoring it"
+    end
+
+    test "an empty profiles list hand-emptied with no env lands in the wizard" do
+      dir = tmp_dir()
+      write!(dir, "{configVersion: 3, profiles: []}")
+      assert :onboard = Config.load(dir, %{}, [])
+    end
+
+    test "keys.json5: a profile map that is not an object warns and treats its keys as missing" do
+      dir = fleet_dir()
+      write_keys!(dir, "{work: 123}")
+
+      logs =
         capture_log(fn ->
-          assert {:ok, %Config{}} = Config.load(dir, %{}, [])
+          assert {:error, "missing provider config: api_key"} = Config.load(dir, %{}, [])
         end)
 
-      assert logs =~ "configVersion 9 is newer"
+      assert logs =~ ~s(keys.json5: "work" is not an object — its keys are unusable)
+    end
+
+    test "keys.json5 unparseable is a loud error naming the path and is never overwritten" do
+      dir = fleet_dir()
+      path = write_keys!(dir, "{work: ")
+      before = File.read!(path)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "invalid JSON5"
+      assert message =~ path
+      assert File.read!(path) == before
+    end
+
+    test "settings.json5 unparseable is a loud error naming the path and is never overwritten" do
+      dir = tmp_dir()
+      path = write!(dir, "{profiles: ")
+      before = File.read!(path)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "invalid JSON5"
+      assert message =~ path
+      assert File.read!(path) == before
+    end
+
+    test "a 0-byte settings.json5 is no config: the state machine takes over (no crash)" do
+      dir = tmp_dir()
+      path = Path.join(dir, "settings.json5")
+      File.write!(path, "")
+      File.chmod!(path, 0o600)
+
+      assert :onboard = Config.load(dir, %{}, [])
+    end
+
+    test "a whitespace-only keys.json5 reads as empty (no crash, no error)" do
+      dir = fleet_dir()
+      write_keys!(dir, "   \n\t ")
+
+      assert {:error, "missing provider config: api_key"} = Config.load(dir, %{}, [])
+    end
+
+    test "loading a damaged-but-parseable v3 directory never rewrites any file" do
+      # The whole family's spine: warnings and classification, zero content
+      # churn. (finish_partial's crash-debris MOVE is the migration's own
+      # warned behavior, not silent load churn — it needs a FLAT STRING
+      # value, which this fixture deliberately avoids: every damage here is
+      # non-string, so nothing converges or rewrites.)
+      dir = fleet_dir()
+      write_keys!(dir, "{work: {'#{@base_url}': 123}, personal: 42}")
+      before = snapshot(dir)
+
+      capture_log(fn -> Config.load(dir, %{}, []) end)
+
+      assert snapshot(dir) == before
     end
   end
 
   describe "security posture" do
-    test "repair happens even when the too-permissive file is also malformed" do
-      # The hand-made-file path is exactly this: 0644 with a typo in it. The
-      # repair must not depend on the file also being valid JSON5
-      # (hostile-review P1).
-      dir = tmp_dir()
-      main = Path.join(dir, "settings.json5")
-      File.write!(main, "{ broken")
-      File.chmod!(main, 0o644)
-
-      assert {:error, message} = Config.load(dir, %{}, [])
-      assert message =~ "invalid JSON5"
-
-      assert mode(main) == 0o600
-    end
-
     test "a symlinked settings.json5 warns and never chmods the target" do
       dir = tmp_dir()
-      target = Path.join(dir, "real-config")
+      target = Path.join(dir, "target.json5")
       File.write!(target, fleet_file())
       File.chmod!(target, 0o644)
       File.ln_s!(target, Path.join(dir, "settings.json5"))
-      write_keys!(dir, fleet_keys())
 
-      logs =
-        capture_log(fn ->
-          assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
-        end)
+      logs = capture_log(fn -> {:error, _error} = Config.load(dir, %{}, []) end)
 
-      assert logs =~ "is a symlink"
-
-      # The loader does not own the target file — its mode is untouched.
+      assert logs =~ "settings.json5 is a symlink — not repairing permissions"
       assert mode(target) == 0o644
     end
 
     test "a too-permissive settings.json5 is repaired to 0600 with a warning" do
       dir = fleet_dir()
-      main = Path.join(dir, "settings.json5")
-      File.chmod!(main, 0o644)
+      path = Path.join(dir, "settings.json5")
+      File.chmod!(path, 0o644)
 
-      logs =
-        capture_log(fn ->
-          assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
-        end)
-
-      assert logs =~ "repairing to 0600"
-
-      assert mode(main) == 0o600
+      capture_log(fn -> {:ok, _config} = Config.load(dir, %{}, []) end)
+      assert mode(path) == 0o600
     end
 
     test "a too-permissive keys.json5 is repaired to 0600 with a warning" do
       dir = fleet_dir()
-      keys = Path.join(dir, "keys.json5")
-      File.chmod!(keys, 0o644)
+      path = Path.join(dir, "keys.json5")
+      File.chmod!(path, 0o644)
 
-      logs =
-        capture_log(fn ->
-          assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
-        end)
-
-      assert logs =~ "keys.json5 is too permissive"
-      assert mode(keys) == 0o600
+      capture_log(fn -> {:ok, _config} = Config.load(dir, %{}, []) end)
+      assert mode(path) == 0o600
     end
 
-    # Hostile review P2-3: invalid UTF-8 raised FunctionClauseError out of
-    # Config.load instead of reaching the config-error path.
-    test "invalid UTF-8 in keys.json5 is an error, not a crash" do
-      dir = fleet_dir()
-      keys = Path.join(dir, "keys.json5")
-      File.write!(keys, "{'work': 'PLACE\xFFHOLDER',}")
-      File.chmod!(keys, 0o600)
-
-      assert {:error, message} = Config.load(dir, %{}, [])
-      assert message == "invalid JSON5 in #{keys}"
-      refute message =~ "PLACE"
-    end
-
-    # Hostile review P1-2, loader half: a root-level apiKey in settings is
-    # warned about and ignored exactly like a profile-level stray.
     test "a stray top-level apiKey warns and is never used" do
       dir = tmp_dir()
 
@@ -916,18 +1296,18 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
-          configVersion: 2,
-          apiKey: 'PLACEHOLDER-stray-root',
+          configVersion: 3,
+          apiKey: 'PLACEHOLDER-stray',
+          defaultProfile: 'work',
           profiles: [{
             name: 'work',
-            baseUrl: 'https://provider.example/v1',
-            models: [{ nickname: 'Sol', model: 'glm-5.3' }],
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
           }],
         }
         """
       )
 
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
 
       logs =
         capture_log(fn ->
@@ -935,174 +1315,79 @@ defmodule DashFloat.ConfigTest do
         end)
 
       assert logs =~ "top-level apiKey is ignored"
-      refute logs =~ "PLACEHOLDER"
     end
 
-    # Historical-loss surfacing (round-2 review, incident-hiding note): a
-    # profile with no key under its name in an EXISTING keys.json5 warns at
-    # load — the shape a lost credential leaves behind. Names only; silent
-    # when keys.json5 is absent (env-keyed setups are legitimate).
-    test "an unkeyed profile warns at load when keys.json5 exists" do
-      dir = tmp_dir()
+    test "an unkeyed provider warns at load when keys.json5 exists" do
+      dir = fleet_dir()
 
-      write!(
+      write_keys!(
         dir,
-        """
-        {
-          configVersion: 2,
-          profiles: [
-            { name: 'work', baseUrl: 'https://provider.example/v1',
-              models: [{ model: 'glm-5.3' }] },
-            { name: 'personal', baseUrl: 'https://provider.example/v1',
-              models: [{ model: 'glm-5.3' }] },
-          ],
-        }
-        """
+        "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}"
       )
 
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
-
-      logs =
-        capture_log(fn ->
-          assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
-
-          assert {:error, message} = Config.load(dir, %{}, profile: "personal")
-          assert message =~ "api_key"
-        end)
-
-      assert logs =~ ~s(profile "personal" has no key in keys.json5)
-      refute logs =~ ~s(profile "work" has no key)
-      refute logs =~ "PLACEHOLDER"
-
-      # Delta-2 P3a: the warning respects the loader's own precedence —
-      # DASHFLOAT_API_KEY keys the profile, so no nag (pre-fix: warned).
-      env = %{"DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"}
-
-      env_logs =
-        capture_log(fn ->
-          assert {:ok, %Config{api_key: "PLACEHOLDER-env-key"}} =
-                   Config.load(dir, env, profile: "personal")
-        end)
-
-      assert env_logs == ""
-
-      # No keys.json5 at all → silent (env-keyed setups).
-      keys_path = Path.join(dir, "keys.json5")
-      File.rm!(keys_path)
-
-      assert capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, env, []) end) == ""
-    end
-
-    # Delta-2 P3b: the documented "mv settings.json5.bak aside" unblock must
-    # not be able to strand a world-readable credential copy no path
-    # tightens — the load repairs the sidecar name.
-    test "load tightens a leftover .bak.old sidecar to 0600" do
-      dir = fleet_dir()
-      sidecar = Path.join(dir, "settings.json5.bak.old")
-      File.write!(sidecar, ~s({"apiKey": "PLACEHOLDER-old"}))
-      File.chmod!(sidecar, 0o644)
-
-      logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
-
-      assert logs =~ "settings.json5.bak.old is too permissive"
-      assert mode(sidecar) == 0o600
-    end
-
-    # Hostile review P2-1, load-path half: the legacy migration's crash
-    # window leaves a 0644 config.json beside a complete layout — re-runs
-    # stand down, so the load itself must converge it to 0600.
-    test "load tightens a leftover world-readable config.json (legacy crash state)" do
-      dir = fleet_dir()
-      legacy = Path.join(dir, "config.json")
-      File.write!(legacy, ~s({"api_key": "PLACEHOLDER-legacy"}))
-      File.chmod!(legacy, 0o644)
-
-      logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
-
-      assert logs =~ "config.json is too permissive"
-      assert mode(legacy) == 0o600
-    end
-
-    test "a symlinked keys.json5 warns and never chmods the target" do
-      dir = fleet_dir()
-      keys = Path.join(dir, "keys.json5")
-      File.rm!(keys)
-
-      target = Path.join(dir, "real-keys")
-      File.write!(target, fleet_keys())
-      File.chmod!(target, 0o644)
-      File.ln_s!(target, keys)
-
       logs =
         capture_log(fn ->
           assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
         end)
 
-      assert logs =~ "keys.json5 is a symlink"
-      assert mode(target) == 0o644
+      # The ACTIVE profile is work: its own provider is keyed. The personal
+      # profile's provider is other-persona noise and stays silent; switch
+      # profiles and it surfaces.
+      refute logs =~ ~s(provider "zai" in profile "work" has no key)
+
+      logs_personal =
+        capture_log(fn ->
+          assert {:error, _error} = Config.load(dir, %{}, profile: "personal")
+        end)
+
+      assert logs_personal =~
+               ~s(provider "provider.example" in profile "personal" has no key in keys.json5)
     end
 
-    test "a non-regular keys.json5 is warned about, left alone, and unreadable" do
-      dir = fleet_dir()
-      keys = Path.join(dir, "keys.json5")
-      File.rm!(keys)
-      File.mkdir!(keys)
-      File.chmod!(keys, 0o700)
+    test "a provider keyed by DASHFLOAT_API_KEY stays silent" do
+      dir = tmp_dir()
+
+      write_keys!(
+        dir,
+        "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}"
+      )
 
       logs =
         capture_log(fn ->
-          assert {:error, message} = Config.load(dir, %{}, [])
-          assert message =~ "cannot read"
-          assert message =~ "keys.json5"
+          write!(
+            dir,
+            String.replace(fleet_file(), ~s/defaultProfile: 'work'/, "defaultProfile: 'personal'")
+          )
+
+          assert {:ok, %Config{api_key: "env-key"}} =
+                   Config.load(dir, %{"DASHFLOAT_API_KEY" => "env-key"}, [])
         end)
 
-      assert logs =~ "not a regular file"
-      assert File.lstat!(keys).type == :directory
+      refute logs =~ "has no key in keys.json5"
+    end
+
+    test "silent when keys.json5 is absent (env-keyed setups)" do
+      dir = tmp_dir()
+      write!(dir, fleet_file())
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{api_key: "env-key"}} =
+                   Config.load(dir, %{"DASHFLOAT_API_KEY" => "env-key"}, [])
+        end)
+
+      refute logs =~ "has no key"
     end
 
     test "oauth.json5 is posture-only: repaired when present, silent when absent, never read" do
       dir = fleet_dir()
       oauth = Path.join(dir, "oauth.json5")
-
-      # Absent: silent.
-      assert capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end) == ""
-
-      # Present, too permissive, and garbage — repaired, never parsed, and
-      # the load does not care.
-      File.write!(oauth, "{ this is not json5 at all")
+      File.write!(oauth, "{}")
       File.chmod!(oauth, 0o644)
 
-      logs =
-        capture_log(fn ->
-          assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
-        end)
-
-      assert logs =~ "oauth.json5 is too permissive"
+      logs = capture_log(fn -> {:ok, _config} = Config.load(dir, %{}, []) end)
       assert mode(oauth) == 0o600
-    end
-
-    test "a leftover too-permissive settings.json5.bak is repaired to 0600" do
-      dir = fleet_dir()
-      backup = Path.join(dir, "settings.json5.bak")
-      File.write!(backup, "// pre-split backup")
-      File.chmod!(backup, 0o644)
-
-      logs =
-        capture_log(fn ->
-          assert {:ok, %Config{}} = Config.load(dir, %{}, [])
-        end)
-
-      assert logs =~ "settings.json5.bak"
-      assert logs =~ "too permissive"
-      assert mode(backup) == 0o600
-    end
-
-    test "a UTF-8 BOM is stripped before decoding" do
-      dir = tmp_dir()
-      write!(dir, "\xEF\xBB\xBF" <> fleet_file())
-      write_keys!(dir, fleet_keys())
-
-      assert {:ok, %Config{nickname: "Flash", profile: "work"}} = Config.load(dir, %{}, [])
+      assert logs =~ "oauth.json5 is too permissive — repairing to 0600"
     end
 
     test "error messages never contain values that were present" do
@@ -1112,21 +1397,30 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
-          configVersion: 2,
-          profiles: [{ name: 'work', baseUrl: 'https://file.example/v1' }],
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{ name: 'work', providers: [{ baseUrl: 'https://secret-endpoint.example/v1' }] }],
         }
         """
       )
 
-      assert {:error, message} = Config.load(dir, %{}, [])
-      assert message == "missing provider config: model, api_key"
-      refute message =~ "file.example"
+      write_keys!(dir, "{work: {'https://secret-endpoint.example/v1': 'PLACEHOLDER-secret-key'}}")
+
+      logs =
+        capture_log(fn ->
+          assert {:error, message} = Config.load(dir, %{}, [])
+          refute message =~ "PLACEHOLDER-secret-key"
+          refute message =~ "secret-endpoint"
+        end)
+
+      refute logs =~ "PLACEHOLDER-secret-key"
     end
 
-    test "Inspect never prints the api key" do
-      config = %Config{base_url: "http://x", model: "m", api_key: "PLACEHOLDER-key"}
-      refute inspect(config) =~ "PLACEHOLDER-key"
-      refute inspect(%{provider: {:ok, config}}) =~ "PLACEHOLDER-key"
+    test "Inspect never prints the api key (nor the provider set's keys)" do
+      assert {:ok, config} = Config.load(fleet_dir(), %{}, [])
+      inspected = inspect(config)
+      refute inspected =~ "PLACEHOLDER"
+      assert inspected =~ "..."
     end
   end
 
@@ -1138,19 +1432,19 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
-          configVersion: 2,
+          configVersion: 3,
+          defaultProfile: 'work',
           profiles: [{
             name: 'work',
-            baseUrl: 'https://provider.example/v1',
-            models: [{ model: 'glm-5.3' }],
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'glm-5.3' }] }],
           }],
         }
         """
       )
 
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
 
-      assert {:ok, %Config{nickname: "glm-5.3", context_tokens: nil}} = Config.load(dir, %{}, [])
+      assert {:ok, %Config{nickname: "glm-5.3"}} = Config.load(dir, %{}, [])
     end
 
     test "unusable context values are nil, never errors" do
@@ -1160,65 +1454,214 @@ defmodule DashFloat.ConfigTest do
         dir,
         """
         {
-          configVersion: 2,
+          configVersion: 3,
+          defaultProfile: 'work',
           profiles: [{
             name: 'work',
-            baseUrl: 'https://provider.example/v1',
-            models: [{ model: 'a', context: 0 }],
+            providers: [{
+              baseUrl: '#{@base_url}',
+              models: [
+                { model: 'a', context: 'garbage' },
+                { model: 'b', context: -1 },
+                { model: 'c', context: 0 },
+              ],
+            }],
           }],
         }
         """
       )
 
-      write_keys!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
 
       assert {:ok, %Config{model: "a", context_tokens: nil}} = Config.load(dir, %{}, [])
     end
   end
 
-  describe "migration is wired into load" do
-    test "a legacy config.json migrates on first load, then loads as the default profile" do
+  describe "parse tolerance arms (ADR 0009)" do
+    test "a profile without providers parses to zero providers" do
       dir = tmp_dir()
 
-      legacy = Path.join(dir, "config.json")
-
-      File.write!(
-        legacy,
-        Jason.encode!(%{
-          base_url: "https://legacy.example/v1",
-          model: "legacy-model",
-          api_key: "PLACEHOLDER-legacy-key"
-        })
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{ name: 'work' }],
+        }
+        """
       )
 
-      assert {:ok,
-              %Config{
-                base_url: "https://legacy.example/v1",
-                model: "legacy-model",
-                api_key: "PLACEHOLDER-legacy-key",
-                nickname: "legacy-model",
-                profile: "default"
-              }} = Config.load(dir, %{}, [])
-
-      backup = Path.join(dir, "config.json.bak")
-      assert File.exists?(backup)
-
-      # The live settings file never holds the credential; keys.json5 does.
-      main = Path.join(dir, "settings.json5")
-      keys = Path.join(dir, "keys.json5")
-      refute File.read!(main) =~ "PLACEHOLDER-legacy-key"
-      assert File.read!(keys) =~ "PLACEHOLDER-legacy-key"
-      assert mode(main) == 0o600
-      assert mode(keys) == 0o600
-
-      # The second load does not migrate again — the marker file exists.
-      assert {:ok, %Config{profile: "default"}} = Config.load(dir, %{}, [])
-
-      files = File.ls!(dir)
-      assert Enum.count(files, &String.starts_with?(&1, "config.json")) == 1
+      assert {:error, "missing provider config: base_url, model, api_key"} =
+               Config.load(dir, %{}, [])
     end
 
-    test "a v1 inline-keys settings.json5 splits in place on load" do
+    test "providers/mcp that are not lists warn and are ignored" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{ name: 'work', providers: 'nope', mcp: 7 }],
+        }
+        """
+      )
+
+      logs = capture_log(fn -> assert :onboard != Config.load(dir, %{}, []) end)
+
+      assert logs =~ ~s(profile "work": providers must be a list — ignored)
+      assert logs =~ ~s(profile "work": mcp must be a list — ignored)
+    end
+
+    test "a base URL without a host uses the whole URL as the label" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{ baseUrl: 'not-a-url', models: [{ model: 'm1' }] }],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'not-a-url': 'PLACEHOLDER-k'}}")
+
+      assert {:ok, %Config{providers: [%{label: "not-a-url"}]}} = Config.load(dir, %{}, [])
+    end
+
+    test "an mcp entry with no token and non-list args parses" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
+            mcp: [{ name: 'fetch', command: 'uvx', args: 'nope' }],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-k'}}")
+
+      logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
+      assert logs != :error
+    end
+
+    test "a string context value parses to an integer window" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1', context: '128000' }] }],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-k'}}")
+
+      assert {:ok, %Config{context_tokens: 128_000}} = Config.load(dir, %{}, [])
+    end
+
+    test "write_keys_entry under an impossible directory path errors naming it" do
+      dir = tmp_dir()
+      blocker = Path.join(dir, "a-file")
+      File.write!(blocker, "in the way")
+      blocked = Path.join([dir, "a-file", "sub"])
+
+      assert {:error, message} = Config.write_keys_entry(blocked, "p", @base_url, "k")
+      assert message =~ "cannot create"
+      assert message =~ "a-file"
+    end
+
+    test "an mcp entry with a non-string token warns; one without args parses" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
+            mcp: [
+              { name: 'numeric', command: 'c', token: 42 },
+              { name: 'no-args', command: 'c' },
+            ],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-k'}}")
+
+      logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
+      assert logs =~ "an mcp entry with a literal token is ignored"
+    end
+
+    test "write_keys_entry on an unwritable directory errors with the path" do
+      dir = tmp_dir()
+      on_exit(fn -> File.chmod!(dir, 0o700) end)
+      File.chmod!(dir, 0o500)
+
+      assert {:error, message} = Config.write_keys_entry(dir, "p", @base_url, "k")
+      assert message =~ "cannot write"
+      assert message =~ "keys.json5"
+      assert message =~ dir
+    end
+  end
+
+  describe "migration is wired into load" do
+    test "a v2 settings + flat keys directory reshapes to v3 on load" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 2,
+          profiles: [{
+            name: 'work',
+            baseUrl: '#{@base_url}',
+            models: [{ nickname: 'Sol', model: 'glm-5.3' }],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: 'PLACEHOLDER-work-key'}")
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-work-key", model: "glm-5.3"}} =
+               Config.load(dir, %{}, [])
+
+      assert {:ok, %{"configVersion" => 3, "defaultProfile" => "work"}} =
+               read_settings(dir)
+    end
+
+    test "no credential material ever lands in the live settings.json5" do
       dir = tmp_dir()
 
       write!(
@@ -1226,182 +1669,208 @@ defmodule DashFloat.ConfigTest do
         """
         {
           configVersion: 1,
-          profiles: [{
-            name: 'work',
-            baseUrl: 'https://provider.example/v1',
-            apiKey: 'PLACEHOLDER-work-key',
-            models: [{ nickname: 'Sol', model: 'glm-5.3' }],
-          }],
-        }
-        """
-      )
-
-      assert {:ok, %Config{api_key: "PLACEHOLDER-work-key", nickname: "Sol", profile: "work"}} =
-               Config.load(dir, %{}, [])
-
-      main = Path.join(dir, "settings.json5")
-      refute File.read!(main) =~ "PLACEHOLDER-work-key"
-      assert mode(Path.join(dir, "keys.json5")) == 0o600
-      assert mode(Path.join(dir, "settings.json5.bak")) == 0o600
-    end
-
-    test "no credential material ever lands in the live settings.json5 (both paths)" do
-      # Legacy path.
-      legacy_dir = tmp_dir()
-      legacy_main = Path.join(legacy_dir, "settings.json5")
-      legacy_backup = Path.join(legacy_dir, "config.json.bak")
-      legacy_source = Path.join(legacy_dir, "config.json")
-
-      File.write!(
-        legacy_source,
-        Jason.encode!(%{
-          base_url: "https://legacy.example/v1",
-          model: "legacy-model",
-          api_key: "PLACEHOLDER-legacy-key"
-        })
-      )
-
-      assert {:ok, %Config{api_key: "PLACEHOLDER-legacy-key"}} =
-               Config.load(legacy_dir, %{}, [])
-
-      refute File.read!(legacy_main) =~ "PLACEHOLDER-legacy-key"
-      assert File.read!(legacy_backup) =~ "PLACEHOLDER-legacy-key"
-      assert mode(legacy_backup) == 0o600
-
-      # In-place split path (the realistic v1-migrated directory).
-      split_dir = tmp_dir()
-      split_main = Path.join(split_dir, "settings.json5")
-      split_keys = Path.join(split_dir, "keys.json5")
-      split_backup = Path.join(split_dir, "settings.json5.bak")
-      old_backup = Path.join(split_dir, "config.json.bak")
-
-      write!(
-        split_dir,
-        """
-        {
-          configVersion: 1,
           profiles: [
-            { name: 'work', baseUrl: 'https://provider.example/v1',
-              apiKey: 'PLACEHOLDER-work-key',
-              models: [{ nickname: 'Sol', model: 'glm-5.3' }] },
-            { name: 'personal', baseUrl: 'https://provider.example/v1',
-              apiKey: 'PLACEHOLDER-personal-key',
-              models: [{ nickname: 'Sol', model: 'glm-5.3' }] },
+            { name: 'work', baseUrl: '#{@base_url}', apiKey: 'PLACEHOLDER-work-key',
+              models: [{ model: 'm1' }] },
           ],
         }
         """
       )
 
-      File.write!(old_backup, ~s({"api_key": "PLACEHOLDER-old"}))
-      File.chmod!(old_backup, 0o644)
+      {:ok, _config} = Config.load(dir, %{}, [])
 
-      assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(split_dir, %{}, [])
-
-      assert {:ok, %Config{api_key: "PLACEHOLDER-personal-key"}} =
-               Config.load(split_dir, %{}, profile: "personal")
-
-      # The LIVE settings file is credential-free...
-      refute File.read!(split_main) =~ "PLACEHOLDER"
-      # ...while the keys live in keys.json5 and the BY-DESIGN backups hold
-      # the old values at 0600 (backups inherit sensitivity — that IS the
-      # principle, not a leak).
-      assert File.read!(split_keys) =~ "PLACEHOLDER-work-key"
-      assert mode(split_keys) == 0o600
-      assert mode(split_backup) == 0o600
-      assert mode(old_backup) == 0o600
-      assert File.read!(split_backup) =~ "PLACEHOLDER-work-key"
+      settings = settings_path(dir)
+      live = File.read!(settings)
+      refute live =~ "PLACEHOLDER"
     end
   end
 
-  test "load/1 uses the default directory and the real environment" do
-    # Point the user-config dir at an empty temp dir, so a real config on the
-    # developer's machine cannot make this test pass or fail by accident.
-    dir = Path.join(@tmp_root, "xdg-#{System.unique_integer([:positive])}")
-    File.mkdir_p!(dir)
+  describe "onboarding writers (ADR 0009)" do
+    test "write_keys_entry merges atomically at 0600 and refuses to clobber damage" do
+      dir = tmp_dir()
 
-    vars = [
-      "XDG_CONFIG_HOME",
-      "DASHFLOAT_BASE_URL",
-      "DASHFLOAT_MODEL",
-      "DASHFLOAT_API_KEY",
-      "DASHFLOAT_CONTEXT_TOKENS",
-      "DASHFLOAT_PROFILE"
-    ]
+      assert :ok = Config.write_keys_entry(dir, "personal", @base_url, "PLACEHOLDER-one")
 
-    saved = Map.new(vars, &{&1, System.get_env(&1)})
-    on_exit(fn -> Enum.each(saved, fn {var, value} -> restore(var, value) end) end)
+      assert {:ok, %{"personal" => %{@base_url => "PLACEHOLDER-one"}}} =
+               read_keys(dir)
 
-    System.put_env("XDG_CONFIG_HOME", dir)
+      assert :ok =
+               Config.write_keys_entry(
+                 dir,
+                 "personal",
+                 "https://other.example/v1",
+                 "PLACEHOLDER-two"
+               )
 
-    for var <- List.delete(vars, "XDG_CONFIG_HOME") do
-      System.delete_env(var)
+      assert {:ok,
+              %{
+                "personal" => %{
+                  @base_url => "PLACEHOLDER-one",
+                  "https://other.example/v1" => "PLACEHOLDER-two"
+                }
+              }} = read_keys(dir)
+
+      keys_file = keys_path(dir)
+      assert mode(keys_file) == 0o600
+
+      # A bare value under the profile name is hand damage: refuse, never
+      # clobber what might hold a key.
+      damaged = tmp_dir()
+      write_keys!(damaged, "{personal: 'PLACEHOLDER-flat'}")
+
+      assert {:error, message} =
+               Config.write_keys_entry(damaged, "personal", @base_url, "PLACEHOLDER-new")
+
+      assert message =~ ~s("personal" holds a bare value)
+
+      damaged_keys = keys_path(damaged)
+      assert File.read!(damaged_keys) == "{personal: 'PLACEHOLDER-flat'}"
     end
 
-    assert Config.config_dir() == Path.join(dir, "dashfloat")
-    assert {:error, "missing provider config: base_url, model, api_key"} = Config.load()
+    test "write_keys_entry refuses an unparseable keys.json5" do
+      dir = tmp_dir()
+      keys = keys_path(dir)
+      write_keys!(dir, "{nope")
+      before = File.read!(keys)
+
+      assert {:error, _write_error} = Config.write_keys_entry(dir, "personal", @base_url, "K")
+      assert File.read!(keys) == before
+    end
+
+    test "write_settings writes the wizard's document atomically at 0600" do
+      dir = tmp_dir()
+
+      assert :ok =
+               Config.write_settings(dir, %{
+                 "configVersion" => 3,
+                 "defaultProfile" => "personal",
+                 "profiles" => [%{"name" => "personal", "providers" => []}]
+               })
+
+      assert {:ok, %{"configVersion" => 3, "defaultProfile" => "personal"}} =
+               read_settings(dir)
+
+      settings_file = settings_path(dir)
+      assert mode(settings_file) == 0o600
+    end
   end
 
-  defp restore(var, nil), do: System.delete_env(var)
-  defp restore(var, value), do: System.put_env(var, value)
+  describe "load/1 uses the default directory and the real environment" do
+    test "reads XDG_CONFIG_HOME, env completing the pieces" do
+      # NEVER the real ~/.config/dashfloat: load/1 would run the real
+      # directory's migrations. XDG_CONFIG_HOME points it at a fixture.
+      dir = tmp_dir()
+      xdg = Path.join(dir, "xdg-root")
+      fixture = Path.join(xdg, "dashfloat")
+      File.mkdir_p!(fixture)
+      write!(fixture, fleet_file())
+      write_keys!(fixture, fleet_keys())
 
-  # Issue #28 rider, load-path half (review P2c): an ALREADY-migrated
-  # directory never runs the migration, so a leftover 0644 config.json.bak
-  # (still holding the old credential) was never touched. The load repairs
-  # it like every other secrets-bearing file — and never chmods through a
-  # symlink.
-  test "load repairs a too-permissive leftover config.json.bak to 0600" do
-    dir = fleet_dir()
-    backup = Path.join(dir, "config.json.bak")
-    File.write!(backup, ~s({"api_key": "PLACEHOLDER-old"}))
-    File.chmod!(backup, 0o644)
+      env = %{
+        "DASHFLOAT_BASE_URL" => "https://env.example/v1",
+        "DASHFLOAT_MODEL" => "env-model",
+        "DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"
+      }
 
-    logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
+      previous_xdg = System.get_env("XDG_CONFIG_HOME")
 
-    assert logs =~ "config.json.bak"
-    assert logs =~ "too permissive"
+      previous =
+        for {var, _value} <- env,
+            into: %{},
+            do: {var, System.get_env(var)}
 
-    assert mode(backup) == 0o600
+      try do
+        System.put_env("XDG_CONFIG_HOME", dir)
+
+        for {var, value} <- env, do: System.put_env(var, value)
+
+        assert {:ok, %Config{model: "env-model"}} = Config.load([])
+      after
+        restore_env("XDG_CONFIG_HOME", previous_xdg)
+        for {var, _value} <- env, do: restore_env(var, previous[var])
+      end
+    end
   end
 
-  test "load leaves a 0600 backup alone and a missing one unmentioned" do
-    dir = fleet_dir()
-    backup = Path.join(dir, "config.json.bak")
-    File.write!(backup, ~s({"api_key": "PLACEHOLDER-old"}))
-    File.chmod!(backup, 0o600)
+  defp restore_env(var, nil), do: System.delete_env(var)
+  defp restore_env(var, value), do: System.put_env(var, value)
 
-    assert capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end) == ""
+  describe "load repairs leftovers (posture riders)" do
+    test "a too-permissive leftover config.json.bak is repaired to 0600" do
+      dir = fleet_dir()
+      bak = Path.join(dir, "config.json.bak")
+      File.write!(bak, ~s({"api_key": "PLACEHOLDER-old"}))
+      File.chmod!(bak, 0o644)
 
-    File.rm!(backup)
-    assert capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end) == ""
+      capture_log(fn -> {:ok, _config} = Config.load(dir, %{}, []) end)
+      assert mode(bak) == 0o600
+    end
+
+    test "a leftover keys.json5.bak (the v3 migration's backup) is repaired too" do
+      dir = fleet_dir()
+      bak = Path.join(dir, "keys.json5.bak")
+      File.write!(bak, "{work: 'PLACEHOLDER-old'}")
+      File.chmod!(bak, 0o644)
+
+      capture_log(fn -> {:ok, _config} = Config.load(dir, %{}, []) end)
+      assert mode(bak) == 0o600
+    end
+
+    test "a 0600 backup is left alone and a missing one unmentioned" do
+      dir = fleet_dir()
+      bak = Path.join(dir, "settings.json5.bak")
+      File.write!(bak, "{}")
+      File.chmod!(bak, 0o600)
+
+      logs = capture_log(fn -> {:ok, _config} = Config.load(dir, %{}, []) end)
+      assert mode(bak) == 0o600
+      refute logs =~ "settings.json5.bak is too permissive"
+    end
+
+    test "never chmods a symlinked backup through to its target" do
+      dir = fleet_dir()
+      target = Path.join(dir, "target.bak")
+      File.write!(target, "{}")
+      File.chmod!(target, 0o644)
+      File.ln_s!(target, Path.join(dir, "settings.json5.bak"))
+
+      capture_log(fn -> {:ok, _config} = Config.load(dir, %{}, []) end)
+      assert mode(target) == 0o644
+    end
+
+    test "warns about and never chmods a non-regular backup" do
+      dir = fleet_dir()
+      nonregular = Path.join(dir, "config.json.bak")
+      File.mkdir_p!(nonregular)
+
+      logs = capture_log(fn -> {:ok, _config} = Config.load(dir, %{}, []) end)
+      assert logs =~ "config.json.bak is a directory"
+    end
   end
 
-  test "load never chmods a symlinked backup through to its target" do
-    dir = fleet_dir()
+  describe "keys.json5 as a non-regular file" do
+    test "a directory named keys.json5 is a loud read error, never clobbered" do
+      dir = fleet_dir()
+      keys_dir = keys_path(dir)
+      File.rm!(keys_dir)
+      File.mkdir!(keys_dir)
 
-    target = Path.join(dir, "elsewhere.json")
-    File.write!(target, ~s({"api_key": "PLACEHOLDER-old"}))
-    File.chmod!(target, 0o644)
-    File.ln_s!(target, Path.join(dir, "config.json.bak"))
-
-    logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
-
-    assert logs =~ "symlink"
-
-    # The target kept its mode — chmod did not follow the link out.
-    assert mode(target) == 0o644
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "cannot read"
+      assert message =~ "keys.json5"
+      assert File.lstat!(keys_dir).type == :directory
+    end
   end
 
-  test "load warns about and never chmods a non-regular backup" do
-    dir = fleet_dir()
-    backup = Path.join(dir, "config.json.bak")
-    File.mkdir!(backup)
-    File.chmod!(backup, 0o700)
+  describe "a UTF-8 BOM is stripped before decoding" do
+    test "a BOM-prefixed settings.json5 loads" do
+      dir = tmp_dir()
+      settings = settings_path(dir)
+      File.write!(settings, "\xEF\xBB\xBF" <> fleet_file())
+      File.chmod!(settings, 0o600)
+      write_keys!(dir, fleet_keys())
 
-    logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
-
-    assert logs =~ "not a regular file"
-
-    assert {:ok, %File.Stat{type: :directory, mode: mode}} = File.lstat(backup)
-    assert Bitwise.band(mode, 0o777) == 0o700
+      assert {:ok, %Config{profile: "work"}} = Config.load(dir, %{}, [])
+    end
   end
 end

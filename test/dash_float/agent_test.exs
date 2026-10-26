@@ -806,6 +806,45 @@ defmodule DashFloat.AgentTest do
     state.phase == :idle
   end
 
+  test "the startup-phase handoff: {:set_provider, _} swaps the provider (ADR 0009)" do
+    server = start_server([final_episode("after setup")])
+    cwd = System.tmp_dir!()
+
+    # Boots on the boot-time classification's error arm — like a forced
+    # selection or onboarding state — then the setup completion delivers the
+    # resolved provider (the UI's plain send, ADR 0009).
+    {:ok, sup} = Task.Supervisor.start_link()
+
+    {:ok, agent} =
+      Agent.start_link(
+        provider: {:error, "no profile selected — choose one to start"},
+        cwd: cwd,
+        supervisor: sup,
+        name: nil
+      )
+
+    on_exit(fn ->
+      if Process.alive?(agent), do: GenServer.stop(agent)
+      if Process.alive?(sup), do: Process.exit(sup, :kill)
+    end)
+
+    send(agent, {:prompt, self(), "too early"})
+    assert_receive {:entry, :system, text}, 500
+    assert text =~ "no provider"
+
+    send(agent, {:set_provider, provider(server)})
+    send(agent, {:prompt, self(), "after setup"})
+
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+
+    messages = request_messages(body)
+
+    assert List.last(messages) == %{
+             "role" => "user",
+             "content" => "after setup"
+           }
+  end
+
   defp free_port do
     {:ok, listen} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}])
     {:ok, port} = :inet.port(listen)

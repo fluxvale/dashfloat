@@ -6,6 +6,7 @@ defmodule DashFloat.TUI.View do
   activity, and entry styling are ADR 0006's.
   """
 
+  alias DashFloat.Config.Onboarding
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Theme
@@ -86,8 +87,18 @@ defmodule DashFloat.TUI.View do
     |> max(3)
   end
 
-  @doc "Renders the four regions. Pure; never raises on odd sizes."
+  @doc """
+  Renders the four regions — or, while the startup phase owns the screen,
+  the one setup box instead (ADR 0009). Pure; never raises on odd sizes.
+  """
   @spec render(State.t(), ExRatatui.Frame.t()) :: [{ExRatatui.widget(), Rect.t()}]
+  def render(%State{setup: setup} = _state, %ExRatatui.Frame{width: width, height: height})
+      when setup != nil do
+    # The startup phase (ADR 0009) replaces the chat UI with one setup box:
+    # the forced-selection modal or the onboarding wizard.
+    [{setup_widget(setup), inset_area(width, height)}]
+  end
+
   def render(%State{} = state, %ExRatatui.Frame{width: width, height: height}) do
     # The transient row exists for an active phase OR an armed exit guard
     # (issue #28; ADR 0006 amendment) — even while idle.
@@ -100,6 +111,230 @@ defmodule DashFloat.TUI.View do
       {input_widget(state), regions.input}
     ]
   end
+
+  ## Setup screens (ADR 0009: forced selection + onboarding wizard)
+
+  defp wizard_lines(%{step: :welcome}) do
+    [
+      {"Welcome to DashFloat.", :assistant},
+      {"Set up your first profile — every step is skippable.", :dim},
+      blank(),
+      hint("⏎ begin · ctrl+q quit")
+    ]
+  end
+
+  defp wizard_lines(%{step: :profile_name, draft: draft}) do
+    [
+      {"Name your first profile — it becomes the default.", :assistant},
+      blank(),
+      input_line(draft, false),
+      hint("⏎ accept · backspace edit")
+    ]
+  end
+
+  defp wizard_lines(%{step: :provider} = wizard) do
+    [
+      {"Add a provider.", :assistant},
+      blank() | option_lines(wizard, &provider_option/2)
+    ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
+  end
+
+  defp wizard_lines(%{step: :custom_url, draft: draft}) do
+    [
+      {"The provider's base URL (OpenAI-compatible).", :assistant},
+      blank(),
+      input_line(draft, false),
+      hint("⏎ accept · esc back")
+    ]
+  end
+
+  defp wizard_lines(%{step: :label, draft: draft}) do
+    [
+      {"Label this provider (optional — defaults to the URL host).", :assistant},
+      blank(),
+      input_line(draft, false)
+    ]
+  end
+
+  defp wizard_lines(%{step: :key, draft: draft}) do
+    [
+      {"The API key: paste it, type $ENV_VAR to use a reference,", :assistant},
+      {"or leave it empty to skip.", :assistant},
+      blank(),
+      input_line(draft, true),
+      hint("⏎ accept · written to keys.json5 (0600) immediately")
+    ]
+  end
+
+  defp wizard_lines(%{step: :model_choice} = wizard) do
+    [
+      {"Pick a model.", :assistant},
+      blank() | option_lines(wizard, &model_choice_option/2)
+    ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
+  end
+
+  defp wizard_lines(%{step: :fetching}) do
+    [
+      {"Fetching models…", :assistant},
+      blank(),
+      hint("esc type it manually instead")
+    ]
+  end
+
+  defp wizard_lines(%{step: :model_pick} = wizard) do
+    [
+      {"Pick a model.", :assistant},
+      blank() | option_lines(wizard, &model_pick_option/2)
+    ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
+  end
+
+  defp wizard_lines(%{step: :model_manual, draft: draft}) do
+    [
+      {"The model id.", :assistant},
+      blank(),
+      input_line(draft, false),
+      hint("⏎ accept · the nickname defaults to the id")
+    ]
+  end
+
+  defp wizard_lines(%{step: :loop} = wizard) do
+    [
+      {"Anything else? The profile works as-is.", :assistant},
+      blank() | option_lines(wizard, &loop_option/2)
+    ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
+  end
+
+  defp wizard_lines(%{step: :mcp_name, draft: draft}) do
+    [
+      {"MCP server name.", :assistant},
+      blank(),
+      input_line(draft, false),
+      hint("⏎ accept · empty skips")
+    ]
+  end
+
+  defp wizard_lines(%{step: :mcp_command, draft: draft}) do
+    [
+      {"MCP command (e.g. uvx).", :assistant},
+      blank(),
+      input_line(draft, false),
+      hint("⏎ accept · empty cancels")
+    ]
+  end
+
+  defp wizard_lines(%{step: :mcp_args, draft: draft}) do
+    [
+      {"MCP arguments (space-separated, optional).", :assistant},
+      blank(),
+      input_line(draft, false)
+    ]
+  end
+
+  defp wizard_lines(%{step: :mcp_token, draft: draft}) do
+    [
+      {"Token environment variable (optional).", :assistant},
+      blank(),
+      input_line(draft, true),
+      hint("stored as $VAR — the value never lands in a file")
+    ]
+  end
+
+  defp wizard_lines(%{step: :done}) do
+    [
+      {"All set — config written.", :assistant},
+      {"DashFloat is starting under your new profile.", :dim},
+      blank(),
+      hint("⏎ continue")
+    ]
+  end
+
+  # A typing line: the draft (masked for secrets) with a block cursor.
+
+  defp setup_widget({:select, names, index}) do
+    setup_box(
+      "DashFloat — select a profile",
+      [
+        {"Which profile should DashFloat start?", :assistant},
+        blank()
+        | Enum.with_index(names, fn name, i -> {:option, i == index, name} end)
+      ] ++ [blank(), hint("↑↓ move · ⏎ start · ctrl+q quit")]
+    )
+  end
+
+  defp setup_widget(%Onboarding{} = wizard) do
+    setup_box("DashFloat — first run", wizard_lines(wizard))
+  end
+
+  defp setup_box(title, lines) do
+    %Paragraph{
+      text: Enum.map(lines, &setup_line/1),
+      block: %Block{
+        title: Span.new(" #{title} ", style: Theme.style(:accent)),
+        borders: [:all],
+        border_type: :rounded,
+        border_style: Theme.style(:dim)
+      },
+      scroll: {0, 0}
+    }
+  end
+
+  # One line per wizard step — plain conversational copy, Octofriend-style,
+  # with the current input line masked when it is a secret (ADR 0009).
+
+  defp provider_option(_wizard, {:preset, preset}),
+    do: "#{preset.name} — #{preset.base_url}"
+
+  defp provider_option(_wizard, :custom),
+    do: "Custom OpenAI-compatible URL…"
+
+  defp provider_option(_wizard, :skip),
+    do: "Skip — configure later"
+
+  defp model_choice_option(_wizard, :fetch),
+    do: "Fetch the model list from the provider"
+
+  defp model_choice_option(_wizard, :manual),
+    do: "Type a model id"
+
+  defp model_choice_option(_wizard, :skip),
+    do: "Skip — hand-edit later"
+
+  defp model_pick_option(_wizard, {:model, id}), do: id
+
+  defp model_pick_option(_wizard, :manual), do: "Type a model id"
+
+  defp loop_option(_wizard, :add_provider), do: "Add another provider"
+
+  defp loop_option(_wizard, :add_mcp), do: "Add an MCP server"
+
+  defp loop_option(_wizard, :done), do: "Done — write the config and start"
+
+  defp input_line(draft, masked) do
+    shown = if masked, do: String.duplicate("*", String.length(draft)), else: draft
+    {"❯ " <> shown <> "█", :assistant}
+  end
+
+  # A selection list: the wizard's options with the chosen one highlighted.
+
+  defp option_lines(wizard, label) do
+    wizard
+    |> Onboarding.options()
+    |> Enum.with_index(fn option, index ->
+      {:option, index == wizard.choice, label.(wizard, option)}
+    end)
+  end
+
+  defp blank, do: {"", :dim}
+
+  defp hint(text), do: {text, :hint}
+
+  defp setup_line({:option, true, text}),
+    do: Line.new([Span.new("❯ " <> text, style: Theme.style(:accent))])
+
+  defp setup_line({:option, false, text}),
+    do: Line.new([Span.new("  " <> text, style: Theme.style(:dim))])
+
+  defp setup_line({text, role}), do: Line.new([Span.new(text, style: Theme.style(role))])
 
   ## Status bar
 

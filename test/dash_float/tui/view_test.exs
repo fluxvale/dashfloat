@@ -2,6 +2,7 @@ defmodule DashFloat.TUI.ViewTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  alias DashFloat.Config.Onboarding
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Theme
@@ -566,6 +567,80 @@ defmodule DashFloat.TUI.ViewTest do
                "⚙ read_file → ok",
                "  body"
              ]
+    end
+  end
+
+  describe "the setup screens (ADR 0009)" do
+    test "the forced-selection modal renders the names and the chosen one" do
+      state = new_state(setup: {:select, ["work", "personal"], 1})
+      frame = %ExRatatui.Frame{width: 80, height: 24}
+
+      assert [{%ExRatatui.Widgets.Paragraph{}, _rect}] = View.render(state, frame)
+
+      term = ExRatatui.init_test_terminal(80, 24)
+      widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+      assert :ok = ExRatatui.draw(term, widgets)
+
+      buffer = ExRatatui.get_buffer_content(term)
+      assert buffer =~ "select a profile"
+      assert buffer =~ "work"
+      assert buffer =~ "personal"
+    end
+
+    test "every wizard step renders its screen (nothing raises, copy is present)" do
+      steps = [
+        {%Onboarding{step: :welcome}, "Welcome to DashFloat."},
+        {%Onboarding{step: :profile_name, draft: "personal"}, "Name your first profile"},
+        {%Onboarding{step: :provider}, "Add a provider."},
+        {%Onboarding{step: :custom_url, draft: "https://x"}, "OpenAI-compatible"},
+        {%Onboarding{step: :label, draft: "zai"}, "Label this provider"},
+        {%Onboarding{step: :key, draft: "k"}, "API key"},
+        {%Onboarding{step: :model_choice}, "Pick a model."},
+        {%Onboarding{step: :fetching}, "Fetching"},
+        {%Onboarding{step: :model_pick, fetched: ["m-a", "m-b"], choice: 1}, "m-b"},
+        {%Onboarding{step: :model_manual, draft: "glm"}, "model id"},
+        {%Onboarding{step: :loop}, "Anything else?"},
+        {%Onboarding{step: :mcp_name, draft: "fetch"}, "MCP server name"},
+        {%Onboarding{step: :mcp_command, draft: "uvx"}, "MCP command"},
+        {%Onboarding{step: :mcp_args, draft: "a b"}, "MCP arguments"},
+        {%Onboarding{step: :mcp_token, draft: "T"}, "Token environment variable"},
+        {%Onboarding{step: :done}, "All set"}
+      ]
+
+      for {wizard, expected} <- steps do
+        term = ExRatatui.init_test_terminal(80, 24)
+        frame = %ExRatatui.Frame{width: 80, height: 24}
+        state = new_state(setup: wizard)
+        widgets = View.render(state, frame)
+        assert :ok = ExRatatui.draw(term, widgets)
+        buffer = ExRatatui.get_buffer_content(term)
+        assert buffer =~ expected
+      end
+    end
+
+    test "the wizard renders its steps, masking secret inputs" do
+      wizard = %DashFloat.Config.Onboarding{step: :welcome}
+
+      state = new_state(setup: wizard)
+      frame = %ExRatatui.Frame{width: 80, height: 24}
+      assert [{%ExRatatui.Widgets.Paragraph{}, _rect}] = View.render(state, frame)
+
+      key_step = %DashFloat.Config.Onboarding{
+        step: :key,
+        draft: "PLACEHOLDER-secret-key",
+        profile_name: "personal"
+      }
+
+      term = ExRatatui.init_test_terminal(80, 24)
+      key_state = new_state(setup: key_step)
+      key_frame = %ExRatatui.Frame{width: 80, height: 24}
+      widgets = View.render(key_state, key_frame)
+      assert :ok = ExRatatui.draw(term, widgets)
+
+      # The draft is masked: the value itself never reaches the screen.
+      buffer = ExRatatui.get_buffer_content(term)
+      assert buffer =~ "❯ "
+      refute buffer =~ "PLACEHOLDER-secret-key"
     end
   end
 

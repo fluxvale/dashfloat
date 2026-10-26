@@ -50,15 +50,26 @@ defmodule DashFloat.Config.JSON5 do
 
   @doc """
   Reads `path` (a leading UTF-8 BOM is stripped — editors add one silently)
-  and decodes it as a JSON5 OBJECT. A missing file is an empty map; every
+  and decodes it as a JSON5 OBJECT. A missing file is an empty map; so is a
+  blank one — an empty `settings.json5`/`keys.json5` is crash debris or
+  hand-emptied damage, not data (ADR 0009's tolerance principle), and the
+  load path must read it as "no config", never as invalid JSON5. Every other
   failure names `path` and never the file's content.
   """
   @spec read_map(Path.t()) :: {:ok, map()} | {:error, String.t()}
   def read_map(path) do
     case File.read(path) do
-      {:ok, contents} -> decode_map(contents, path)
-      {:error, :enoent} -> {:ok, %{}}
-      {:error, reason} -> {:error, "cannot read #{path}: #{:file.format_error(reason)}"}
+      {:ok, contents} ->
+        case blank?(contents) do
+          true -> {:ok, %{}}
+          false -> decode_map(contents, path)
+        end
+
+      {:error, :enoent} ->
+        {:ok, %{}}
+
+      {:error, reason} ->
+        {:error, "cannot read #{path}: #{:file.format_error(reason)}"}
     end
   end
 
@@ -197,6 +208,13 @@ defmodule DashFloat.Config.JSON5 do
   defp path_prefix(path), do: path <> "."
 
   ## Decoding helpers
+
+  defp blank?(contents) do
+    contents
+    |> strip_bom()
+    |> String.trim()
+    |> Kernel.==("")
+  end
 
   defp strip_bom("\xEF\xBB\xBF" <> rest), do: rest
   defp strip_bom(contents), do: contents

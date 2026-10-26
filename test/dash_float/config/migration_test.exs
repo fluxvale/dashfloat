@@ -93,10 +93,29 @@ defmodule DashFloat.Config.MigrationTest do
       main: Path.join(dir, "settings.json5"),
       keys: Path.join(dir, "keys.json5"),
       settings_backup: Path.join(dir, "settings.json5.bak"),
+      keys_backup: Path.join(dir, "keys.json5.bak"),
       legacy: Path.join(dir, "config.json"),
       backup: Path.join(dir, "config.json.bak")
     }
   end
+
+  # The recurring read-and-decode chains, as helpers (credo's pipe rules
+  # would flag every inline occurrence).
+  defp decoded_keys(dir), do: decode_file(paths(dir).keys)
+
+  defp decoded_main(dir), do: decode_file(paths(dir).main)
+
+  defp decode_file(path) do
+    path
+    |> File.read!()
+    |> JSON5.decode()
+  end
+
+  defp models_of(provider), do: Map.get(provider, "models")
+
+  defp rename_second(map), do: put_in(map, ["profiles", Access.at(1), "name"], "second")
+
+  defp unwrap_rendered({:ok, text}), do: text
 
   defp mode(path) do
     {:ok, %File.Stat{mode: mode}} = File.stat(path)
@@ -113,16 +132,21 @@ defmodule DashFloat.Config.MigrationTest do
 
       assert {:ok,
               %{
-                "configVersion" => 2,
+                "configVersion" => 3,
+                "defaultProfile" => "default",
                 "profiles" => [
                   %{
                     "name" => "default",
-                    "baseUrl" => "https://legacy.example/v1",
-                    "models" => [
+                    "providers" => [
                       %{
-                        "nickname" => "legacy-model",
-                        "model" => "legacy-model",
-                        "context" => 128_000
+                        "baseUrl" => "https://legacy.example/v1",
+                        "models" => [
+                          %{
+                            "nickname" => "legacy-model",
+                            "model" => "legacy-model",
+                            "context" => 128_000
+                          }
+                        ]
                       }
                     ]
                   }
@@ -132,7 +156,9 @@ defmodule DashFloat.Config.MigrationTest do
                |> File.read!()
                |> JSON5.decode()
 
-      assert {:ok, %{"default" => "PLACEHOLDER-legacy-key"}} =
+      # The legacy chain lands ENDPOINT-KEYED (ADR 0009): one write, no v2
+      # intermediate on disk.
+      assert {:ok, %{"default" => %{"https://legacy.example/v1" => "PLACEHOLDER-legacy-key"}}} =
                keys
                |> File.read!()
                |> JSON5.decode()
@@ -191,12 +217,13 @@ defmodule DashFloat.Config.MigrationTest do
 
       %{main: main, keys: keys} = paths(dir)
 
-      assert {:ok, %{"profiles" => [%{"baseUrl" => "https://leg'acy.example/v1"}]}} =
+      assert {:ok,
+              %{"profiles" => [%{"providers" => [%{"baseUrl" => "https://leg'acy.example/v1"}]}]}} =
                main
                |> File.read!()
                |> JSON5.decode()
 
-      assert {:ok, %{"default" => "PLACEHOLDER-mo'dern-key"}} =
+      assert {:ok, %{"default" => %{"https://leg'acy.example/v1" => "PLACEHOLDER-mo'dern-key"}}} =
                keys
                |> File.read!()
                |> JSON5.decode()
@@ -267,10 +294,9 @@ defmodule DashFloat.Config.MigrationTest do
 
       assert {:ok, :migrated} = @migration.maybe_migrate(dir)
 
-      assert {:ok, %{"profiles" => [%{"models" => [%{"context" => 128_000}]}]}} =
-               paths(dir).main
-               |> File.read!()
-               |> JSON5.decode()
+      assert {:ok,
+              %{"profiles" => [%{"providers" => [%{"models" => [%{"context" => 128_000}]}]}]}} =
+               decoded_main(dir)
     end
 
     test "an unusable legacy context_tokens is simply omitted from the new layout" do
@@ -278,10 +304,8 @@ defmodule DashFloat.Config.MigrationTest do
 
       assert {:ok, :migrated} = @migration.maybe_migrate(dir)
 
-      assert {:ok, %{"profiles" => [%{"models" => [entry]}]}} =
-               paths(dir).main
-               |> File.read!()
-               |> JSON5.decode()
+      assert {:ok, %{"profiles" => [%{"providers" => [%{"models" => [entry]}]}]}} =
+               decoded_main(dir)
 
       refute Map.has_key?(entry, "context")
     end
@@ -387,7 +411,9 @@ defmodule DashFloat.Config.MigrationTest do
 
       assert {:ok, :migrated} = @migration.maybe_migrate(dir)
 
-      assert {:ok, %{"default" => "PLACEHOLDER-user-key"}} =
+      # The user's flat v2 key is completed to endpoint-keyed by the v3
+      # step (the single-provider join is unambiguous) — value untouched.
+      assert {:ok, %{"default" => %{"https://legacy.example/v1" => "PLACEHOLDER-user-key"}}} =
                keys
                |> File.read!()
                |> JSON5.decode()
@@ -674,7 +700,7 @@ defmodule DashFloat.Config.MigrationTest do
     defp file_texts(dir) do
       # File.read, not read!: a .bak symlink may point at a directory —
       # unreadable holders contribute nothing rather than raising.
-      ["settings.json5", "keys.json5", "settings.json5.bak", "config.json.bak"]
+      ["settings.json5", "keys.json5", "settings.json5.bak", "keys.json5.bak", "config.json.bak"]
       |> Enum.map(&Path.join(dir, &1))
       |> Enum.filter(&File.exists?/1)
       |> Enum.flat_map(&read_or_empty/1)
@@ -717,7 +743,7 @@ defmodule DashFloat.Config.MigrationTest do
         main_path = Path.join(dir, "settings.json5")
         keys_path = Path.join(dir, "keys.json5")
         backup_path = Path.join(dir, "settings.json5.bak")
-        original_main = File.read!(main_path)
+        _original_main = File.read!(main_path)
         keys_file_states = [:same, :different, :superset, :subset, :malformed]
         original_keys = if keys_state in keys_file_states, do: File.read!(keys_path)
 
@@ -742,9 +768,18 @@ defmodule DashFloat.Config.MigrationTest do
 
         case outcome do
           # REFUSED: the invariant's other arm — nothing destructive happened.
+          # (Under the v3 CHAIN a cell can legitimately refuse at the v2 step
+          # after the split succeeded — settings then hold the v2 shape with
+          # every value homed in keys/backup. The byte-identical claim is
+          # the SPLIT's contract; the sweep pins the chain's: every value
+          # still on disk, and keys/backup never rewritten by a refusal.)
           {:error, _message} ->
-            assert File.read!(main_path) == original_main,
-                   "cell #{cell}: refusal rewrote settings"
+            on_disk = file_texts(dir)
+
+            for value <- spec.values do
+              assert String.contains?(on_disk, value),
+                     "cell #{cell}: refusal LOST a credential value"
+            end
 
             if original_keys,
               do: assert(File.read!(keys_path) == original_keys, "cell #{cell}")
@@ -797,7 +832,8 @@ defmodule DashFloat.Config.MigrationTest do
                |> File.read!()
                |> JSON5.decode()
 
-      assert decoded["configVersion"] == 2
+      assert decoded["configVersion"] == 3
+      assert decoded["defaultProfile"] == "work"
       assert decoded["yourName"] == "terry-placeholder"
       refute File.read!(main) =~ "PLACEHOLDER"
 
@@ -805,12 +841,20 @@ defmodule DashFloat.Config.MigrationTest do
       refute Map.has_key?(work, "apiKey")
       refute Map.has_key?(personal, "apiKey")
 
-      assert work["models"]
-             |> hd()
-             |> Map.get("modalities") == ["text"]
+      first_model =
+        work["providers"]
+        |> hd()
+        |> models_of()
+        |> hd()
 
-      # Keys land keyed by PROFILE NAME, 0600.
-      assert {:ok, %{"work" => "PLACEHOLDER-work-key", "personal" => "PLACEHOLDER-personal-key"}} =
+      assert Map.get(first_model, "modalities") == ["text"]
+
+      # Keys land ENDPOINT-KEYED under their profiles (ADR 0009), 0600.
+      assert {:ok,
+              %{
+                "work" => %{"https://provider.example/v1" => "PLACEHOLDER-work-key"},
+                "personal" => %{"https://provider.example/v1" => "PLACEHOLDER-personal-key"}
+              }} =
                keys
                |> File.read!()
                |> JSON5.decode()
@@ -840,7 +884,7 @@ defmodule DashFloat.Config.MigrationTest do
       assert File.read!(settings_backup) == backup_contents
     end
 
-    test "a v1 file with no inline credential field is byte-untouched" do
+    test "a v1 file with no inline credential field skips the SPLIT and still reshapes to v3" do
       dir = tmp_dir()
 
       stripped =
@@ -850,20 +894,39 @@ defmodule DashFloat.Config.MigrationTest do
 
       write_v1!(dir, stripped)
 
-      logs = capture_log(fn -> assert {:ok, :not_needed} = @migration.maybe_migrate(dir) end)
+      # The split's own rule holds — nothing to de-secret, so no settings
+      # backup, no keys file. But v3 has no v1/v2 read path: the reshape
+      # still restructures the profiles (ADR 0009).
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
 
-      assert logs == ""
-      assert File.read!(paths(dir).main) == stripped
-      refute File.exists?(paths(dir).settings_backup)
+      refute File.exists?(paths(dir).keys)
+
+      {:ok, decoded} = decoded_main(dir)
+      assert decoded["configVersion"] == 3
+
+      assert [%{"baseUrl" => "https://provider.example/v1"}] =
+               hd(decoded["profiles"])["providers"]
+
+      refute File.read!(paths(dir).main) =~ "apiKey"
     end
 
-    test "a v2 file with a stray inline key is left alone (the loader warns instead)" do
+    test "a v2 file with a stray inline key: the split stands down, the reshape still runs" do
       dir =
         write_v1!(tmp_dir(), String.replace(v1_inline(), "configVersion: 1", "configVersion: 2"))
 
-      assert {:ok, :not_needed} = @migration.maybe_migrate(dir)
-      assert File.read!(paths(dir).main) =~ "apiKey"
-      refute File.exists?(paths(dir).settings_backup)
+      # The SPLIT's rule is unchanged — v2+ strays are the loader's warning,
+      # not a rewrite — but the v3 reshape restructures the profiles; the
+      # stray rides verbatim (still the loader's warning territory).
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      main = File.read!(paths(dir).main)
+      assert main =~ "PLACEHOLDER-work-key"
+
+      {:ok, decoded} = JSON5.decode(main)
+      assert decoded["configVersion"] == 3
+
+      assert [%{"baseUrl" => "https://provider.example/v1"}] =
+               hd(decoded["profiles"])["providers"]
     end
 
     # Hostile review P1-1: keys.json5 AND settings.json5.bak both pre-exist,
@@ -922,11 +985,9 @@ defmodule DashFloat.Config.MigrationTest do
       assert {:ok, :migrated} = @migration.maybe_migrate(dir)
 
       assert {:ok, decoded} =
-               paths(dir).main
-               |> File.read!()
-               |> JSON5.decode()
+               decoded_main(dir)
 
-      assert decoded["configVersion"] == 2
+      assert decoded["configVersion"] == 3
       refute File.read!(paths(dir).main) =~ "PLACEHOLDER"
     end
 
@@ -1007,7 +1068,7 @@ defmodule DashFloat.Config.MigrationTest do
       refute main =~ "PLACEHOLDER-root-key"
 
       assert {:ok, decoded} = JSON5.decode(main)
-      assert decoded["configVersion"] == 2
+      assert decoded["configVersion"] == 3
 
       assert File.read!(paths(dir).settings_backup) =~ "PLACEHOLDER-root-key"
       assert mode(paths(dir).settings_backup) == 0o600
@@ -1058,10 +1119,8 @@ defmodule DashFloat.Config.MigrationTest do
 
       assert {:ok, :migrated} = @migration.maybe_migrate(dir)
 
-      assert {:ok, %{"work" => "PLACEHOLDER-work-key"}} =
-               paths(dir).keys
-               |> File.read!()
-               |> JSON5.decode()
+      assert {:ok, %{"work" => %{"https://provider.example/v1" => "PLACEHOLDER-work-key"}}} =
+               decoded_keys(dir)
 
       refute File.exists?(tmp)
     end
@@ -1125,12 +1184,33 @@ defmodule DashFloat.Config.MigrationTest do
       assert main =~ "PLACEHOLDER-dup-new"
 
       fresh = write_v1!(tmp_dir(), duplicates_file())
-      assert {:ok, :migrated} = @migration.maybe_migrate(fresh)
 
-      # First-wins value lands in keys.json5; the loser survives byte-exact
-      # in the backup. Neither value is lost.
+      # The SPLIT succeeds (the loser is homed in the backup), but the v3
+      # reshape refuses: one value cannot nest under two endpoints. The
+      # chain surfaces the reshape's remedy; nothing is lost either way.
+      capture_log(fn ->
+        assert {:error, message} = @migration.maybe_migrate(fresh)
+        assert message =~ ~s(duplicate profile "work" with a key in keys.json5)
+      end)
+
       assert File.read!(paths(fresh).keys) =~ "PLACEHOLDER-dup-old"
       assert File.read!(paths(fresh).settings_backup) =~ "PLACEHOLDER-dup-new"
+
+      # The remedy: rename one by hand; the re-run migrates.
+      {:ok, v2_map} = decoded_main(fresh)
+
+      renamed =
+        v2_map
+        |> rename_second()
+        |> JSON5.render()
+        |> unwrap_rendered()
+
+      File.write!(paths(fresh).main, renamed <> "\n")
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(fresh)
+
+      assert {:ok, %{"work" => %{"https://provider.example/v1" => "PLACEHOLDER-dup-old"}}} =
+               decoded_keys(fresh)
     end
 
     # Delta-2 P2: a self-referential .bak symlink made File.read "prove" the
@@ -1279,15 +1359,17 @@ defmodule DashFloat.Config.MigrationTest do
           assert {:ok, :migrated} = @migration.maybe_migrate(dir)
         end)
 
-      # The user's keys file is the explicit new home — never rewritten; the
-      # inline values survive in the settings backup.
-      assert {:ok, %{"work" => "PLACEHOLDER-user-key"}} =
+      # The user's keys file is the explicit new home — the SPLIT never
+      # rewrites it; the v3 reshape then moves its flat value to the
+      # endpoint-keyed shape with a byte-exact keys.json5.bak behind it.
+      assert {:ok, %{"work" => %{"https://provider.example/v1" => "PLACEHOLDER-user-key"}}} =
                keys
                |> File.read!()
                |> JSON5.decode()
 
       refute File.read!(paths(dir).main) =~ "PLACEHOLDER"
       assert File.read!(paths(dir).settings_backup) =~ "PLACEHOLDER-work-key"
+      assert File.read!(paths(dir).keys_backup) =~ "PLACEHOLDER-user-key"
 
       # P3-3: the survival claim is TRUE in this state — no pre-existing
       # .bak, so this split wrote the backup the warning mentions.
@@ -1415,9 +1497,7 @@ defmodule DashFloat.Config.MigrationTest do
       assert {:ok, :migrated} = @migration.maybe_migrate(dir)
 
       assert {:ok, decoded} =
-               paths(dir).main
-               |> File.read!()
-               |> JSON5.decode()
+               decoded_main(dir)
 
       assert Enum.all?(decoded["profiles"], &(not Map.has_key?(&1, "apiKey")))
       refute File.exists?(paths(dir).keys)
@@ -1480,18 +1560,525 @@ defmodule DashFloat.Config.MigrationTest do
       # Only the NAMED profile's key is collected; the garbage entries are
       # tolerated content and survive the rewrite verbatim.
       assert {:ok, decoded} =
-               paths(dir).main
-               |> File.read!()
-               |> JSON5.decode()
+               decoded_main(dir)
 
       ["not-a-map", no_name, work] = decoded["profiles"]
       assert no_name == %{"baseUrl" => "https://no-name.example"}
       refute Map.has_key?(work, "apiKey")
 
-      assert {:ok, %{"work" => "PLACEHOLDER-work-key"}} =
-               paths(dir).keys
-               |> File.read!()
-               |> JSON5.decode()
+      assert {:ok, %{"work" => %{"https://provider.example/v1" => "PLACEHOLDER-work-key"}}} =
+               decoded_keys(dir)
+    end
+  end
+
+  describe "v3 reshape: v2 profiles → one-provider profiles" do
+    defp v2_settings do
+      """
+      {
+        configVersion: 2,
+        profiles: [
+          {
+            name: 'work',
+            baseUrl: 'https://provider.example/v1',
+            settings: { defaultModel: 'Flash' },
+            models: [
+              { nickname: 'Sol', model: 'glm-5.3', context: 524288 },
+              { nickname: 'Flash', model: 'glm-5.3-flash', context: 196608 },
+            ],
+          },
+          {
+            name: 'personal',
+            baseUrl: 'https://synthetic.example/openai/v1',
+            models: [{ nickname: 'Deep', model: 'hf:deepseek' }],
+          },
+        ],
+      }
+      """
+    end
+
+    defp v2_keys do
+      "{'work': 'PLACEHOLDER-work-key', 'personal': 'PLACEHOLDER-personal-key',}"
+    end
+
+    defp v2_dir do
+      dir = tmp_dir()
+      write_v1!(dir, v2_settings())
+      write_keys_file!(dir, v2_keys())
+      dir
+    end
+
+    test "a realistic multi-profile v2 directory migrates with every credential in exactly keys[profile][baseUrl]" do
+      dir = v2_dir()
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      %{main: main, keys: keys, settings_backup: settings_backup, keys_backup: keys_backup} =
+        paths(dir)
+
+      assert {:ok, decoded} = decode_file(main)
+
+      assert decoded["configVersion"] == 3
+      # v2's effective default (the first profile) is preserved — no forced
+      # selection modal as a migration side effect.
+      assert decoded["defaultProfile"] == "work"
+
+      [work, personal] = decoded["profiles"]
+      assert work["name"] == "work"
+
+      assert [%{"baseUrl" => "https://provider.example/v1", "models" => models}] =
+               work["providers"]
+
+      assert [%{"baseUrl" => "https://synthetic.example/openai/v1"}] = personal["providers"]
+      assert work["settings"] == %{"defaultModel" => "Flash"}
+      # No label is written — the host default is the point (ADR 0009).
+      labelless =
+        work["providers"]
+        |> hd()
+        |> Map.has_key?("label")
+
+      refute labelless
+
+      assert [
+               %{"nickname" => "Sol", "model" => "glm-5.3", "context" => 524_288},
+               %{"nickname" => "Flash", "model" => "glm-5.3-flash", "context" => 196_608}
+             ] = models
+
+      # THE NO-LOSS INVARIANT, v3 arm: every credential value present in
+      # EXACTLY the endpoint-keyed slots; none anywhere in live settings.
+      assert {:ok,
+              %{
+                "work" => %{"https://provider.example/v1" => "PLACEHOLDER-work-key"},
+                "personal" => %{
+                  "https://synthetic.example/openai/v1" => "PLACEHOLDER-personal-key"
+                }
+              }} = decode_file(keys)
+
+      live_main = File.read!(main)
+      refute live_main =~ "PLACEHOLDER"
+
+      # Backups inherit sensitivity: byte-exact pre-reshape copies at 0600.
+      assert File.read!(settings_backup) == v2_settings()
+      assert mode(settings_backup) == 0o600
+      assert File.read!(keys_backup) == v2_keys()
+      assert mode(keys_backup) == 0o600
+
+      # Idempotent: the v3 marker stands the chain down.
+      assert {:ok, :not_needed} = @migration.maybe_migrate(dir)
+    end
+
+    test "refusal: duplicate v2 profile names with a key — one value cannot nest under two endpoints" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 2,
+          profiles: [
+            { name: 'work', baseUrl: 'https://one.example/v1', models: [{ model: 'm1' }] },
+            { name: 'work', baseUrl: 'https://two.example/v1', models: [{ model: 'm2' }] },
+          ],
+        }
+        """
+      )
+
+      write_keys_file!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+
+      assert {:error, message} = @migration.maybe_migrate(dir)
+      assert message =~ ~s(duplicate profile "work" with a key in keys.json5)
+      assert message =~ "rename one by hand"
+
+      # Nothing was written.
+      assert {:ok, _decoded} = decoded_main(dir)
+      assert File.read!(paths(dir).keys) == "{'work': 'PLACEHOLDER-work-key',}"
+
+      # The remedy clears it: rename one by hand, re-run.
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 2,
+          profiles: [
+            { name: 'work', baseUrl: 'https://one.example/v1', models: [{ model: 'm1' }] },
+            { name: 'second', baseUrl: 'https://two.example/v1', models: [{ model: 'm2' }] },
+          ],
+        }
+        """
+      )
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      assert {:ok, %{"work" => %{"https://one.example/v1" => "PLACEHOLDER-work-key"}}} =
+               decoded_keys(dir)
+    end
+
+    test "refusal: a key without a baseUrl has no endpoint to nest under" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 2,
+          profiles: [{ name: 'work', models: [{ model: 'm1' }] }],
+        }
+        """
+      )
+
+      write_keys_file!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+
+      assert {:error, message} = @migration.maybe_migrate(dir)
+      assert message =~ ~s(profile "work" has a key but no baseUrl)
+      assert message =~ "add the baseUrl"
+      assert File.read!(paths(dir).keys) == "{'work': 'PLACEHOLDER-work-key',}"
+    end
+
+    test "refusal: models without a baseUrl have no provider to live in (env-completed v2)" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 2,
+          profiles: [{ name: 'work', models: [{ model: 'm1' }] }],
+        }
+        """
+      )
+
+      assert {:error, message} = @migration.maybe_migrate(dir)
+      assert message =~ ~s(profile "work" has models but no baseUrl)
+    end
+
+    test "refusal: a v3-shaped file without configVersion: 3 trips the ambiguity guard" do
+      cases = [
+        # A top-level defaultProfile with no marker
+        {"{ defaultProfile: 'work', profiles: [{ name: 'work' }] }", "defaultProfile"},
+        # A profile-level providers tree with no marker
+        {"{ profiles: [{ name: 'work', providers: [{ baseUrl: 'https://provider.example/v1', models: [{ model: 'm1' }] }] }] }",
+         "providers"},
+        # An mcp list with no marker
+        {"{ profiles: [{ name: 'work', mcp: [{ name: 'fetch', command: 'uvx' }] }] }", "mcp"}
+      ]
+
+      for {file, _trigger} <- cases do
+        dir = tmp_dir()
+        write_v1!(dir, file)
+
+        assert {:error, message} = @migration.maybe_migrate(dir)
+        assert message =~ "already has the v3 shape"
+        assert message =~ "set configVersion: 3 by hand"
+      end
+    end
+
+    test "refusal: keys.json5 already endpoint-keyed while settings predates v3" do
+      dir = tmp_dir()
+      write_v1!(dir, v2_settings())
+      write_keys_file!(dir, "{'work': {'https://provider.example/v1': 'PLACEHOLDER-work-key'}}")
+
+      assert {:error, message} = @migration.maybe_migrate(dir)
+      assert message =~ "already endpoint-keyed"
+      assert message =~ "set configVersion: 3"
+    end
+
+    test "refusal: dead keys may only drop when the keys backup holds them" do
+      refusing = tmp_dir()
+      write_v1!(refusing, v2_settings())
+
+      write_keys_file!(
+        refusing,
+        "{'work': 'PLACEHOLDER-work-key', 'ghost': 'PLACEHOLDER-ghost-key'}"
+      )
+
+      # A stale keys.json5.bak blocks the fresh backup the drop needs.
+      keys_bak = Path.join(refusing, "keys.json5.bak")
+      File.write!(keys_bak, "// stale")
+      File.chmod!(keys_bak, 0o600)
+
+      assert {:error, message} = @migration.maybe_migrate(refusing)
+      assert message =~ "profiles that no longer exist"
+      assert message =~ "move a stale keys.json5.bak aside"
+      assert File.read!(keys_bak) == "// stale"
+
+      # The remedy: move the stale backup aside; a fresh one holds the dead
+      # value, and the drop proceeds.
+      File.rename!(keys_bak, keys_bak <> ".old")
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(refusing)
+
+      assert {:ok,
+              %{
+                "work" => %{"https://provider.example/v1" => "PLACEHOLDER-work-key"}
+              }} = decoded_keys(refusing)
+
+      assert File.read!(keys_bak) =~ "PLACEHOLDER-ghost-key"
+    end
+
+    test "junk (non-string) key values warn and drop — they are not credentials" do
+      dir = tmp_dir()
+      write_v1!(dir, v2_settings())
+      write_keys_file!(dir, "{'work': 'PLACEHOLDER-work-key', 'ghost': 42}")
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+        end)
+
+      assert logs =~ ~s("ghost" holds a non-string value — dropping it as junk)
+      assert {:ok, decoded} = decoded_keys(dir)
+      refute Map.has_key?(decoded, "ghost")
+    end
+
+    test "crash debris (settings v3, keys flat) converges on the next load" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [
+            { name: 'work', providers: [{ baseUrl: 'https://provider.example/v1',
+              models: [{ model: 'm1' }] }] },
+          ],
+        }
+        """
+      )
+
+      write_keys_file!(dir, "{'work': 'PLACEHOLDER-work-key',}")
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+        end)
+
+      assert logs =~ "completed an interrupted v3 migration"
+
+      assert {:ok, %{"work" => %{"https://provider.example/v1" => "PLACEHOLDER-work-key"}}} =
+               decoded_keys(dir)
+
+      # Fully-converged: a re-run is a no-op.
+      assert {:ok, :not_needed} = @migration.maybe_migrate(dir)
+    end
+
+    test "a completed v3 directory with flat keys for several providers warns and moves nothing" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [
+            { name: 'work', providers: [
+              { baseUrl: 'https://one.example/v1', models: [{ model: 'm1' }] },
+              { baseUrl: 'https://two.example/v1', models: [{ model: 'm2' }] },
+            ] },
+          ],
+        }
+        """
+      )
+
+      write_keys_file!(dir, "{'work': 'PLACEHOLDER-ambiguous',}")
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, :not_needed} = @migration.maybe_migrate(dir)
+        end)
+
+      assert logs =~ "no single provider endpoint — nest it under the baseUrl by hand"
+      assert File.read!(paths(dir).keys) == "{'work': 'PLACEHOLDER-ambiguous',}"
+    end
+
+    test "a flat key under a profile that does not exist warns and stays" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [
+            { name: 'work', providers: [{ baseUrl: 'https://provider.example/v1',
+              models: [{ model: 'm1' }] }] },
+          ],
+        }
+        """
+      )
+
+      write_keys_file!(dir, "{'ghost': 'PLACEHOLDER-ghost',}")
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, :not_needed} = @migration.maybe_migrate(dir)
+        end)
+
+      assert logs =~ ~s("ghost" holds a bare key but no profile is named "ghost")
+      assert File.read!(paths(dir).keys) == "{'ghost': 'PLACEHOLDER-ghost',}"
+    end
+
+    test "finish_partial arms: unparseable keys error, nested values stay, mixed flats merge" do
+      # Unparseable keys beside a v3 settings: a loud error, never a guess.
+      broken = tmp_dir()
+
+      write_v1!(
+        broken,
+        "{configVersion: 3, profiles: [{ name: 'work', providers: [{ baseUrl: 'https://one.example/v1' }]}]}"
+      )
+
+      write_keys_file!(broken, "{ broken")
+
+      assert {:error, message} = @migration.maybe_migrate(broken)
+      assert message =~ "invalid JSON5"
+
+      # A flat value AND a nested value under the same name: the flat moves
+      # up (merge), the nested stays.
+      mixed = tmp_dir()
+
+      write_v1!(
+        mixed,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{ name: 'work', providers: [{ baseUrl: 'https://one.example/v1' }] }],
+        }
+        """
+      )
+
+      write_keys_file!(
+        mixed,
+        "{'work': {'https://other.example/v1': 'PLACEHOLDER-nested'}, 'work-flat': 'PLACEHOLDER-flat'}"
+      )
+
+      write_v1!(
+        mixed,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [
+            { name: 'work', providers: [{ baseUrl: 'https://one.example/v1' }] },
+            { name: 'work-flat', providers: [{ baseUrl: 'https://flat.example/v1' }] },
+          ],
+        }
+        """
+      )
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(mixed)
+
+      assert {:ok,
+              %{
+                "work" => %{"https://other.example/v1" => "PLACEHOLDER-nested"},
+                "work-flat" => %{"https://flat.example/v1" => "PLACEHOLDER-flat"}
+              }} = decoded_keys(mixed)
+    end
+
+    test "a keys.json5 holding only blanks is rewritten to the empty v3 shape" do
+      dir = tmp_dir()
+      write_v1!(dir, v2_settings())
+      write_keys_file!(dir, "{'work': '', 'ghost': null}")
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      assert {:ok, %{}} = decoded_keys(dir)
+    end
+
+    test "a v2 directory with no addressable profiles reshapes without defaultProfile" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 2,
+          profiles: ["garbage", 7, {}],
+        }
+        """
+      )
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      assert {:ok, %{"configVersion" => 3, "profiles" => ["garbage", 7, %{}]}} =
+               decoded_main(dir)
+
+      {:ok, decoded} = decoded_main(dir)
+      refute Map.has_key?(decoded, "defaultProfile")
+    end
+
+    test "a v3 profile whose providers is not a list finishes with nothing to move" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          profiles: [{ name: 'work', providers: 'nope' }],
+        }
+        """
+      )
+
+      write_keys_file!(dir, "{'work': 'PLACEHOLDER-flat'}")
+
+      logs = capture_log(fn -> assert {:ok, :not_needed} = @migration.maybe_migrate(dir) end)
+      assert logs =~ ~s(profile "work" has no single provider endpoint)
+    end
+
+    test "a pre-existing keys.json5.bak identical to the current keys counts as preserved" do
+      dir = tmp_dir()
+      write_v1!(dir, v2_settings())
+      write_keys_file!(dir, v2_keys())
+      # Simulate the crash state: the backup already holds these exact bytes.
+      keys_file = Path.join(dir, "keys.json5")
+      backup_file = Path.join(dir, "keys.json5.bak")
+      write_keys_file!(dir, v2_keys())
+      File.rename!(keys_file, backup_file)
+      write_keys_file!(dir, v2_keys())
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+      assert File.read!(backup_file) == v2_keys()
+    end
+
+    test "finish_partial's keys write failure is an error, never a crash" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{ name: 'work', providers: [{ baseUrl: 'https://one.example/v1' }] }],
+        }
+        """
+      )
+
+      write_keys_file!(dir, "{'work': 'PLACEHOLDER-flat'}")
+      on_exit(fn -> File.chmod!(dir, 0o700) end)
+      File.chmod!(dir, 0o500)
+
+      assert {:error, message} = @migration.maybe_migrate(dir)
+      assert message =~ "cannot write"
+    end
+
+    test "a v1 inline-keys file reaches v3 in ONE load (the chain composes)" do
+      dir = write_v1!(tmp_dir())
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      {:ok, decoded} = decoded_main(dir)
+      assert decoded["configVersion"] == 3
+      assert decoded["defaultProfile"] == "work"
+
+      assert {:ok,
+              %{
+                "work" => %{"https://provider.example/v1" => "PLACEHOLDER-work-key"},
+                "personal" => %{"https://provider.example/v1" => "PLACEHOLDER-personal-key"}
+              }} = decoded_keys(dir)
     end
   end
 end

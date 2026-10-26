@@ -1,8 +1,11 @@
 # 0009 — Config layout v3: persona profiles, endpoint-keyed keys, deliberate selection, onboarding
 
-- **Status:** Proposed — Phase A design record for [issue #32](https://github.com/fluxvale/dashfloat/issues/32);
-  flips to Accepted when the design review signs off and the implementing PR
-  merges.
+- **Status:** Accepted — PA design review approved the Phase A record with all
+  six shaped corners endorsed (2026-10-26); the owner's later requirement
+  (issue #32 body) added the standing model catalog refresh below, and this ADR
+  now records it. The merged keys-split (#31) matched everything this record
+  anticipated — no Phase A decision needed adjusting against the merged
+  reality.
 - **Date:** 2026-10-26
 - **Implements:** [issue #32](https://github.com/fluxvale/dashfloat/issues/32).
 - **Supersedes:** the *schema*, *model addressing and selection*, *effective
@@ -193,11 +196,16 @@ pure function over dir + env + cli):
 Modeled on Octofriend's first-time setup: a step-by-step modal wizard,
 conversational plain copy, provider presets, key by paste **or** env-var
 reference, sensible skips everywhere, ending with working files on disk. It
-runs in the Application start path *before* the main TUI mounts — the wizard
-is startup UI in the migration tradition (the sanctioned exception to "UI
-performs no file I/O": it holds state; its writes go through the config
-layer's atomic writer), and when it finishes the app loads normally and starts
-under the new profile. Key inputs render masked; no step ever echoes a value.
+runs as a **startup phase of the one TUI**: the Application classifies at
+boot, starts the UI in a setup mode (wizard or forced-selection modal), and
+the completed choice re-loads the config and hands the result to both the UI
+and the already-started agent — the wizard holds state; its writes and the
+selection's reload go through the config layer's atomic machinery, and the
+main chat UI mounts only when setup clears. This is the sanctioned exception
+to "UI performs no file I/O", scoped to the startup phase exactly like the
+migration the wizard extends; when it finishes the app loads normally and
+starts under the new profile. Key inputs render masked; no step ever echoes a
+value.
 
 - **W0 Welcome** — one line of copy, Enter to begin. Ctrl-C aborts: nothing
   written, exit.
@@ -224,9 +232,8 @@ under the new profile. Key inputs render masked; no step ever echoes a value.
   failure — auth, network, timeout — falls back to manual model-id entry with
   a gentle note, never an error screen. **Nickname defaults to the model id.**
   Skippable (empty menu is legal). One entry; menu breadth is a hand-edit.
-  The fetch is the wizard's only outbound call and is optional end to end —
-  the offline test suite exercises it via the existing loopback-server pattern
-  and the fallback.
+  The fetch is the same standing fetch defined below — onboarding reuses the
+  catalog machinery, not a second HTTP path.
 - **W5 Optional loops** — "add another provider?" (W2 again under the same
   profile), "add an MCP server?" (`name`, `command`, space-separated `args`,
   optional token env-var name stored as `$REF`), or "done". All skippable.
@@ -250,6 +257,72 @@ under the new profile. Key inputs render masked; no step ever echoes a value.
 
 Presets are code constants shared by the wizard (a tiny module — nothing
 configurable, nothing secret in them).
+
+### Standing model catalog refresh (owner requirement, added at review)
+
+Fetching `/models` is **not onboarding-only**. At every startup DashFloat
+refreshes the model catalog from each configured provider — Octofriend's
+pattern (`synthetic-models.ts`: fetch at startup, short timeout, fail-open)
+adapted to DashFloat's async TUI:
+
+- **Scope:** each provider of the **active profile** — the only profile whose
+  menus this session can address (selection is startup-only until runtime
+  switching exists). Fetching other personas' providers would be cost with no
+  consumer; the scope widens when the runtime picker does.
+- **Fetch:** `GET {baseUrl}/models` per provider, `Authorization: Bearer` with
+  the provider's **effective key** (`DASHFLOAT_API_KEY` for the active
+  provider, else `keys[profile][baseUrl]` after `$REF` resolution); the header
+  is **omitted when no key resolves** — a catalog that needs no auth still
+  refreshes. 5 s timeout, no retries.
+- **Fail-open, absolutely:** any failure — auth, network, timeout, non-2xx, a
+  body that is not the OpenAI `{data: […]}` shape — leaves the configured
+  menus untouched. The refresh can never block, crash, or error the app; a
+  failure is at most a debug-level log line.
+- **Merge rules (in-memory, per session):** the user's explicit settings
+  entries always win — a catalog entry whose id matches an existing entry
+  never overrides it, but **may refresh metadata: the context window**
+  (catalog wins when it reports one) and capability extras; catalog entries
+  the menu lacks are **added** (nickname defaults to the id). Nothing is
+  written back to settings.json5 automatically — no config churn on every
+  start; persisting a discovered model stays hand-editing.
+- **Async wiring:** the fetch runs as a supervised, unlinked task started
+  after the TUI mounts — startup latency stays flat. The catalog lands as a
+  message; the UI stores it (per provider), and its one observable effect
+  today is the status bar's context denominator filling in for a selected
+  model whose config entry carried no `context`. The merged menu is exposed in
+  state for the future runtime picker.
+- Onboarding W4 reuses this same fetch and merge — one HTTP path, one parser,
+  one merge contract.
+
+### Malformed-config tolerance (owner requirement, added at review)
+
+A hand-damaged file degrades to the least-surprising working state with a
+warning naming the field or profile — never a crash, never silent
+misbehavior (the v2 tolerance pattern, made universal). Terence's scenario —
+an accidentally deleted `defaultProfile` — is the canonical case: the warning
+names it, and the classification state machine IS the recovery path (one
+profile auto-selects, two or more force the modal, zero hand off to the
+wizard or env-only). The edges, each defined as delete-it / wrong-type-it /
+empty-it:
+
+- `defaultProfile` missing (silent — it is optional), not-a-string, blank,
+  or unknown (warn + unset) → the classification arms above.
+- `profiles` not-a-list / empty / entries that are not objects / entries
+  without `name` → per-entry skip-with-warning (a nameless profile is
+  unaddressable); zero surviving profiles → the state machine.
+- `providers`/`mcp` entries that are not objects or lack `baseUrl`/`name`/
+  `command` → skip-with-warning per entry.
+- keys.json5 values that are not strings, or a profile's map that is not an
+  object → warn + treat as a missing key. **keys.json5 only refuses when
+  UNPARSEABLE** — never clobber what might hold keys.
+- An empty (0-byte) settings.json5 is not a marker (#31's crash-debris
+  rule): it reads as no config, and the state machine takes over.
+- A file unreadable at the JSON5 level is a **loud error naming the path**
+  (the #31 message tradition) and is **never auto-overwritten** — the wizard
+  runs on absent/empty/zero-profile shapes, not over unparseable data.
+- Loading a damaged-but-parseable v3 directory never rewrites any file's
+  content: warnings and classification only. (The crash-debris completion
+  move is the migration's own warned behavior, not load churn.)
 
 ### Migration v2 → v3 (and the v1 chain)
 
@@ -340,6 +413,17 @@ noted below as a future slice); the README's no-provider TUI mode.
 - **A `--profile <unknown>` warn-and-continue** (v2 behavior) — rejected:
   deliberate selection is the point of the lane; the env-only corner keeps the
   old behavior where it is the only behavior that makes sense.
+- **Blocking catalog fetch at startup** (Octofriend's literal pattern — the
+  app waits) — rejected: an offline or slow provider would stall every launch
+  for the timeout; async-after-mount keeps startup latency flat, and fail-open
+  makes the wait pointless anyway.
+- **Fetching every profile's providers** at startup — rejected: menus of
+  non-active personas have no consumer this lane (startup-only selection);
+  the fetch set is the active profile's providers and widens with the runtime
+  picker.
+- **Persisting the refreshed catalog** back to settings.json5 — rejected (owner
+  rule): automatic write-back would churn the config file on every start and
+  race hand-edits; the merge is in-memory per session.
 
 ## Consequences
 
@@ -411,6 +495,22 @@ network only via the existing loopback-server pattern.
     never hangs.
 12. **Warning parity:** an active provider unkeyed in an existing keys.json5
     warns; silent when keys.json5 is absent or `DASHFLOAT_API_KEY` keys it.
+13. **Standing catalog refresh:** loopback `/models` for two providers (both
+    land); fail-open arms — timeout, non-2xx, garbage body — leave menus
+    untouched and the app unharmed; a key-less provider is fetched **without**
+    an Authorization header and still fail-opens; merge rules — an id
+    collision never overrides the user's entry but refreshes `context` when
+    the catalog reports one, a catalog-only id is added with nickname = id;
+    the async task's landing message updates the UI state (wiring), and
+    nothing is ever written back to settings.json5.
+14. **Hand-vandalized configs (the tolerance family):** every edge above —
+    `defaultProfile` deleted / not-a-string / unknown (warning asserted in
+    BOTH classification arms), `profiles` not-a-list / empty / non-object /
+    nameless entries, providers/mcp junk entries, keys.json5 non-string
+    values and non-object profile maps, a 0-byte settings.json5, unparseable
+    settings and keys — each asserting the specified degradation, the
+    warning, no crash, and no file content rewritten as a side effect of
+    loading.
 
 Existing config/migration tests pin v1/v2 semantics and are updated to the v3
 truth in the same PR — the no-loss and hygiene assertions they already carry

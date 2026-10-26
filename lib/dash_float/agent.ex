@@ -100,6 +100,15 @@ defmodule DashFloat.Agent do
   # A prompt while busy is a UI bug (the UI gates on phase): ignore, never crash.
   def handle_info({:prompt, _ui, _text}, state), do: {:noreply, state}
 
+  # The startup phase's handoff (ADR 0009): the agent boots with the boot-time
+  # classification (an error while the wizard/modal runs); once setup
+  # completes, the UI delivers the resolved provider here — the agent is the
+  # single voice, so the config it streams with must be this one message old
+  # at most.
+  def handle_info({:set_provider, provider}, state) do
+    {:noreply, %{state | provider: provider}}
+  end
+
   def handle_info(
         {:confirm_decision, ref, decision},
         %__MODULE__{tool_slot: {:confirming, ref, call}} = state

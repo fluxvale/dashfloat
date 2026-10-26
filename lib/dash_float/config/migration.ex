@@ -1,11 +1,14 @@
 defmodule DashFloat.Config.Migration do
   @moduledoc """
-  One-time migrations to the split credential layout
+  One-time migrations to the split, endpoint-keyed credential layout
   ([ADR 0008](../decisions/0008-config-layout-profiles-json5.md) and its
-  keys-split amendment): `settings.json5` carries no credential material and
-  API keys live in `keys.json5`, keyed by profile name.
+  keys-split amendment; [ADR 0009](../decisions/0009-config-v3-persona-profiles.md)
+  for the v3 step): `settings.json5` carries no credential material and API
+  keys live in `keys.json5`, nested per profile and keyed by provider
+  `baseUrl`.
 
-  Runs as the first step of every `DashFloat.Config.load/2,3`, two paths:
+  Runs as the first step of every `DashFloat.Config.load/2,3`, three chained
+  paths:
 
     * **legacy** — no (non-empty) `settings.json5`, a legacy `config.json`
       exists: the legacy triple becomes the `default` profile (de-secreted)
@@ -18,6 +21,12 @@ defmodule DashFloat.Config.Migration do
       from the collected keys, then the settings file is rewritten de-secreted
       at `configVersion` 2. A v1 file with no inline credential field is
       byte-untouched.
+    * **v3 reshape** — a `settings.json5` older than `configVersion` 3
+      becomes the persona layout: each profile's `baseUrl`+`models` move into
+      `providers[0]`, `keys[profile]` becomes `keys[profile][baseUrl]`, and
+      `defaultProfile` is set to the first profile (preserving v2's effective
+      default). Refuses loudly — with remedies, nothing written — on the
+      shapes it cannot move unambiguously (ADR 0009's catalog).
 
   A pre-existing `keys.json5` WINS over collected keys (it is the user's
   explicit new home; the old values survive in the backup); a malformed one
@@ -37,16 +46,19 @@ defmodule DashFloat.Config.Migration do
   @main_file "settings.json5"
   @main_backup "settings.json5.bak"
   @keys_file "keys.json5"
-  @tmp_suffix ".tmp"
+  @keys_backup "keys.json5.bak"
   @default_profile "default"
   # The split marker: this and later versions carry no inline credentials.
   @main_version 2
-  @secret_mode 0o600
+  # The persona-profiles marker (ADR 0009): providers live inside profiles
+  # and keys.json5 is endpoint-keyed (nested per provider baseUrl).
+  @v3_version 3
 
   @doc """
   `{:ok, :migrated}` after a migration, `{:ok, :not_needed}` when there is
   nothing to do, `{:error, message}` when the source is unusable or a target
-  cannot be written.
+  cannot be written. The three paths chain in order: legacy → split → v3
+  reshape, so a v1 directory reaches v3 in one load.
   """
   @spec maybe_migrate(Path.t()) :: {:ok, :migrated | :not_needed} | {:error, String.t()}
   def maybe_migrate(dir) do
@@ -54,13 +66,37 @@ defmodule DashFloat.Config.Migration do
 
     # An EMPTY settings.json5 is not a marker: it can only be crash debris
     # (writes are tmp+rename atomic) or an empty user file — neither carries
-    # data, so the legacy migration proceeds over it.
+    # data, so the legacy migration proceeds over it (and load treats it as
+    # no config, ADR 0009's tolerance principle).
     if marker?(main) do
-      split_inline(dir, main)
+      chain(split_inline(dir, main), fn -> reshape_v3(main) end)
     else
-      legacy = Path.join(dir, @legacy_file)
+      legacy_branch(dir, main)
+    end
+  end
 
-      if File.exists?(legacy), do: migrate_legacy(dir, legacy, main), else: {:ok, :not_needed}
+  defp legacy_branch(dir, main) do
+    legacy = Path.join(dir, @legacy_file)
+
+    if File.exists?(legacy) do
+      chain(migrate_legacy(dir, legacy, main), fn -> reshape_v3(main) end)
+    else
+      reshape_v3(main)
+    end
+  end
+
+  # The chain composes outcomes: an error stops the chain and surfaces
+  # verbatim (refusals keep their no-write guarantee); a `:migrated` from
+  # EITHER step reports as migrated — a later step standing down must not
+  # mask that a migration actually happened (idempotence tests depend on
+  # distinguishing the first run from re-runs).
+  defp chain({:error, _reason} = error, _next), do: error
+
+  defp chain({:ok, first}, next) do
+    case next.() do
+      {:ok, :migrated} -> {:ok, :migrated}
+      {:ok, :not_needed} -> {:ok, first}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -393,6 +429,537 @@ defmodule DashFloat.Config.Migration do
     match?({:ok, %File.Stat{type: :regular}}, File.lstat(path))
   end
 
+  ## v3 reshape (v2 profiles → one-provider profiles, endpoint-keyed keys)
+
+  # Settings v2 (or v1-without-inline-keys) → v3 (ADR 0009): each profile's
+  # baseUrl+models move into providers[0], keys[profile] → keys[profile]
+  # [baseUrl]. Writes order settings-FIRST: a crash after the settings write
+  # leaves keys.json5 flat and intact — the exact state finish_partial/1
+  # converges on the next load. A dead keys.json5 entry is dropped only when
+  # the keys backup provably holds it (decision from the backup's actual
+  # outcome, #31 rule); movable values land by construction.
+  #
+  # A non-regular settings.json5 or keys.json5 is left ENTIRELY by hand —
+  # tmp+rename would sever a symlink or clobber the file's semantics, the
+  # split's own rule (the completion path below warns instead of reading
+  # through a non-regular keys file).
+  defp reshape_v3(main) do
+    dir = Path.dirname(main)
+
+    if marker?(main) and regular?(main, @main_file) and
+         regular?(Path.join(dir, @keys_file), @keys_file) do
+      case read_and_decode(main) do
+        {:error, _message} = error -> error
+        {:ok, _raw, map} -> maybe_reshape(main, map)
+      end
+    else
+      {:ok, :not_needed}
+    end
+  end
+
+  defp maybe_reshape(main, map) do
+    cond do
+      version?(map, @v3_version) -> finish_partial(main, map)
+      v3_or_newer?(map) -> {:ok, :not_needed}
+      v3_tripwire?(map) -> {:error, tripwire_message(main)}
+      true -> full_reshape(main, map)
+    end
+  end
+
+  defp version?(%{"configVersion" => version}, version) when is_integer(version), do: true
+  defp version?(_map, _version), do: false
+
+  defp v3_or_newer?(%{"configVersion" => version})
+       when is_integer(version) and version >= @v3_version,
+       do: true
+
+  defp v3_or_newer?(_map), do: false
+
+  # A v3-shaped document predating its marker would be silently gutted by the
+  # reshape (its provider trees read as unknown keys) — refuse and say what
+  # to set instead of guessing (ADR 0009 refusal catalog).
+  defp v3_tripwire?(map) do
+    profiles = profiles_list(map)
+
+    Map.has_key?(map, "defaultProfile") or
+      Enum.any?(profiles, fn
+        entry when is_map(entry) -> Map.has_key?(entry, "providers") or Map.has_key?(entry, "mcp")
+        _entry -> false
+      end)
+  end
+
+  defp tripwire_message(main) do
+    "#{main} already has the v3 shape (providers, mcp, or defaultProfile) " <>
+      "but no configVersion: 3 — set configVersion: 3 by hand and re-run"
+  end
+
+  # The crash-debris completion path: settings is v3 but keys.json5 may
+  # still hold FLAT values (settings was written first; the process died
+  # before the keys rewrite). A flat value under an existing profile with
+  # exactly one provider baseUrl moves up; nested values are the finished
+  # shape and stay; anything else warns and stays verbatim — no value is
+  # dropped here, so no loss decision is needed.
+  defp finish_partial(main, map) do
+    keys_path = sibling(main, @keys_file)
+
+    if File.exists?(keys_path) do
+      complete_partial(keys_path, map)
+    else
+      {:ok, :not_needed}
+    end
+  end
+
+  defp complete_partial(keys_path, map) do
+    case JSON5.read_map(keys_path) do
+      {:ok, keys} -> apply_partial_moves(keys_path, map, keys)
+      {:error, _message} = error -> error
+    end
+  end
+
+  defp apply_partial_moves(keys_path, map, keys) do
+    {moves, warnings} = partial_moves(map, keys)
+
+    if moves == [] do
+      Enum.each(warnings, &Logger.warning/1)
+      {:ok, :not_needed}
+    else
+      write_partial_moves(keys_path, keys, moves, warnings)
+    end
+  end
+
+  defp write_partial_moves(keys_path, keys, moves, warnings) do
+    merged = merge_partial_keys(keys, moves)
+
+    with {:ok, doc} <- render_doc(@keys_file, merged, "move it") do
+      write_completed_moves(keys_path, doc, moves, warnings)
+    end
+  end
+
+  defp write_completed_moves(keys_path, doc, moves, warnings) do
+    case write_private(keys_path, doc <> "\n") do
+      :ok ->
+        Enum.each(warnings, &Logger.warning/1)
+
+        Logger.warning(
+          "#{@keys_file}: completed an interrupted v3 migration — " <>
+            "#{length(moves)} key(s) moved to their provider endpoints"
+        )
+
+        {:ok, :migrated}
+
+      {:error, _message} = error ->
+        error
+    end
+  end
+
+  # Per profile NAME: a flat usable value moves when the named profile has
+  # exactly one provider with a usable baseUrl (the only unambiguous join).
+  # Nested values are the finished shape; non-string and blank values are
+  # inert damage, not credentials — they warn and stay (ADR 0009's tolerance
+  # principle).
+  defp partial_moves(map, keys) do
+    profiles = v3_named_profiles(map)
+
+    Enum.flat_map_reduce(keys, [], fn {name, value}, warnings ->
+      profile = profile_by_name(profiles, name)
+
+      cond do
+        is_map(value) ->
+          {[], warnings}
+
+        profile == nil ->
+          {[],
+           [bare_key_warning(name, "no profile is named \"#{name}\" — it is unused") | warnings]}
+
+        not is_binary(value) or blank_to_nil(value) == nil ->
+          {[],
+           [
+             ~s(#{@keys_file}: "#{name}" holds a bare non-string or blank value — it is unused)
+             | warnings
+           ]}
+
+        length(profile.base_urls) != 1 ->
+          {[],
+           [
+             ~s(#{@keys_file}: "#{name}" holds a bare key but profile "#{name}" has no single provider endpoint — nest it under the baseUrl by hand)
+             | warnings
+           ]}
+
+        true ->
+          {[{name, hd(profile.base_urls), blank_to_nil(value)}], warnings}
+      end
+    end)
+  end
+
+  defp bare_key_warning(name, reason),
+    do: ~s(#{@keys_file}: "#{name}" holds a bare key but #{reason})
+
+  defp merge_partial_keys(keys, moves) do
+    Enum.reduce(moves, keys, fn {name, base_url, value}, acc ->
+      nested = existing_nested(acc, name)
+      Map.put(acc, name, Map.put_new(nested, base_url, value))
+    end)
+  end
+
+  # A name that already carries nested entries (finish_partial's mixed
+  # state) keeps them; a flat slot is replaced by the fresh nest.
+  defp existing_nested(acc, name) do
+    case acc[name] do
+      %{} = map -> map
+      _flat_or_absent -> %{}
+    end
+  end
+
+  defp full_reshape(main, map) do
+    keys_path = sibling(main, @keys_file)
+
+    with {:ok, keys} <- read_flat_keys(keys_path),
+         {:ok, {new_map, moved, dead, junk}} <- plan_reshape(map, keys) do
+      Enum.each(junk, &Logger.warning/1)
+
+      keys_backup = backup_bytes(keys_path, @keys_backup)
+
+      case ensure_no_v3_loss(dead, keys_backup) do
+        :ok -> commit_reshape(main, keys_path, new_map, keys, moved, dead)
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  defp commit_reshape(main, keys_path, new_map, keys, moved, dead) do
+    _settings_backup = backup_bytes(main, @main_backup)
+
+    with {:ok, settings_text} <- render_doc(@main_file, new_map, "reshape it"),
+         :ok <- write_private(main, settings_text <> "\n"),
+         :ok <- write_v3_keys(keys_path, keys, moved, dead) do
+      repair_backup(Path.dirname(main))
+      {:ok, :migrated}
+    end
+  end
+
+  # The keys rewrite: nothing to do when no keys file existed; every other
+  # state rewrites the nested shape (a moved map of zero entries renders as
+  # `{}` — exactly the cleanup a blanks-only or dead-only file deserves).
+  defp write_v3_keys(_keys_path, nil, _moved, _dead), do: :ok
+
+  defp write_v3_keys(keys_path, _keys, moved, _dead) do
+    with {:ok, doc} <- render_doc(@keys_file, moved, "reshape it") do
+      write_private(keys_path, doc <> "\n")
+    end
+  end
+
+  # Reads keys.json5 when present: every value must be a FLAT string (the v2
+  # shape) — a nested map is already endpoint-keyed and refuses (the shape
+  # ambiguity this migration must not guess through). `nil` when the file is
+  # absent; an unparseable file is an error (never destroy unreadable data).
+  defp read_flat_keys(keys_path) do
+    if File.exists?(keys_path) do
+      case JSON5.read_map(keys_path) do
+        {:ok, keys} -> reject_endpoint_keyed(keys)
+        {:error, _message} = error -> error
+      end
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp reject_endpoint_keyed(keys) do
+    if Enum.any?(keys, fn {_name, value} -> is_map(value) end) do
+      {:error,
+       "#{@keys_file} is already endpoint-keyed (per-provider URLs) but " <>
+         "#{@main_file} predates v3 — set configVersion: 3 in #{@main_file} or fix #{@keys_file} by hand"}
+    else
+      {:ok, keys}
+    end
+  end
+
+  # Validates the v2 directory against the refusal catalog and computes both
+  # documents plus the inert-junk warnings. No write happens until this
+  # returns ok (ADR 0009).
+  defp plan_reshape(map, keys) do
+    with :ok <- check_dup_names(map, keys),
+         :ok <- check_joinable(map, keys),
+         {:ok, new_map} <- reshape_map(map),
+         {:ok, {moved, dead, junk}} <- split_keys(map, keys) do
+      {:ok, {new_map, moved, dead, junk}}
+    end
+  end
+
+  defp check_dup_names(map, keys) do
+    names =
+      map
+      |> profiles_list()
+      |> Enum.flat_map(&usable_name/1)
+
+    dup = List.first(names -- Enum.uniq(names))
+
+    if dup && is_map(keys) && usable?(keys[dup]) do
+      {:error,
+       ~s(#{@main_file}: duplicate profile "#{dup}" with a key in #{@keys_file} ) <>
+         "— rename one by hand so the key can move to its provider endpoint, then re-run"}
+    else
+      :ok
+    end
+  end
+
+  # A key without a baseUrl has no endpoint to nest under; models without a
+  # baseUrl have no provider to live in (env-completed v2 endpoints cannot be
+  # resolved by a file transform that never reads env).
+  defp check_joinable(map, keys) do
+    map
+    |> named_profiles()
+    |> Enum.find_value(:ok, fn profile ->
+      cond do
+        is_map(keys) and usable?(keys[profile.name]) and profile.base_url == nil ->
+          {:error,
+           ~s(#{@main_file}: profile "#{profile.name}" has a key but no baseUrl ) <>
+             "— add the baseUrl so the key can move to keys[profile][baseUrl], or move the key by hand"}
+
+        movable_models?(profile) and profile.base_url == nil ->
+          {:error,
+           ~s(#{@main_file}: profile "#{profile.name}" has models but no baseUrl ) <>
+             "— add the baseUrl so the models can move into a provider, or reshape it by hand"}
+
+        true ->
+          nil
+      end
+    end)
+  end
+
+  defp movable_models?(%{models: models}), do: is_list(models) and models != []
+
+  defp reshape_map(map) do
+    profiles =
+      map
+      |> profiles_list()
+      |> Enum.map(&reshape_profile/1)
+
+    base = Map.merge(map, %{"configVersion" => @v3_version, "profiles" => profiles})
+
+    case first_profile_name(profiles) do
+      nil -> {:ok, base}
+      name -> {:ok, Map.put(base, "defaultProfile", name)}
+    end
+  end
+
+  # A named profile with a baseUrl becomes a one-provider profile; its
+  # settings map and unknown extras ride verbatim. A profile without a
+  # baseUrl keeps everything but gains no providers (it may still carry a
+  # name and settings). Non-map entries pass through untouched.
+  defp reshape_profile(entry) when is_map(entry) do
+    case {value_of(entry["name"]), value_of(entry["baseUrl"])} do
+      {name, base_url} when is_binary(name) and is_binary(base_url) ->
+        provider = %{"baseUrl" => base_url, "models" => Map.get(entry, "models", [])}
+
+        entry
+        |> Map.drop(["baseUrl", "models"])
+        |> Map.put("providers", [provider])
+
+      _other ->
+        entry
+    end
+  end
+
+  defp reshape_profile(entry), do: entry
+
+  defp first_profile_name([%{"name" => name} | _rest]) when is_binary(name), do: name
+  defp first_profile_name([_other | rest]), do: first_profile_name(rest)
+  defp first_profile_name([]), do: nil
+
+  # keys[profile] = K → keys[profile][baseUrl] = K. Entries under names with
+  # no movable profile are DEAD: kept out of the new document, they may only
+  # drop when the backup holds them (ensure_no_v3_loss decides from the
+  # backup's actual outcome). Non-string values are inert junk — warned and
+  # dropped, never treated as credentials (ADR 0009 tolerance).
+  defp split_keys(_map, nil), do: {:ok, {%{}, [], []}}
+
+  defp split_keys(map, keys) do
+    movable = movable_profiles(map)
+
+    {moved_pairs, dead_pairs} =
+      Enum.split_with(keys, fn {name, value} ->
+        usable?(value) and profile_by_name(movable, name) != nil
+      end)
+
+    moved =
+      Map.new(moved_pairs, fn {name, value} ->
+        %{base_url: base_url} = profile_by_name(movable, name)
+        {name, %{base_url => blank_to_nil(value)}}
+      end)
+
+    dead = for {name, value} <- dead_pairs, usable?(value), do: {name, blank_to_nil(value)}
+
+    junk =
+      for {name, value} <- dead_pairs,
+          not is_binary(value),
+          do: ~s(#{@keys_file}: "#{name}" holds a non-string value — dropping it as junk)
+
+    {:ok, {moved, dead, junk}}
+  end
+
+  # THE INVARIANT (v3 arm): a dead keys.json5 value may only be dropped when
+  # the keys backup provably holds it on disk — :written or :identical — the
+  # same actual-outcome rule as the split's ensure_no_loss. Every movable
+  # value lands in the new keys.json5 by construction (the refusal catalog
+  # blocked everything that could not move).
+  defp ensure_no_v3_loss([], _keys_backup), do: :ok
+
+  defp ensure_no_v3_loss(_dead, keys_backup) when keys_backup in [:written, :identical], do: :ok
+
+  defp ensure_no_v3_loss(_dead, _keys_backup) do
+    {:error,
+     "cannot reshape to v3: #{@keys_file} holds keys for profiles that no longer " <>
+       "exist and #{@keys_backup} cannot be written — move a stale #{@keys_backup} aside " <>
+       "so a fresh backup can hold them, or nest the keys by hand"}
+  end
+
+  # The named, addressable v2 profiles (first-wins on duplicate names,
+  # matching the loader's rule and collect_keys).
+  defp named_profiles(map) do
+    map
+    |> profiles_list()
+    |> Enum.flat_map(fn
+      entry when is_map(entry) ->
+        case value_of(entry["name"]) do
+          nil -> []
+          name -> [%{name: name, base_url: value_of(entry["baseUrl"]), models: entry["models"]}]
+        end
+
+      _entry ->
+        []
+    end)
+    |> dedup_first_wins()
+  end
+
+  defp movable_profiles(map) do
+    map
+    |> named_profiles()
+    |> Enum.reject(&(&1.base_url == nil))
+  end
+
+  defp dedup_first_wins(profiles) do
+    {kept, _seen} =
+      Enum.reduce(profiles, {[], MapSet.new()}, fn profile, {acc, seen} ->
+        if MapSet.member?(seen, profile.name) do
+          {acc, seen}
+        else
+          {[profile | acc], MapSet.put(seen, profile.name)}
+        end
+      end)
+
+    Enum.reverse(kept)
+  end
+
+  defp profile_by_name(profiles, name),
+    do: Enum.find(profiles, fn profile -> profile.name == name end)
+
+  # finish_partial reads V3-shaped maps: names plus each profile's provider
+  # baseUrls (usable ones, in order).
+  defp v3_named_profiles(map) do
+    map
+    |> profiles_list()
+    |> Enum.flat_map(fn
+      entry when is_map(entry) ->
+        case value_of(entry["name"]) do
+          nil -> []
+          name -> [%{name: name, base_urls: v3_base_urls(entry)}]
+        end
+
+      _entry ->
+        []
+    end)
+    |> dedup_first_wins()
+  end
+
+  defp v3_base_urls(%{"providers" => providers}) when is_list(providers) do
+    Enum.flat_map(providers, fn
+      entry when is_map(entry) ->
+        case value_of(entry["baseUrl"]) do
+          nil -> []
+          base_url -> [base_url]
+        end
+
+      _entry ->
+        []
+    end)
+  end
+
+  defp v3_base_urls(_entry), do: []
+
+  defp usable_name(entry) when is_map(entry) do
+    case value_of(entry["name"]) do
+      nil -> []
+      name -> [name]
+    end
+  end
+
+  defp usable_name(_entry), do: []
+
+  defp value_of(value), do: blank_to_nil(value)
+
+  defp sibling(main, name) do
+    main
+    |> Path.dirname()
+    |> Path.join(name)
+  end
+
+  # Byte-exact backup with the split's outcome vocabulary: :written /
+  # :identical / :kept / :failed — never clobbered, never read through a
+  # symlink (lstat first), 0600 whenever written, :absent when there is no
+  # source file to back up.
+  defp backup_bytes(path, label) do
+    backup = sibling(path, label)
+
+    cond do
+      not File.exists?(path) ->
+        :absent
+
+      not regular_file?(path) ->
+        Logger.warning("#{path} is not a regular file — not backing it up")
+        :failed
+
+      true ->
+        read_backup_source(path, backup, label)
+    end
+  end
+
+  defp read_backup_source(path, backup, label) do
+    case File.read(path) do
+      {:ok, raw} -> place_backup(raw, backup, label)
+      {:error, _reason} -> :failed
+    end
+  end
+
+  defp place_backup(raw, backup, label) do
+    cond do
+      not File.exists?(backup) ->
+        case write_private(backup, raw) do
+          :ok ->
+            :written
+
+          {:error, _reason} ->
+            Logger.warning("cannot write #{label} — migrating without a fresh backup")
+            :failed
+        end
+
+      not regular_file?(backup) ->
+        Logger.warning("#{label} is not a regular file — keeping it; not read through")
+        :kept
+
+      true ->
+        Posture.tighten(backup, label)
+
+        case File.read(backup) do
+          {:ok, contents} when contents == raw ->
+            :identical
+
+          _other ->
+            Logger.warning("#{label} already exists — keeping it; no new backup is written")
+            :kept
+        end
+    end
+  end
+
   ## Legacy migration (config.json → default profile + keys.json5)
 
   defp migrate_legacy(dir, legacy, main) do
@@ -407,7 +974,11 @@ defmodule DashFloat.Config.Migration do
          {:ok, fields} <- legacy_fields(legacy, map),
          :ok <- representable(fields),
          {:ok, keys_doc} <-
-           render_doc(@keys_file, %{@default_profile => fields.api_key}, "migrate it"),
+           render_doc(
+             @keys_file,
+             %{@default_profile => %{fields.base_url => fields.api_key}},
+             "migrate it"
+           ),
          {:ok, main_doc} <- render_doc(@main_file, legacy_main(fields), "migrate it"),
          :ok <- write_keys_unless_present(Path.join(dir, @keys_file), keys_doc),
          :ok <- write_private(main, main_doc <> "\n") do
@@ -461,9 +1032,13 @@ defmodule DashFloat.Config.Migration do
       end
 
     %{
-      "configVersion" => @main_version,
+      "configVersion" => @v3_version,
+      "defaultProfile" => @default_profile,
       "profiles" => [
-        %{"name" => @default_profile, "baseUrl" => fields.base_url, "models" => [entry]}
+        %{
+          "name" => @default_profile,
+          "providers" => [%{"baseUrl" => fields.base_url, "models" => [entry]}]
+        }
       ]
     }
   end
@@ -528,48 +1103,12 @@ defmodule DashFloat.Config.Migration do
 
   ## Shared writers and posture
 
-  # Written tmp-then-rename (atomic on POSIX): no crash can leave a torn or
-  # half-written file. The tmp file is created empty under 0600 before any
-  # content lands in it — so every file this module writes, including
-  # backups of secrets-bearing files, is 0600 from its first byte. Contents
-  # are written EXACTLY as given — rendered documents get their trailing
-  # newline from the caller; the split's backup copies the raw bytes
-  # byte-exact. The tmp path is lstat-guarded like the destination: a
-  # pre-planted .tmp symlink would otherwise be chmod'd and written THROUGH,
-  # clobbering whatever it points at (hostile review P2-2).
-  defp write_private(path, contents) do
-    tmp = path <> @tmp_suffix
-
-    with :ok <- guard_tmp(path, tmp),
-         :ok <- File.touch(tmp),
-         :ok <- File.chmod(tmp, @secret_mode),
-         :ok <- File.write(tmp, contents),
-         :ok <- File.rename(tmp, path) do
-      :ok
-    else
-      # guard_tmp's message is already user-shaped; filesystem reasons are
-      # wrapped. The tmp debris of a failed write is removed either way.
-      {:error, reason} when is_binary(reason) ->
-        {:error, reason}
-
-      {:error, reason} when is_atom(reason) ->
-        File.rm(tmp)
-        {:error, "cannot write #{path}: #{:file.format_error(reason)}"}
-    end
-  end
-
-  defp guard_tmp(path, tmp) do
-    case File.lstat(tmp) do
-      {:ok, %File.Stat{type: :regular}} ->
-        :ok
-
-      {:ok, %File.Stat{type: other}} ->
-        {:error, "cannot write #{path}: #{tmp} is a #{other}, not a regular file"}
-
-      _missing ->
-        :ok
-    end
-  end
+  # All writes go through Posture.write_private (atomic tmp-0600+rename,
+  # lstat-guarded) — shared with the v3 reshape and the onboarding wizard
+  # (ADR 0009). Contents are written EXACTLY as given — rendered documents
+  # get their trailing newline from the caller; the split's backup copies the
+  # raw bytes byte-exact.
+  defp write_private(path, contents), do: Posture.write_private(path, contents)
 
   # The rename is last: until it happens, a crash leaves the new layout
   # partial and the legacy file intact, so a re-run converges. An existing
@@ -603,8 +1142,9 @@ defmodule DashFloat.Config.Migration do
 
   @doc """
   Best-effort 0600 repair of leftover secrets-bearing files on the LOAD path
-  (ADR 0008 posture, issue #28): beside an existing `settings.json5`, a
-  `config.json.bak`, `settings.json5.bak`, an inert never-renamed
+  (ADR 0008 posture, issue #28; the v3 arm adds `keys.json5.bak` — ADR 0009):
+  beside an existing `settings.json5`, a `config.json.bak`,
+  `settings.json5.bak`, `keys.json5.bak`, an inert never-renamed
   `config.json` (the legacy migration's crash window, or a #23-era partial
   run), or the DOCUMENTED refusal-unblock sidecar `settings.json5.bak.old`
   (`mv settings.json5.bak settings.json5.bak.old` — delta-2 P3b: the remedy
@@ -618,10 +1158,12 @@ defmodule DashFloat.Config.Migration do
     legacy = Path.join(dir, @legacy_file)
     backup = Path.join(dir, @backup_file)
     settings_backup = Path.join(dir, @main_backup)
+    keys_backup = Path.join(dir, @keys_backup)
     sidecar = Path.join(dir, @main_backup <> ".old")
     Posture.tighten(legacy, @legacy_file)
     Posture.tighten(backup, @backup_file)
     Posture.tighten(settings_backup, @main_backup)
+    Posture.tighten(keys_backup, @keys_backup)
     Posture.tighten(sidecar, "#{@main_backup}.old")
     :ok
   end
@@ -685,7 +1227,7 @@ defmodule DashFloat.Config.Migration do
   end
 
   defp positive_int(raw) when is_integer(raw) and raw in 1..1_000_000_000_000, do: raw
-  defp positive_int(_other), do: nil
+  defp positive_int(_raw), do: nil
 
   defp names(fields), do: Enum.map_join(fields, ", ", fn {field, _v} -> Atom.to_string(field) end)
 end
