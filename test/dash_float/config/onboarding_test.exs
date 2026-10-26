@@ -172,6 +172,12 @@ defmodule DashFloat.Config.OnboardingTest do
       assert [{:write_key, {"personal", @zai_url, "$ZAI_KEY"}}] = actions
     end
 
+    test "a blank Enter skips the key too" do
+      {state, actions} = drive(at_key_step(), ["enter"])
+      assert actions == []
+      assert Onboarding.options(state) == [:manual, :skip]
+    end
+
     test "esc skips the key" do
       {state, actions} = drive(at_key_step(), ["esc"])
       assert actions == []

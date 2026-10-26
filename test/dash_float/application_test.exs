@@ -60,6 +60,15 @@ defmodule DashFloat.ApplicationTest do
              )
   end
 
+  test "the boot resolver the TUI receives reloads with the chosen profile" do
+    dir = v3_dir()
+
+    resolver = Application.boot_resolver(dir, %{}, [])
+    assert {:ok, %DashFloat.Config{profile: "work"}} = resolver.("work")
+    assert {:error, _missing} = resolver.("ghost")
+    assert {:ok, %DashFloat.Config{profile: "work"}} = resolver.(nil)
+  end
+
   test "a forced-selection boot wires the modal setup and the agent's error arm" do
     dir = tmp_dir()
     settings = Path.join(dir, "settings.json5")

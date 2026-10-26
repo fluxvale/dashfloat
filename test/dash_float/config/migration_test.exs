@@ -1829,6 +1829,19 @@ defmodule DashFloat.Config.MigrationTest do
       refute Map.has_key?(decoded, "ghost")
     end
 
+    test "refusal: an unparseable keys.json5 beside a v2 settings is a loud error" do
+      dir = tmp_dir()
+      write_v1!(dir, v2_settings())
+      keys = Path.join(dir, "keys.json5")
+      File.write!(keys, "{ broken")
+      File.chmod!(keys, 0o600)
+
+      assert {:error, message} = @migration.maybe_migrate(dir)
+      assert message =~ "invalid JSON5"
+      assert message =~ "keys.json5"
+      assert File.read!(keys) == "{ broken"
+    end
+
     test "crash debris (settings v3, keys flat) converges on the next load" do
       dir = tmp_dir()
 

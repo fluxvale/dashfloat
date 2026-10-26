@@ -111,7 +111,7 @@ defmodule DashFloat.Application do
        agent: DashFloat.Agent,
        config_dir: config_dir,
        setup: setup_state(classification),
-       resolve: fn name -> Config.load(config_dir, env, put_profile(cli, name)) end}
+       resolve: boot_resolver(config_dir, env, cli)}
     ]
   end
 
@@ -119,8 +119,16 @@ defmodule DashFloat.Application do
   defp setup_state(:onboard), do: Onboarding.new()
   defp setup_state(_other), do: nil
 
-  defp put_profile(cli, nil), do: Keyword.put(cli, :profile, nil)
-  defp put_profile(cli, name) when is_binary(name), do: Keyword.put(cli, :profile, name)
+  @doc false
+  # The setup phase's reload seam (ADR 0009): the completed selection (or the
+  # wizard's finish) re-loads through exactly this closure — nil (the
+  # wizard, defaultProfile decides) or a chosen profile name. Public so the
+  # boot tests exercise the real resolver the TUI receives.
+  @spec boot_resolver(String.t(), map(), keyword()) ::
+          (String.t() | nil -> Config.classification())
+  def boot_resolver(config_dir, env, cli) do
+    fn name -> Config.load(config_dir, env, Keyword.put(cli, :profile, name)) end
+  end
 
   defp test_env? do
     Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) and Mix.env() == :test

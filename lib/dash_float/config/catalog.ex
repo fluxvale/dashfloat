@@ -64,8 +64,6 @@ defmodule DashFloat.Config.Catalog do
       end
 
     {:ok, parsed}
-  rescue
-    _reason -> :error
   end
 
   defp parse(_other), do: :error

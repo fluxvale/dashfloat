@@ -448,10 +448,11 @@ defmodule DashFloat.Config.Migration do
 
     if marker?(main) and regular?(main, @main_file) and
          regular?(Path.join(dir, @keys_file), @keys_file) do
-      case read_and_decode(main) do
-        {:error, _message} = error -> error
-        {:ok, _raw, map} -> maybe_reshape(main, map)
-      end
+      # Total match: the split arm (which ran first, same file) already
+      # decoded these bytes successfully or errored before us — a failure
+      # here is not a reachable state.
+      {:ok, map} = JSON5.read_map(main)
+      maybe_reshape(main, map)
     else
       {:ok, :not_needed}
     end
@@ -595,19 +596,11 @@ defmodule DashFloat.Config.Migration do
     do: ~s(#{@keys_file}: "#{name}" holds a bare key but #{reason})
 
   defp merge_partial_keys(keys, moves) do
+    # One flat value per name (duplicate keys last-win at decode), so each
+    # move owns its name's nest outright.
     Enum.reduce(moves, keys, fn {name, base_url, value}, acc ->
-      nested = existing_nested(acc, name)
-      Map.put(acc, name, Map.put_new(nested, base_url, value))
+      Map.put(acc, name, %{base_url => value})
     end)
-  end
-
-  # A name that already carries nested entries (finish_partial's mixed
-  # state) keeps them; a flat slot is replaced by the fresh nest.
-  defp existing_nested(acc, name) do
-    case acc[name] do
-      %{} = map -> map
-      _flat_or_absent -> %{}
-    end
   end
 
   defp full_reshape(main, map) do
@@ -906,27 +899,14 @@ defmodule DashFloat.Config.Migration do
   # Byte-exact backup with the split's outcome vocabulary: :written /
   # :identical / :kept / :failed — never clobbered, never read through a
   # symlink (lstat first), 0600 whenever written, :absent when there is no
-  # source file to back up.
+  # source file to back up. Callers guarantee a REGULAR, just-read file
+  # (the reshape guards both before getting here), so the read is total.
   defp backup_bytes(path, label) do
-    backup = sibling(path, label)
-
-    cond do
-      not File.exists?(path) ->
-        :absent
-
-      not regular_file?(path) ->
-        Logger.warning("#{path} is not a regular file — not backing it up")
-        :failed
-
-      true ->
-        read_backup_source(path, backup, label)
-    end
-  end
-
-  defp read_backup_source(path, backup, label) do
-    case File.read(path) do
-      {:ok, raw} -> place_backup(raw, backup, label)
-      {:error, _reason} -> :failed
+    if File.exists?(path) do
+      {:ok, raw} = File.read(path)
+      place_backup(raw, sibling(path, label), label)
+    else
+      :absent
     end
   end
 
