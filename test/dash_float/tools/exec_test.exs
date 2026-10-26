@@ -171,17 +171,25 @@ defmodule DashFloat.Tools.ExecTest do
   end
 
   test "a successful command reaps children it left behind" do
+    # A per-run unique sleep DURATION, not a fixed "sleep 251": pgrep -f is a
+    # substring match over every process on the machine, and on shared CI
+    # runners an ambient process can carry the fixed string (two red runs
+    # cited survivors at early-boot PIDs on different hosts). Unique markers
+    # are the pattern the kill test below already uses.
+    duration = 251_000 + System.unique_integer([:positive])
+    marker = "sleep #{duration}"
+
     # A stale survivor from an earlier, broken run must not read as ours.
-    System.cmd("pkill", ["-9", "-f", "sleep 251"])
+    System.cmd("pkill", ["-9", "-f", marker])
     :timer.sleep(50)
 
     result =
-      Exec.run("sh -c 'sleep 251 >/dev/null 2>&1 & echo done'", sandbox("reap"), 5_000, 4_096)
+      Exec.run("sh -c '#{marker} >/dev/null 2>&1 & echo done'", sandbox("reap"), 5_000, 4_096)
 
     assert result.ok == true
     assert result.exit == 0
     assert result.output == "done\n"
-    assert_eventually_gone("sleep 251")
+    assert_eventually_gone(marker)
   end
 
   test "binary output is scrubbed to valid UTF-8" do
