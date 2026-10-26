@@ -17,6 +17,13 @@ defmodule DashFloat.CLI do
   @flags ["--profile", "--model"]
   @keys %{"--profile" => :profile, "--model" => :model}
 
+  @doc """
+  Whether argv asks for the version (`--version`), which the boot handles and
+  exits before config loading or terminal setup (ADR 0010).
+  """
+  @spec version?([String.t()]) :: boolean()
+  def version?(argv) when is_list(argv), do: "--version" in argv
+
   @doc "Parses argv into `[profile: name, model: name]`, warning and skipping what it does not recognize."
   @spec parse([String.t()]) :: keyword()
   def parse(argv) when is_list(argv) do
@@ -26,6 +33,10 @@ defmodule DashFloat.CLI do
   end
 
   defp do_parse([], acc), do: acc
+
+  # Handled by the boot before load (ADR 0010) — not a selection flag, and not
+  # a typo worth warning about.
+  defp do_parse(["--version" | rest], acc), do: do_parse(rest, acc)
 
   defp do_parse([flag, value | rest], acc) when flag in @flags do
     do_parse(rest, put_new(acc, Map.fetch!(@keys, flag), value))

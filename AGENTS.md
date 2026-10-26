@@ -4,7 +4,8 @@ Instructions for AI coding agents working in this repository.
 
 DashFloat is a fast, robust CLI AI coding harness in Elixir — OTP concurrency
 for streaming, tool execution, and session management, an `ex_ratatui` TUI, and
-`burrito` single-binary distribution. Before making architectural decisions,
+`mix release` tarballs distributed through an installer and Homebrew. Before
+making architectural decisions,
 read `docs/decisions/` — the ADRs record what was decided, why, and which
 alternatives were rejected. Do not re-litigate settled decisions.
 

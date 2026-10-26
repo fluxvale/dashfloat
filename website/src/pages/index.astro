@@ -37,10 +37,10 @@ import Base from "../layouts/Base.astro";
         </p>
       </li>
       <li>
-        <h3>Ships as one binary</h3>
+        <h3>Installs in one line</h3>
         <p>
-          burrito single-binary releases — no runtime to install, no bundles to
-          untangle.
+          A single curl | sh installs a self-contained release — no Erlang or
+          Elixir toolchain — with a Homebrew tap for macOS.
         </p>
       </li>
     </ul>
@@ -49,11 +49,10 @@ import Base from "../layouts/Base.astro";
   <section class="section quickstart">
     <h2>Quickstart</h2>
     <p class="status-note">
-      Pre-alpha. Requires Elixir 1.20 and Erlang/OTP 29.
+      Pre-alpha. One command, no Erlang or Elixir toolchain.
     </p>
-    <pre><code>git clone https://github.com/fluxvale/dashfloat.git
-cd dashfloat
-mix run --no-halt</code></pre>
+    <pre><code>curl -fsSL https://github.com/fluxvale/dashfloat/releases/latest/download/install.sh | sh
+dashfloat</code></pre>
     <p>
       Point it at any OpenAI-compatible provider in
       <code>~/.config/dashfloat/settings.json5</code> (API keys live in a sibling

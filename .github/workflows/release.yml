@@ -1,0 +1,469 @@
+name: Release
+
+# Builds DashFloat per platform on a `v*` tag and attaches the tarballs, the
+# combined sha256 checksums, and the installer to that tag's GitHub Release.
+# Then it installs the *published* assets through the real installer on a
+# clean Debian container and on both macOS runners (ADR 0010).
+#
+# workflow_dispatch is a rehearsal: it builds every platform and runs the
+# installer against those build artifacts, publishing nothing. That is how the
+# pipeline is exercised before a tag exists.
+#
+# Linux is built inside a pinned debian:bookworm container so the glibc floor
+# (2.34, measured) is a property of the image, not of whatever OS GitHub's
+# runner has this month. macOS has no container story: each arch builds
+# natively.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Version + tag agreement in one place, so a mistyped tag cannot ship a
+  # release whose assets disagree with the binary's own --version.
+  prepare:
+    name: resolve version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read mix.exs version and check the tag
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^ *version: "\([^"]*\)",$/\1/p' mix.exs | head -1)
+          if [ -z "$version" ]; then
+            echo "could not read version from mix.exs" >&2
+            exit 1
+          fi
+          if [ "$REF_TYPE" = "tag" ] && [ "$REF_NAME" != "v$version" ]; then
+            echo "tag $REF_NAME does not match mix.exs version $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Only a tag publishes; a dispatch run is a rehearsal.
+          if [ "$REF_TYPE" = "tag" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The glibc baseline. The image is dated, not floating: moving the floor is a
+  # deliberate commit, never a silent change under an existing artifact.
+  build-linux:
+    name: linux x86_64 (glibc 2.34)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: hexpm/elixir:1.20.4-erlang-29.1.2-debian-bookworm-20261020
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache deps and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            deps
+            _build
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            release-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build release
+        env:
+          MIX_ENV: prod
+        run: |
+          mix deps.get --check-locked
+          mix release --overwrite
+
+      # Prove the artifact, not the build tree: this is the exact directory the
+      # tarball ships. --version forces the NIF to load.
+      - name: Smoke the assembled release
+        run: |
+          ./_build/prod/rel/dashfloat/bin/dashfloat --version
+          ./_build/prod/rel/dashfloat/bin/dashfloat eval \
+            'IO.puts(Base.encode16(:crypto.hash(:sha256, "dashfloat")))'
+          # Fail the build if the artifact ever needs a newer glibc than the
+          # ADR promises, instead of discovering it on a user's machine.
+          floor=$(objdump -T _build/prod/rel/dashfloat/erts-*/bin/beam.smp \
+            | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "measured glibc floor: $floor"
+          test "$floor" = "GLIBC_2.34"
+          echo "--- ERTS linkage ---"
+          ldd _build/prod/rel/dashfloat/erts-*/bin/beam.smp | grep -E 'libtinfo|libstdc\+\+|libc\.so'
+          echo "--- crypto NIF linkage ---"
+          readelf -d _build/prod/rel/dashfloat/lib/crypto-*/priv/lib/crypto.so | grep NEEDED
+          echo "--- ex_ratatui NIF ---"
+          ls -l _build/prod/rel/dashfloat/lib/ex_ratatui-*/priv/native/
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -eu
+          mkdir -p dist
+          asset="dashfloat-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          # Release root at the tarball root: the installer extracts into an
+          # empty versioned dir and Homebrew's libexec.install Dir["*"] both
+          # expect the contents directly (ADR 0010).
+          tar -czf "dist/$asset" -C _build/prod/rel/dashfloat .
+          ls -l dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-linux-x86_64
+          path: dist/*
+          retention-days: 7
+
+  build-macos:
+    name: ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        id: setup-beam
+        with:
+          elixir-version: "1.20.x"
+          otp-version: "29"
+
+      - name: Cache deps and build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            deps
+            _build
+          key: release-${{ matrix.target }}-${{ steps.setup-beam.outputs.elixir-version }}-${{ steps.setup-beam.outputs.otp-version }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            release-${{ matrix.target }}-${{ steps.setup-beam.outputs.elixir-version }}-${{ steps.setup-beam.outputs.otp-version }}-
+
+      - name: Build release
+        env:
+          MIX_ENV: prod
+        run: |
+          mix deps.get --check-locked
+          mix release --overwrite
+
+      # Each matrix entry must resolve its own precompiled NIF. A wrong or
+      # missing artifact has to fail here, not on a user's machine.
+      - name: Smoke the assembled release
+        run: |
+          ./_build/prod/rel/dashfloat/bin/dashfloat --version
+          echo "--- NIF in the assembled release ---"
+          ls -l _build/prod/rel/dashfloat/lib/ex_ratatui-*/priv/native/
+          file _build/prod/rel/dashfloat/lib/ex_ratatui-*/priv/native/*.so
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          mkdir -p dist
+          asset="dashfloat-${VERSION}-${TARGET}.tar.gz"
+          tar -czf "dist/$asset" -C _build/prod/rel/dashfloat .
+          ls -l dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          retention-days: 7
+
+  # One Release per tag. Checksums are computed here, once, over the artifacts
+  # that actually uploaded — no per-job checksum files to collide or disagree.
+  publish:
+    name: publish release
+    needs: [prepare, build-linux, build-macos]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums, installer, and completeness check
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -eu
+          ls -l dist
+          # Refuse to publish a release that does not carry all three targets.
+          for target in x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
+            test -f "dist/dashfloat-$VERSION-$target.tar.gz"
+          done
+          (cd dist && sha256sum ./*.tar.gz | sed 's#  \./#  #' > "dashfloat-$VERSION-sha256sums.txt")
+          # The installer ships with the release, so the URL users pipe from is
+          # the script that belongs to that version.
+          cp install.sh dist/install.sh
+          cat "dist/dashfloat-$VERSION-sha256sums.txt"
+          sha256sum dist/install.sh
+
+      - name: Write release notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          cat > notes.md <<EOF
+          DashFloat $VERSION — the first packaged release.
+
+          ## Install
+
+          \`\`\`sh
+          curl -fsSL https://github.com/fluxvale/dashfloat/releases/latest/download/install.sh | sh
+          \`\`\`
+
+          Installs into \`~/.local/share/dashfloat\`, puts a shim in
+          \`~/.local/bin\`, verifies the sha256 before extracting, and prunes the
+          previous version on upgrade. Pin this version with
+          \`DASHFLOAT_VERSION=$VERSION\`.
+          EOF
+
+          # Homebrew is the macOS-native path but lives in a separate repo, so
+          # the notes promise it only once the tap exists — otherwise the
+          # install line in every release would 404.
+          if gh api repos/fluxvale/homebrew-tap >/dev/null 2>&1; then
+            cat >> notes.md <<'EOF'
+
+          macOS with Homebrew:
+
+          ```sh
+          brew install fluxvale/tap/dashfloat
+          ```
+          EOF
+          fi
+
+          cat >> notes.md <<EOF
+
+          ## macOS: first launch of an unsigned build
+
+          These binaries are not notarized. A copy downloaded **with a browser**
+          carries the quarantine flag and macOS refuses it with "unidentified
+          developer". Clear it once, either way:
+
+          - Finder: right-click (or Control-click) \`dashfloat\`, choose **Open**,
+            then **Open** again in the dialog.
+          - Terminal: \`xattr -d com.apple.quarantine "\$(command -v dashfloat)"\`.
+
+          Installing with \`curl\` or Homebrew sets no quarantine flag, so there is
+          nothing to clear. Notarization is not part of $VERSION.
+
+          ## Linux requirements
+
+          Built on Debian 12 and needs glibc 2.34+, so it runs on Debian 12+,
+          Ubuntu 22.04+, and current Fedora/RHEL; Debian 11 does not. It links the system
+          \`libtinfo.so.6\`, \`libstdc++.so.6\`, and OpenSSL 3
+          (\`libcrypto.so.3\`); those are present on the distributions above but
+          not necessarily in a minimal container — the installer checks first
+          and names the package. Debian 11 and Alpine/musl are not supported,
+          nor is Linux arm64.
+
+          ## Verify
+
+          \`\`\`sh
+          curl -fsSLO https://github.com/fluxvale/dashfloat/releases/download/v$VERSION/dashfloat-$VERSION-sha256sums.txt
+          sha256sum -c dashfloat-$VERSION-sha256sums.txt   # macOS: shasum -a 256 -c
+          \`\`\`
+
+          Windows is not supported in $VERSION.
+          EOF
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "DashFloat ${TAG#v}" --notes-file notes.md
+          fi
+          gh release upload "$TAG" dist/* --clobber
+          gh release view "$TAG" --json assets --jq '.assets[].name'
+
+  # Rehearsal: the same installer, against the artifacts this run just built,
+  # with no release to fetch from. Proves the whole path before a tag exists.
+  smoke-rehearsal:
+    name: install smoke (rehearsal, debian:stable)
+    needs: [prepare, build-linux, build-macos]
+    if: needs.prepare.outputs.publish != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container:
+      image: debian:stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Install from the built artifacts and ask for the version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -eu
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ca-certificates curl python3 >/dev/null
+          . /etc/os-release; echo "--- host: $PRETTY_NAME ($(ldd --version | head -1))"
+          (cd dist && sha256sum ./*.tar.gz | sed 's#  \./#  #' > "dashfloat-$VERSION-sha256sums.txt")
+          (cd dist && setsid python3 -m http.server 8765 >/dev/null 2>&1 &)
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            curl -fsS -o /dev/null http://127.0.0.1:8765/ && break
+            sleep 0.5
+          done
+          echo "--- installer (same script users get) ---"
+          DASHFLOAT_VERSION="$VERSION" \
+          DASHFLOAT_RELEASE_BASE_URL=http://127.0.0.1:8765 \
+            sh ./install.sh
+          echo "--- installed binary ---"
+          export PATH="$HOME/.local/bin:$PATH"
+          command -v dashfloat
+          dashfloat --version
+
+  # The DoD proof, on the published assets, through the real installer — the
+  # same command a user runs. debian:stable is the ticket's clean container;
+  # debian:bookworm is the declared floor, so that claim is tested too;
+  # bullseye (glibc 2.31) is the negative case, so the floor is proved to be a
+  # real limit rather than an assumption nobody checked.
+  smoke-linux:
+    name: install smoke (debian:${{ matrix.release }})
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container:
+      image: debian:${{ matrix.release }}
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [bookworm, stable]
+        include:
+          - release: bullseye
+            expect_failure: true
+    steps:
+      - name: Install from the release, then ask the binary its version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DEBIAN_RELEASE: ${{ matrix.release }}
+          EXPECT_FAILURE: ${{ matrix.expect_failure }}
+        run: |
+          set -eu
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ca-certificates curl binutils >/dev/null
+          . /etc/os-release; echo "--- host: $PRETTY_NAME ($(ldd --version | head -1))"
+          echo "--- installer (curl | sh, exactly what a user runs) ---"
+          if [ "${EXPECT_FAILURE:-false}" = "true" ]; then
+            # Below the declared floor: the installer or the binary must fail
+            # with a clear message. A success here would mean the floor claim
+            # is wrong.
+            if curl -fsSL "https://github.com/fluxvale/dashfloat/releases/download/v$VERSION/install.sh" | sh; then
+              echo "expected the install to fail on this glibc, but it succeeded" >&2
+              exit 1
+            fi
+            echo "install correctly refused on $(. /etc/os-release; echo "$PRETTY_NAME")"
+            exit 0
+          fi
+          curl -fsSL "https://github.com/fluxvale/dashfloat/releases/download/v$VERSION/install.sh" | sh
+          echo "--- installed binary ---"
+          export PATH="$HOME/.local/bin:$PATH"
+          command -v dashfloat
+          dashfloat --version
+          echo "--- linkage of the installed tree ---"
+          root="$HOME/.local/share/dashfloat/current"
+          ldd "$root"/erts-*/bin/beam.smp | grep -E 'libtinfo|libstdc\+\+|libc\.so'
+          readelf -d "$root"/lib/crypto-*/priv/lib/crypto.so | grep NEEDED
+          echo "--- OpenSSL NIF actually loads ---"
+          "$root/bin/dashfloat" eval 'IO.puts(Base.encode16(:crypto.hash(:sha256, "dashfloat")))'
+          echo "--- ex_ratatui NIF in the installed tree ---"
+          ls -l "$root"/lib/ex_ratatui-*/priv/native/
+
+  # macOS has no container: the runner is the clean machine, and both
+  # architectures install from the real installer.
+  smoke-macos:
+    name: install smoke (${{ matrix.target }})
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - name: Install from the release, then ask the binary its version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -eu
+          echo "--- host ---"
+          sw_vers
+          uname -m
+          echo "--- installer (curl | sh, exactly what a user runs) ---"
+          curl -fsSL "https://github.com/fluxvale/dashfloat/releases/download/v$VERSION/install.sh" | sh
+          echo "--- installed binary ---"
+          export PATH="$HOME/.local/bin:$PATH"
+          command -v dashfloat
+          dashfloat --version
+          echo "--- linkage of the installed tree ---"
+          root="$HOME/.local/share/dashfloat/current"
+          otool -L "$root"/erts-*/bin/beam.smp | head -12
+          ls -l "$root"/lib/ex_ratatui-*/priv/native/
+          echo "--- NIF loads ---"
+          "$root/bin/dashfloat" eval 'IO.puts(Base.encode16(:crypto.hash(:sha256, "dashfloat")))'

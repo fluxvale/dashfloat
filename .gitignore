@@ -28,9 +28,6 @@ dash_float-*.tar
 # Mix internal state.
 /.mix/
 
-# Burrito release output.
-/burrito_out/
-
 # Local agent model pins — never committed.
 /opencode.jsonc
 

@@ -32,3 +32,4 @@ their replacement.
 | [0007](0007-tool-calls-and-execution.md) | Tool calls & execution: agent loop, five tools, path policy, confirmations | Accepted |
 | [0008](0008-config-layout-profiles-json5.md) | Config layout v2: single-file JSON5 with profiles | Accepted |
 | [0009](0009-config-v3-persona-profiles.md) | Config layout v3: persona profiles, endpoint-keyed keys, deliberate selection, onboarding | Accepted |
+| [0010](0010-release-packaging.md) | Release packaging: core `mix release` tarballs, installer, Homebrew | Accepted |

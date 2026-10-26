@@ -302,11 +302,10 @@ defmodule DashFloat.TUI do
 
   @impl ExRatatui.App
   def terminate(reason, state) do
-    # Standalone runs (`mix run --no-halt`, future burrito binary) exit the VM
-    # when the TUI quits so the shell prompt comes back. Only an explicit quit
-    # is a success — a supervisor-driven or failing shutdown reports 1 (ADR
-    # 0002). Test-mode instances own no real terminal and must not stop the
-    # test VM.
+    # Standalone runs (`mix run --no-halt`, release binary) exit the VM when
+    # the TUI quits so the shell prompt comes back. Only an explicit quit is a
+    # success — a supervisor-driven or failing shutdown reports 1 (ADR 0002).
+    # Test-mode instances own no real terminal and must not stop the test VM.
     code = exit_code(reason)
     if state.live?, do: System.stop(code)
 

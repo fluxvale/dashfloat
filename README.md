@@ -7,8 +7,9 @@ DashFloat streams LLM responses, executes structured tool calls, and manages
 coding sessions from the terminal. It is built on OTP concurrency — a pure
 render-loop UI process, an agent-manager GenServer, stream-handler tasks, and
 isolated subprocess execution — with an
-[`ex_ratatui`](https://hex.pm/packages/ex_ratatui) TUI and
-[`burrito`](https://hex.pm/packages/burrito) single-binary distribution.
+[`ex_ratatui`](https://hex.pm/packages/ex_ratatui) TUI, packaged with core
+[`mix release`](https://hexdocs.pm/mix/Mix.Tasks.Release.html) tarballs
+([ADR 0010](docs/decisions/0010-release-packaging.md)).
 
 Website: <https://dashfloat.com> — the landing page and these docs, rendered.
 
@@ -20,6 +21,25 @@ SSE client streams tokens into the existing TUI
 ([ADR 0002](docs/decisions/0002-tui-skeleton.md)). Next up per the
 [ADR 0001](docs/decisions/0001-founding-stack-and-architecture.md) roadmap: tool
 call execution, context management & history persistence.
+
+## Install
+
+```sh
+curl -fsSL https://github.com/fluxvale/dashfloat/releases/latest/download/install.sh | sh
+```
+
+No Erlang or Elixir toolchain needed: the release bundles ERTS. The installer
+verifies the tarball's sha256 before extracting, installs into
+`~/.local/share/dashfloat/versions/<version>` behind a `current` symlink, puts
+a shim in `~/.local/bin`, and prunes the previous version on upgrade. Pin a
+version with `DASHFLOAT_VERSION=0.1.0`. On macOS, Homebrew is the native path
+(`brew install fluxvale/tap/dashfloat`), and unsigned builds need a one-time
+right-click-open — see the [release notes](https://github.com/fluxvale/dashfloat/releases).
+Linux builds need glibc 2.34+ (Debian 12+, Ubuntu 22.04+), OpenSSL 3,
+`libtinfo.so.6`, and `libstdc++.so.6`; the installer checks for those first
+and names the package to install. Debian 11, Alpine/musl, Linux arm64, and
+Windows are not supported yet. Packaging details:
+[ADR 0010](docs/decisions/0010-release-packaging.md).
 
 ## Run it
 
@@ -120,8 +140,10 @@ with keys, keyless endpoints, and v3-shaped files missing
 [ADR 0009](docs/decisions/0009-config-v3-persona-profiles.md). Then:
 
 ```sh
-mix run --no-halt
+dashfloat
 ```
+
+From a source checkout, `mix run --no-halt` runs the same TUI.
 
 Type a prompt and press Enter: tokens stream into the log and the status bar
 flips Streaming → Idle when the reply completes. Press Esc mid-stream to cancel
@@ -146,7 +168,6 @@ loopback server).
   ratatui bindings, precompiled NIFs)
 - [`req`](https://hex.pm/packages/req) — HTTP / SSE streaming
 - [`jason`](https://hex.pm/packages/jason) — JSON
-- [`burrito`](https://hex.pm/packages/burrito) — single-binary releases
 
 ## Development
 
