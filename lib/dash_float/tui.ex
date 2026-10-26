@@ -18,6 +18,8 @@ defmodule DashFloat.TUI do
   # back blank (ADR 0002). The behaviour form is documented as equivalent.
   @behaviour ExRatatui.App
 
+  alias DashFloat.Config
+  alias DashFloat.Config.Catalog
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
@@ -54,9 +56,31 @@ defmodule DashFloat.TUI do
   @impl ExRatatui.App
   def mount(opts) do
     # The agent monitor lives in this process, not State.new/1 — State stays
-    # free of side effects (ADR 0007).
-    state = State.new(opts)
-    {:ok, State.claim_agent(state)}
+    # free of side effects (ADR 0007). The standing catalog refresh starts
+    # here too (ADR 0009): supervised, unlinked, fail-open — live runs use
+    # the real HTTP path, tests inject `catalog_fetcher:`.
+    opts
+    |> State.new()
+    |> State.claim_agent()
+    |> maybe_start_catalog()
+    |> then(&{:ok, &1})
+  end
+
+  defp maybe_start_catalog(%State{provider: {:ok, %Config{providers: [_head | _tail]}}} = state) do
+    if state.live? or state.catalog_fetcher do
+      start_catalog(state)
+    else
+      state
+    end
+  end
+
+  defp maybe_start_catalog(%State{} = state), do: state
+
+  defp start_catalog(%State{} = state) do
+    opts = if state.catalog_fetcher, do: [fetch: state.catalog_fetcher], else: []
+    {:ok, config} = state.provider
+    _result = Catalog.refresh_async(config.providers, opts)
+    state
   end
 
   @impl ExRatatui.App
@@ -69,10 +93,8 @@ defmodule DashFloat.TUI do
 
     case action do
       :quit -> {:stop, state}
-      {:submit, prompt} -> schedule(prompt_agent(prompt, state))
-      {:confirm, decision} -> schedule(confirm_decision(decision, state))
-      :cancel -> schedule(cancel_agent(state))
       nil -> schedule(state)
+      _setup_action -> setup_action(action, state)
     end
   end
 
@@ -115,6 +137,16 @@ defmodule DashFloat.TUI do
   def handle_event(%ExRatatui.Event.Paste{}, %{confirm: pending} = state) when pending != nil,
     do: schedule(state)
 
+  # The startup phase owns PASTE as well as keys (P1-2, hostile review): the
+  # key step's own copy says "paste it", and a paste routed to the hidden
+  # composer would leave the credential as pending chat text — then submit
+  # it to the provider on the first post-setup Enter. Setup pastes feed the
+  # wizard's draft; the forced-selection modal has no text step, so pastes
+  # there are inert.
+  def handle_event(%ExRatatui.Event.Paste{content: content}, %State{setup: setup} = state)
+      when setup != nil,
+      do: schedule(State.setup_paste(state, content))
+
   def handle_event(%ExRatatui.Event.Paste{content: content}, state),
     do: schedule(State.paste(state, content))
 
@@ -122,6 +154,25 @@ defmodule DashFloat.TUI do
     do: schedule(State.resize(state, w, h))
 
   def handle_event(_event, state), do: schedule(state)
+
+  # The startup phase's actions (ADR 0009) — the chat actions stay above.
+  defp setup_action({:submit, prompt}, state), do: schedule(prompt_agent(prompt, state))
+  defp setup_action({:confirm, decision}, state), do: schedule(confirm_decision(decision, state))
+  defp setup_action(:cancel, state), do: schedule(cancel_agent(state))
+
+  defp setup_action({:select_profile, name}, state),
+    do: schedule(resolve_setup(state, name))
+
+  defp setup_action(:setup_finish, state), do: schedule(resolve_setup(state, nil))
+
+  defp setup_action({:write_key, {profile, base_url, value}}, state),
+    do: schedule(write_wizard_key(state, profile, base_url, value))
+
+  defp setup_action({:fetch_models, {base_url, raw_key}}, state),
+    do: schedule(fetch_wizard_models(state, base_url, raw_key))
+
+  defp setup_action({:write_settings, doc}, state),
+    do: schedule(write_wizard_settings(state, doc))
 
   @impl ExRatatui.App
   def handle_info(@tick, state) do
@@ -164,6 +215,16 @@ defmodule DashFloat.TUI do
 
   def handle_info({:confirm, _ref, _payload} = msg, state),
     do: schedule(State.stream_message(state, msg))
+
+  # The standing catalog refresh landed (ADR 0009): in-memory merge, the
+  # context denominator fills in, nothing else changes.
+  def handle_info({:catalog, results}, state),
+    do: schedule(State.catalog_arrived(state, results))
+
+  # The wizard's /models fetch landed (ADR 0009): feeds the picker; any
+  # failure already degraded to manual entry by the fetch's fail-open.
+  def handle_info({:wizard_models, result}, state),
+    do: schedule(State.models_arrived(state, result))
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     {state, _verdict} = State.agent_down(state, ref, reason)
@@ -285,10 +346,103 @@ defmodule DashFloat.TUI do
 
   defp write_clipboard(_state, _no_copy), do: :ok
 
+  # A cancelled stream; the seam contract is plain sends both directions.
   defp cancel_agent(state) do
     send(state.agent, {:cancel})
     state
   end
+
+  ## The startup phase's side effects (ADR 0009 — the sanctioned exception
+  ## to "the UI performs no file I/O", scoped exactly to setup): the wizard's
+  ## writes and fetches run through the config layer's atomic machinery and
+  ## the supervised task pool, never inline rendering paths.
+
+  # A profile was chosen (modal) or the wizard finished: re-load through the
+  # Application's resolver and deliver the outcome to the agent and the
+  # catalog refresh.
+  defp resolve_setup(%State{} = state, name) do
+    case state.resolve do
+      nil ->
+        {cleared, _action} = State.provider_resolved(state, {:error, "no provider configured"})
+        cleared
+
+      resolve ->
+        # P2-3 (hostile review): the handoff normalizes at the boundary —
+        # the agent's provider is ALWAYS {:ok, _} | {:error, msg}. A raw
+        # :onboard / {:select, _} classification (a failed settings write
+        # leaving zero profiles, say) used to reach the agent's case and
+        # crash it on the first prompt; now it becomes a human-readable
+        # error the agent DISPLAYS.
+        provider = for_agent(safe_resolve(resolve, name))
+        {resolved, {:agent_provider, provider}} = State.provider_resolved(state, provider)
+
+        send(state.agent, {:set_provider, provider})
+        restart_catalog(resolved, provider)
+    end
+  end
+
+  defp for_agent({:ok, _config} = ok), do: ok
+  defp for_agent({:error, _message} = error), do: error
+
+  defp for_agent(:onboard),
+    do: {:error, "first-run setup is incomplete — finish the wizard, or configure by hand"}
+
+  defp for_agent({:select, names}),
+    do: {:error, "no profile selected — choose one of: " <> Enum.join(names, ", ")}
+
+  # A resolved working config restarts the standing catalog refresh under
+  # the new provider set (ADR 0009).
+  defp restart_catalog(%State{} = resolved, {:ok, %Config{providers: [_head | _tail]}}),
+    do: maybe_start_catalog(resolved)
+
+  defp restart_catalog(%State{} = resolved, _classification), do: resolved
+
+  # The resolver reads files and runs migrations; its failure mode is the
+  # classification's own error arm, never a crash in the UI process.
+  defp safe_resolve(resolve, name) do
+    resolve.(name)
+  rescue
+    _reason -> {:error, "config could not be loaded"}
+  end
+
+  defp write_wizard_key(%State{} = state, profile, base_url, value) do
+    case Config.write_keys_entry(state.config_dir, profile, base_url, value) do
+      :ok ->
+        state
+
+      {:error, message} ->
+        Logger.warning(message)
+        state
+    end
+  end
+
+  defp write_wizard_settings(%State{} = state, document) do
+    case Config.write_settings(state.config_dir, document) do
+      :ok ->
+        state
+
+      {:error, message} ->
+        Logger.warning(message)
+        state
+    end
+  end
+
+  # The wizard's /models fetch: a supervised task so a 5 s timeout never
+  # blocks the UI; the result lands as `{:wizard_models, _}`. A `$ENV_VAR`
+  # key resolves here — the wizard stores references verbatim.
+  defp fetch_wizard_models(%State{} = state, base_url, raw_key) do
+    parent = self()
+    key = resolve_wizard_key(raw_key)
+
+    Task.Supervisor.start_child(DashFloat.TaskSupervisor, fn ->
+      send(parent, {:wizard_models, Catalog.fetch(base_url, key)})
+    end)
+
+    state
+  end
+
+  defp resolve_wizard_key("$" <> var) when byte_size(var) > 0, do: System.get_env(var)
+  defp resolve_wizard_key(literal) when is_binary(literal), do: literal
 
   defp confirm_decision(decision, %{confirm: %{ref: ref}} = state) do
     send(state.agent, {:confirm_decision, ref, decision})

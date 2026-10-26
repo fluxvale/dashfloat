@@ -6,7 +6,12 @@
   **amended 2026-10-25** ([issue #28](https://github.com/fluxvale/dashfloat/issues/28) —
   layout margin, double Ctrl+C exit guard, mouse selection/copy; see
   [Amendment (2026-10-25, issue #28)](#amendment-2026-10-25-issue-28-margin-exit-guard-mouse-selection)
-  below)
+  below); **amended 2026-10-26** ([issue #32](https://github.com/fluxvale/dashfloat/issues/32) —
+  the overlay vocabulary gains two startup screens, the forced-selection
+  modal and the onboarding wizard, rendered in place of the chat chrome
+  until setup clears; specification and screens:
+  [ADR 0009](0009-config-v3-persona-profiles.md) § "Startup classification"
+  and § "First-run onboarding wizard")
 - **Date:** 2026-10-24
 - **Implements:** [issue #16](https://github.com/fluxvale/dashfloat/issues/16) — Phase 2.5 of the
   [ADR 0001](0001-founding-stack-and-architecture.md) roadmap.

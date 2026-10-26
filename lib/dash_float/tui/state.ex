@@ -13,6 +13,7 @@ defmodule DashFloat.TUI.State do
   See ADRs 0002, 0006, and 0007.
   """
 
+  alias DashFloat.Config.Onboarding
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.View
@@ -28,8 +29,25 @@ defmodule DashFloat.TUI.State do
           lines: [ExRatatui.Text.Line.t()]
         }
   @type confirm :: %{ref: term(), id: term(), name: String.t()}
+
+  @typedoc """
+  One keypress's outcome. The chat actions are ADR 0002/0006/0007; the
+  setup actions (ADR 0009) carry the wizard's side-effecting steps to the
+  TUI runner: a profile picked in the forced-selection modal, the wizard's
+  finish handoff, an immediate keys.json5 write, the `/models` fetch, and
+  the final settings.json5 write.
+  """
   @type action ::
-          :quit | {:submit, String.t()} | {:confirm, :approved | :rejected} | :cancel | nil
+          :quit
+          | {:submit, String.t()}
+          | {:confirm, :approved | :rejected}
+          | :cancel
+          | nil
+          | {:select_profile, String.t()}
+          | :setup_finish
+          | {:write_key, {String.t(), String.t(), String.t()}}
+          | {:fetch_models, {String.t(), String.t()}}
+          | {:write_settings, map()}
 
   @type stats :: %{
           tokens: non_neg_integer(),
@@ -50,12 +68,25 @@ defmodule DashFloat.TUI.State do
   @exit_window_ms 2_000
 
   @enforce_keys [:input]
+
+  # A crash report prints this state (P1-3, hostile review): the startup
+  # phase can hold the wizard's plaintext key (draft / pending.key), and
+  # ADR 0005's never-echo rule must hold in the log exactly as it holds on
+  # the masked screen. `setup` is excluded wholesale; the provider config
+  # carries its own derivation.
+  @derive {Inspect, except: [:setup]}
   defstruct [
     :input,
     :provider,
     :cwd,
     :agent,
     :confirm,
+    # The startup phase (ADR 0009): the forced-selection modal or the
+    # onboarding wizard, rendered instead of the chat UI until it clears.
+    :setup,
+    :config_dir,
+    :resolve,
+    :catalog_fetcher,
     phase: :idle,
     entries: [],
     in_flight: nil,
@@ -82,7 +113,10 @@ defmodule DashFloat.TUI.State do
     size: @default_size,
     live?: false,
     agent_ref: nil,
-    selection: nil
+    selection: nil,
+    # The standing catalog refresh's landing state (ADR 0009): per-provider
+    # fetched entries, keyed by baseUrl. In-memory per session only.
+    catalog: %{}
   ]
 
   @type t :: %__MODULE__{
@@ -109,8 +143,21 @@ defmodule DashFloat.TUI.State do
           confirm: confirm() | nil,
           exit_guard_at: integer() | nil,
           exit_guard_ref: reference() | nil,
-          selection: Selection.t() | nil
+          selection: Selection.t() | nil,
+          setup: setup() | nil,
+          config_dir: String.t() | nil,
+          resolve: (String.t() | nil -> DashFloat.Config.classification()) | nil,
+          catalog: %{optional(String.t()) => [DashFloat.Config.Catalog.entry()]},
+          catalog_fetcher:
+            (String.t(), String.t() | nil -> {:ok, [DashFloat.Config.Catalog.entry()]} | :error)
+            | nil
         }
+
+  @typedoc """
+  The startup phase (ADR 0009): `{:select, names, index}` is the
+  forced-selection modal; `%Onboarding{}` is the wizard.
+  """
+  @type setup :: {:select, [String.t()], non_neg_integer()} | DashFloat.Config.Onboarding.t()
 
   @typedoc """
   One message of the stream contract (see `stream_message/2` and ADR 0002 /
@@ -163,7 +210,11 @@ defmodule DashFloat.TUI.State do
       confirm: nil,
       cwd: cwd_label(),
       size: initial_size(opts),
-      live?: is_nil(Keyword.get(opts, :test_mode))
+      live?: is_nil(Keyword.get(opts, :test_mode)),
+      setup: Keyword.get(opts, :setup),
+      config_dir: Keyword.get(opts, :config_dir),
+      resolve: Keyword.get(opts, :resolve),
+      catalog_fetcher: Keyword.get(opts, :catalog_fetcher)
     }
   end
 
@@ -185,13 +236,117 @@ defmodule DashFloat.TUI.State do
   defp label(%DashFloat.Config{model: model}) when is_binary(model), do: model
   defp label(_other), do: nil
 
-  @doc "The provider's context window, or nil when it was not configured."
+  # The startup phase (ADR 0009) owns every key until it clears: the wizard
+  # or the forced-selection modal replaces the chat UI. The global Ctrl+C /
+  # Ctrl+Q clauses above still quit from here — deliberateness includes the
+  # right to leave.
+  defp setup_key(%{setup: {:select, names, index}} = state, code) do
+    case code do
+      "up" -> {%{state | setup: {:select, names, move_index(index, -1, names)}}, nil}
+      "down" -> {%{state | setup: {:select, names, move_index(index, 1, names)}}, nil}
+      "enter" -> {state, {:select_profile, Enum.at(names, index)}}
+      _other -> {state, nil}
+    end
+  end
+
+  defp setup_key(%{setup: %Onboarding{} = wizard} = state, code) do
+    {wizard, action} = Onboarding.handle_key(wizard, code)
+    {%{state | setup: wizard}, translate(action)}
+  end
+
+  # The wizard's pure actions become TUI actions the runner executes (file
+  # writes through the config layer, the async fetch, the finish handoff);
+  # quitting is the TUI router's global Ctrl+C/Ctrl+Q, not a wizard action.
+  defp translate(nil), do: nil
+  defp translate({:write_key, _spec} = action), do: action
+  defp translate({:fetch_models, _spec} = action), do: action
+  defp translate({:write_settings, _doc} = action), do: action
+  defp translate(:finish), do: :setup_finish
+
+  defp move_index(index, delta, names) do
+    count = length(names)
+    if count == 0, do: 0, else: rem(index + delta + count, count)
+  end
+
+  @doc """
+  A selection was made (or the wizard finished): the resolved classification
+  replaces the provider everywhere — the UI state here, the agent via the
+  TUI's `{:set_provider, _}` send — and the startup phase clears. The
+  returned action tells the TUI to do the agent send and start the catalog
+  refresh (ADR 0009).
+  """
+  @spec provider_resolved(t(), DashFloat.Config.classification()) ::
+          {t(), {:agent_provider, DashFloat.Config.classification()}}
+  def provider_resolved(%__MODULE__{} = state, classification) do
+    # The class guard (P1-2, hostile review): leaving setup CLEARS the
+    # composer — whatever a routing bug of the day may have dropped there
+    # mid-setup, a credential pasted at the wrong moment can never become
+    # chat prompt text.
+    ExRatatui.textarea_set_value(state.input, "")
+
+    {%{state | setup: nil, provider: classification}, {:agent_provider, classification}}
+  end
+
+  @doc """
+  A paste while the startup phase owns the screen (P1-2, hostile review):
+  the wizard's text steps take the content as typed input (newlines
+  normalized away — a key pasted with a trailing newline is the common
+  shape); the forced-selection modal has no text input, so pastes are
+  inert. The chat composer is never touched while setup is active.
+  """
+  @spec setup_paste(t(), String.t()) :: t()
+  def setup_paste(%__MODULE__{setup: %Onboarding{} = wizard} = state, content) do
+    %{state | setup: Onboarding.paste(wizard, content)}
+  end
+
+  def setup_paste(%__MODULE__{} = state, _content), do: state
+
+  @doc """
+  The wizard's `/models` fetch landed (ADR 0009): feeds the picker when the
+  wizard is waiting on it, ignores anything stale.
+  """
+  @spec models_arrived(t(), term()) :: t()
+  def models_arrived(%__MODULE__{setup: %Onboarding{} = wizard} = state, result) do
+    %{state | setup: Onboarding.models_arrived(wizard, result)}
+  end
+
+  def models_arrived(%__MODULE__{} = state, _result), do: state
+
+  @doc """
+  The standing catalog refresh landed (ADR 0009): per-provider entries are
+  stored in memory — the one observable effect today is the status bar's
+  context denominator filling in for a selected model whose config entry
+  carried no `context`. Nothing is written back to settings.json5.
+  """
+  @spec catalog_arrived(t(), %{optional(String.t()) => [DashFloat.Config.Catalog.entry()]}) :: t()
+  def catalog_arrived(%__MODULE__{} = state, catalog) when is_map(catalog) do
+    %{state | catalog: catalog}
+  end
+
+  @doc "The provider's context window, or the catalog's fresh value for the selected model when the config entry carried none (ADR 0009)."
   @spec provider_context_tokens(t()) :: pos_integer() | nil
   def provider_context_tokens(%__MODULE__{provider: {:ok, %{context_tokens: n}}})
       when is_integer(n) and n > 0,
       do: n
 
+  def provider_context_tokens(%__MODULE__{
+        provider: {:ok, %{context_tokens: nil, model: model, base_url: base_url}},
+        catalog: catalog
+      }) do
+    case catalog do
+      %{^base_url => entries} -> catalog_context(entries, model)
+      _other -> nil
+    end
+  end
+
   def provider_context_tokens(%__MODULE__{}), do: nil
+
+  defp catalog_context(entries, model) do
+    case Enum.find(entries, &(&1.model == model)) do
+      %{context: context} when is_integer(context) and context > 0 -> context
+      _other -> nil
+    end
+  end
 
   @doc "The status bar's cwd label (`~/<last two segments>`, computed at new/1)."
   @spec cwd_label(t()) :: String.t()
@@ -318,6 +473,14 @@ defmodule DashFloat.TUI.State do
 
   # Ctrl+Q stays the immediate, deliberate quit (named in the placeholder).
   defp route_key(state, "q", ["ctrl"], _now), do: {state, :quit}
+
+  # The startup phase (ADR 0009) owns every key until it clears: the wizard
+  # or the forced-selection modal replaces the chat UI. The global quit
+  # clauses above still quit from here — deliberateness includes the right
+  # to leave.
+  defp route_key(%{setup: setup} = state, code, _modifiers, _now) when setup != nil do
+    setup_key(state, code)
+  end
 
   # Confirmation mode (a pending confirm from the agent, ADR 0007): Enter
   # approves, Esc rejects, and every other key is swallowed — typing

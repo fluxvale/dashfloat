@@ -2,6 +2,7 @@ defmodule DashFloat.TUI.StateTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  alias DashFloat.Config.Onboarding
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
@@ -294,7 +295,7 @@ defmodule DashFloat.TUI.StateTest do
       assert extended.selection.head == {3, 5}
 
       {released, {:copy, text}} = State.select_mouse(extended, "up", 6, 5)
-      assert released.selection != nil
+      assert match?(%{head: _}, released.selection)
       # Last row slices through col 5's cell ("beta l" — the pointed cell
       # is included; review P2a).
       assert text == "alpha line\n\nbeta l"
@@ -403,7 +404,7 @@ defmodule DashFloat.TUI.StateTest do
       # Two cells away (3-cell extent): a deliberate selection — copies.
       {anchored3, _nil} = State.select_mouse(state, "down", 1, 3)
       {dragged3, {:copy, text}} = State.select_mouse(anchored3, "up", 3, 3)
-      assert dragged3.selection != nil
+      assert match?(%{head: _}, dragged3.selection)
       assert text == "alp"
     end
 
@@ -428,7 +429,7 @@ defmodule DashFloat.TUI.StateTest do
       {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
       {dragged, _nil} = State.select_mouse(anchored, "drag", 6, 5)
       {kept, {:copy, _text}} = State.select_mouse(dragged, "up", 6, 5)
-      assert kept.selection != nil
+      assert match?(%{head: _}, kept.selection)
 
       # …a native-selection gesture starts (shift+down): the old highlight
       # goes away…
@@ -448,7 +449,7 @@ defmodule DashFloat.TUI.StateTest do
       {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
       {paused, _nil} = State.select_mouse(anchored, "drag", 6, 5, ["shift"])
       {resumed, {:copy, _text}} = State.select_mouse(paused, "up", 6, 5)
-      assert resumed.selection != nil
+      assert match?(%{head: _}, resumed.selection)
     end
 
     test "an over-cap selection reports its size instead of copying" do
@@ -574,7 +575,7 @@ defmodule DashFloat.TUI.StateTest do
       {into, _no_copy} = State.select_mouse(dirty, "down", 1, 4)
       {into_drag, _no_copy} = State.select_mouse(into, "drag", 6, 5)
       {into_selected, {:copy, _reply_text}} = State.select_mouse(into_drag, "up", 6, 5)
-      assert into_selected.selection != nil
+      assert match?(%{head: _}, into_selected.selection)
 
       replaced = State.stream_message(into_selected, {:phase, :idle}, 1_400)
       assert replaced.selection == nil
@@ -1502,7 +1503,7 @@ defmodule DashFloat.TUI.StateTest do
         |> Map.put(:agent_ref, ref)
         |> State.stream_message({:confirm, make_ref(), confirm_request(["+ x"])})
 
-      assert state.confirm != nil
+      assert match?(%{ref: _}, state.confirm)
 
       {after_down, :handled} = State.agent_down(state, ref, :killed)
       assert after_down.confirm == nil
@@ -1749,6 +1750,156 @@ defmodule DashFloat.TUI.StateTest do
   defp assert_words_survive(pieces, text) do
     joined = Enum.join(pieces, " ")
     assert String.split(joined) == String.split(text)
+  end
+
+  describe "the startup phase (ADR 0009)" do
+    test "setup_paste feeds wizard text steps and is inert on the selection modal" do
+      started = Onboarding.new()
+      {name_step, _nil} = Onboarding.handle_key(started, "enter")
+      name_state = setup_state(setup: name_step)
+      pasted = State.setup_paste(name_state, "PLACEHOLDER-key\r\n")
+      assert pasted.setup.draft == "personalPLACEHOLDER-key"
+
+      # The forced-selection modal owns no text input: a paste changes
+      # nothing (P1-2 — it can never reach the composer instead).
+      modal = setup_state(setup: {:select, ["a", "b"], 0})
+      assert State.setup_paste(modal, "anything") == modal
+    end
+
+    test "P1-3 regression: Inspect never prints the wizard's key (crash-log leak)" do
+      # The reviewer's 4-line crash-report repro: State.setup holds the
+      # plaintext key (draft / pending.key); a TUI crash used to dump it
+      # into the log. The derivations must redact — Config.ex is the house
+      # reference pattern.
+      wizard =
+        Enum.reduce(
+          ["enter", "enter", "enter", "enter", "k", "e", "y", "enter"],
+          Onboarding.new(),
+          fn key, wizard ->
+            {wizard, _action} = Onboarding.handle_key(wizard, key)
+            wizard
+          end
+        )
+
+      assert wizard.pending.key == "key"
+
+      state = setup_state(setup: wizard)
+      refute inspect(state) =~ "key: \"key\""
+      refute inspect(state) =~ ~s(pending: %{)
+      assert inspect(state) =~ "..."
+
+      # The wizard alone redacts too (standalone logs, IEx).
+      refute inspect(wizard) =~ ~s(key: "key")
+      refute inspect(wizard) =~ ~s(draft: "key")
+    end
+
+    defp setup_state(opts \\ []) do
+      [test_mode: {80, 24}]
+      |> Keyword.merge(opts)
+      |> State.new()
+    end
+
+    test "the forced-selection modal moves with up/down and commits with Enter" do
+      state = setup_state(setup: {:select, ["a", "b"], 0})
+
+      moved_state = state
+
+      {up, nil} = State.handle_key(moved_state, "up", [])
+      assert up.setup == {:select, ["a", "b"], 1}
+
+      {moved, nil} = State.handle_key(moved_state, "down", [])
+      assert moved.setup == {:select, ["a", "b"], 1}
+
+      {wrapped, nil} = State.handle_key(moved, "down", [])
+      assert wrapped.setup == {:select, ["a", "b"], 0}
+
+      {chosen, {:select_profile, "b"}} = State.handle_key(moved, "enter", [])
+      assert chosen.setup == {:select, ["a", "b"], 1}
+    end
+
+    defp step_wizard(key, wizard) do
+      {wizard, _action} = Onboarding.handle_key(wizard, key)
+      wizard
+    end
+
+    test "the wizard routes through the setup branch: typing and stepping" do
+      state = setup_state(setup: Onboarding.new())
+
+      {welcome, nil} = State.handle_key(state, "enter", [])
+      assert welcome.setup.step == :profile_name
+
+      {named, nil} = State.handle_key(welcome, "w", [])
+      assert named.setup.draft =~ "w"
+    end
+
+    test "other keys fall through the setup branch untouched" do
+      state = setup_state(setup: {:select, ["a"], 0})
+      {same, nil} = State.handle_key(state, "x", [])
+      assert same.setup == {:select, ["a"], 0}
+    end
+
+    test "provider_resolved clears setup, sets the provider, and emits the agent handoff" do
+      state = setup_state(setup: {:select, ["a"], 0})
+      config = %DashFloat.Config{base_url: "https://x.example", model: "m", api_key: "k"}
+
+      {resolved, {:agent_provider, {:ok, ^config}}} =
+        State.provider_resolved(state, {:ok, config})
+
+      assert resolved.setup == nil
+      assert resolved.provider == {:ok, config}
+    end
+
+    test "models_arrived feeds a waiting wizard and ignores stale results" do
+      start = Onboarding.new()
+      keys = ["enter", "enter", "enter", "enter", "k", "enter", "enter"]
+
+      wizard = Enum.reduce(keys, start, &step_wizard/2)
+
+      state = setup_state(setup: wizard)
+
+      fed = State.models_arrived(state, {:ok, [%{model: "m1", context: nil}]})
+      assert fed.setup.step == :model_pick
+
+      stale = State.models_arrived(setup_state(), {:ok, [%{model: "late"}]})
+      assert stale.setup == nil
+    end
+
+    test "catalog_arrived stores the sweep and fills the context denominator (ADR 0009)" do
+      base = "https://provider.example/v1"
+
+      config = %DashFloat.Config{
+        base_url: base,
+        model: "glm-5.3",
+        api_key: "k",
+        context_tokens: nil
+      }
+
+      state = setup_state(provider: {:ok, config})
+      assert State.provider_context_tokens(state) == nil
+
+      landed = State.catalog_arrived(state, %{base => [%{model: "glm-5.3", context: 128_000}]})
+
+      assert State.provider_context_tokens(landed) == 128_000
+      assert landed.catalog == %{base => [%{model: "glm-5.3", context: 128_000}]}
+
+      # A configured context always wins over the catalog's metadata.
+      configured = setup_state(provider: {:ok, %{config | context_tokens: 64_000}})
+
+      filled =
+        State.catalog_arrived(configured, %{base => [%{model: "glm-5.3", context: 128_000}]})
+
+      assert State.provider_context_tokens(filled) == 64_000
+
+      # A catalog entry without usable context leaves the fallback nil.
+      bare = setup_state(provider: {:ok, config})
+
+      contextless =
+        State.catalog_arrived(bare, %{
+          base => [%{model: "glm-5.3", context: nil}]
+        })
+
+      assert State.provider_context_tokens(contextless) == nil
+    end
   end
 
   # Runs one animation tick (rendering dirty in-flight lines), keeping state.

@@ -12,6 +12,9 @@ defmodule DashFloat.TUITest do
   use ExUnit.Case, async: false
 
   alias DashFloat.Config
+  alias DashFloat.Config.JSON5
+  alias DashFloat.Config.Onboarding
+  alias DashFloat.SSEServer
   alias DashFloat.TUI
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
@@ -84,6 +87,440 @@ defmodule DashFloat.TUITest do
       Process.sleep(15)
       eventually(pid, fun, tries - 1)
     end
+  end
+
+  test "the standing catalog refresh starts at mount and lands in state (ADR 0009)" do
+    # An injected fetcher (tests never touch the network); the sweep
+    # delivers {:catalog, map} and the state stores it.
+    provider =
+      {:ok,
+       %Config{
+         base_url: "https://active.example/v1",
+         model: "m1",
+         api_key: "PLACEHOLDER-k",
+         providers: [
+           %{label: "a", base_url: "https://active.example/v1", api_key: "PLACEHOLDER-k"}
+         ]
+       }}
+
+    {:ok, pid} =
+      start_tui(
+        provider: provider,
+        catalog_fetcher: fn "https://active.example/v1", "PLACEHOLDER-k" ->
+          {:ok, [%{model: "m1", context: 128_000}]}
+        end
+      )
+
+    state = eventually(pid, fn s -> s.catalog != %{} end)
+
+    assert state.catalog == %{
+             "https://active.example/v1" => [%{model: "m1", context: 128_000}]
+           }
+
+    # The context denominator fills in from the catalog (config carried none).
+    assert State.provider_context_tokens(state) == 128_000
+  end
+
+  test "the setup phase completes: a selection resolves through the resolver and hands off (ADR 0009)" do
+    # The classification's :select arm boots the TUI in setup mode; the
+    # modal's Enter runs the Application-style resolver, updates the
+    # provider, and notifies the agent (here: the test process).
+    resolver = fn
+      "work" -> {:ok, %Config{base_url: "https://resolved.example/v1", model: "m1", api_key: "k"}}
+    end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile selected — choose one to start"},
+        setup: {:select, ["work"], 0},
+        resolve: resolver,
+        config_dir: "/tmp/opencode/does-not-matter"
+      )
+
+    press(pid, "enter")
+
+    assert_receive {:set_provider, {:ok, config}}, 1_000
+    assert config.base_url == "https://resolved.example/v1"
+
+    state = eventually(pid, fn s -> s.setup == nil end)
+    assert state.provider == {:ok, config}
+  end
+
+  test "the onboarding wizard runs end to end through the app (ADR 0009)" do
+    # A loopback /models server stands in for the provider: the wizard's
+    # fetch goes through the REAL Catalog.fetch path, offline.
+    script = [http_ok(models_body(["glm-loopback", "other-one"])), :close]
+
+    {:ok, server} = SSEServer.start_link(script)
+    on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+    base = SSEServer.base_url(server)
+
+    dir =
+      Path.join(System.tmp_dir!(), "dashfloat-tui-wizard-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    resolver = fn _nil_or_name ->
+      DashFloat.Config.load(dir, %{}, [])
+    end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile configured — finish first-run setup"},
+        setup: Onboarding.new(),
+        config_dir: dir,
+        resolve: resolver
+      )
+
+    # welcome → profile name (accept the prefill) → provider: custom →
+    # its URL (the loopback) → label (accept) → key paste.
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+
+    for ch <- String.codepoints(base), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("PLACEHOLDER-wizard-key"), do: press(pid, ch)
+
+    press(pid, "enter")
+
+    # The key landed IMMEDIATELY (ADR 0009: per-step writes, 0600).
+    keys_path = Path.join(dir, "keys.json5")
+    eventually(pid, fn _s -> File.exists?(keys_path) end)
+    assert match?({:ok, %File.Stat{}}, File.stat(keys_path))
+
+    # Model: fetch from the provider (the loopback above), pick the second id.
+    press(pid, "enter")
+
+    picker =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :model_pick
+      end)
+
+    assert picker.setup.fetched == ["glm-loopback", "other-one"]
+    press(pid, "down")
+    press(pid, "enter")
+
+    # Loop: done — settings.json5 is written, the wizard hands off, the
+    # agent (the test process) gets the resolved provider.
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+
+    # The done screen hands off (ADR 0009: any Enter finishes).
+    press(pid, "enter")
+
+    assert_receive {:set_provider, {:ok, config}}, 2_000
+    assert config.base_url == base
+    assert config.api_key == "PLACEHOLDER-wizard-key"
+    assert config.model == "other-one"
+
+    state = eventually(pid, fn s -> s.setup == nil end)
+    assert state.provider == {:ok, config}
+
+    # Both files on disk at 0600; the entered key is the effective one.
+    settings_path = Path.join(dir, "settings.json5")
+    assert File.exists?(settings_path)
+
+    assert {:ok, %File.Stat{mode: keys_mode}} = File.stat(keys_path)
+    assert Bitwise.band(keys_mode, 0o777) == 0o600
+
+    assert {:ok, %File.Stat{mode: settings_mode}} = File.stat(settings_path)
+    assert Bitwise.band(settings_mode, 0o777) == 0o600
+  end
+
+  test "a failing settings write at wizard-done warns and continues" do
+    dir = wizard_dir("dashfloat-tui-swf")
+    keys_file = Path.join(dir, "keys.json5")
+    File.write!(keys_file, "{}")
+    File.chmod!(keys_file, 0o600)
+    # Block the settings write: its tmp staging path is a directory.
+    blocked_tmp = Path.join(dir, "settings.json5.tmp")
+    File.mkdir_p!(blocked_tmp)
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile configured"},
+        setup: Onboarding.new(),
+        config_dir: dir
+      )
+
+    # Straight to the loop with no provider and no key, then done.
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+
+    settings_path = Path.join(dir, "settings.json5")
+    eventually(pid, fn s -> s.setup.step == :done end)
+    refute File.exists?(settings_path)
+  end
+
+  test "P1-2 regression: a bracketed paste at the key step feeds the wizard, never the composer" do
+    # Reviewer repro: paste at W3 routed to the hidden chat composer — the
+    # key never reached keys.json5, and the first post-setup Enter SUBMITTED
+    # it to the provider as a prompt.
+    dir = wizard_dir("dashfloat-tui-paste")
+    resolver = fn _name -> DashFloat.Config.load(dir, %{}, []) end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile configured"},
+        setup: Onboarding.new(),
+        config_dir: dir,
+        resolve: resolver
+      )
+
+    # To the key step: welcome → name (prefill) → zai preset → label.
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+
+    # THE PASTE (bracketed, with the trailing newline terminals add).
+    Runtime.inject_event(pid, %ExRatatui.Event.Paste{
+      content: "PLACEHOLDER-pasted-key\r\n"
+    })
+
+    state =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :key and s.setup.draft != ""
+      end)
+
+    # The wizard holds the key; the composer holds NOTHING.
+    assert state.setup.draft == "PLACEHOLDER-pasted-key"
+    assert State.input_text(state) == ""
+
+    # Enter writes it — immediately, 0600 (ADR 0009 per-step writes).
+    press(pid, "enter")
+
+    keys_file = Path.join(dir, "keys.json5")
+
+    eventually(pid, fn _s -> File.exists?(keys_file) end)
+
+    zai = "https://api.z.ai/api/coding/paas/v4"
+
+    assert {:ok, %{"personal" => %{^zai => "PLACEHOLDER-pasted-key"}}} =
+             JSON5.read_map(keys_file)
+  end
+
+  test "P1-2 class guard: setup exits CLEAR the composer; Enter never submits mid-setup" do
+    # Whatever a routing bug of the day drops into the composer during
+    # setup, it can never become chat prompt text: (1) Enter while setup is
+    # active belongs to the wizard; (2) leaving setup clears the draft.
+    resolver = fn _name -> {:error, "resolved-error-arm"} end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile selected — choose one to start"},
+        setup: {:select, ["work"], 0},
+        resolve: resolver
+      )
+
+    # Poison the composer directly (the routing-bug-of-the-day stand-in):
+    # ExRatatui.textarea_set_value on the live input.
+    state = get_state(pid)
+    ExRatatui.textarea_set_value(state.input, "PLACEHOLDER-poison-key")
+
+    # Enter while setup is active: the modal consumes it (select_profile),
+    # never a submit.
+    press(pid, "enter")
+
+    assert_receive {:set_provider, {:error, "resolved-error-arm"}}, 1_000
+
+    cleared = eventually(pid, fn s -> s.setup == nil end)
+    assert State.input_text(cleared) == ""
+    assert system_entries(cleared) == []
+  end
+
+  test "P2-3 regression: an :onboard classification resolves to a displayed error, never a crash" do
+    # Reviewer repro path: the wizard's settings write fails → setup clears
+    # → the resolver reloads a zero-profile directory → :onboard reached
+    # the agent raw and crashed it on the first prompt (CaseClauseError).
+    dir = wizard_dir("dashfloat-tui-onboard")
+    # A directory that stays profile-less: the reload yields :onboard.
+    resolver = fn _name -> DashFloat.Config.load(dir, %{}, []) end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile configured"},
+        setup: {:select, ["ghost"], 0},
+        resolve: resolver,
+        agent: self()
+      )
+
+    press(pid, "enter")
+
+    assert_receive {:set_provider, {:error, handoff}}, 1_000
+    assert handoff =~ "first-run setup is incomplete"
+    refute match?(:onboard, handoff)
+    refute match?({:select, _names}, handoff)
+  end
+
+  test "P2-3 arm: a {:select, names} reload hands the agent a readable error naming the profiles" do
+    resolver = fn _name -> {:select, ["work", "personal"]} end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile selected — choose one to start"},
+        setup: {:select, ["work"], 0},
+        resolve: resolver
+      )
+
+    press(pid, "enter")
+
+    assert_receive {:set_provider, {:error, handoff}}, 1_000
+    assert handoff =~ "no profile selected — choose one of: work, personal"
+  end
+
+  test "a selection with no resolver clears setup without crashing" do
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile selected — choose one to start"},
+        setup: {:select, ["work"], 0}
+      )
+
+    press(pid, "enter")
+
+    state = eventually(pid, fn s -> s.setup == nil end)
+    assert state.provider == {:error, "no provider configured"}
+  end
+
+  test "a raising resolver degrades to the classification error arm" do
+    resolver = fn _name -> raise "boom" end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile selected — choose one to start"},
+        setup: {:select, ["work"], 0},
+        resolve: resolver
+      )
+
+    press(pid, "enter")
+
+    state =
+      eventually(pid, fn s ->
+        s.provider == {:error, "config could not be loaded"}
+      end)
+
+    assert state.provider == {:error, "config could not be loaded"}
+    assert state.setup == nil
+  end
+
+  test "a wizard $ENV_VAR key resolves from the environment for the fetch" do
+    # The wizard stores the reference verbatim; the fetch resolves it.
+    var = "DASHFLOAT_WIZARD_TEST_KEY"
+    previous = System.get_env(var)
+    System.put_env(var, "PLACEHOLDER-resolved-key")
+
+    on_exit(fn ->
+      if previous, do: System.put_env(var, previous), else: System.delete_env(var)
+    end)
+
+    script = [http_ok(models_body(["glm-env"])), :close]
+
+    {:ok, server} = SSEServer.start_link(script)
+    on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+    base = SSEServer.base_url(server)
+
+    dir = Path.join(System.tmp_dir!(), "dashfloat-tui-ref-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile configured"},
+        setup: Onboarding.new(),
+        config_dir: dir
+      )
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    for ch <- String.codepoints(base), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("$" <> var), do: press(pid, ch)
+    press(pid, "enter")
+
+    # Model: fetch from the provider (the loopback above).
+    press(pid, "enter")
+
+    # The reference is stored verbatim; the fetch resolves the env var.
+    picker =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :model_pick
+      end)
+
+    assert picker.setup.fetched == ["glm-env"]
+
+    keys_file = Path.join(dir, "keys.json5")
+    assert {:ok, keys} = JSON5.read_map(keys_file)
+    assert keys["personal"][base] == "$" <> var
+  end
+
+  test "wizard writes refuse safely and a missing resolver still clears setup" do
+    dir = wizard_dir("dashfloat-tui-wizard")
+    # Hand damage: an unparseable keys.json5 must be refused, never clobbered.
+    keys_file = Path.join(dir, "keys.json5")
+    File.write!(keys_file, "{ broken")
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no provider configured"},
+        setup: Onboarding.new(),
+        config_dir: dir
+      )
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("k"), do: press(pid, ch)
+    press(pid, "enter")
+
+    # The write failed with a warning; the damaged file is untouched.
+    eventually(pid, fn s -> s.setup.step == :model_choice end)
+    assert File.read!(keys_file) == "{ broken"
+
+    # A selection with no resolver wired: setup clears, nothing crashes.
+    assert {:error, _load_error} = DashFloat.Config.load(dir, %{"DASHFLOAT_API_KEY" => "k"}, [])
+  end
+
+  defp wizard_dir(prefix) do
+    dir = Path.join(System.tmp_dir!(), "#{prefix}-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    dir
+  end
+
+  defp http_ok(body) do
+    length =
+      body
+      |> byte_size()
+      |> Integer.to_string()
+
+    {:send,
+     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: " <>
+       length <> "\r\n\r\n" <> body}
+  end
+
+  defp models_body(ids) do
+    ids
+    |> Enum.map(&%{"id" => &1})
+    |> then(&%{data: &1})
+    |> Jason.encode!()
   end
 
   defp system_entries(state), do: for(%{kind: :system, text: text} <- state.entries, do: text)

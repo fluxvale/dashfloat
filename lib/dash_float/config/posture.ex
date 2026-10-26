@@ -2,8 +2,9 @@ defmodule DashFloat.Config.Posture do
   @moduledoc """
   The 0600 security posture shared by the config files' load and migration
   paths ([ADR 0008](../decisions/0008-config-layout-profiles-json5.md) and its
-  keys-split amendment): a file that ever held credentials is 0600 wherever it
-  lives.
+  keys-split amendment; [ADR 0009](../decisions/0009-config-v3-persona-profiles.md)
+  for the writer's wider use): a file that ever held credentials is 0600
+  wherever it lives, and every config write lands atomically at 0600.
 
   Best effort, failures ignored — repair never blocks a load; this only keeps
   secrets private. Only REGULAR files are chmod'd — lstat, not stat: chmod
@@ -16,6 +17,7 @@ defmodule DashFloat.Config.Posture do
   require Logger
 
   @secret_mode 0o600
+  @tmp_suffix ".tmp"
 
   @doc "Tightens `path` to 0600 when too permissive; `label` names it in warnings."
   @spec tighten(Path.t(), String.t()) :: :ok
@@ -35,6 +37,48 @@ defmodule DashFloat.Config.Posture do
 
       {:ok, %File.Stat{type: other}} ->
         Logger.warning("#{label} is a #{other}, not a regular file — permissions left alone")
+
+      _missing ->
+        :ok
+    end
+  end
+
+  @doc """
+  Writes `contents` to `path` atomically at 0600 (ADR 0008/0009): tmp file
+  created empty under 0600, filled, renamed — no crash can leave a torn or
+  half-written destination, and every byte the file ever holds is
+  private-only. The tmp path is lstat-guarded: a pre-planted `.tmp` symlink
+  is refused, never written through. `{:error, message}` names paths only.
+  """
+  @spec write_private(Path.t(), binary()) :: :ok | {:error, String.t()}
+  def write_private(path, contents) when is_binary(path) and is_binary(contents) do
+    tmp = path <> @tmp_suffix
+
+    with :ok <- guard_tmp(path, tmp),
+         :ok <- File.touch(tmp),
+         :ok <- File.chmod(tmp, @secret_mode),
+         :ok <- File.write(tmp, contents),
+         :ok <- File.rename(tmp, path) do
+      :ok
+    else
+      # guard_tmp's message is already user-shaped; filesystem reasons are
+      # wrapped. The tmp debris of a failed write is removed either way.
+      {:error, reason} when is_binary(reason) ->
+        {:error, reason}
+
+      {:error, reason} when is_atom(reason) ->
+        File.rm(tmp)
+        {:error, "cannot write #{path}: #{:file.format_error(reason)}"}
+    end
+  end
+
+  defp guard_tmp(path, tmp) do
+    case File.lstat(tmp) do
+      {:ok, %File.Stat{type: :regular}} ->
+        :ok
+
+      {:ok, %File.Stat{type: other}} ->
+        {:error, "cannot write #{path}: #{tmp} is a #{other}, not a regular file"}
 
       _missing ->
         :ok

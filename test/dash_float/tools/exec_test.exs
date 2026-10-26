@@ -128,16 +128,27 @@ defmodule DashFloat.Tools.ExecTest do
   end
 
   # pgrep exits 1 on no matches — which is exactly what we want to see.
-  defp assert_eventually_gone(marker) do
+  # A deadline loop, not a single retry: under CI runner contention the
+  # child IS reaped, just later than any fixed window — poll to a bound and
+  # fail with the survivors named when the deadline hits (self-diagnosing).
+  defp assert_eventually_gone(marker, deadline_ms \\ 5_000) do
+    deadline = System.monotonic_time(:millisecond) + deadline_ms
+
+    do_assert_eventually_gone(marker, deadline)
+  end
+
+  defp do_assert_eventually_gone(marker, deadline) do
     {matches, _status} = System.cmd("pgrep", ["-f", marker])
 
     if matches == "" do
       assert true
     else
-      :timer.sleep(50)
-
-      {matches, _status} = System.cmd("pgrep", ["-f", marker])
-      assert matches == ""
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("process matching #{inspect(marker)} still alive at the deadline: #{matches}")
+      else
+        :timer.sleep(100)
+        do_assert_eventually_gone(marker, deadline)
+      end
     end
   end
 
@@ -160,17 +171,25 @@ defmodule DashFloat.Tools.ExecTest do
   end
 
   test "a successful command reaps children it left behind" do
+    # A per-run unique sleep DURATION, not a fixed "sleep 251": pgrep -f is a
+    # substring match over every process on the machine, and on shared CI
+    # runners an ambient process can carry the fixed string (two red runs
+    # cited survivors at early-boot PIDs on different hosts). Unique markers
+    # are the pattern the kill test below already uses.
+    duration = 251_000 + System.unique_integer([:positive])
+    marker = "sleep #{duration}"
+
     # A stale survivor from an earlier, broken run must not read as ours.
-    System.cmd("pkill", ["-9", "-f", "sleep 251"])
+    System.cmd("pkill", ["-9", "-f", marker])
     :timer.sleep(50)
 
     result =
-      Exec.run("sh -c 'sleep 251 >/dev/null 2>&1 & echo done'", sandbox("reap"), 5_000, 4_096)
+      Exec.run("sh -c '#{marker} >/dev/null 2>&1 & echo done'", sandbox("reap"), 5_000, 4_096)
 
     assert result.ok == true
     assert result.exit == 0
     assert result.output == "done\n"
-    assert_eventually_gone("sleep 251")
+    assert_eventually_gone(marker)
   end
 
   test "binary output is scrubbed to valid UTF-8" do

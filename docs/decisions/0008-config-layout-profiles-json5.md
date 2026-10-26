@@ -4,7 +4,13 @@
   credentials split back out into `keys.json5` + `oauth.json5`,
   `settings.json5` de-secreted; see
   [Amendment (2026-10-25, issue #29)](#amendment-2026-10-25-issue-29-credentials-split-back-out)
-  below)
+  below); **partially superseded 2026-10-26** by
+  [ADR 0009](0009-config-v3-persona-profiles.md) ([issue #32](https://github.com/fluxvale/dashfloat/issues/32) —
+  the schema, selection, and migration sections: profiles become personas
+  bundling `providers[]` + `mcp[]`, `keys.json5` becomes endpoint-keyed,
+  selection turns deliberate with onboarding). ADR 0009 keeps this record's
+  JSON5 dialect, error hygiene, atomic writes, posture principles, and
+  no-loss invariant verbatim.
 - **Date:** 2026-10-24
 - **Implements:** [issue #22](https://github.com/fluxvale/dashfloat/issues/22).
 - **Supersedes:** the *Provider config — one endpoint, file + env* section of

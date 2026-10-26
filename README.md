@@ -23,45 +23,82 @@ call execution, context management & history persistence.
 
 ## Run it
 
-Configure your provider — any OpenAI-compatible endpoint, one profile per
-subscription — in `~/.config/dashfloat/settings.json5`. API keys live in a
-sibling `keys.json5`, keyed by profile name, so the settings file (and every
-backup, dotfile sync, or example of it) is structurally incapable of leaking
-a credential; both files are 0600. The first profile is the default; each
-profile owns its model menu, whose first entry is its default model
-(`settings.defaultModel` can name another). An `oauth.json5` sibling is
-reserved for a future OAuth flow (ignored until one exists). A legacy
-`config.json`, or a v1 `settings.json5` with inline keys, migrates itself on
-first run — backups inherit the source's sensitivity, so anything that ever
-held a credential is 0600 wherever it lives:
+Configure your providers — any OpenAI-compatible endpoints — in
+`~/.config/dashfloat/settings.json5`. A profile is a persona (personal,
+work) bundling several subscriptions (`providers[]`), each with its own model
+menu, plus its own MCP servers; `defaultProfile` names the startup persona.
+API keys live in a sibling `keys.json5`, nested per profile and keyed by the
+provider's `baseUrl`, so the settings file (and every backup, dotfile sync,
+or example of it) is structurally incapable of leaking a credential; both
+files are 0600. An `oauth.json5` sibling is reserved for a future OAuth flow
+(ignored until one exists). Legacy layouts — a v1 `config.json`, a v1
+`settings.json5` with inline keys, or a v2 flat `keys.json5` — migrate
+themselves on first run under a no-loss invariant: every credential value
+lands somewhere retrievable or the migration refuses loudly with a remedy.
+Backups inherit the source's sensitivity, so anything that ever held a
+credential is 0600 wherever it lives:
 
 ```json5
 // settings.json5 — no credential material, ever
 {
-  configVersion: 2,
+  configVersion: 3,
+  defaultProfile: 'personal',
   profiles: [
     {
-      name: 'work',
-      baseUrl: 'https://api.openai.com/v1',
-      models: [{ nickname: 'mini', model: 'gpt-4o-mini', context: 128000 }],
+      name: 'personal',
+      defaultProvider: 'zai',       // optional label; absent = the first provider
+      providers: [
+        // label optional too — it defaults to the URL host ('api.z.ai' here)
+        { label: 'zai', baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+          models: [{ nickname: 'glm-5.3', model: 'glm-5.3', context: 128000 }] },
+        { baseUrl: 'https://api.synthetic.new/openai/v1',
+          models: [{ model: 'hf:deepseek-ai/DeepSeek-V3-0324' }] },
+      ],
+      mcp: [                        // storage shape; tokens are env references
+        { name: 'fetch', command: 'uvx', args: ['mcp-server-fetch'], token: '$FETCH_TOKEN' },
+      ],
     },
   ],
 }
 ```
 
 ```json5
-// keys.json5 — the only home for API keys
-{ 'work': 'PLACEHOLDER', }
+// keys.json5 — the only home for API keys, keyed by endpoint
+{
+  personal: {
+    'https://api.z.ai/api/coding/paas/v4': 'PLACEHOLDER',
+    'https://api.synthetic.new/openai/v1': '$SYNTHETIC_API_KEY',  // env reference
+  },
+}
 ```
+
+**Profile selection is deliberate:** no flag → `defaultProfile`; an unknown
+`defaultProfile` (say, hand-deleted) warns and a TUI modal forces a choice;
+`--profile <name>` (or `DASHFLOAT_PROFILE`) selects explicitly, and an
+unknown name is a hard error listing the valid ones. With zero profiles and
+no env config, a first-run wizard walks you through naming a profile, adding
+a provider (Z.AI Coding Plan and Synthetic presets, or any custom
+OpenAI-compatible URL), pasting a key, and picking a model — every step
+skippable, files written 0600 as you go.
 
 `DASHFLOAT_BASE_URL`, `DASHFLOAT_MODEL`, `DASHFLOAT_API_KEY`, and
 `DASHFLOAT_CONTEXT_TOKENS` override the files per field (the effective API
-key is `DASHFLOAT_API_KEY`, else `keys[profile name]`); `--profile <name>`
-(startup flag, or `DASHFLOAT_PROFILE`) selects the active profile and
-`--model <nickname>` a model within it. A stray inline `apiKey` in
-settings.json5 is warned about and ignored — never a fallback. The status bar
-names the active model `nickname (profile)`. Put your provider's own base URL
-in `baseUrl`; DashFloat appends `/chat/completions`.
+key is `DASHFLOAT_API_KEY`, else `keys[profile][baseUrl of the active
+provider]`); `--model <nickname>` selects a model within the active
+provider's menu. A stray inline `apiKey` in settings.json5 is warned about
+and ignored — never a fallback. The status bar names the active model
+`nickname (profile)`. Put your provider's own base URL in `baseUrl`;
+DashFloat appends `/chat/completions`. At startup DashFloat also refreshes
+the model catalog from each of the active profile's providers (`GET
+{baseUrl}/models`, fail-open, in-memory: your explicit entries always win,
+new models are added) — nothing is written back to your config.
+
+Damaged configs degrade with warnings, never crashes: a deleted
+`defaultProfile`, a mistyped `profiles` list, junk entries — each names the
+field and falls back to the least-surprising working state. An unparseable
+file is a loud error naming the path and is never auto-overwritten.
+
+Details: [ADR 0009](docs/decisions/0009-config-v3-persona-profiles.md).
 
 The v1→v2 split never loses a credential silently: if a key it is about to
 remove would end up in no file (a pre-existing `keys.json5` that wins without
@@ -73,8 +110,12 @@ The error's remedies are real: add the key under its profile name to
 the moved file to 0600 automatically) so the next start can write
 a fresh one. A `settings.json5.bak` that is a symlink is never read
 through or replaced — it counts as no backup, and the split refuses if a
-key would be lost. Details:
-[ADR 0008](docs/decisions/0008-config-layout-profiles-json5.md). Then:
+key would be lost. The v2→v3 reshape follows the same invariant (dead
+keys only drop behind a fresh `keys.json5.bak`; duplicate profile names
+with keys, keyless endpoints, and v3-shaped files missing
+`configVersion: 3` all refuse with remedies in the message). Details:
+[ADR 0008](docs/decisions/0008-config-layout-profiles-json5.md) and
+[ADR 0009](docs/decisions/0009-config-v3-persona-profiles.md). Then:
 
 ```sh
 mix run --no-halt
