@@ -1,26 +1,37 @@
 defmodule DashFloat.Config do
   @moduledoc """
-  Provider configuration for the LLM streaming engine: one JSON5 file,
+  Provider configuration for the LLM streaming engine: JSON5 files,
   profiles, and per-field env overrides
-  ([ADR 0008](../decisions/0008-config-layout-profiles-json5.md)).
+  ([ADR 0008](../decisions/0008-config-layout-profiles-json5.md) and its
+  keys-split amendment).
 
   Reads `~/.config/dashfloat/settings.json5` (`XDG_CONFIG_HOME` respected) —
-  profiles with their endpoint, credential, optional open settings map, and
-  model menu; the file contains secrets, so it is repaired to 0600 on load. A
-  legacy `config.json` is migrated once, automatically, with a backup.
+  profiles with their endpoint, optional open settings map, and model menu.
+  The settings file is credential-free by construction: API keys live in a
+  sibling `keys.json5`, keyed by PROFILE NAME, 0600 always; `oauth.json5` is
+  reserved for a future OAuth flow (absence-tolerant; 0600 when present, and
+  never read). settings.json5 stays 0600 as well — free hardening. A legacy
+  `config.json` or a v1 inline-keys `settings.json5` is migrated once,
+  automatically, with 0600 backups (backups inherit the source's
+  sensitivity: anything that ever held credentials backs up at 0600).
 
   The active profile is the `--profile` flag, else `DASHFLOAT_PROFILE`, else
   the first profile. The selected model is the `--model` flag's entry (by
   nickname, then id), else the profile's `settings.defaultModel`, else the
   first menu entry. Environment variables overlay per field — file < env,
-  blank env = absent. Loading happens once in `DashFloat.Application` and
-  rides into the TUI as a mount opt; the UI process performs no file I/O
-  (ADR 0005's contract, unchanged). The status bar shows the selected entry's
-  nickname and profile via `DashFloat.TUI.State.provider_label/1`.
+  blank env = absent; the effective API key is `DASHFLOAT_API_KEY`, else
+  `keys[profile.name]`. A stray inline `apiKey` in settings.json5 is
+  tolerated with a warning and IGNORED — never a fallback; the structural
+  guarantee that settings cannot hold a credential would otherwise be
+  cosmetic. Loading happens once in `DashFloat.Application` and rides into
+  the TUI as a mount opt; the UI process performs no file I/O (ADR 0005's
+  contract, unchanged). The status bar shows the selected entry's nickname
+  and profile via `DashFloat.TUI.State.provider_label/1`.
   """
 
   alias DashFloat.Config.JSON5
   alias DashFloat.Config.Migration
+  alias DashFloat.Config.Posture
 
   require Logger
 
@@ -34,8 +45,9 @@ defmodule DashFloat.Config do
   @profile_var "DASHFLOAT_PROFILE"
 
   @main_file "settings.json5"
-  @secret_mode 0o600
-  @main_version 1
+  @keys_file "keys.json5"
+  @oauth_file "oauth.json5"
+  @main_version 2
   # The one settings key selection reads today; everything else is tolerated
   # with a warning so future dimensions need no migration (ADR 0008).
   @known_settings ["defaultModel"]
@@ -70,44 +82,86 @@ defmodule DashFloat.Config do
   end
 
   @doc """
-  Testable core: loads `settings.json5` in `dir` (missing file = empty),
-  overlaid with `env` (a map of variable names to values) and `cli` (the
-  `profile:`/`model:` keywords from `DashFloat.CLI.parse/1`; flag beats env,
-  env beats file). Blank fields after the merge yield an error naming only
-  the missing field names — values are never echoed. `context_tokens` is
-  optional: env wins over the file, and anything that is not a positive
-  integer is nil — never an error (ADR 0006).
+  Testable core: loads `settings.json5` + `keys.json5` in `dir` (a missing
+  file = empty map), overlaid with `env` (a map of variable names to values)
+  and `cli` (the `profile:`/`model:` keywords from `DashFloat.CLI.parse/1`;
+  flag beats env, env beats file). The effective API key is
+  `DASHFLOAT_API_KEY`, else `keys[active profile name]`. Blank fields after
+  the merge yield an error naming only the missing field names — values are
+  never echoed. `context_tokens` is optional: env wins over the file, and
+  anything that is not a positive integer is nil — never an error
+  (ADR 0006).
   """
   @spec load(Path.t(), map(), keyword()) :: {:ok, t()} | {:error, String.t()}
   def load(dir, env, cli) when is_binary(dir) and is_map(env) and is_list(cli) do
     main_path = Path.join(dir, @main_file)
+    keys_path = Path.join(dir, @keys_file)
+    oauth_path = Path.join(dir, @oauth_file)
 
-    # Repair runs BEFORE the parse: a hand-made file is most likely both
-    # malformed and too permissive, and the security posture must not depend
-    # on the file also being valid JSON5 (hostile-review finding). A
-    # leftover legacy backup repairs too — an already-migrated directory
-    # never runs the migration that would have tightened it (issue #28).
-    with {:ok, _migration} <- Migration.maybe_migrate(dir),
-         :ok <- repair_perms(main_path),
+    # Repairs run BEFORE everything that parses: a hand-made file is most
+    # likely both malformed and too permissive, and the security posture
+    # must not depend on the file also being valid JSON5 (hostile-review
+    # finding) — including when the migration itself fails parsing it.
+    # oauth.json5 is posture-only — never read, absence silent. Leftover
+    # backups repair too: an already-migrated directory never runs the
+    # migration that would have tightened them (issue #28).
+    with :ok <- Posture.tighten(main_path, @main_file),
+         :ok <- Posture.tighten(keys_path, @keys_file),
+         :ok <- Posture.tighten(oauth_path, @oauth_file),
          :ok <- Migration.repair_backup(dir),
-         {:ok, main} <- read_map(main_path) do
+         {:ok, _migration} <- Migration.maybe_migrate(dir),
+         {:ok, main} <- JSON5.read_map(main_path),
+         {:ok, keys} <- JSON5.read_map(keys_path) do
       check_version(main)
+      warn_stray_root_key(main)
 
-      main
-      |> parse_profiles()
-      |> select(env, cli)
+      profiles = parse_profiles(main)
+      warn_unkeyed_profiles(profiles, keys, keys_path, env)
+      select(profiles, keys, env, cli)
+    end
+  end
+
+  # Surfaces HISTORICAL loss at startup (hostile review, incident-hiding
+  # note): a settings profile with no key under its name in an existing
+  # keys.json5 is exactly the shape a lost credential leaves behind — and
+  # the dead-key mirror. The warning respects the loader's own precedence
+  # (env > keys[profile]): a profile completed by DASHFLOAT_API_KEY is keyed
+  # and stays silent (delta-2 P3a). Profile NAMES only, never values;
+  # silent when keys.json5 is absent (env-keyed setups are legitimate).
+  defp warn_unkeyed_profiles(profiles, keys, keys_path, env) do
+    for profile <- profiles,
+        File.exists?(keys_path),
+        is_nil(env_value(env, @fields[:api_key])),
+        is_nil(value(keys[profile.name])) do
+      Logger.warning(~s(profile "#{profile.name}" has no key in #{@keys_file}))
+    end
+  end
+
+  # The profile-level stray warning's root twin (hostile review P1-2): a
+  # root-level apiKey is ignored exactly like a profile-level one — warned,
+  # never a fallback, never silently tolerated.
+  defp warn_stray_root_key(main) do
+    if Map.has_key?(main, "apiKey") do
+      Logger.warning(
+        "#{@main_file}: top-level apiKey is ignored — API keys live in #{@keys_file}, keyed by profile name"
+      )
     end
   end
 
   ## Selection (ADR 0008: profiles, menus, first-entry default)
 
-  defp select(profiles, env, cli) do
+  defp select(profiles, keys, env, cli) do
     active = active_profile(profiles, env, cli)
     profile = Enum.find(profiles, fn parsed -> parsed.name == active end)
     warn_unknown_profile(active, profiles, env, cli)
     entry = select_entry(entry_menu(profile), profile_settings(profile), cli)
 
-    build(effective(profile, entry, env), context(env, entry), entry && entry.nickname, active)
+    build(
+      effective(profile, entry, keys, env),
+      context(env, entry),
+      entry && entry.nickname,
+      active
+    )
   end
 
   defp entry_menu(nil), do: []
@@ -117,14 +171,18 @@ defmodule DashFloat.Config do
   defp profile_settings(profile), do: profile.settings
 
   # Effective fields: the file's source (profile, selected entry) under
-  # per-field env overrides (file < env, ADR 0008).
-  defp effective(profile, entry, env) do
+  # per-field env overrides (file < env, ADR 0008). The key's file source is
+  # keys.json5 BY PROFILE NAME — settings.json5 cannot supply one.
+  defp effective(profile, entry, keys, env) do
     %{
       base_url: env_value(env, @fields[:base_url]) || (profile && profile.base_url),
       model: env_value(env, @fields[:model]) || (entry && entry.model),
-      api_key: env_value(env, @fields[:api_key]) || (profile && profile.api_key)
+      api_key: env_value(env, @fields[:api_key]) || profile_key(keys, profile)
     }
   end
+
+  defp profile_key(_keys, nil), do: nil
+  defp profile_key(keys, profile), do: value(keys[profile.name])
 
   # Env wins over the file; a blank env var counts as absent (like every other
   # field), but a value present and unusable is simply nil (ADR 0006).
@@ -288,10 +346,11 @@ defmodule DashFloat.Config do
         nil
 
       name ->
+        warn_stray_key(name, entry)
+
         %{
           name: name,
           base_url: value(entry["baseUrl"]),
-          api_key: value(entry["apiKey"]),
           settings: parse_settings(name, entry["settings"]),
           models: parse_models(name, entry["models"])
         }
@@ -301,6 +360,18 @@ defmodule DashFloat.Config do
   defp parse_profile(_other) do
     Logger.warning("#{@main_file}: a profile entry that is not an object is ignored")
     nil
+  end
+
+  # Tolerate-and-warn, value IGNORED — never a fallback: using a stray inline
+  # key would defeat the structural guarantee that settings.json5 cannot
+  # hold a credential (ADR 0008 keys-split amendment).
+  defp warn_stray_key(name, entry) do
+    if Map.has_key?(entry, "apiKey") do
+      Logger.warning(
+        ~s(#{@main_file}: profile "#{name}": apiKey is ignored ) <>
+          "— API keys live in #{@keys_file}, keyed by profile name"
+      )
+    end
   end
 
   defp parse_settings(_name, nil), do: nil
@@ -362,31 +433,7 @@ defmodule DashFloat.Config do
     nil
   end
 
-  ## File reading and posture
-
-  defp read_map(path) do
-    case File.read(path) do
-      {:ok, contents} ->
-        stripped = strip_bom(contents)
-
-        case JSON5.decode(stripped) do
-          {:ok, map} when is_map(map) -> {:ok, map}
-          {:ok, _other} -> {:error, "invalid JSON5 in #{path}: expected an object"}
-          {:error, message} -> {:error, "#{message} in #{path}"}
-        end
-
-      {:error, :enoent} ->
-        {:ok, %{}}
-
-      {:error, reason} ->
-        {:error, "cannot read #{path}: #{:file.format_error(reason)}"}
-    end
-  end
-
-  # Several editors prepend a UTF-8 BOM on save; the parser rejects it with
-  # an opaque error, and hand-editing is the primary workflow.
-  defp strip_bom("\xEF\xBB\xBF" <> rest), do: rest
-  defp strip_bom(contents), do: contents
+  ## Version check
 
   defp check_version(main) do
     case main["configVersion"] do
@@ -397,35 +444,6 @@ defmodule DashFloat.Config do
 
       _other ->
         :ok
-    end
-  end
-
-  # The file holds secrets (ADR 0008): it is created 0600 by migration;
-  # repair a hand-made or tool-mangled one back to 0600 (best effort — a
-  # repair failure warns, and load proceeds). lstat, not stat: chmod must
-  # never follow a symlink out of the config directory onto a file the
-  # loader does not own — a symlinked config warns and is loaded as-is.
-  defp repair_perms(path) do
-    case File.lstat(path) do
-      {:ok, %File.Stat{type: :symlink}} ->
-        Logger.warning("#{@main_file} is a symlink — not repairing permissions")
-
-      {:ok, %File.Stat{mode: mode}} ->
-        tighten(path, mode)
-
-      _missing ->
-        :ok
-    end
-  end
-
-  defp tighten(path, mode) do
-    if Bitwise.band(mode, 0o077) != 0 do
-      Logger.warning("#{@main_file} is too permissive — repairing to 0600")
-      # Best effort; the result is ignored — repair never blocks a load, and
-      # chmod by the file's owner fails only in exotic states.
-      File.chmod(path, @secret_mode)
-    else
-      :ok
     end
   end
 

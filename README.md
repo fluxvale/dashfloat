@@ -22,32 +22,56 @@ call execution, context management & history persistence.
 ## Run it
 
 Configure your provider — any OpenAI-compatible endpoint, one profile per
-subscription — in `~/.config/dashfloat/settings.json5` (created 0600; it holds
-credentials). The first profile is the default; each profile owns its model
-menu, whose first entry is its default model (`settings.defaultModel` can name
-another). A legacy `config.json` migrates itself into a `default` profile on
-first run:
+subscription — in `~/.config/dashfloat/settings.json5`. API keys live in a
+sibling `keys.json5`, keyed by profile name, so the settings file (and every
+backup, dotfile sync, or example of it) is structurally incapable of leaking
+a credential; both files are 0600. The first profile is the default; each
+profile owns its model menu, whose first entry is its default model
+(`settings.defaultModel` can name another). An `oauth.json5` sibling is
+reserved for a future OAuth flow (ignored until one exists). A legacy
+`config.json`, or a v1 `settings.json5` with inline keys, migrates itself on
+first run — backups inherit the source's sensitivity, so anything that ever
+held a credential is 0600 wherever it lives:
 
 ```json5
+// settings.json5 — no credential material, ever
 {
-  configVersion: 1,
+  configVersion: 2,
   profiles: [
     {
       name: 'work',
       baseUrl: 'https://api.openai.com/v1',
-      apiKey: 'PLACEHOLDER',
       models: [{ nickname: 'mini', model: 'gpt-4o-mini', context: 128000 }],
     },
   ],
 }
 ```
 
+```json5
+// keys.json5 — the only home for API keys
+{ 'work': 'PLACEHOLDER', }
+```
+
 `DASHFLOAT_BASE_URL`, `DASHFLOAT_MODEL`, `DASHFLOAT_API_KEY`, and
-`DASHFLOAT_CONTEXT_TOKENS` override the file per field; `--profile <name>`
+`DASHFLOAT_CONTEXT_TOKENS` override the files per field (the effective API
+key is `DASHFLOAT_API_KEY`, else `keys[profile name]`); `--profile <name>`
 (startup flag, or `DASHFLOAT_PROFILE`) selects the active profile and
-`--model <nickname>` a model within it. The status bar names the active model
-`nickname (profile)`. Put your provider's own base URL in `baseUrl`; DashFloat
-appends `/chat/completions`. Details:
+`--model <nickname>` a model within it. A stray inline `apiKey` in
+settings.json5 is warned about and ignored — never a fallback. The status bar
+names the active model `nickname (profile)`. Put your provider's own base URL
+in `baseUrl`; DashFloat appends `/chat/completions`.
+
+The v1→v2 split never loses a credential silently: if a key it is about to
+remove would end up in no file (a pre-existing `keys.json5` that wins without
+holding that exact value, and a `settings.json5.bak` that cannot be
+re-written), startup fails with `cannot split settings.json5: … no home`.
+The error's remedies are real: add the key under its profile name to
+`keys.json5`, or move the stale backup aside
+(`mv settings.json5.bak settings.json5.bak.old` — the next start tightens
+the moved file to 0600 automatically) so the next start can write
+a fresh one. A `settings.json5.bak` that is a symlink is never read
+through or replaced — it counts as no backup, and the split refuses if a
+key would be lost. Details:
 [ADR 0008](docs/decisions/0008-config-layout-profiles-json5.md). Then:
 
 ```sh

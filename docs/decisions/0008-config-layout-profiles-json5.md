@@ -1,6 +1,10 @@
 # 0008 — Config layout v2: single-file JSON5 with profiles
 
-- **Status:** Accepted
+- **Status:** Accepted; **amended 2026-10-25** ([issue #29](https://github.com/fluxvale/dashfloat/issues/29) —
+  credentials split back out into `keys.json5` + `oauth.json5`,
+  `settings.json5` de-secreted; see
+  [Amendment (2026-10-25, issue #29)](#amendment-2026-10-25-issue-29-credentials-split-back-out)
+  below)
 - **Date:** 2026-10-24
 - **Implements:** [issue #22](https://github.com/fluxvale/dashfloat/issues/22).
 - **Supersedes:** the *Provider config — one endpoint, file + env* section of
@@ -45,6 +49,13 @@ file is created 0600 and repaired to 0600 on load**. No `keys.json5`, no
 (footgun-free, because the loader described here never reads such a file).
 JSON5 throughout; hand-editing is the primary workflow (a leading UTF-8 BOM is
 stripped before decoding — editors add one silently).
+
+*(Reversed by the
+[keys-split amendment](#amendment-2026-10-25-issue-29-credentials-split-back-out):
+credentials live in a sibling `keys.json5`, `settings.json5` carries no
+credential material, and a reserved `oauth.json5` exists by name. The
+profiles/schema/selection machinery below stands unchanged unless the
+amendment says otherwise.)*
 
 ### JSON5 parsing (verify-first outcome)
 
@@ -177,6 +188,10 @@ The `DashFloat.Config.t()` struct keeps its consumer-facing shape
 | `api_key` | active profile's `apiKey` | `DASHFLOAT_API_KEY` |
 | `context_tokens` | selected entry's `context` | `DASHFLOAT_CONTEXT_TOKENS` |
 
+*(The `api_key` row's file source is `keys[profile.name]` since the
+[keys-split amendment](#amendment-2026-10-25-issue-29-credentials-split-back-out);
+env precedence is unchanged.)*
+
 A blank env var counts as absent (v1 rule). `nickname` has no env override —
 it is file vocabulary. Env-only configs (no config file at all) keep working,
 as in v1. Missing required fields after the merge yield `{:error, message}`
@@ -257,7 +272,13 @@ denominator still reads `context_tokens` off the provider.
   single file. The split buys 0644-vs-0600 separation, but profiles already
   bound credentials to subscriptions, the two-file dance complicated migration
   (partial-layout states needed guards), and one chmod target is simpler to
-  keep honest than two.
+  keep honest than two. *(Reversed by the
+  [keys-split amendment](#amendment-2026-10-25-issue-29-credentials-split-back-out):
+  the split is the layout after all — not for 0644-vs-0600 separation, but
+  because a settings file that cannot hold a credential makes every backup,
+  example, and dotfile sync structurally incapable of leaking one. The
+  migration complexity the original rejection feared is handled by the
+  amendment's split-marker and merge rules.)*
 - **CLI `--model` as a full addressing scheme** (profile+nickname pairs like
   `work/Sol`) — `--profile` already scopes the menu; `--model <nickname>`
   under it fell out naturally and is enough. Not gold-plated further.
@@ -284,3 +305,149 @@ denominator still reads `context_tokens` off the provider.
 - Secrets have exactly one home, chmod-checked at creation and at every load,
   asserted by tests. Migration never destroys user data — the legacy file
   survives as a backup rename.
+
+---
+
+## Amendment (2026-10-25, issue #29): credentials split back out
+
+**Status:** Accepted. **Reverses** the file-layout and security-posture
+sections above (the "one file holds the secrets" decision, and the `keys.json5`
+alternative rejection). Everything else — profiles, the schema's non-credential
+fields, model selection, precedence (file < env), the never-echo-values rule,
+the JSON5 dialect choice — stands.
+
+### Why the reversal
+
+The single-file layout made every copy of `settings.json5` a secrets-bearing
+artifact: the 2026-10-25 backup-perms incident (issue #28) was exactly this
+failure mode — a legacy file that *had* held a credential was copied
+world-readable. Hardening every copy is whack-a-mole; **a settings file that
+cannot hold a credential makes every backup, example, dotfile sync, and export
+structurally incapable of leaking one. Nothing to remember, nothing to
+redact.** Owner decision same day, after the PA's recommendation: "continue to
+have a keys.json5 and an oauth.json5 so we can be secure."
+
+### Decision
+
+**Layout** in `~/.config/dashfloat/` (`XDG_CONFIG_HOME` honored):
+
+| File | Contents | Mode |
+| --- | --- | --- |
+| `settings.json5` | `configVersion`, `yourName`, profiles (`name`, `baseUrl`, `settings`, `models`) — NO credential material | 0600 anyway (free) |
+| `keys.json5` | API keys keyed by PROFILE NAME — the only home for keys | 0600 always: create + repair |
+| `oauth.json5` | reserved for a future OAuth flow; absence-tolerant, never read by this loader | 0600 when present (posture-only) |
+
+`configVersion` 2 is the split marker. The effective API key is
+`DASHFLOAT_API_KEY` > `keys[active profile name]` — precedence otherwise
+unchanged; a profile whose key is missing yields the existing field-names-only
+error.
+
+**Stray inline credentials: tolerate-and-warn, value IGNORED — never a
+fallback.** A stray `apiKey` in settings.json5 warns:
+`settings.json5: profile "<name>": apiKey is ignored — API keys live in
+keys.json5, keyed by profile name`. Falling back to it would make the
+structural guarantee cosmetic.
+
+**Backups inherit the source's sensitivity** — the principle: any backup of a
+file that ever held credentials is 0600. `config.json.bak`, a pre-split
+`settings.json5.bak`, the legacy file before its rename: all 0600 wherever
+they live (issue #28's rider, generalized).
+
+### Migration v2 (idempotent, atomic tmp+rename, both paths)
+
+1. **Legacy** (no non-empty `settings.json5`, `config.json` present): renders
+   the de-secreted settings + `keys.json5` `%{'default': <key>}`, writes keys
+   BEFORE settings (the credential reaches its new home before the marker file
+   exists), then renames the legacy file to `config.json.bak` — all #28
+   rider behavior verbatim (never clobber an existing `.bak`, tighten it and
+   the legacy file, symlink-safe chmod, non-regular files left alone).
+2. **In-place split** (a `settings.json5` older than v2 has inline `apiKey`
+   fields): copy the file byte-exact to `settings.json5.bak` (0600 — a COPY,
+   not a rename: a rename-first crash window would leave no settings.json5 and
+   nothing to re-trigger; a copy leaves the original to converge on re-run),
+   write `keys.json5` from the collected keys, then rewrite settings de-secreted
+   at `configVersion` 2. A v1 file with no inline credential field is
+   byte-untouched — rewriting it churns user formatting for nothing.
+
+**Split ordering is crash-convergent:** renders (pure) run before any write;
+backup → keys → de-secreted rewrite; the credential always has its new home
+before the old one is emptied. A failed backup copy is a warning, not an error
+(the keys still land first); a failed keys write aborts before the settings
+rewrite.
+
+**Merge rules:** a pre-existing `keys.json5` WINS over collected keys (it is
+the user's explicit new home; the old values survive in the backup) — never
+rewritten. A malformed existing `keys.json5` is a migration error: never
+destroy unreadable data. Symlinked or non-regular `settings.json5`/`keys.json5`
+skip the split with a warning — tmp+rename would sever the link; split by hand.
+
+### General JSON5 renderer
+
+`DashFloat.Config.JSON5.render/1` renders a whole decoded map (sorted keys,
+bare identifier keys, 2-space indent, trailing commas, `quote_value`
+semantics), so tolerated content — `yourName`, unknown top-level keys, models
+extras — survives a rewrite losslessly; only formatting is lost. An
+unrepresentable string (a backslash, or both quote kinds — the Combine
+backend processes no escapes) fails the render naming the value's PATH (e.g.
+`profiles[0].apiKey`), never its content. Bare keys also dodge the parser's
+ECMA reserved words (`default:` as a bare key is unreadable — verified
+against the dep, and "default" is a keys.json5 key). The legacy path keeps its
+up-front per-field representability checks so its field-name error survives.
+
+### Consequences of the amendment
+
+- Three files share one posture (`DashFloat.Config.Posture`): 0600 at
+  creation, best-effort repair on load before anything parses a file,
+  regular-files-only, lstat-guarded (never chmod through a symlink; a
+  directory by a secrets name keeps its own semantics). The `.tmp` staging
+  paths get the same guard — a pre-planted `keys.json5.tmp` symlink is
+  refused, never written through.
+- `DashFloat.Config.load/2,3` reads both `settings.json5` and `keys.json5`
+  (missing = empty map; malformed = load error naming the file; invalid
+  UTF-8 included — any parser crash degrades to the fixed error string, so
+  startup always reaches its config-error path); the `Config.t()` struct,
+  env overrides, and consumers are untouched.
+- **A credential is never silently lost** (review fix-round rule, proven
+  cell-by-cell by a table-driven sweep test over the constructible
+  pre-state matrix — keys.json5 × backup × v1 shape, crash states modeled
+  as pre-states since writes are tmp+rename atomic): every inline
+  credential the split removes gets a home — a keys.json5 slot with exactly
+  that value, or the byte-exact backup. The decision is made from the
+  backup's ACTUAL outcome (`:written`/`:identical`/`:kept`/`:failed`),
+  never from a prediction, and completes before the one destructive step
+  (the settings rewrite). It REFUSES when a pre-existing keys.json5 wins
+  without holding a value (a differing value under a collected name, a
+  duplicate-name loser keys.json5 cannot key by name, a root-level or
+  blank-name credential) and no usable backup exists. Both unblocks are
+  real and tested: adding the key under its name to keys.json5 clears the
+  refusal, a `settings.json5.bak` byte-identical to the current file (the
+  crash-recovery state) converges automatically, and moving a stale `.bak`
+  aside lets the next start write a fresh backup. Warnings claim only what
+  has already happened (the "backed up first" clause only follows an actual
+  backup write).
+- The LOAD path surfaces historical loss: a profile with no key under its
+  name in an existing keys.json5 warns at startup (names only, respecting
+  the loader's own precedence — a profile completed by
+  `DASHFLOAT_API_KEY` is keyed and stays silent; quiet when keys.json5 is
+  absent entirely). The refusal-unblock sidecar `settings.json5.bak.old`
+  is part of the same posture: the load tightens it like every other
+  secrets-bearing leftover, so the documented `mv` remedy cannot strand a
+  world-readable credential copy. A symlinked `settings.json5.bak` is
+  lstat-guarded (never read through — a self-referential link would
+  masquerade as a byte-exact backup while the rewrite empties the only
+  real copy): it counts as no backup and feeds the loss decision.
+- A ROOT-level `apiKey` is stripped by the split and warned by the loader
+  exactly like a profile-level stray — nothing credential-shaped rides into
+  live v2 settings unwarned.
+- The legacy file is tightened to 0600 BEFORE the legacy migration writes
+  anything, and the load path tightens a leftover never-renamed
+  `config.json` beside a complete layout — the crash window between the
+  settings write and the backup rename can no longer strand a world-readable
+  credential that re-runs (marker present) would never touch.
+- Rendered keys are fully anchored identifiers (a trailing-newline key must
+  render quoted, not silently rename to its prefix) and dodge the parser's
+  ECMA reserved words.
+- The grep-able invariant: after any migration or load, the live
+  `settings.json5` contains no credential value — asserted across both
+  migration paths; by-design backups hold old values at 0600, which is the
+  principle working, not a leak.
