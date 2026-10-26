@@ -806,6 +806,34 @@ defmodule DashFloat.AgentTest do
     state.phase == :idle
   end
 
+  test "P2-3 regression: the no-provider notice carries the actual error (unknown --profile)" do
+    # A static setup hint for a typo'd flag is a support dead-end; the
+    # hard error's own text (valid names, never values) is the remedy.
+    {:ok, sup} = Task.Supervisor.start_link()
+
+    message =
+      "profile \"ghost\" matches no profile in settings.json5 — valid profiles: work, personal"
+
+    {:ok, agent} =
+      Agent.start_link(
+        provider: {:error, message},
+        cwd: System.tmp_dir!(),
+        supervisor: sup,
+        name: nil
+      )
+
+    on_exit(fn ->
+      if Process.alive?(agent), do: GenServer.stop(agent)
+      if Process.alive?(sup), do: Process.exit(sup, :kill)
+    end)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:entry, :system, text}, 500
+    assert text =~ "no provider configured"
+    assert text =~ "valid profiles: work, personal"
+    assert text =~ "settings.json5"
+  end
+
   test "the startup-phase handoff: {:set_provider, _} swaps the provider (ADR 0009)" do
     server = start_server([final_episode("after setup")])
     cwd = System.tmp_dir!()

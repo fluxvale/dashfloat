@@ -137,6 +137,16 @@ defmodule DashFloat.TUI do
   def handle_event(%ExRatatui.Event.Paste{}, %{confirm: pending} = state) when pending != nil,
     do: schedule(state)
 
+  # The startup phase owns PASTE as well as keys (P1-2, hostile review): the
+  # key step's own copy says "paste it", and a paste routed to the hidden
+  # composer would leave the credential as pending chat text — then submit
+  # it to the provider on the first post-setup Enter. Setup pastes feed the
+  # wizard's draft; the forced-selection modal has no text step, so pastes
+  # there are inert.
+  def handle_event(%ExRatatui.Event.Paste{content: content}, %State{setup: setup} = state)
+      when setup != nil,
+      do: schedule(State.setup_paste(state, content))
+
   def handle_event(%ExRatatui.Event.Paste{content: content}, state),
     do: schedule(State.paste(state, content))
 
@@ -357,13 +367,28 @@ defmodule DashFloat.TUI do
         cleared
 
       resolve ->
-        {resolved, {:agent_provider, classification}} =
-          State.provider_resolved(state, safe_resolve(resolve, name))
+        # P2-3 (hostile review): the handoff normalizes at the boundary —
+        # the agent's provider is ALWAYS {:ok, _} | {:error, msg}. A raw
+        # :onboard / {:select, _} classification (a failed settings write
+        # leaving zero profiles, say) used to reach the agent's case and
+        # crash it on the first prompt; now it becomes a human-readable
+        # error the agent DISPLAYS.
+        provider = for_agent(safe_resolve(resolve, name))
+        {resolved, {:agent_provider, provider}} = State.provider_resolved(state, provider)
 
-        send(state.agent, {:set_provider, classification})
-        restart_catalog(resolved, classification)
+        send(state.agent, {:set_provider, provider})
+        restart_catalog(resolved, provider)
     end
   end
+
+  defp for_agent({:ok, _config} = ok), do: ok
+  defp for_agent({:error, _message} = error), do: error
+
+  defp for_agent(:onboard),
+    do: {:error, "first-run setup is incomplete — finish the wizard, or configure by hand"}
+
+  defp for_agent({:select, names}),
+    do: {:error, "no profile selected — choose one of: " <> Enum.join(names, ", ")}
 
   # A resolved working config restarts the standing catalog refresh under
   # the new provider set (ADR 0009).

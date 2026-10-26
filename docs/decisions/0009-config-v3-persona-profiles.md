@@ -307,9 +307,14 @@ empty-it:
 
 - `defaultProfile` missing (silent — it is optional), not-a-string, blank,
   or unknown (warn + unset) → the classification arms above.
-- `profiles` not-a-list / empty / entries that are not objects / entries
-  without `name` → per-entry skip-with-warning (a nameless profile is
-  unaddressable); zero surviving profiles → the state machine.
+- `profiles` not-a-list / entries that are not objects / a profile-level
+  `providers`/`mcp` that is not a list → **the migration refuses** (the
+  refusal catalog above); at LOAD the shape degrades instead: not-a-list
+  warns, nameless entries skip with a warning (a nameless profile is
+  unaddressable); zero surviving profiles → the state machine. A
+  `profiles: []`-over-the-file rewrite is the one outcome tolerance never
+  buys — malformed input to a WRITER is refusal, never deletion (hostile
+  review P1-1).
 - `providers`/`mcp` entries that are not objects or lack `baseUrl`/`name`/
   `command` → skip-with-warning per entry.
 - keys.json5 values that are not strings, or a profile's map that is not an
@@ -362,6 +367,13 @@ load; a v1-era refusal surfaces with #31's message before this step runs.
     endpoint), but v3 menus hang off providers and the migration never reads
     env (remedy: add the `baseUrl`). Names-only shells (no baseUrl, no key, no
     models) pass through as provider-less profiles;
+  - **unshapeable input (hostile review P1-1):** a `profiles` field that is
+    not a list, a list entry that is not an object, or a profile-level
+    `providers`/`mcp` that is not a list — writing `profiles: []` over such a
+    file would delete its provider tree (and any keys still inside it) from
+    every file on disk, so BOTH the split and the reshape refuse it
+    byte-unchanged with the field named (remedy: fix the file by hand, or set
+    `configVersion: 3` if it is already v3);
   - **v3-shaped ambiguity tripwires:** a profile carrying `providers` or
     `mcp`, or a top-level `defaultProfile`, without `configVersion: 3` — the
     file looks v3 already and reshaping it as v2 would silently orphan its
@@ -370,6 +382,11 @@ load; a v1-era refusal surfaces with #31's message before this step runs.
     refused by path, never clobbered.
 - **Idempotent:** the marker makes re-runs no-ops; a crash mid-migration
   leaves v2 intact (tmp+rename atomicity) and the re-run converges.
+- **Dangling `.bak` symlinks are kept, never replaced** (issue #33's class,
+  fixed here): a dangling link answers `File.exists? == false`, which the
+  regular-file guard never reached — both backup paths lstat first now, so a
+  `.bak` symlink (live or dangling) survives every migration with a warning
+  and counts as no backup for the loss decision.
 
 ### Carried over unchanged (ADR 0008 / #31)
 

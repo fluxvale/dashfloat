@@ -19,9 +19,14 @@ defmodule DashFloat.Agent do
   # Display excerpt for tool-result rows; the model gets the bounded full result.
   @display_lines 30
 
-  @no_provider "[llm: no provider configured — set up profiles in " <>
-                 "~/.config/dashfloat/settings.json5 or " <>
-                 "DASHFLOAT_BASE_URL/DASHFLOAT_MODEL/DASHFLOAT_API_KEY]"
+  # P2-3 (hostile review): the no-provider notice CARRIES the actual error —
+  # an unknown --profile hard error or a migration refusal is the user's
+  # real remedy, and a static setup hint is a support dead-end. The message
+  # is provider vocabulary (paths, profile names), never values.
+  @no_provider_prefix "[llm: no provider configured — "
+
+  @no_provider_suffix " | set up profiles in ~/.config/dashfloat/settings.json5 or " <>
+                        "DASHFLOAT_BASE_URL/DASHFLOAT_MODEL/DASHFLOAT_API_KEY]"
 
   @enforce_keys [:provider, :cwd, :supervisor]
   defstruct [
@@ -86,8 +91,8 @@ defmodule DashFloat.Agent do
   def handle_info({:prompt, ui, text}, %__MODULE__{status: :idle} = state)
       when is_pid(ui) and is_binary(text) do
     case state.provider do
-      {:error, _message} ->
-        display(ui, {:entry, :system, @no_provider})
+      {:error, message} ->
+        display(ui, {:entry, :system, no_provider_text(message)})
         display(ui, {:phase, :idle})
         {:noreply, state}
 
@@ -570,4 +575,9 @@ defmodule DashFloat.Agent do
     |> inspect()
     |> String.slice(0, 120)
   end
+
+  # The error message rides the notice (P2-3): the user sees WHY — a typo'd
+  # --profile, a migration refusal, an unfinished wizard — not a static hint.
+  defp no_provider_text(message),
+    do: @no_provider_prefix <> message <> @no_provider_suffix
 end

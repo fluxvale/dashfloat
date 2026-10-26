@@ -164,9 +164,33 @@ defmodule DashFloat.Config do
   def write_settings(dir, document) when is_binary(dir) and is_map(document) do
     main_path = Path.join(dir, @main_file)
 
-    with :ok <- ensure_dir(dir),
+    with :ok <- empty_or_absent(main_path),
+         :ok <- ensure_dir(dir),
          {:ok, doc} <- JSON5.render(document) do
       Posture.write_private(main_path, doc <> "\n")
+    end
+  end
+
+  # A NON-EMPTY settings.json5 already in place is never overwritten (P2-1,
+  # hostile review — the #31 never-clobber rule): the wizard runs on
+  # absent/empty/zero-profile shapes, and a hand-made or unparseable file is
+  # the user's to move aside, not ours to replace.
+  defp empty_or_absent(path) do
+    case File.read(path) do
+      {:ok, contents} ->
+        if String.trim(contents) == "" do
+          :ok
+        else
+          {:error,
+           "#{@main_file} already exists and is not empty — rename it aside " <>
+             "(mv #{path} #{path}.old) and re-run setup to write a fresh one"}
+        end
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, "cannot read #{path}: #{:file.format_error(reason)}"}
     end
   end
 
@@ -212,7 +236,7 @@ defmodule DashFloat.Config do
       warn_stray_root_key(main)
 
       profiles = parse_profiles(main)
-      warn_unkeyed_profiles(profiles, keys, keys_path, env)
+      warn_unkeyed_profiles(main, profiles, keys, keys_path, env, cli)
       classify(main, profiles, keys, env, cli)
     end
   end
@@ -333,21 +357,47 @@ defmodule DashFloat.Config do
   # endpoints; silent when keys.json5 is absent (env-keyed setups are
   # legitimate). An unset $ENV_VAR reference names the variable — env var
   # names are addresses, not secrets (ADR 0009).
-  defp warn_unkeyed_profiles(profiles, keys, keys_path, env) do
-    for profile <- profiles,
-        File.exists?(keys_path),
-        not env_key?(env),
-        provider <- profile.providers do
-      # A binding inside a `for` clause list would act as a FILTER (a nil
-      # raw key would silently stop iteration) — compute in the body.
-      raw = raw_key(keys, profile, provider)
+  # P3-4 (hostile review): the warning fires for the ACTIVE profile's
+  # providers only — a fully-keyed default must not be nagged about another
+  # persona's unkeyed provider. The active profile is resolved exactly as
+  # classify/5 resolves it (flag > env > valid defaultProfile > the sole
+  # profile); when no profile can be active yet (zero profiles, or a forced
+  # selection with no default), nobody is warned — the modal decides first.
+  defp warn_unkeyed_profiles(main, profiles, keys, keys_path, env, cli) do
+    case active_profile_name(main, profiles, env, cli) do
+      nil -> :ok
+      name -> warn_unkeyed_profile(Enum.find(profiles, &(&1.name == name)), keys, keys_path, env)
+    end
+  end
 
-      if resolve_key(raw, env) == nil do
-        warn_unkeyed_provider(profile, provider, raw, env)
-      end
+  defp active_profile_name(main, profiles, env, cli) do
+    explicit = cli_value(cli, :profile) || env_value(env, @profile_var)
+
+    cond do
+      is_binary(explicit) -> explicit
+      match?([_only], profiles) -> hd(profiles).name
+      true -> default_profile_name(main, profiles)
+    end
+  end
+
+  defp warn_unkeyed_profile(nil, _keys, _keys_path, _env), do: :ok
+
+  defp warn_unkeyed_profile(profile, keys, keys_path, env) do
+    if File.exists?(keys_path) and not env_key?(env) do
+      for provider <- profile.providers, do: warn_if_unkeyed(profile, provider, keys, env)
     end
 
     :ok
+  end
+
+  defp warn_if_unkeyed(profile, provider, keys, env) do
+    # A binding inside a `for` clause list would act as a FILTER (a nil raw
+    # key would silently stop iteration) — compute in the body.
+    raw = raw_key(keys, profile, provider)
+
+    if resolve_key(raw, env) == nil do
+      warn_unkeyed_provider(profile, provider, raw, env)
+    end
   end
 
   defp warn_unkeyed_provider(profile, provider, raw, env) do
@@ -827,8 +877,9 @@ defmodule DashFloat.Config do
   defp parse_mcp_entry(_name, entry) when is_map(entry) do
     with name when is_binary(name) <- value(entry["name"]) || :missing,
          command when is_binary(command) <- value(entry["command"]) || :missing,
-         token when token in [nil, :ref] <- mcp_token(entry["token"]) do
-      %{name: name, command: command, args: args(entry["args"]), token: token}
+         token when token in [nil, :ref] <- mcp_token(entry["token"]),
+         args when is_list(args) <- valid_args(entry["args"]) do
+      %{name: name, command: command, args: args, token: token}
     else
       :missing ->
         Logger.warning("#{@main_file}: an mcp entry without a name or command is ignored")
@@ -840,6 +891,14 @@ defmodule DashFloat.Config do
             "token must be a $ENV_VAR reference"
         )
 
+        nil
+
+      :bad_args ->
+        Logger.warning("#{@main_file}: an mcp entry with a non-list args is ignored")
+        nil
+
+      :bad_arg_element ->
+        Logger.warning("#{@main_file}: an mcp entry with a non-scalar arg is ignored")
         nil
     end
   end
@@ -857,9 +916,23 @@ defmodule DashFloat.Config do
 
   defp mcp_token(_other), do: :literal_token
 
-  defp args(nil), do: []
-  defp args(list) when is_list(list), do: Enum.map(list, &to_string/1)
-  defp args(_other), do: []
+  # `args` must be a list of scalars — to_string/1 on a map or nested list
+  # raises Protocol.UndefinedError straight out of load (P2-2, hostile
+  # review). Shape junk NEVER crashes the loader: the entry skips with a
+  # warning.
+  defp valid_args(nil), do: []
+
+  defp valid_args(entries) when is_list(entries) do
+    if Enum.all?(entries, &scalar?/1) do
+      Enum.map(entries, &to_string/1)
+    else
+      :bad_arg_element
+    end
+  end
+
+  defp valid_args(_other), do: :bad_args
+
+  defp scalar?(value), do: is_binary(value) or is_number(value) or is_boolean(value)
 
   defp parse_settings(_name, nil), do: nil
 

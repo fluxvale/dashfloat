@@ -1753,6 +1753,33 @@ defmodule DashFloat.TUI.StateTest do
   end
 
   describe "the startup phase (ADR 0009)" do
+    test "P1-3 regression: Inspect never prints the wizard's key (crash-log leak)" do
+      # The reviewer's 4-line crash-report repro: State.setup holds the
+      # plaintext key (draft / pending.key); a TUI crash used to dump it
+      # into the log. The derivations must redact — Config.ex is the house
+      # reference pattern.
+      wizard =
+        Enum.reduce(
+          ["enter", "enter", "enter", "enter", "k", "e", "y", "enter"],
+          Onboarding.new(),
+          fn key, wizard ->
+            {wizard, _action} = Onboarding.handle_key(wizard, key)
+            wizard
+          end
+        )
+
+      assert wizard.pending.key == "key"
+
+      state = setup_state(setup: wizard)
+      refute inspect(state) =~ "key: \"key\""
+      refute inspect(state) =~ ~s(pending: %{)
+      assert inspect(state) =~ "..."
+
+      # The wizard alone redacts too (standalone logs, IEx).
+      refute inspect(wizard) =~ ~s(key: "key")
+      refute inspect(wizard) =~ ~s(draft: "key")
+    end
+
     defp setup_state(opts \\ []) do
       [test_mode: {80, 24}]
       |> Keyword.merge(opts)

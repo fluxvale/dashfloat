@@ -685,6 +685,13 @@ defmodule DashFloat.Config.MigrationTest do
         :self_link ->
           File.ln_s!(main, backup)
 
+        # P2-4 (issue #33's class): a DANGLING .bak symlink answers
+        # File.exists? == false — pre-fix the write replaced the link with
+        # a regular file, silently, against the "never replaced" docs.
+        :dangling_link ->
+          target = Path.join(dir, "no-such-target")
+          File.ln_s!(target, backup)
+
         :outside_link ->
           copy = Path.join(dir, "dotfiles-copy")
           File.write!(copy, spec.file)
@@ -714,6 +721,49 @@ defmodule DashFloat.Config.MigrationTest do
       end
     end
 
+    test "malformed-shape cells refuse cleanly with the file byte-unchanged (P1-1)" do
+      shapes = [
+        # profiles as a map carrying an inline key (the loss-class repro)
+        "{configVersion: 1, profiles: {work: {baseUrl: 'https://provider.example/v1', apiKey: 'PLACEHOLDER-work-key'}}}",
+        # profiles as a string
+        "{configVersion: 1, profiles: 'nope', apiKey: 'PLACEHOLDER-root-key'}",
+        # a list holding a non-object entry beside a real profile
+        "{configVersion: 1, profiles: ['junk', {name: 'work', baseUrl: 'https://provider.example/v1', apiKey: 'PLACEHOLDER-work-key'}]}",
+        # providers as a map on a named entry
+        "{configVersion: 1, profiles: [{name: 'work', baseUrl: 'https://provider.example/v1', apiKey: 'PLACEHOLDER-work-key', providers: {x: 1}}]}",
+        # mcp as a map on a named entry ({}, the empty object literal, is a
+        # json5-dep parser quirk in this position — a non-empty map is the
+        # honest fixture for the same wrong type)
+        "{configVersion: 1, profiles: [{name: 'work', baseUrl: 'https://provider.example/v1', apiKey: 'PLACEHOLDER-work-key', mcp: {mode: 1}}}]"
+      ]
+
+      for file <- shapes, bak_state <- [:absent, :stale] do
+        dir = tmp_dir()
+        main = Path.join(dir, "settings.json5")
+        File.write!(main, file)
+        File.chmod!(main, 0o600)
+        if bak_state == :stale, do: write_backup!(dir, "// stale")
+
+        cell = "#{bak_state}:#{String.slice(file, 0, 40)}"
+
+        # Either refusal arm protects the file: our unshapeable refusal, or
+        # the json5 dep's own parse error — the dep's parse outcome for a
+        # few of these shapes is PER-BOOT nondeterministic (same VM always
+        # agrees; across boots, hash-order in its parser tables flips a
+        # marginal shape — banked as a follow-up). A parse error is also a
+        # loud, nothing-written refusal, which is the invariant here.
+        assert {:error, message} = @migration.maybe_migrate(dir), "cell #{cell}"
+
+        assert message =~ "not a shape the v3 migration can represent" or
+                 message =~ "invalid JSON5",
+               "cell #{cell}: #{message}"
+
+        # Refuse-and-unchanged: the malformed file (and its inline keys)
+        # survive byte-exact.
+        assert File.read!(main) == file, "cell #{cell}"
+      end
+    end
+
     test "every pre-state cell preserves every credential value or refuses cleanly" do
       shapes = Map.keys(@shapes)
 
@@ -733,6 +783,7 @@ defmodule DashFloat.Config.MigrationTest do
         :stale,
         :tmp_occupied,
         :self_link,
+        :dangling_link,
         :outside_link,
         :link_dir
       ]
@@ -755,8 +806,8 @@ defmodule DashFloat.Config.MigrationTest do
 
         {outcome, _logs} = with_log(fn -> @migration.maybe_migrate(dir) end)
 
-        # Symlinked backups are never clobbered, in either arm.
-        if bak_state in [:self_link, :outside_link, :link_dir] do
+        # Symlinked backups — dangling included — are never replaced.
+        if bak_state in [:self_link, :dangling_link, :outside_link, :link_dir] do
           assert File.lstat!(backup_path).type == :symlink, "cell #{cell}: .bak link replaced"
         end
 
@@ -1536,38 +1587,26 @@ defmodule DashFloat.Config.MigrationTest do
       refute File.exists?(paths(dir).settings_backup)
     end
 
-    test "garbage profile entries ride through the split untouched" do
+    test "P1-1 regression: garbage (non-object) entries now REFUSE the chain, byte-unchanged" do
+      # Pre-fix these rode through the rewrite verbatim; the hostile
+      # review's rule is stricter and loss-free: a non-object entry is
+      # unshapeable for v3, and tolerating it through a rewrite is how the
+      # map-shaped profiles hole hid. The chain refuses, nothing is
+      # written, the credential stays put.
       dir = tmp_dir()
 
-      write_v1!(
-        dir,
-        """
-        {
-          configVersion: 1,
-          profiles: [
-            'not-a-map',
-            { baseUrl: 'https://no-name.example' },
-            { name: 'work', baseUrl: 'https://provider.example/v1',
-              apiKey: 'PLACEHOLDER-work-key',
-              models: [{ nickname: 'Sol', model: 'glm-5.3' }] },
-          ],
-        }
-        """
-      )
+      damaged =
+        "{configVersion: 1, profiles: ['not-a-map', {name: 'work', baseUrl: 'https://provider.example/v1', apiKey: 'PLACEHOLDER-work-key'}]}"
 
-      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+      main = Path.join(dir, "settings.json5")
+      File.write!(main, damaged)
+      File.chmod!(main, 0o600)
 
-      # Only the NAMED profile's key is collected; the garbage entries are
-      # tolerated content and survive the rewrite verbatim.
-      assert {:ok, decoded} =
-               decoded_main(dir)
-
-      ["not-a-map", no_name, work] = decoded["profiles"]
-      assert no_name == %{"baseUrl" => "https://no-name.example"}
-      refute Map.has_key?(work, "apiKey")
-
-      assert {:ok, %{"work" => %{"https://provider.example/v1" => "PLACEHOLDER-work-key"}}} =
-               decoded_keys(dir)
+      assert {:error, message} = @migration.maybe_migrate(dir)
+      assert message =~ "not a shape the v3 migration can represent"
+      assert File.read!(main) == damaged
+      assert File.read!(main) =~ "PLACEHOLDER-work-key"
+      refute File.exists?(paths(dir).keys)
     end
   end
 
@@ -1748,6 +1787,87 @@ defmodule DashFloat.Config.MigrationTest do
 
       assert {:error, message} = @migration.maybe_migrate(dir)
       assert message =~ ~s(profile "work" has models but no baseUrl)
+    end
+
+    test "P1-1 regression: a map-shaped profiles field with inline keys is refused, never emptied" do
+      # Reviewer repro A: `profiles` as a MAP (not a list) makes every
+      # guard no-op (profiles_list reads []) and the reshape used to write
+      # `configVersion: 3, profiles: []` OVER the file — both inline keys
+      # vanished from every file on disk, no refusal. Pre-fix this ran to
+      # :onboard with the tree gone.
+      dir = tmp_dir()
+      main = Path.join(dir, "settings.json5")
+
+      damaged =
+        "{configVersion: 2, profiles: {work: {baseUrl: 'https://one.example/v1', apiKey: 'PLACEHOLDER-a'}, home: {baseUrl: 'https://two.example/v1', apiKey: 'PLACEHOLDER-b'}}}"
+
+      File.write!(main, damaged)
+      File.chmod!(main, 0o600)
+      # A stale backup present: pre-fix the chain still wrote over the file.
+      write_backup!(dir, "// stale")
+
+      assert {:error, message} = @migration.maybe_migrate(dir)
+      assert message =~ "not a shape the v3 migration can represent"
+      assert message =~ "profiles must be a list of objects"
+
+      # EVERYTHING byte-unchanged: both credentials still in the live file.
+      assert File.read!(main) == damaged
+      assert File.read!(main) =~ "PLACEHOLDER-a"
+      assert File.read!(main) =~ "PLACEHOLDER-b"
+      refute File.exists?(paths(dir).keys)
+    end
+
+    test "P1-1 regression: a v3-shaped tree inside a map-shaped profiles is refused" do
+      # Reviewer repro B: a full provider tree + mcp + defaultProfile inside
+      # a `profiles` map, no configVersion: 3. The tripwire cannot see it
+      # (profiles_list reads []); pre-fix the reshape silently emptied it
+      # with ZERO warnings.
+      dir = tmp_dir()
+      main = Path.join(dir, "settings.json5")
+
+      damaged =
+        "{defaultProfile: 'work', profiles: {work: {providers: [{baseUrl: 'https://one.example/v1'}], mcp: [{name: 'f', command: 'uvx'}]}}}"
+
+      File.write!(main, damaged)
+      File.chmod!(main, 0o600)
+
+      assert {:error, message} = @migration.maybe_migrate(dir)
+      assert message =~ "not a shape the v3 migration can represent"
+      assert File.read!(main) == damaged
+      assert File.read!(main) =~ "https://one.example/v1"
+      assert File.read!(main) =~ "mcp"
+    end
+
+    test "P1-1 regression: non-object entries and non-list providers/mcp refuse" do
+      cases = [
+        # a list holding a non-object entry
+        "{configVersion: 2, profiles: [{name: 'ok', baseUrl: 'https://one.example/v1'}, 7]}",
+        # a list-holding entry with providers as a map
+        "{configVersion: 2, profiles: [{name: 'ok', baseUrl: 'https://one.example/v1', providers: {a: 1}}]}",
+        # mcp not a list on a v2 entry
+        "{configVersion: 2, profiles: [{name: 'ok', baseUrl: 'https://one.example/v1', mcp: 3}]}"
+      ]
+
+      for damaged <- cases do
+        dir = tmp_dir()
+        main = Path.join(dir, "settings.json5")
+        File.write!(main, damaged)
+        File.chmod!(main, 0o600)
+
+        assert {:error, message} = @migration.maybe_migrate(dir), inspect(damaged)
+        assert message =~ "not a shape the v3 migration can represent"
+        assert File.read!(main) == damaged, inspect(damaged)
+      end
+    end
+
+    test "an absent profiles field still reshapes to the empty v3 list (nothing to lose)" do
+      dir = tmp_dir()
+      write_v1!(dir, "{configVersion: 2, yourName: 'terry-placeholder'}")
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      assert {:ok, %{"configVersion" => 3, "profiles" => [], "yourName" => "terry-placeholder"}} =
+               decoded_main(dir)
     end
 
     test "refusal: a v3-shaped file without configVersion: 3 trips the ambiguity guard" do
@@ -2000,7 +2120,80 @@ defmodule DashFloat.Config.MigrationTest do
       assert {:ok, %{}} = decoded_keys(dir)
     end
 
-    test "a v2 directory with no addressable profiles reshapes without defaultProfile" do
+    test "P1-1 regression: a v2 directory with non-object profile entries refuses" do
+      dir = tmp_dir()
+      damaged = "{configVersion: 2, profiles: [\"garbage\", 7, {}]}"
+      main = Path.join(dir, "settings.json5")
+      File.write!(main, damaged)
+      File.chmod!(main, 0o600)
+
+      assert {:error, message} = @migration.maybe_migrate(dir)
+      assert message =~ "not a shape the v3 migration can represent"
+      assert File.read!(main) == damaged
+    end
+
+    test "a v2 directory with an EMPTY profiles list reshapes to the empty v3 list" do
+      # An empty list is a list: nothing to lose, and the marker advances.
+      # (defaultProfile stays absent — no addressable profile to name.)
+      dir = tmp_dir()
+      write_v1!(dir, "{configVersion: 2, profiles: []}")
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      assert {:ok, %{"configVersion" => 3, "profiles" => []}} = decoded_main(dir)
+
+      {:ok, decoded} = decoded_main(dir)
+      refute Map.has_key?(decoded, "defaultProfile")
+    end
+
+    test "a v3 profile with junk inside providers skips the junk and moves nothing" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{ name: 'work', providers: ['junk', 7] }],
+        }
+        """
+      )
+
+      write_keys_file!(dir, "{'work': 'PLACEHOLDER-flat'}")
+
+      logs = capture_log(fn -> assert {:ok, :not_needed} = @migration.maybe_migrate(dir) end)
+      assert logs =~ ~s(profile "work" has no single provider endpoint)
+
+      assert {:ok, keys} = decoded_keys(dir)
+      assert keys == %{"work" => "PLACEHOLDER-flat"}
+    end
+
+    test "a v3 directory with junk entries in profiles skips them; named profiles still move" do
+      dir = tmp_dir()
+
+      write_v1!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: ['junk', 7, { name: 'work', providers: [{ baseUrl: 'https://one.example/v1' }] }],
+        }
+        """
+      )
+
+      write_keys_file!(dir, "{'work': 'PLACEHOLDER-flat'}")
+
+      assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+
+      assert {:ok, %{"work" => %{"https://one.example/v1" => "PLACEHOLDER-flat"}}} =
+               decoded_keys(dir)
+    end
+
+    test "a v2 directory with a NAMELESS map entry skips it for defaultProfile" do
+      # Nameless maps ride through (they are objects; load drops them with
+      # a warning); the first NAMED profile still becomes defaultProfile.
       dir = tmp_dir()
 
       write_v1!(
@@ -2008,18 +2201,20 @@ defmodule DashFloat.Config.MigrationTest do
         """
         {
           configVersion: 2,
-          profiles: ["garbage", 7, {}],
+          profiles: [
+            { baseUrl: 'https://nameless.example/v1', models: [{ model: 'x' }] },
+            { name: 'work', baseUrl: 'https://provider.example/v1', models: [{ model: 'm1' }] },
+          ],
         }
         """
       )
 
       assert {:ok, :migrated} = @migration.maybe_migrate(dir)
 
-      assert {:ok, %{"configVersion" => 3, "profiles" => ["garbage", 7, %{}]}} =
+      assert {:ok, %{"defaultProfile" => "work", "profiles" => [_nameless, work]}} =
                decoded_main(dir)
 
-      {:ok, decoded} = decoded_main(dir)
-      refute Map.has_key?(decoded, "defaultProfile")
+      assert work["name"] == "work"
     end
 
     test "a v3 profile whose providers is not a list finishes with nothing to move" do

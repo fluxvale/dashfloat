@@ -1595,6 +1595,81 @@ defmodule DashFloat.ConfigTest do
       assert message =~ "a-file"
     end
 
+    test "P2-2 regression: an mcp entry whose args holds an object warns and skips, never raises" do
+      # Reviewer's 17-shape fuzz crash: to_string/1 on a map raises
+      # Protocol.UndefinedError straight out of Config.load. Shape junk
+      # NEVER crashes the loader (tolerance principle).
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
+            mcp: [{ name: 'obj-args', command: 'c', args: {nested: 1} }],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-k'}}")
+
+      logs = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
+      assert logs =~ "an mcp entry with a non-list args is ignored"
+
+      # A list holding a non-scalar element is the same class.
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
+            mcp: [{ name: 'obj-elem', command: 'c', args: ['ok', {bad: 1}] }],
+          }],
+        }
+        """
+      )
+
+      logs_late = capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
+      assert logs_late =~ "an mcp entry with a non-scalar arg is ignored"
+    end
+
+    test "scalar args (numbers, booleans) stringify; P3-4: only the ACTIVE profile's unkeyed providers warn" do
+      dir = fleet_dir()
+
+      # personal is NOT the active profile (defaultProfile: 'work') — its
+      # unkeyed provider must stay silent; work is fully keyed.
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{profile: "work"}} = Config.load(dir, %{}, [])
+        end)
+
+      refute logs =~ "has no key in keys.json5"
+      refute logs =~ ~s(profile "personal")
+
+      # Make the ACTIVE profile the unkeyed one and it speaks.
+      write!(
+        dir,
+        String.replace(fleet_file(), "defaultProfile: 'work'", "defaultProfile: 'personal'")
+      )
+
+      logs_personal =
+        capture_log(fn ->
+          assert {:error, _missing} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs_personal =~ ~s(provider "provider.example" in profile "personal" has no key)
+    end
+
     test "an mcp entry with a non-string token warns; one without args parses" do
       dir = tmp_dir()
 
@@ -1737,6 +1812,44 @@ defmodule DashFloat.ConfigTest do
       assert File.read!(keys) == before
     end
 
+    test "P2-1 regression: write_settings refuses a non-empty existing settings.json5" do
+      # The wizard must never clobber what it did not write — an
+      # unparseable or hand-made file is the user's to move aside (#31's
+      # never-clobber rule, the reviewer's repro).
+      dir = tmp_dir()
+      settings = settings_path(dir)
+      File.write!(settings, "{profiles: broken")
+      before = File.read!(settings)
+
+      assert {:error, message} =
+               Config.write_settings(dir, %{
+                 "configVersion" => 3,
+                 "profiles" => [%{"name" => "personal", "providers" => []}]
+               })
+
+      assert message =~ "already exists and is not empty"
+      assert message =~ "rename it aside"
+      assert File.read!(settings) == before
+
+      # A parseable-but-foreign file is equally protected.
+      File.write!(settings, "{yourName: 'someone-else'}")
+
+      assert {:error, _refused} =
+               Config.write_settings(dir, %{"configVersion" => 3, "profiles" => []})
+
+      assert File.read!(settings) == "{yourName: 'someone-else'}"
+
+      # Empty (crash debris) is the one overwrite the wizard owns.
+      File.write!(settings, "")
+
+      assert :ok =
+               Config.write_settings(dir, %{
+                 "configVersion" => 3,
+                 "defaultProfile" => "personal",
+                 "profiles" => [%{"name" => "personal", "providers" => []}]
+               })
+    end
+
     test "write_settings writes the wizard's document atomically at 0600" do
       dir = tmp_dir()
 
@@ -1758,7 +1871,14 @@ defmodule DashFloat.ConfigTest do
   describe "load/1 uses the default directory and the real environment" do
     test "reads XDG_CONFIG_HOME, env completing the pieces" do
       # NEVER the real ~/.config/dashfloat: load/1 would run the real
-      # directory's migrations. XDG_CONFIG_HOME points it at a fixture.
+      # directory's migrations. XDG_CONFIG_HOME points it at a fixture — and
+      # the test PROVES the path: config_dir/0 must resolve INSIDE this
+      # sandbox, and the load must read the fixture's file (the profile and
+      # base_url come from settings.json5; env completes only the model and
+      # key). Deleting the fixture changes the outcome — the fleet's guard
+      # on the real-dir incident class (hostile review: the previous
+      # fixture lived at dir/xdg-root while XDG pointed at dir, so the load
+      # never read it and the assertion passed vacuously).
       dir = tmp_dir()
       xdg = Path.join(dir, "xdg-root")
       fixture = Path.join(xdg, "dashfloat")
@@ -1767,7 +1887,6 @@ defmodule DashFloat.ConfigTest do
       write_keys!(fixture, fleet_keys())
 
       env = %{
-        "DASHFLOAT_BASE_URL" => "https://env.example/v1",
         "DASHFLOAT_MODEL" => "env-model",
         "DASHFLOAT_API_KEY" => "PLACEHOLDER-env-key"
       }
@@ -1780,11 +1899,25 @@ defmodule DashFloat.ConfigTest do
             do: {var, System.get_env(var)}
 
       try do
-        System.put_env("XDG_CONFIG_HOME", dir)
+        System.put_env("XDG_CONFIG_HOME", xdg)
 
         for {var, value} <- env, do: System.put_env(var, value)
 
-        assert {:ok, %Config{model: "env-model"}} = Config.load([])
+        assert Config.config_dir() == fixture
+
+        assert {:ok, %Config{model: "env-model", profile: "work", base_url: @base_url}} =
+                 Config.load([])
+
+        # And the fixture was load-bearing: without it the same env lands on
+        # a different, fileless outcome (env-only — no profile, no file
+        # base_url). This is the arm that fails if the path ever stops
+        # resolving into the sandbox.
+        File.rm_rf!(fixture)
+        env_complete = Map.put(env, "DASHFLOAT_BASE_URL", "https://env-only.example/v1")
+        for {var, value} <- env_complete, do: System.put_env(var, value)
+
+        assert {:ok, %Config{profile: nil, base_url: "https://env-only.example/v1"}} =
+                 Config.load([])
       after
         restore_env("XDG_CONFIG_HOME", previous_xdg)
         for {var, _value} <- env, do: restore_env(var, previous[var])

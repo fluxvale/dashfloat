@@ -134,10 +134,23 @@ defmodule DashFloat.Config.Migration do
   end
 
   defp maybe_split(dir, main, keys_path, map, raw) do
-    if split_pending?(map) and regular?(main, @main_file) and regular?(keys_path, @keys_file) do
-      do_split(dir, main, keys_path, map, raw)
-    else
-      {:ok, :not_needed}
+    cond do
+      not split_pending?(map) ->
+        {:ok, :not_needed}
+
+      # P1-1 (hostile review), the split-side arm: de_secret/collect_keys
+      # read through profiles_list/1 too — a not-a-list `profiles` beside a
+      # root-level key would have the SPLIT write `profiles: []` over the
+      # file (same gutting as the reshape's, one stage earlier). Unshapeable
+      # input refuses before any write, byte-unchanged.
+      unshapeable?(map) ->
+        {:error, unshapeable_message(main)}
+
+      regular?(main, @main_file) and regular?(keys_path, @keys_file) ->
+        do_split(dir, main, keys_path, map, raw)
+
+      true ->
+        {:ok, :not_needed}
     end
   end
 
@@ -387,6 +400,9 @@ defmodule DashFloat.Config.Migration do
     backup = Path.join(dir, @main_backup)
 
     cond do
+      kept_dangling_link?(backup) ->
+        :kept
+
       not File.exists?(backup) ->
         case write_private(backup, raw) do
           :ok ->
@@ -429,6 +445,27 @@ defmodule DashFloat.Config.Migration do
     match?({:ok, %File.Stat{type: :regular}}, File.lstat(path))
   end
 
+  # P2-4 (hostile review, issue #33's class with a live consequence): a
+  # DANGLING .bak symlink answers File.exists? == false, so the
+  # not-regular-file guard is never reached and the write replaces the
+  # user's link with a regular file — silently, against the docs' "never
+  # replaced". lstat sees the link itself: dangling or not, a .bak symlink
+  # is KEPT with a warning and counts as no backup for the loss decision.
+  defp kept_dangling_link?(path) do
+    if not File.exists?(path) and match?({:ok, %File.Stat{type: :symlink}}, File.lstat(path)) do
+      warn_kept_link(path)
+      true
+    else
+      false
+    end
+  end
+
+  defp warn_kept_link(path) do
+    Logger.warning(
+      "#{Path.basename(path)} is a symlink (dangling or not) — keeping it, never replacing it"
+    )
+  end
+
   ## v3 reshape (v2 profiles → one-provider profiles, endpoint-keyed keys)
 
   # Settings v2 (or v1-without-inline-keys) → v3 (ADR 0009): each profile's
@@ -462,9 +499,48 @@ defmodule DashFloat.Config.Migration do
     cond do
       version?(map, @v3_version) -> finish_partial(main, map)
       v3_or_newer?(map) -> {:ok, :not_needed}
+      unshapeable?(map) -> {:error, unshapeable_message(main)}
       v3_tripwire?(map) -> {:error, tripwire_message(main)}
       true -> full_reshape(main, map)
     end
+  end
+
+  # P1-1 (hostile review): a `profiles` field that is not a list — or a list
+  # holding non-object entries, or a profile-level `providers`/`mcp` that is
+  # not a list — is UNSHAPEABLE: `profiles_list/1` would read it as empty
+  # and the reshape would write `configVersion: 3, profiles: []` over the
+  # file, deleting the provider/menu/MCP tree (and any inline keys inside
+  # it) from every file on disk. Malformed tolerance is degradation at
+  # LOAD; the migration's rule for what it cannot represent is REFUSAL,
+  # byte-unchanged, with the field named (ADR 0009 refusal catalog).
+  defp unshapeable?(map) do
+    case map["profiles"] do
+      nil ->
+        false
+
+      entries when is_list(entries) ->
+        Enum.any?(entries, fn
+          entry when is_map(entry) -> bad_list?(entry, "providers") or bad_list?(entry, "mcp")
+          _not_an_object -> true
+        end)
+
+      _not_a_list ->
+        true
+    end
+  end
+
+  defp bad_list?(entry, key) do
+    case entry[key] do
+      nil -> false
+      value when is_list(value) -> false
+      _not_a_list -> true
+    end
+  end
+
+  defp unshapeable_message(main) do
+    "#{main}: the profiles field is not a shape the v3 migration can represent " <>
+      "(profiles must be a list of objects, providers/mcp lists) — nothing was " <>
+      "written; fix the file by hand (or set configVersion: 3 if it is already v3)"
   end
 
   defp version?(%{"configVersion" => version}, version) when is_integer(version), do: true
@@ -480,12 +556,16 @@ defmodule DashFloat.Config.Migration do
   # reshape (its provider trees read as unknown keys) — refuse and say what
   # to set instead of guessing (ADR 0009 refusal catalog).
   defp v3_tripwire?(map) do
-    profiles = profiles_list(map)
+    # Non-map entries never reach the tripwire: unshapeable? refuses them
+    # first (same file, earlier arm), so the filter is total here.
+    profiles =
+      map
+      |> profiles_list()
+      |> Enum.filter(&is_map/1)
 
     Map.has_key?(map, "defaultProfile") or
-      Enum.any?(profiles, fn
-        entry when is_map(entry) -> Map.has_key?(entry, "providers") or Map.has_key?(entry, "mcp")
-        _entry -> false
+      Enum.any?(profiles, fn entry ->
+        Map.has_key?(entry, "providers") or Map.has_key?(entry, "mcp")
       end)
   end
 
@@ -739,6 +819,9 @@ defmodule DashFloat.Config.Migration do
   # settings map and unknown extras ride verbatim. A profile without a
   # baseUrl keeps everything but gains no providers (it may still carry a
   # name and settings). Non-map entries pass through untouched.
+  # Non-map entries cannot reach here (unshapeable? refuses them first);
+  # there is deliberately NO fallback — a violation crashes loudly rather
+  # than passing junk through, which is the bug class this guard ends.
   defp reshape_profile(entry) when is_map(entry) do
     case {value_of(entry["name"]), value_of(entry["baseUrl"])} do
       {name, base_url} when is_binary(name) and is_binary(base_url) ->
@@ -752,8 +835,6 @@ defmodule DashFloat.Config.Migration do
         entry
     end
   end
-
-  defp reshape_profile(entry), do: entry
 
   defp first_profile_name([%{"name" => name} | _rest]) when is_binary(name), do: name
   defp first_profile_name([_other | rest]), do: first_profile_name(rest)
@@ -809,17 +890,17 @@ defmodule DashFloat.Config.Migration do
   # The named, addressable v2 profiles (first-wins on duplicate names,
   # matching the loader's rule and collect_keys).
   defp named_profiles(map) do
+    # Non-map entries cannot reach here (unshapeable? refuses them before
+    # the reshape runs), so the map filter is total — the old pass-through
+    # arm was the junk-riding class the review closed.
     map
     |> profiles_list()
-    |> Enum.flat_map(fn
-      entry when is_map(entry) ->
-        case value_of(entry["name"]) do
-          nil -> []
-          name -> [%{name: name, base_url: value_of(entry["baseUrl"]), models: entry["models"]}]
-        end
-
-      _entry ->
-        []
+    |> Enum.filter(&is_map/1)
+    |> Enum.flat_map(fn entry ->
+      case value_of(entry["name"]) do
+        nil -> []
+        name -> [%{name: name, base_url: value_of(entry["baseUrl"]), models: entry["models"]}]
+      end
     end)
     |> dedup_first_wins()
   end
@@ -912,6 +993,9 @@ defmodule DashFloat.Config.Migration do
 
   defp place_backup(raw, backup, label) do
     cond do
+      kept_dangling_link?(backup) ->
+        :kept
+
       not File.exists?(backup) ->
         case write_private(backup, raw) do
           :ok ->

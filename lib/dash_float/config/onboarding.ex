@@ -25,6 +25,8 @@ defmodule DashFloat.Config.Onboarding do
   alias DashFloat.Config.Catalog
   alias DashFloat.Config.Presets
 
+  @env_ref ~r/\A\$[A-Z_][A-Z0-9_]*\z/
+
   @type step ::
           :welcome
           | :profile_name
@@ -61,6 +63,10 @@ defmodule DashFloat.Config.Onboarding do
           mcp: [%{name: String.t(), command: String.t(), args: [String.t()], token: nil | :ref}]
         }
 
+  # Inspected standalone (logs, IEx): the draft and the pending provider can
+  # hold the plaintext key — ADR 0005's never-echo rule, belt to
+  # DashFloat.TUI.State's own :setup exclusion (P1-3, hostile review).
+  @derive {Inspect, except: [:draft, :pending]}
   defstruct step: :welcome,
             draft: "",
             pending: nil,
@@ -76,6 +82,38 @@ defmodule DashFloat.Config.Onboarding do
   @doc "The initial wizard state."
   @spec new() :: t()
   def new, do: %__MODULE__{}
+
+  @doc """
+  A bracketed paste into the wizard's current text step (P1-2, hostile
+  review): appended to the draft with CR/CRLF/newlines normalized out — a
+  key pasted with a trailing newline is the common terminal shape.
+  Selection steps ignore it (no text input there).
+  """
+  @spec paste(t(), String.t()) :: t()
+  def paste(%__MODULE__{step: step, draft: draft} = state, content)
+      when is_binary(content) and
+             step in [
+               :profile_name,
+               :custom_url,
+               :label,
+               :key,
+               :model_manual,
+               :mcp_name,
+               :mcp_command,
+               :mcp_args,
+               :mcp_token
+             ] do
+    %{state | draft: draft <> normalize(content)}
+  end
+
+  def paste(%__MODULE__{} = state, _content), do: state
+
+  defp normalize(content) do
+    content
+    |> String.replace("\r\n", "")
+    |> String.replace("\r", "")
+    |> String.replace("\n", "")
+  end
 
   @doc """
   One keypress: `{state, action}`. `code` is an `ExRatatui` key code; the
@@ -269,17 +307,11 @@ defmodule DashFloat.Config.Onboarding do
   defp step_key(state, :mcp_args, code), do: {edit(state, code), nil}
 
   defp step_key(state, :mcp_token, "enter") do
-    token =
-      case nonblank(state.draft) do
-        nil -> nil
-        var when is_binary(var) -> if(String.starts_with?(var, "$"), do: var, else: "$" <> var)
-      end
-
     entry = %{
       name: state.mcp_name,
       command: state.mcp_command,
       args: state.mcp_args,
-      token: token
+      token: valid_token_ref(state.draft)
     }
 
     state = %{state | mcp: state.mcp ++ [entry]}
@@ -368,6 +400,21 @@ defmodule DashFloat.Config.Onboarding do
   def options(%__MODULE__{}), do: []
 
   ## Internals
+
+  # A token reference the loader cannot resolve back ($lowercase etc.) is
+  # stored as NO token rather than a value the loader would drop the whole
+  # entry for (P3-3, hostile review — the strict $[A-Z_][A-Z0-9_]* shape is
+  # the loader's contract; the wizard must not write against it).
+  defp valid_token_ref(draft) do
+    case nonblank(draft) do
+      nil ->
+        nil
+
+      var ->
+        var = if(String.starts_with?(var, "$"), do: var, else: "$" <> var)
+        if(Regex.match?(@env_ref, var), do: var, else: nil)
+    end
+  end
 
   defp mcp_doc(entry),
     do: %{"name" => entry.name, "command" => entry.command, "args" => entry.args}

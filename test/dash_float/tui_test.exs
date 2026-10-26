@@ -265,6 +265,123 @@ defmodule DashFloat.TUITest do
     refute File.exists?(settings_path)
   end
 
+  test "P1-2 regression: a bracketed paste at the key step feeds the wizard, never the composer" do
+    # Reviewer repro: paste at W3 routed to the hidden chat composer — the
+    # key never reached keys.json5, and the first post-setup Enter SUBMITTED
+    # it to the provider as a prompt.
+    dir = wizard_dir("dashfloat-tui-paste")
+    resolver = fn _name -> DashFloat.Config.load(dir, %{}, []) end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile configured"},
+        setup: Onboarding.new(),
+        config_dir: dir,
+        resolve: resolver
+      )
+
+    # To the key step: welcome → name (prefill) → zai preset → label.
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+
+    # THE PASTE (bracketed, with the trailing newline terminals add).
+    Runtime.inject_event(pid, %ExRatatui.Event.Paste{
+      content: "PLACEHOLDER-pasted-key\r\n"
+    })
+
+    state =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :key and s.setup.draft != ""
+      end)
+
+    # The wizard holds the key; the composer holds NOTHING.
+    assert state.setup.draft == "PLACEHOLDER-pasted-key"
+    assert State.input_text(state) == ""
+
+    # Enter writes it — immediately, 0600 (ADR 0009 per-step writes).
+    press(pid, "enter")
+
+    keys_file = Path.join(dir, "keys.json5")
+
+    eventually(pid, fn _s -> File.exists?(keys_file) end)
+
+    zai = "https://api.z.ai/api/coding/paas/v4"
+
+    assert {:ok, %{"personal" => %{^zai => "PLACEHOLDER-pasted-key"}}} =
+             JSON5.read_map(keys_file)
+  end
+
+  test "P1-2 class guard: setup exits CLEAR the composer; Enter never submits mid-setup" do
+    # Whatever a routing bug of the day drops into the composer during
+    # setup, it can never become chat prompt text: (1) Enter while setup is
+    # active belongs to the wizard; (2) leaving setup clears the draft.
+    resolver = fn _name -> {:error, "resolved-error-arm"} end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile selected — choose one to start"},
+        setup: {:select, ["work"], 0},
+        resolve: resolver
+      )
+
+    # Poison the composer directly (the routing-bug-of-the-day stand-in):
+    # ExRatatui.textarea_set_value on the live input.
+    state = get_state(pid)
+    ExRatatui.textarea_set_value(state.input, "PLACEHOLDER-poison-key")
+
+    # Enter while setup is active: the modal consumes it (select_profile),
+    # never a submit.
+    press(pid, "enter")
+
+    assert_receive {:set_provider, {:error, "resolved-error-arm"}}, 1_000
+
+    cleared = eventually(pid, fn s -> s.setup == nil end)
+    assert State.input_text(cleared) == ""
+    assert system_entries(cleared) == []
+  end
+
+  test "P2-3 regression: an :onboard classification resolves to a displayed error, never a crash" do
+    # Reviewer repro path: the wizard's settings write fails → setup clears
+    # → the resolver reloads a zero-profile directory → :onboard reached
+    # the agent raw and crashed it on the first prompt (CaseClauseError).
+    dir = wizard_dir("dashfloat-tui-onboard")
+    # A directory that stays profile-less: the reload yields :onboard.
+    resolver = fn _name -> DashFloat.Config.load(dir, %{}, []) end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile configured"},
+        setup: {:select, ["ghost"], 0},
+        resolve: resolver,
+        agent: self()
+      )
+
+    press(pid, "enter")
+
+    assert_receive {:set_provider, {:error, handoff}}, 1_000
+    assert handoff =~ "first-run setup is incomplete"
+    refute match?(:onboard, handoff)
+    refute match?({:select, _names}, handoff)
+  end
+
+  test "P2-3 arm: a {:select, names} reload hands the agent a readable error naming the profiles" do
+    resolver = fn _name -> {:select, ["work", "personal"]} end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile selected — choose one to start"},
+        setup: {:select, ["work"], 0},
+        resolve: resolver
+      )
+
+    press(pid, "enter")
+
+    assert_receive {:set_provider, {:error, handoff}}, 1_000
+    assert handoff =~ "no profile selected — choose one of: work, personal"
+  end
+
   test "a selection with no resolver clears setup without crashing" do
     {:ok, pid} =
       start_tui(

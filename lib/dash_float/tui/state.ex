@@ -68,6 +68,13 @@ defmodule DashFloat.TUI.State do
   @exit_window_ms 2_000
 
   @enforce_keys [:input]
+
+  # A crash report prints this state (P1-3, hostile review): the startup
+  # phase can hold the wizard's plaintext key (draft / pending.key), and
+  # ADR 0005's never-echo rule must hold in the log exactly as it holds on
+  # the masked screen. `setup` is excluded wholesale; the provider config
+  # carries its own derivation.
+  @derive {Inspect, except: [:setup]}
   defstruct [
     :input,
     :provider,
@@ -271,8 +278,28 @@ defmodule DashFloat.TUI.State do
   @spec provider_resolved(t(), DashFloat.Config.classification()) ::
           {t(), {:agent_provider, DashFloat.Config.classification()}}
   def provider_resolved(%__MODULE__{} = state, classification) do
+    # The class guard (P1-2, hostile review): leaving setup CLEARS the
+    # composer — whatever a routing bug of the day may have dropped there
+    # mid-setup, a credential pasted at the wrong moment can never become
+    # chat prompt text.
+    ExRatatui.textarea_set_value(state.input, "")
+
     {%{state | setup: nil, provider: classification}, {:agent_provider, classification}}
   end
+
+  @doc """
+  A paste while the startup phase owns the screen (P1-2, hostile review):
+  the wizard's text steps take the content as typed input (newlines
+  normalized away — a key pasted with a trailing newline is the common
+  shape); the forced-selection modal has no text input, so pastes are
+  inert. The chat composer is never touched while setup is active.
+  """
+  @spec setup_paste(t(), String.t()) :: t()
+  def setup_paste(%__MODULE__{setup: %Onboarding{} = wizard} = state, content) do
+    %{state | setup: Onboarding.paste(wizard, content)}
+  end
+
+  def setup_paste(%__MODULE__{} = state, _content), do: state
 
   @doc """
   The wizard's `/models` fetch landed (ADR 0009): feeds the picker when the

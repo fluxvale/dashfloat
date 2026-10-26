@@ -587,6 +587,16 @@ defmodule DashFloat.Config.OnboardingTest do
       assert mcp_entry == %{"name" => "n", "command" => "cmd", "args" => []}
     end
 
+    test "a paste at a non-text step is inert (selections own no draft)" do
+      welcome = Onboarding.new()
+      assert Onboarding.paste(welcome, "ignored") == welcome
+
+      provider = press(welcome, ["enter", "enter"])
+      pasted = Onboarding.paste(provider, "ignored")
+      assert pasted.choice == provider.choice
+      refute Map.get(pasted, :draft) =~ "ignored"
+    end
+
     test "options on non-selection steps is the empty list" do
       assert Onboarding.options(Onboarding.new()) == []
       assert Onboarding.options(%Onboarding{step: :profile_name}) == []
