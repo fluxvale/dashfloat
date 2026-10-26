@@ -1,0 +1,42 @@
+---
+// Bundled by Astro into dist/_astro/*.css and linked from every page.
+import "../styles.css";
+
+interface Props {
+  title: string;
+  description?: string;
+}
+
+const {
+  title,
+  description = "DashFloat — a fast, robust CLI AI coding harness in Elixir.",
+} = Astro.props;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="generator" content={Astro.generator} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="wordmark" href="/">DashFloat</a>
+      <nav>
+        <a href="/docs">Docs</a>
+        <a href="https://github.com/fluxvale/dashfloat">GitHub</a>
+      </nav>
+    </header>
+    <main>
+      <slot />
+    </main>
+    <footer class="site-footer">
+      <span>DashFloat · MIT license · copy is a draft</span>
+      <a href="https://github.com/fluxvale/dashfloat">github.com/fluxvale/dashfloat</a>
+    </footer>
+  </body>
+</html>

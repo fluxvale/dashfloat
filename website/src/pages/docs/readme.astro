@@ -1,0 +1,18 @@
+---
+import Base from "../../layouts/Base.astro";
+import { readReadme, renderMarkdown } from "../../lib/docs";
+
+const html = renderMarkdown(readReadme());
+---
+
+<Base title="README · DashFloat" description="DashFloat README — overview, setup, stack, and development.">
+  <div class="breadcrumb"><a href="/">DashFloat</a> / <a href="/docs">Docs</a> / README</div>
+  <article class="md">
+    <Fragment set:html={html} />
+  </article>
+  <p class="source-link">
+    Source:
+    <a href="https://github.com/fluxvale/dashfloat/blob/main/README.md">README.md</a>
+    in the repository.
+  </p>
+</Base>
