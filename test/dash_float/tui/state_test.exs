@@ -1753,6 +1753,19 @@ defmodule DashFloat.TUI.StateTest do
   end
 
   describe "the startup phase (ADR 0009)" do
+    test "setup_paste feeds wizard text steps and is inert on the selection modal" do
+      started = Onboarding.new()
+      {name_step, _nil} = Onboarding.handle_key(started, "enter")
+      name_state = setup_state(setup: name_step)
+      pasted = State.setup_paste(name_state, "PLACEHOLDER-key\r\n")
+      assert pasted.setup.draft == "personalPLACEHOLDER-key"
+
+      # The forced-selection modal owns no text input: a paste changes
+      # nothing (P1-2 — it can never reach the composer instead).
+      modal = setup_state(setup: {:select, ["a", "b"], 0})
+      assert State.setup_paste(modal, "anything") == modal
+    end
+
     test "P1-3 regression: Inspect never prints the wizard's key (crash-log leak)" do
       # The reviewer's 4-line crash-report repro: State.setup holds the
       # plaintext key (draft / pending.key); a TUI crash used to dump it

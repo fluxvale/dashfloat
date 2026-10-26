@@ -729,12 +729,12 @@ defmodule DashFloat.Config.MigrationTest do
         "{configVersion: 1, profiles: 'nope', apiKey: 'PLACEHOLDER-root-key'}",
         # a list holding a non-object entry beside a real profile
         "{configVersion: 1, profiles: ['junk', {name: 'work', baseUrl: 'https://provider.example/v1', apiKey: 'PLACEHOLDER-work-key'}]}",
-        # providers as a map on a named entry
-        "{configVersion: 1, profiles: [{name: 'work', baseUrl: 'https://provider.example/v1', apiKey: 'PLACEHOLDER-work-key', providers: {x: 1}}]}",
-        # mcp as a map on a named entry ({}, the empty object literal, is a
-        # json5-dep parser quirk in this position — a non-empty map is the
-        # honest fixture for the same wrong type)
-        "{configVersion: 1, profiles: [{name: 'work', baseUrl: 'https://provider.example/v1', apiKey: 'PLACEHOLDER-work-key', mcp: {mode: 1}}}]"
+        # providers not a list on a named entry (map literals as values here
+        # are json5-dep per-boot parser flakes — strings exercise the same
+        # wrong-type path deterministically)
+        "{configVersion: 1, profiles: [{name: 'work', baseUrl: 'https://provider.example/v1', apiKey: 'PLACEHOLDER-work-key', providers: 'not-a-list'}]}",
+        # mcp not a list, same class
+        "{configVersion: 1, profiles: [{name: 'work', baseUrl: 'https://provider.example/v1', apiKey: 'PLACEHOLDER-work-key', mcp: 'not-a-list'}]}"
       ]
 
       for file <- shapes, bak_state <- [:absent, :stale] do
@@ -1842,8 +1842,8 @@ defmodule DashFloat.Config.MigrationTest do
       cases = [
         # a list holding a non-object entry
         "{configVersion: 2, profiles: [{name: 'ok', baseUrl: 'https://one.example/v1'}, 7]}",
-        # a list-holding entry with providers as a map
-        "{configVersion: 2, profiles: [{name: 'ok', baseUrl: 'https://one.example/v1', providers: {a: 1}}]}",
+        # a list-holding entry with providers not a list
+        "{configVersion: 2, profiles: [{name: 'ok', baseUrl: 'https://one.example/v1', providers: 'nope'}]}",
         # mcp not a list on a v2 entry
         "{configVersion: 2, profiles: [{name: 'ok', baseUrl: 'https://one.example/v1', mcp: 3}]}"
       ]

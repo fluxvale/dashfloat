@@ -960,14 +960,15 @@ defmodule DashFloat.Config.Migration do
 
   defp v3_base_urls(_entry), do: []
 
+  # Non-map entries cannot reach plan_reshape (unshapeable? refuses them
+  # first) — there is deliberately no fallback: a violation crashes loudly
+  # instead of silently ignoring the junk it was handed.
   defp usable_name(entry) when is_map(entry) do
     case value_of(entry["name"]) do
       nil -> []
       name -> [name]
     end
   end
-
-  defp usable_name(_entry), do: []
 
   defp value_of(value), do: blank_to_nil(value)
 

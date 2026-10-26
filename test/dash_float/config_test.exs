@@ -1850,6 +1850,20 @@ defmodule DashFloat.ConfigTest do
                })
     end
 
+    test "write_settings on an unreadable settings.json5 is a read error naming the path" do
+      dir = tmp_dir()
+      settings = settings_path(dir)
+      File.write!(settings, "{}")
+      on_exit(fn -> File.chmod!(settings, 0o600) end)
+      File.chmod!(settings, 0o000)
+
+      assert {:error, message} =
+               Config.write_settings(dir, %{"configVersion" => 3, "profiles" => []})
+
+      assert message =~ "cannot read"
+      assert message =~ "settings.json5"
+    end
+
     test "write_settings writes the wizard's document atomically at 0600" do
       dir = tmp_dir()
 
