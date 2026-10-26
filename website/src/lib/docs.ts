@@ -17,19 +17,27 @@ export interface AdrMeta {
   status: string;
 }
 
-const slugify = (text: string): string =>
-  text
-    .toLowerCase()
-    .replace(/[^\w\- ]/g, "")
-    .trim()
-    .replace(/\s+/g, "-");
+// github-slugger parity (what GitHub's own anchors use): lowercase, drop
+// punctuation (an em dash leaves its two surrounding spaces → "--"), every
+// space becomes one hyphen, and repeats get a -1/-2 suffix.
+const slugs = new Map<string, number>();
 
-// GitHub-style heading ids so in-page anchors (#amendment-...) keep working.
+function githubSlug(text: string): string {
+  const slug = text
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\-_ ]/g, "")
+    .replace(/ /g, "-");
+  const seen = slugs.get(slug) ?? 0;
+  slugs.set(slug, seen + 1);
+  return seen === 0 ? slug : `${slug}-${seen}`;
+}
+
 marked.use({
   renderer: {
     heading(token: Tokens.Heading) {
       const text = this.parser.parseInline(token.tokens);
-      return `<h${token.depth} id="${slugify(token.text)}">${text}</h${token.depth}>`;
+      return `<h${token.depth} id="${githubSlug(token.text)}">${text}</h${token.depth}>`;
     },
   },
 });
@@ -58,9 +66,35 @@ function rewriteLinks(tokens: Tokens.Generic[] | undefined): void {
 }
 
 export function renderMarkdown(md: string): string {
+  slugs.clear(); // ids dedupe per document, like GitHub's own anchors
   const tokens = marked.lexer(md);
   rewriteLinks(tokens);
   return marked.parser(tokens);
+}
+
+// The Status bullet can wrap over several source lines and carry markdown
+// (bold, links). Capture the whole bullet, reduce it to plain text, and keep
+// the first clause — "Accepted" for an amended ADR, exactly what the repo's
+// own docs/decisions/README.md index shows.
+function plainStatus(md: string): string {
+  const lines = md.split("\n");
+  const start = lines.findIndex((line) => /^-\s+\*\*Status:\*\*/.test(line));
+  if (start === -1) return "Accepted";
+  const bullet = [lines[start]!.replace(/^-\s+\*\*Status:\*\*\s*/, "")];
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (line.trim() === "" || /^(\-\s|#)/.test(line)) break;
+    bullet.push(line.trim());
+  }
+  const text = bullet
+    .join(" ")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/\*\*/g, "")
+    .replace(/`/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const first = text.split(";")[0]!.trim();
+  return first === "" ? "Accepted" : first;
 }
 
 export function listAdrs(): AdrMeta[] {
@@ -74,12 +108,11 @@ export function listAdrs(): AdrMeta[] {
     .map((file) => {
       const md = fs.readFileSync(path.join(decisionsDir, file), "utf8");
       const heading = md.match(/^# (\d{4}) — (.+)$/m);
-      const status = md.match(/^-\s+\*\*Status:\*\*\s+(.+)$/m);
       return {
         slug: file.replace(/\.md$/, ""),
         number: heading?.[1] ?? file.slice(0, 4),
         title: heading?.[2] ?? file,
-        status: status?.[1] ?? "Accepted",
+        status: plainStatus(md),
       };
     });
 }

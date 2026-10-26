@@ -1,4 +1,7 @@
 ---
+// Bundled by Astro into dist/_astro/*.css and linked from every page.
+import "../styles.css";
+
 interface Props {
   title: string;
   description?: string;
@@ -19,7 +22,6 @@ const {
     <meta name="description" content={description} />
     <meta name="generator" content={Astro.generator} />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <header class="site-header">

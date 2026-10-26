@@ -1,13 +1,17 @@
 name: Deploy website
 
 # Build and publish website/ to GitHub Pages on every push to main that
-# touches the site (or this workflow). The PR-side check lives in ci.yml.
+# touches the site or its build inputs (README.md, docs/decisions/ are
+# rendered into the site — see src/lib/docs.ts). The PR-side check lives in
+# ci.yml.
 on:
   push:
     branches: [main]
     paths:
       - "website/**"
       - ".github/workflows/deploy-website.yml"
+      - "README.md"
+      - "docs/decisions/**"
 
 permissions:
   contents: read
@@ -24,6 +28,10 @@ jobs:
     name: Build and deploy to Pages
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      # No build-time network call to telemetry.astro.build ("no surprises in
+      # CI"); Astro has no config key for this, so it must be the env var.
+      ASTRO_TELEMETRY_DISABLED: "1"
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}

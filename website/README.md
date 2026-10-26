@@ -12,8 +12,13 @@ pages; other relative links point back at the file on GitHub.
 ```sh
 npm ci        # exact installs from package-lock.json
 npm run dev   # local dev server
-npm run build # static output in dist/ (includes public/CNAME)
+npm run build # static output in dist/, then scripts/verify-build.mjs asserts
+              # on it: CNAME, CSS shipped + referenced, README/ADR page
+              # coverage, no markdown leakage on /docs
 ```
+
+Set `ASTRO_TELEMETRY_DISABLED=1` locally (CI does) if you want builds with
+no telemetry call.
 
 Dependencies are pinned to exact versions in `package.json` and
 `package-lock.json`; dependabot opens the bumps.
