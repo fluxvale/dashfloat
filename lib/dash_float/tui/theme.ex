@@ -31,7 +31,8 @@ defmodule DashFloat.TUI.Theme do
     hint: @dim,
     status_busy: @accent,
     status_tool: %Style{fg: :light_yellow},
-    status_idle: @dim
+    status_idle: @dim,
+    error: %Style{fg: :light_red}
   }
 
   @spinner_frames ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]

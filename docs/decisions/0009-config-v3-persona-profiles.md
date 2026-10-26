@@ -5,7 +5,8 @@
   (issue #32 body) added the standing model catalog refresh below, and this ADR
   now records it. The merged keys-split (#31) matched everything this record
   anticipated — no Phase A decision needed adjusting against the merged
-  reality.
+  reality. The onboarding write-refusal surface amendment below landed with
+  [issue #39](https://github.com/fluxvale/dashfloat/issues/39).
 - **Date:** 2026-10-26
 - **Implements:** [issue #32](https://github.com/fluxvale/dashfloat/issues/32).
 - **Supersedes:** the *schema*, *model addressing and selection*, *effective
@@ -243,6 +244,46 @@ value.
   still yields a valid minimal config — settings.json5 with one named,
   provider-less profile — so onboarding never loops.
 
+### Wizard write refusals surface on the wizard (issue #39 amendment)
+
+Through #37 the wizard's writers refused correctly — `write_keys_entry` and
+`write_settings` never clobber — but a refusal rode a `Logger.warning` the
+alt-screen TUI swallows: the wizard advanced to a done screen claiming
+"All set — config written" over a write that never happened, and the next
+launch re-entered onboarding forever. The tolerance principle above promises
+loud, on-surface recovery; this amendment makes the wizard keep it. The state
+machine is otherwise untouched.
+
+- **Mechanism — advance-and-bounce, not a boot pre-check:** the step change
+  and its write action stay one atomic `handle_key` pair; the TUI runner
+  executes the write synchronously in the same key event and, on refusal,
+  feeds the config layer's message back into the pure machine
+  (`Onboarding.write_failed/2` — the same feedback family as
+  `models_arrived/2`). A refused key write bounces to `:key` with the typed
+  value restored in the (masked) draft and `pending.key` unset — the fetch
+  offer must not appear for a key that is not on disk. A refused settings
+  write bounces to `:loop`, the step where Done was picked. `:done`, its
+  "All set" copy, and its finish handoff are therefore reachable only by a
+  write that actually succeeded.
+- **Why bounce-back over a pre-check at wizard boot:** `write_settings`'s
+  refusal set is wider than "settings.json5 non-empty" (directory creation,
+  unquotable strings, tmp-path obstruction, posture failures), and the key
+  write needs an on-surface refusal mechanism anyway — one feedback path
+  covers every refusal class for both writers, where a boot pre-check would
+  predict one class of one writer and race a file appearing mid-wizard.
+  Bouncing also preserves the in-memory wizard: apply the remedy (mv the
+  file aside), pick Done again, the retry writes — no re-walk.
+- **Rendering:** the bounced-to screen shows the config layer's message —
+  error and remedy, word-wrapped to the box, in the error style; any step
+  transition clears it (the error belongs to the step that produced it).
+  While a refusal is showing at `:key`, the hint swaps from the write
+  promise ("written to keys.json5 (0600) immediately") to a retry wording —
+  the hint never claims a write the file state contradicts.
+- **Refusal messages carry remedies** (the migration tradition, extended to
+  the wizard's writers): an unquotable value names the character class (a
+  backslash, or both quote kinds) and the `$ENV_VAR` alternative — never the
+  value; the non-empty-file refusal keeps its `mv` remedy verbatim.
+
 ### Presets (first-class, verified)
 
 - **Z.AI Coding Plan** — `https://api.z.ai/api/coding/paas/v4`, key paste.
@@ -282,15 +323,18 @@ adapted to DashFloat's async TUI:
   entries always win — a catalog entry whose id matches an existing entry
   never overrides it, but **may refresh metadata: the context window**
   (catalog wins when it reports one) and capability extras; catalog entries
-  the menu lacks are **added** (nickname defaults to the id). Nothing is
-  written back to settings.json5 automatically — no config churn on every
-  start; persisting a discovered model stays hand-editing.
+  the menu lacks are **added** (nickname defaults to the id) — the
+  `Catalog.merge/2` contract, defined and tested for the runtime picker that
+  is its consumer. It is not wired into any menu today (issue #39's README
+  correction): the refresh's one wired effect is the context denominator
+  below. Nothing is written back to settings.json5 automatically — no config
+  churn on every start; persisting a discovered model stays hand-editing.
 - **Async wiring:** the fetch runs as a supervised, unlinked task started
   after the TUI mounts — startup latency stays flat. The catalog lands as a
   message; the UI stores it (per provider), and its one observable effect
   today is the status bar's context denominator filling in for a selected
-  model whose config entry carried no `context`. The merged menu is exposed in
-  state for the future runtime picker.
+  model whose config entry carried no `context`. The fetched entries are
+  kept in state for the future runtime picker.
 - Onboarding W4 reuses this same fetch and merge — one HTTP path, one parser,
   one merge contract.
 

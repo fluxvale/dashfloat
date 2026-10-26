@@ -618,6 +618,46 @@ defmodule DashFloat.TUI.ViewTest do
       end
     end
 
+    test "a refused write renders the error and remedy on the wizard surface (issue #39)" do
+      # Key step: the refusal replaces the write-promise hint with the retry
+      # wording, and the draft stays masked.
+      key_state =
+        new_state(
+          setup: %Onboarding{
+            step: :key,
+            draft: "PLACEHOLDER-secret\\key",
+            error:
+              "keys.json5 cannot store that key — it contains a backslash or both quote kinds; " <>
+                "re-enter it without the character, or store a $ENV_VAR reference instead"
+          }
+        )
+
+      key_buffer = drawn_text(key_state)
+      assert key_buffer =~ "cannot store that key"
+      assert key_buffer =~ "$ENV_VAR"
+      assert key_buffer =~ "retries the write"
+      refute key_buffer =~ "immediately"
+      refute key_buffer =~ "PLACEHOLDER"
+
+      # Loop step: the remedy rides above the options with the retry hint;
+      # the done screen's copy is nowhere.
+      loop_state =
+        new_state(
+          setup: %Onboarding{
+            step: :loop,
+            error:
+              "settings.json5 already exists and is not empty — rename it aside " <>
+                "(mv settings.json5 settings.json5.old) and re-run setup to write a fresh one"
+          }
+        )
+
+      loop_buffer = drawn_text(loop_state)
+      assert loop_buffer =~ "not empty"
+      assert loop_buffer =~ "retries the write"
+      assert loop_buffer =~ "write the config and start"
+      refute loop_buffer =~ "All set"
+    end
+
     test "the wizard renders its steps, masking secret inputs" do
       wizard = %DashFloat.Config.Onboarding{step: :welcome}
 
@@ -778,6 +818,14 @@ defmodule DashFloat.TUI.ViewTest do
   end
 
   ## helpers
+
+  # The full drawn frame as text (the setup screens render one widget).
+  defp drawn_text(state) do
+    term = ExRatatui.init_test_terminal(80, 24)
+    widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+    assert :ok = ExRatatui.draw(term, widgets)
+    ExRatatui.get_buffer_content(term)
+  end
 
   defp user_entry(text) do
     [%{kind: :user, text: text, lines: Render.entry_lines(:user, text)}]

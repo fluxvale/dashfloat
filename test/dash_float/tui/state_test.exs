@@ -1864,6 +1864,28 @@ defmodule DashFloat.TUI.StateTest do
       assert stale.setup == nil
     end
 
+    test "setup_write_failed bounces a waiting wizard and is inert elsewhere (issue #39)" do
+      at_done =
+        Enum.reduce(
+          ["enter", "enter", "down", "down", "down", "enter", "down", "down", "enter"],
+          Onboarding.new(),
+          &step_wizard/2
+        )
+
+      assert at_done.step == :done
+
+      state = setup_state(setup: at_done)
+
+      bounced = State.setup_write_failed(state, "settings.json5 already exists")
+      assert bounced.setup.step == :loop
+      assert bounced.setup.error == "settings.json5 already exists"
+      assert bounced.setup.choice == 2
+
+      # Off the wizard (the modal, or no setup at all) the feedback is inert.
+      modal = setup_state(setup: {:select, ["a"], 0})
+      assert State.setup_write_failed(modal, "late") == modal
+    end
+
     test "catalog_arrived stores the sweep and fills the context denominator (ADR 0009)" do
       base = "https://provider.example/v1"
 

@@ -134,10 +134,55 @@ defmodule DashFloat.Config do
     with :ok <- ensure_dir(dir),
          {:ok, keys} <- JSON5.read_map(keys_path),
          {:ok, merged} <- nest_key(keys, profile, base_url, value),
-         {:ok, doc} <- JSON5.render(merged) do
+         {:ok, doc} <- render_keys(merged, value) do
       Posture.write_private(keys_path, doc <> "\n")
     end
   end
+
+  # A string the JSON5 dialect cannot quote (a backslash, or both quote
+  # kinds) refuses with the remedy in the message — never the value (issue
+  # #39: the wizard surfaces this on screen). The value is quotable-checkable
+  # up front; a render failure despite a quotable value means the profile
+  # NAME or the endpoint is the unquotable string, and the remedy names those
+  # fields instead of blaming the key the user just typed (hostile review).
+  defp render_keys(merged, value) do
+    with :ok <- quotable(value),
+         {:ok, doc} <- JSON5.render(merged) do
+      {:ok, doc}
+    else
+      {:error, :unrepresentable} -> {:error, unquotable_key_message()}
+      {:error, _path} -> {:error, unquotable_name_message()}
+    end
+  end
+
+  defp quotable(value) do
+    case JSON5.quote_value(value) do
+      {:ok, _quoted} -> :ok
+      {:error, :unrepresentable} -> {:error, :unrepresentable}
+    end
+  end
+
+  defp render_with_remedy(document, message) do
+    case JSON5.render(document) do
+      {:ok, doc} -> {:ok, doc}
+      {:error, _path} -> {:error, message}
+    end
+  end
+
+  defp unquotable_key_message,
+    do:
+      "#{@keys_file} cannot store that key — it contains a backslash or " <>
+        "both quote kinds; re-enter it without the character, or store a $ENV_VAR reference instead"
+
+  defp unquotable_name_message,
+    do:
+      "#{@keys_file} cannot store the profile name or endpoint — one contains " <>
+        "a backslash or both quote kinds; rename the profile or re-enter the URL"
+
+  defp unquotable_settings_message,
+    do:
+      "#{@main_file} cannot store that text — a profile name, label, URL, or MCP " <>
+        "field contains a backslash or both quote kinds; remove the character and run setup again"
 
   # A profile slot that is not an object is pre-v3 damage holding who-knows-
   # what — refuse rather than clobber it; nil and nested maps merge cleanly.
@@ -166,7 +211,7 @@ defmodule DashFloat.Config do
 
     with :ok <- empty_or_absent(main_path),
          :ok <- ensure_dir(dir),
-         {:ok, doc} <- JSON5.render(document) do
+         {:ok, doc} <- render_with_remedy(document, unquotable_settings_message()) do
       Posture.write_private(main_path, doc <> "\n")
     end
   end
