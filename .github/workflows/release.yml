@@ -357,20 +357,22 @@ jobs:
 
       - name: Install from the built artifacts and ask for the version
         env:
-          VERSION: ${{ needs.prepare.outputs.version }}
+          # NOT `VERSION`: `. /etc/os-release` below sets VERSION to the distro
+          # release ("13 (trixie)") and would silently replace this value.
+          DASHFLOAT_VER: ${{ needs.prepare.outputs.version }}
         run: |
           set -eu
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends ca-certificates curl python3 >/dev/null
           . /etc/os-release; echo "--- host: $PRETTY_NAME ($(ldd --version | head -1))"
-          (cd dist && sha256sum ./*.tar.gz | sed 's#  \./#  #' > "dashfloat-$VERSION-sha256sums.txt")
+          (cd dist && sha256sum ./*.tar.gz | sed 's#  \./#  #' > "dashfloat-$DASHFLOAT_VER-sha256sums.txt")
           (cd dist && setsid python3 -m http.server 8765 >/dev/null 2>&1 &)
           for _ in 1 2 3 4 5 6 7 8 9 10; do
             curl -fsS -o /dev/null http://127.0.0.1:8765/ && break
             sleep 0.5
           done
           echo "--- installer (same script users get) ---"
-          DASHFLOAT_VERSION="$VERSION" \
+          DASHFLOAT_VERSION="$DASHFLOAT_VER" \
           DASHFLOAT_RELEASE_BASE_URL=http://127.0.0.1:8765 \
             sh ./install.sh
           echo "--- installed binary ---"
@@ -401,7 +403,9 @@ jobs:
     steps:
       - name: Install from the release, then ask the binary its version
         env:
-          VERSION: ${{ needs.prepare.outputs.version }}
+          # NOT `VERSION`: `. /etc/os-release` sets VERSION to the distro
+          # release and would silently replace this value.
+          DASHFLOAT_VER: ${{ needs.prepare.outputs.version }}
           DEBIAN_RELEASE: ${{ matrix.release }}
           EXPECT_FAILURE: ${{ matrix.expect_failure }}
         run: |
@@ -414,14 +418,14 @@ jobs:
             # Below the declared floor: the installer or the binary must fail
             # with a clear message. A success here would mean the floor claim
             # is wrong.
-            if curl -fsSL "https://github.com/fluxvale/dashfloat/releases/download/v$VERSION/install.sh" | sh; then
+            if curl -fsSL "https://github.com/fluxvale/dashfloat/releases/download/v$DASHFLOAT_VER/install.sh" | sh; then
               echo "expected the install to fail on this glibc, but it succeeded" >&2
               exit 1
             fi
             echo "install correctly refused on $(. /etc/os-release; echo "$PRETTY_NAME")"
             exit 0
           fi
-          curl -fsSL "https://github.com/fluxvale/dashfloat/releases/download/v$VERSION/install.sh" | sh
+          curl -fsSL "https://github.com/fluxvale/dashfloat/releases/download/v$DASHFLOAT_VER/install.sh" | sh
           echo "--- installed binary ---"
           export PATH="$HOME/.local/bin:$PATH"
           command -v dashfloat
