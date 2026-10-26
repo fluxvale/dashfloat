@@ -10,7 +10,7 @@ isolated subprocess execution — with an
 [`ex_ratatui`](https://hex.pm/packages/ex_ratatui) TUI and
 [`burrito`](https://hex.pm/packages/burrito) single-binary distribution.
 
-Website: <https://dashfloat.com> — landing page plus these docs rendered.
+Website: <https://dashfloat.com> — the landing page and these docs, rendered.
 
 ## Status
 
