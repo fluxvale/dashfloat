@@ -14,11 +14,19 @@ defmodule DashFloat.Application do
   @impl Application
   def start(_type, args) when is_list(args) do
     test? = Keyword.get(args, :test?, test_env?())
-    argv = Keyword.get(args, :argv, boot_argv())
+
+    argv =
+      Keyword.get(
+        args,
+        :argv,
+        boot_argv(Keyword.get(args, :plain_argv), Keyword.get(args, :system_argv))
+      )
 
     # A version query must work with no TTY, no config, and no provider: the
-    # installer and CI smoke a downloaded artifact this way (ADR 0010).
-    if not test?, do: handle_version(argv)
+    # installer and CI smoke a downloaded artifact this way (ADR 0010). `halt`
+    # is the test seam for the exit itself — a real halt would take the test
+    # VM down with it.
+    if not test?, do: handle_version(argv, Keyword.get(args, :halt, &System.halt/1))
 
     env = Keyword.get(args, :env, System.get_env())
     config_dir = Keyword.get(args, :config_dir, Config.config_dir())
@@ -61,11 +69,11 @@ defmodule DashFloat.Application do
   # installer and CI smoke a downloaded artifact this way (ADR 0010). The NIF
   # is forced to load first because a version query is the cheapest packaging
   # smoke — a NIF/host mismatch must fail loudly instead of answering 0.
-  defp handle_version(argv) do
+  defp handle_version(argv, halt) do
     if DashFloat.CLI.version?(argv) do
       :ok = ExRatatui.Native.ensure_loaded()
       IO.binwrite(:stdio, "dashfloat #{DashFloat.version()}\n")
-      System.halt(0)
+      halt.(0)
     end
   end
 
@@ -74,11 +82,14 @@ defmodule DashFloat.Application do
   # init arguments are the only place the user's flags appear. Fall back to
   # them (minus the launcher's own --no-halt) so `dashfloat --version` and the
   # selection flags work in a release as they do under `mix run` (ADR 0010).
-  defp boot_argv do
+  defp boot_argv(plain, system_argv) do
+    plain = plain || Enum.map(:init.get_plain_arguments(), &List.to_string/1)
+    system_argv = system_argv || System.argv()
+
     argv =
-      case System.argv() do
-        [_some | _more] = system_argv -> system_argv
-        _no_argv -> Enum.map(:init.get_plain_arguments(), &List.to_string/1)
+      case system_argv do
+        [_some | _more] -> system_argv
+        _no_argv -> plain
       end
 
     Enum.reject(argv, &(&1 == "--no-halt"))
