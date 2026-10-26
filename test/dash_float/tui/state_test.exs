@@ -1851,8 +1851,10 @@ defmodule DashFloat.TUI.StateTest do
       assert State.provider_context_tokens(filled) == 64_000
 
       # A catalog entry without usable context leaves the fallback nil.
+      bare = setup_state(provider: {:ok, config})
+
       contextless =
-        State.catalog_arrived(setup_state(provider: {:ok, config}), %{
+        State.catalog_arrived(bare, %{
           base => [%{model: "glm-5.3", context: nil}]
         })
 
