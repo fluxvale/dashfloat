@@ -94,12 +94,14 @@ defmodule DashFloat.Tools.Exec.GroupTest do
     dir = Path.join(System.tmp_dir!(), "df-group-refuse-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     File.chmod!(dir, 0o200)
+    cwd = Path.join(System.tmp_dir!(), "df-group-cwd-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(cwd)
 
     old = System.get_env("TMPDIR")
     System.put_env("TMPDIR", dir)
 
     try do
-      result = Exec.run("echo hi", dir, 5_000, 4_096)
+      result = Exec.run("echo hi", cwd, 5_000, 4_096)
 
       assert result[:ok] == false
       assert result[:exit] == nil
@@ -108,6 +110,7 @@ defmodule DashFloat.Tools.Exec.GroupTest do
       if old, do: System.put_env("TMPDIR", old), else: System.delete_env("TMPDIR")
       File.chmod!(dir, 0o700)
       File.rm_rf(dir)
+      File.rm_rf(cwd)
     end
   end
 
