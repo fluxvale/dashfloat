@@ -22,11 +22,13 @@ defmodule DashFloat.Application do
         boot_argv(Keyword.get(args, :plain_argv), Keyword.get(args, :system_argv))
       )
 
+    # One halt seam for every boot-time exit; a real halt would take the
+    # test VM down with it.
+    halt = Keyword.get(args, :halt, &System.halt/1)
+
     # A version query must work with no TTY, no config, and no provider: the
-    # installer and CI smoke a downloaded artifact this way (ADR 0010). `halt`
-    # is the test seam for the exit itself — a real halt would take the test
-    # VM down with it.
-    if not test?, do: handle_version(argv, Keyword.get(args, :halt, &System.halt/1))
+    # installer and CI smoke a downloaded artifact this way (ADR 0010).
+    if not test?, do: handle_version(argv, halt)
 
     env = Keyword.get(args, :env, System.get_env())
     config_dir = Keyword.get(args, :config_dir, Config.config_dir())
@@ -49,6 +51,13 @@ defmodule DashFloat.Application do
 
     if not test? and setup_stateful?(classification) and not interactive?(interactive?) do
       IO.binwrite(:stderr, setup_instructions(config_dir))
+
+      # The {:error, _} return from Application.start/2 is what makes OTP
+      # terminate the kernel and drop erl_crash.dump in the user's CWD, so
+      # the refusal exits at the boundary instead. The return is unreachable
+      # in production (the halt ends the VM) — it is the test seam's value.
+      # See ADR 0011.
+      halt.(1)
 
       {:error, :interactive_setup_required}
     else
@@ -101,8 +110,16 @@ defmodule DashFloat.Application do
   defp setup_stateful?(:onboard), do: true
   defp setup_stateful?(_other), do: false
 
-  defp interactive?(nil), do: match?({:ok, _}, :io.columns(:standard_input))
+  # :io.columns(:standard_input) is always {:error, :enotsup} under a
+  # release's -noshell boot, even on a real pty — ask the fd primitive.
+  # See ADR 0011.
+  defp interactive?(nil), do: tty?()
   defp interactive?(override) when is_boolean(override), do: override
+
+  @doc false
+  @spec tty?((:stdin | :stdout -> term())) :: boolean()
+  def tty?(isatty \\ &:prim_tty.isatty/1),
+    do: isatty.(:stdin) == true or isatty.(:stdout) == true
 
   defp setup_instructions(config_dir) do
     """
