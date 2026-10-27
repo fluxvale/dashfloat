@@ -192,6 +192,26 @@ defmodule DashFloat.Tools.ExecTest do
     assert_eventually_gone(marker)
   end
 
+  test "a fast-exiting command's background children do not outlive the run" do
+    # The leak contract of issue #59: the group kill must not depend on the
+    # port being alive, or a command that exits before its children leaks
+    # them. The spawn-window unit proof lives in GroupTest.
+    duration = 300_000 + System.unique_integer([:positive])
+    marker = "sleep #{duration}"
+
+    # A stale survivor from an earlier, broken run must not read as ours.
+    System.cmd("pkill", ["-9", "-f", marker])
+    :timer.sleep(50)
+
+    result =
+      Exec.run("sh -c '#{marker} >/dev/null 2>&1 & echo done'", sandbox("fastreap"), 5_000, 4_096)
+
+    assert result.ok == true
+    assert result.exit == 0
+    assert result.output == "done\n"
+    assert_eventually_gone(marker)
+  end
+
   test "binary output is scrubbed to valid UTF-8" do
     result = Exec.run("printf a\\\\377b", sandbox("binary"), 5_000, 4_096)
 

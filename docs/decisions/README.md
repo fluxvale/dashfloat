@@ -35,3 +35,4 @@ their replacement.
 | [0010](0010-release-packaging.md) | Release packaging: core `mix release` tarballs, installer, Homebrew | Accepted |
 | [0011](0011-boot-tty-and-clean-refusal.md) | Boot-time terminal detection, the clean refusal, and libsctp in the release | Accepted |
 | [0012](0012-runner-dead-before-monitor-is-cancelled.md) | A runner dead before its monitor goes up is cancelled, not crashed | Accepted |
+| [0013](0013-exec-pgid-tracked-at-spawn.md) | Exec's process group is tracked at spawn, not queried from the port at reap | Accepted |

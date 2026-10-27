@@ -13,23 +13,27 @@ defmodule DashFloat.Tools.Exec do
   exits 2). Output past the cap is still consumed and counted, never
   accumulated.
 
-  On completion — normal exit OR timeout — the command's process group is
-  SIGKILLed: `Port.close/1` only closes the pipes, and a program that
+  On completion — normal exit OR timeout OR cancel — the command's process
+  group is SIGKILLed: `Port.close/1` only closes the pipes, and a program that
   never reads stdin (a busy shell loop) survives it — verified on this
   system, where it would spin at 100% CPU forever. Group-killing the normal
   path also reaps same-group children the command left behind (a child that
   escapes via `setsid` survives this — closing that needs a process-level
-  sandbox). Spawned children lead their own session, so killing the
-  negative pid takes the entire group; the killer runs with its stderr
-  silenced because after a clean exit the group is usually already gone and
-  kill(1) would otherwise complain on the BEAM's stderr.
+  sandbox). The group id is learned at spawn, not from the port: a wrapper
+  shell writes its own pid — as the spawned child's session leader, the pid
+  IS the pgid — into a tracker file before exec'ing the command, so the kill
+  never depends on the port being alive (`Port.info/2` returns nil once a
+  fast-exiting program is gone, which used to skip the kill and leak its
+  background children — issue #59). Spawned children lead their own session,
+  so killing the negative pid takes the entire group; the killer runs with
+  its stderr silenced because after a clean exit the group is usually already
+  gone and kill(1) would otherwise complain on the BEAM's stderr.
   """
 
   alias DashFloat.Tools.Edit
+  alias DashFloat.Tools.Exec.Group
 
   @drain_grace 10
-  @shell "/bin/sh"
-  @kill_executable "/bin/kill"
 
   @doc """
   Runs `command` in `cwd`, returning `%{ok, exit, output, truncated,
@@ -44,15 +48,7 @@ defmodule DashFloat.Tools.Exec do
              is_integer(cap_bytes) and cap_bytes >= 0 do
     case File.stat(cwd) do
       {:ok, %File.Stat{type: :directory}} ->
-        deadline = System.monotonic_time(:millisecond) + timeout_ms
-
-        port =
-          Port.open(
-            {:spawn, shell(command)},
-            [:binary, :stream, :use_stdio, :stderr_to_stdout, :exit_status, {:cd, cwd}]
-          )
-
-        loop(port, birth_pid(port), deadline, timeout_ms, cap_bytes, "", 0, false)
+        spawn_tracked(command, cwd, timeout_ms, cap_bytes)
 
       {:ok, _stat} ->
         %{ok: false, exit: nil, error: "spawn failed: not a directory: " <> cwd}
@@ -62,39 +58,51 @@ defmodule DashFloat.Tools.Exec do
     end
   end
 
-  # Captured at birth: once the program exits, Port.info returns nil and the
-  # group id (== the program's pid) would be unfindable. A program that dies
-  # within the Port.open window (echo) can already be gone here — nothing to
-  # signal, the exit_status still arrives.
-  defp birth_pid(port) do
-    case Port.info(port, :os_pid) do
-      {:os_pid, pid} -> pid
-      # Belt: same race window as signal_group/2's nil clause.
-      # coveralls-ignore-next-line
-      _already_gone -> nil
+  # No fallback when arming fails: without a tracker the group kill would
+  # again depend on the port's lifetime, so an unusable tmp dir refuses the
+  # spawn honestly (see ADR 0013).
+  defp spawn_tracked(command, cwd, timeout_ms, cap_bytes) do
+    case Group.arm() do
+      {:ok, tracker} ->
+        deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+        port =
+          Port.open(
+            {:spawn, Group.wrap(command, tracker)},
+            [:binary, :stream, :use_stdio, :stderr_to_stdout, :exit_status, {:cd, cwd}]
+          )
+
+        loop(port, tracker, deadline, timeout_ms, cap_bytes, "", 0, false)
+
+      {:error, reason} ->
+        %{
+          ok: false,
+          exit: nil,
+          error: "spawn failed: cannot arm the process-group tracker: " <> reason
+        }
     end
   end
 
   # The receive timeout is an absolute deadline (recomputed after every
   # message), so a producer that never idles still dies at timeout_ms.
-  defp loop(port, os_pid, deadline, timeout_ms, cap, output, total, truncated) do
+  defp loop(port, tracker, deadline, timeout_ms, cap, output, total, truncated) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     if remaining <= 0 do
-      timed_out(port, os_pid, timeout_ms, output, total, truncated)
+      timed_out(port, tracker, timeout_ms, output, total, truncated)
     else
       receive do
         # The user's Esc: kill the group (a bare Port.close would leak the
         # program spinning), swallow the dying output, report the cancel.
         :cancel ->
-          cancelled(port, os_pid, output, total, truncated)
+          cancelled(port, tracker, output, total, truncated)
 
         {^port, {:data, data}} ->
           {output, total, truncated} = take(data, cap, output, total, truncated)
-          loop(port, os_pid, deadline, timeout_ms, cap, output, total, truncated)
+          loop(port, tracker, deadline, timeout_ms, cap, output, total, truncated)
 
         {^port, {:exit_status, status}} ->
-          signal_group(port, os_pid)
+          Group.reap(tracker, port)
           {output, truncated} = stamp(output, total, truncated)
 
           %{
@@ -106,13 +114,13 @@ defmodule DashFloat.Tools.Exec do
           }
       after
         remaining ->
-          timed_out(port, os_pid, timeout_ms, output, total, truncated)
+          timed_out(port, tracker, timeout_ms, output, total, truncated)
       end
     end
   end
 
-  defp cancelled(port, os_pid, output, total, truncated) do
-    signal_group(port, os_pid)
+  defp cancelled(port, tracker, output, total, truncated) do
+    Group.reap(tracker, port)
     drain(port)
     {output, truncated} = stamp(output, total, truncated)
 
@@ -126,11 +134,11 @@ defmodule DashFloat.Tools.Exec do
     }
   end
 
-  defp timed_out(port, os_pid, timeout_ms, output, total, truncated) do
+  defp timed_out(port, tracker, timeout_ms, output, total, truncated) do
     # No Port.close here: the SIGKILL below terminates the program (and with
     # it the port) — closing a port the kill already ended raises. The drain
     # swallows whatever the dying program flushed, including its exit_status.
-    signal_group(port, os_pid)
+    Group.reap(tracker, port)
     drain(port)
     {output, truncated} = stamp(output, total, truncated)
 
@@ -175,45 +183,4 @@ defmodule DashFloat.Tools.Exec do
       @drain_grace -> :ok
     end
   end
-
-  # Spawned children lead their own session, so the negative pid is the whole
-  # process group — the program itself plus anything it left behind. The tiny
-  # pid-reuse window between a group's death and this signal is accepted
-  # (wrapping pid_max takes far longer than the run of a command). The
-  # killer's stderr is silenced: after a clean exit the group is usually
-  # already gone and kill(1) would otherwise complain on the BEAM's stderr.
-  #
-  # Belt for the instant-death window between Port.open and Port.info: only
-  # observed under scheduler load (a coverage-instrumented run), never
-  # deterministic in a test. A nil birth pid may just mean the handshake was
-  # slow — re-query while the program lives; only a truly dead program (or a
-  # fast one whose children already died with it) yields nil again.
-  # coveralls-ignore-start
-  defp signal_group(port, nil) do
-    case Port.info(port, :os_pid) do
-      {:os_pid, os_pid} -> kill_group(os_pid)
-      _gone -> :ok
-    end
-  end
-
-  # coveralls-ignore-stop
-  defp signal_group(_port, os_pid), do: kill_group(os_pid)
-
-  defp kill_group(os_pid) do
-    group = Integer.to_string(-os_pid)
-
-    killer =
-      Port.open(
-        {:spawn_executable, @shell},
-        [:exit_status, {:args, ["-c", "exec #{@kill_executable} -9 #{group} 2>/dev/null"]}]
-      )
-
-    # kill(1) only delivers a signal; it always exits promptly.
-    receive do
-      {^killer, {:exit_status, _status}} -> :ok
-    end
-  end
-
-  # POSIX single-quote escaping: ' -> '\''
-  defp shell(command), do: "/bin/sh -c '" <> String.replace(command, "'", "'\\''") <> "'"
 end
