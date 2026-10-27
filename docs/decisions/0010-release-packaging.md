@@ -209,8 +209,11 @@ the assets.
   Ubuntu 22.04+, and current Fedora/RHEL — but a *minimal* container image can
   lack them, so the installer checks for them up front and names the package
   to install instead of installing a binary that cannot start. `libsctp.so.1`
-  is optional: with it absent the VM logs one `Failed open sctp dynamic
-  library` line at boot and continues.
+  is not a dependency: *Amended by
+  [ADR 0011](0011-boot-tty-and-clean-refusal.md)* — ERTS dlopens it at VM init
+  and prints an `=ESOCK WARNING` block on stdout when it is missing, so the
+  release bundles the library and puts it on `LD_LIBRARY_PATH`; the warning is
+  gone and users install nothing extra.
 - macOS binaries are unsigned: Gatekeeper blocks the first launch of a
   downloaded copy until the user right-click-opens it. The release notes and
   the installer's output say so.

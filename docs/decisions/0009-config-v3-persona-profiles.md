@@ -194,6 +194,12 @@ pure function over dir + env + cli):
    users never see a wizard); otherwise → **onboarding wizard**.
 6. When the wizard or modal would run on a non-interactive stdin, error with
    setup instructions instead — the harness must never hang in CI or scripts.
+   *Amended by [ADR 0011](0011-boot-tty-and-clean-refusal.md):* "interactive"
+   means a tty on stdin **or** stdout as reported by `:prim_tty.isatty/1`
+   (`:io.columns/1` is always `{:error, :enotsup}` on a release's `-noshell`
+   stdin, so it refused every first run of the installed binary), and the
+   refusal exits 1 at the boot boundary instead of returning an error into
+   OTP's permanent-application crash path.
 
 ### First-run onboarding wizard (UX spec)
 
