@@ -410,7 +410,17 @@ jobs:
           EXPECT_FAILURE: ${{ matrix.expect_failure }}
         run: |
           set -eu
-          apt-get update -qq
+          if [ "$DEBIAN_RELEASE" = "bullseye" ]; then
+            # bullseye left LTS in Aug 2026 and the live pools no longer
+            # serve its debs (404s), so apt points at the archive (#47).
+            printf '%s\n' \
+              'deb http://archive.debian.org/debian bullseye main' \
+              'deb http://archive.debian.org/debian-security bullseye-security main' \
+              > /etc/apt/sources.list
+            apt-get -o Acquire::Check-Valid-Until=false update -qq
+          else
+            apt-get update -qq
+          fi
           apt-get install -y -qq --no-install-recommends ca-certificates curl binutils >/dev/null
           . /etc/os-release; echo "--- host: $PRETTY_NAME ($(ldd --version | head -1))"
           echo "--- installer (curl | sh, exactly what a user runs) ---"
