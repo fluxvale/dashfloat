@@ -6,7 +6,10 @@
   now records it. The merged keys-split (#31) matched everything this record
   anticipated — no Phase A decision needed adjusting against the merged
   reality. The onboarding write-refusal surface amendment below landed with
-  [issue #39](https://github.com/fluxvale/dashfloat/issues/39).
+  [issue #39](https://github.com/fluxvale/dashfloat/issues/39) (before the
+  tracker crossing was untangled — it shipped as PR #41's wizard work); the
+  v1+interleave pre-split refusal amendment below lands with the reopened
+  issue #39, the migration defect that issue actually carries.
 - **Date:** 2026-10-26
 - **Implements:** [issue #32](https://github.com/fluxvale/dashfloat/issues/32).
 - **Supersedes:** the *schema*, *model addressing and selection*, *effective
@@ -437,6 +440,53 @@ load; a v1-era refusal surfaces with #31's message before this step runs.
   regular-file guard never reached — both backup paths lstat first now, so a
   `.bak` symlink (live or dangling) survives every migration with a warning
   and counts as no backup for the loss decision.
+
+### The v1+interleave split refuses before it writes (issue #39, migration amendment)
+
+The chain composes split → reshape in one load, and each step refused only on
+its own catalog. That left a seam: a v1 file carrying BOTH an inline
+credential AND a v3-only field (`defaultProfile`, or a profile-level
+`providers`/`mcp`) — a hand-merged file, the shape a user gets halfway
+through following two generations of docs — split cleanly (the v3-only field
+rides verbatim by design), and the reshape's ambiguity tripwire then refused
+on that same preserved field AFTER the split had written `configVersion: 2`
+to disk. The tripwire's remedy ("set `configVersion: 3`") is computed for a
+genuinely v3-shaped file missing its marker; applied to the now-v2-shaped
+post-split file it yields a provider-less config that fails to load, with
+the flat key stranded in `keys.json5` and the real recovery named nowhere on
+screen. No value was ever lost — backups and `keys.json5` hold everything —
+but the printed remedy was a dead end: the remedy for state N was computed
+against state N-1.
+
+- **Decision (the issue's first sanctioned arm):** the split refuses the
+  interleave at the head of the chain, before any write. A file that is
+  both split-pending (pre-v2 with inline credentials) and v3-tripped
+  (`defaultProfile`, or profile-level `providers`/`mcp` — the reshape's own
+  tripwire predicate, reused verbatim, evaluated after `unshapeable?`'s
+  profiles-are-a-list-of-objects guarantee) refuses with both facts named
+  and an explicit nothing-was-written guarantee; the directory stays
+  byte-identical. Remedy in the message: remove the v3-only fields and
+  re-run — the chain then carries the file to v3 in one load and re-derives
+  `defaultProfile` itself (the first profile), so nothing the migration
+  could compute is lost — or reshape the file to v3 by hand.
+- **Why the prediction is sound:** `de_secret/1` only strips `apiKey` and
+  stamps `configVersion`/`profiles`; every tripwire key survives the split
+  verbatim, so the pre-split map trips if and only if the post-split map
+  trips. Refusing at the head keeps the chain transactional — the directory
+  never enters a half-migrated state the chain itself could predict — and
+  zero writes is the stronger, cheaper-to-verify guarantee.
+- **Rejected alternative (the issue's other sanctioned arm):** a
+  shape-aware remedy on the post-split tripwire ("delete the field").
+  It would keep the write-then-refuse state, require the tripwire to tell
+  a hand-made v3 file from a post-split v2 file (same field, different
+  surrounding shape), and leave the user editing a v2 file the chain just
+  wrote instead of the one they hand-damaged.
+- The reshape's own tripwire arm (no inline credentials → that arm also
+  writes nothing) keeps its "set `configVersion: 3`" remedy — honest for
+  the genuinely v3-shaped files it exists to catch. Its advice can still
+  misfit a hand-made v2/v1-shaped file carrying a stray `defaultProfile`
+  (nothing is written there either); that no-write neighboring class is a
+  conscious non-goal of this amendment.
 
 ### Carried over unchanged (ADR 0008 / #31)
 
