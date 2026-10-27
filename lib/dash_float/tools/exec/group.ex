@@ -12,6 +12,8 @@ defmodule DashFloat.Tools.Exec.Group do
   of everything the command spawns. See ADR 0013.
   """
 
+  require Logger
+
   defstruct [:path]
 
   @type t :: %__MODULE__{path: String.t()}
@@ -23,21 +25,31 @@ defmodule DashFloat.Tools.Exec.Group do
 
   @doc """
   Pre-writes the tracker file, holding the sentinel `"0\n"` until the wrapper
-  reports. Fails rather than degrading: a spawn without a tracker would again
-  learn its pgid from the port and leak on fast exit.
+  reports. The path is absolute (a relative `TMPDIR` resolves differently in
+  the wrapper, which runs under the command's cwd), the name is unguessable,
+  and the create is exclusive with 0600 — the same hardening
+  `Runner.write_file/3` applies to its temp files — so a pre-planted symlink
+  is never followed and no other user can write the file. Fails rather than
+  degrading: a spawn without a tracker would again learn its pgid from the
+  port and leak on fast exit.
   """
   @spec arm() :: {:ok, t()} | {:error, String.t()}
   def arm do
-    dir = System.tmp_dir() || "/tmp"
+    dir = Path.expand(System.tmp_dir())
 
-    name =
-      "dashfloat-exec-#{System.pid()}-#{Integer.to_string(:erlang.unique_integer([:positive]))}.pgid"
-
+    rand = :crypto.strong_rand_bytes(8)
+    name = "dashfloat-exec-" <> Base.encode16(rand, case: :lower) <> ".pgid"
     path = Path.join(dir, name)
 
-    case File.write(path, "0\n") do
-      :ok -> {:ok, %__MODULE__{path: path}}
-      {:error, reason} -> {:error, to_string(:file.format_error(reason))}
+    case File.open(path, [:write, :exclusive], &IO.write(&1, "0\n")) do
+      {:ok, :ok} ->
+        case File.chmod(path, 0o600) do
+          :ok -> {:ok, %__MODULE__{path: path}}
+          {:error, reason} -> {:error, to_string(:file.format_error(reason))}
+        end
+
+      {:error, reason} ->
+        {:error, to_string(:file.format_error(reason))}
     end
   end
 
@@ -50,8 +62,8 @@ defmodule DashFloat.Tools.Exec.Group do
   """
   @spec wrap(String.t(), t()) :: String.t()
   def wrap(command, tracker) do
-    inner = "echo $$ > " <> shquote(tracker.path) <> " && exec /bin/sh -c " <> shquote(command)
-    "/bin/sh -c " <> shquote(inner)
+    inner = "echo $$ > " <> shquote(tracker.path) <> " && exec #{@shell} -c " <> shquote(command)
+    "#{@shell} -c " <> shquote(inner)
   end
 
   @doc """
@@ -65,18 +77,37 @@ defmodule DashFloat.Tools.Exec.Group do
       {:ok, pgid} ->
         kill_group(pgid)
 
-      :unwritten ->
+      :sentinel ->
         # Belt for a completion that beats the wrapper's report (a :cancel
         # landing inside the spawn window): a live port's os_pid is the pgid.
         case Port.info(port, :os_pid) do
           {:os_pid, os_pid} ->
             kill_group(os_pid)
 
-          # Dead port AND unwritten tracker: the wrapper never wrote, so its
-          # `&&` failed and the user command was never exec'd — the group
-          # only ever held the wrapper itself. Provably nothing to kill;
+          # Dead port AND the sentinel never left the tracker: the wrapper's
+          # `&&` never passed, so the user command was never exec'd — the
+          # group only ever held the wrapper itself. Provably nothing to kill;
           # this is the proof issue #59's silent skip cannot come back.
           _gone ->
+            :ok
+        end
+
+      # The tracker is missing or its content is not a report the wrapper
+      # could have written: the pgid may have been reported and then lost (a
+      # tmp cleaner, or the command deleting its own tracker), so
+      # nothing-to-kill cannot be proven. Kill by the belt if the port still
+      # answers; otherwise say so instead of skipping silently (issue #59).
+      :unknown ->
+        case Port.info(port, :os_pid) do
+          {:os_pid, os_pid} ->
+            kill_group(os_pid)
+
+          _gone ->
+            Logger.warning(
+              "exec tracker #{tracker.path} unreadable at reap: " <>
+                "cannot verify the command's process group was killed"
+            )
+
             :ok
         end
     end
@@ -85,34 +116,44 @@ defmodule DashFloat.Tools.Exec.Group do
     :ok
   end
 
-  # The wrapper reports a moment after the port opens; under scheduler load
-  # the read can race that write (sentinel "0", empty, mid-write): retry
-  # briefly before declaring the report never came.
-  defp read_pgid(_path, 0), do: :unwritten
-
+  # The wrapper reports a moment after the port opens; a :cancel landing in
+  # that window can read the sentinel while the write is still in flight —
+  # give it a moment before treating the sentinel as final. Anything else
+  # that is not a well-formed report is final immediately.
   defp read_pgid(path, tries) do
     case parse_pgid(path) do
       {:ok, pgid} ->
         {:ok, pgid}
 
-      :unwritten ->
+      :sentinel when tries > 1 ->
         Process.sleep(@report_grace_ms)
         read_pgid(path, tries - 1)
+
+      final ->
+        final
     end
   end
 
+  # A report is digits + newline and names a real process group (≥ 2; group 1
+  # would make the kill target -1, every process the uid can signal). The
+  # trailing newline is required — a torn prefix would otherwise be signalled
+  # as a live pgid — and a non-regular file (a swapped-in FIFO would hang the
+  # read) is never trusted.
   defp parse_pgid(path) do
-    case File.read(path) do
-      {:ok, content} ->
-        trimmed = String.trim(content)
+    with {:ok, %File.Stat{type: :regular}} <- File.stat(path),
+         {:ok, content} <- File.read(path) do
+      classify(content)
+    else
+      _unreadable -> :unknown
+    end
+  end
 
-        case Integer.parse(trimmed) do
-          {pgid, ""} when pgid > 0 -> {:ok, pgid}
-          _sentinel_or_garbage -> :unwritten
-        end
+  defp classify("0\n"), do: :sentinel
 
-      {:error, _reason} ->
-        :unwritten
+  defp classify(content) do
+    case Integer.parse(content) do
+      {pgid, "\n"} when pgid >= 2 -> {:ok, pgid}
+      _unparsed -> :unknown
     end
   end
 

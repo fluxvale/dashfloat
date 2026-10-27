@@ -38,7 +38,9 @@ defmodule DashFloat.Tools.Exec do
   @doc """
   Runs `command` in `cwd`, returning `%{ok, exit, output, truncated,
   total_bytes}` on exit, a `timed out after <ms>ms` map on timeout, or a
-  `spawn failed` map when `cwd` is unusable. A `:cancel` message delivered to
+  `spawn failed` map when `cwd` is unusable or the process-group tracker
+  cannot be armed (an unusable tmp dir — the kill would depend on the port's
+  lifetime, so the spawn is refused instead). A `:cancel` message delivered to
   the caller mid-run (the agent's Esc interrupt) kills the process group and
   returns `%{ok: false, cancelled: true, …}` with the partial output.
   """

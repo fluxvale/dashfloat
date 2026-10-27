@@ -641,10 +641,11 @@ defmodule DashFloat.AgentTest do
     # start_child returns, and Process.monitor/1 on a pid that already died
     # fires immediately with reason :noproc. Forged here with the slot's real
     # ref and the real runner pid — the live window is scheduler-dependent —
-    # and the equivalence is exact by happens-before: the child sends
-    # :tool_done before exiting, so a :noproc DOWN reaching a still-{:running}
-    # slot proves no result was ever sent. Nothing ran, so nothing crashed:
-    # the honest status is cancelled (ADR 0012).
+    # and the equivalence holds post-ADR-0012: the runner self-reports every
+    # death its body can observe (the try/rescue in dispatch_runner/2), so a
+    # :noproc DOWN reaching a still-{:running} slot means the body never
+    # reported: it never started, or died to an external kill — both are the
+    # deaths the :killed clause already reports as cancelled.
     server =
       start_server([
         call_tool_episode("call_w", "execute_command", %{"command" => "sleep 5"}),
