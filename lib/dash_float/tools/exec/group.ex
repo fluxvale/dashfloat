@@ -65,18 +65,27 @@ defmodule DashFloat.Tools.Exec.Group do
              :ok <- File.chmod(path, 0o600) do
           :ok
         else
+          # Reachable only by a failing or full tmp (verified against
+          # /dev/full in review); not deterministic in a suite.
+          # coveralls-ignore-start
           {:error, reason} ->
             File.rm(path)
             {:error, to_string(:file.format_error(reason))}
+
+            # coveralls-ignore-stop
         end
 
       {:error, reason} ->
         {:error, to_string(:file.format_error(reason))}
     end
   rescue
+    # The raise shape of a failing write (again /dev/full, not a suite).
+    # coveralls-ignore-start
     exception ->
       File.rm(path)
       {:error, Exception.message(exception)}
+
+      # coveralls-ignore-stop
   end
 
   @doc """
