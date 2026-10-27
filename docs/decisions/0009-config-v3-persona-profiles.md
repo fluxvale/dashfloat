@@ -445,48 +445,67 @@ load; a v1-era refusal surfaces with #31's message before this step runs.
 
 The chain composes split → reshape in one load, and each step refused only on
 its own catalog. That left a seam: a v1 file carrying BOTH an inline
-credential AND a v3-only field (`defaultProfile`, or a profile-level
-`providers`/`mcp`) — a hand-merged file, the shape a user gets halfway
-through following two generations of docs — split cleanly (the v3-only field
-rides verbatim by design), and the reshape's ambiguity tripwire then refused
-on that same preserved field AFTER the split had written `configVersion: 2`
-to disk. The tripwire's remedy ("set `configVersion: 3`") is computed for a
-genuinely v3-shaped file missing its marker; applied to the now-v2-shaped
-post-split file it yields a provider-less config that fails to load, with
-the flat key stranded in `keys.json5` and the real recovery named nowhere on
-screen. No value was ever lost — backups and `keys.json5` hold everything —
-but the printed remedy was a dead end: the remedy for state N was computed
-against state N-1.
+credential AND a v3-only field — a hand-merged file, the shape a user gets
+halfway through following two generations of docs — split cleanly (the
+v3-only field rides verbatim by design), and the reshape's ambiguity
+tripwire then refused on that same preserved field AFTER the split had
+written `configVersion: 2` to disk. The tripwire's remedy ("set
+`configVersion: 3`") is computed for a genuinely v3-shaped file missing its
+marker; applied to the post-split file whose profiles are still v1/v2-shaped
+(`baseUrl` at profile level, no `providers`) it yields a provider-less
+config that fails to load, with the flat key stranded in `keys.json5` and
+the real recovery named nowhere on screen. No value was ever lost — backups
+and `keys.json5` hold everything — but the printed remedy was a dead end:
+the remedy for state N was computed against state N-1.
 
-- **Decision (the issue's first sanctioned arm):** the split refuses the
-  interleave at the head of the chain, before any write. A file that is
-  both split-pending (pre-v2 with inline credentials) and v3-tripped
-  (`defaultProfile`, or profile-level `providers`/`mcp` — the reshape's own
-  tripwire predicate, reused verbatim, evaluated after `unshapeable?`'s
-  profiles-are-a-list-of-objects guarantee) refuses with both facts named
-  and an explicit nothing-was-written guarantee; the directory stays
-  byte-identical. Remedy in the message: remove the v3-only fields and
-  re-run — the chain then carries the file to v3 in one load and re-derives
-  `defaultProfile` itself (the first profile), so nothing the migration
-  could compute is lost — or reshape the file to v3 by hand.
+- **Decision (the issue's first sanctioned arm, narrowed by hostile
+  review):** the split refuses the interleave at the head of the chain,
+  before any write — but only the interleave whose remedy would actually
+  dead-end: inline credentials beside v3-only fields (`defaultProfile`,
+  `mcp`) while NO profile carries a `providers` tree. The refusal names
+  both facts and an explicit nothing-was-written guarantee; the directory
+  stays byte-identical. Remedy in the message: remove the v3-only fields
+  and re-run — the chain then carries the file to v3 in one load and
+  re-derives `defaultProfile` itself (the first profile); re-add anything
+  removed (`mcp` is authored content the migration cannot compute) — or
+  reshape the file to v3 by hand.
+- **Why providers-carrying interleaves are excluded (review round 1,
+  P1-1):** when a profile already carries a `providers` tree, the split
+  preserves it and the flat key nests under its single provider endpoint —
+  the tripwire's "set `configVersion: 3`" remedy converges there, ending
+  loadable with the tree intact (pinned by test). Refusing those at the
+  head would trade a working automatic path for manual work, and a
+  removal-remedy there would invite deleting the authored provider/mcp
+  trees — exactly the half-migrated damage this amendment exists to
+  prevent. They keep the chain's write-then-refuse with its fitting
+  remedy (the issue's second arm).
+- **The refusal is gated on the split's own precondition (review round 1,
+  P1-2):** it fires only where the split itself would run — regular
+  `settings.json5` and `keys.json5`. A symlinked or otherwise non-regular
+  layout keeps the stand-down: the split was already left by hand there,
+  and some such directories (a v3-shaped file completed by a symlinked
+  keys file) load fine without any migration.
 - **Why the prediction is sound:** `de_secret/1` only strips `apiKey` and
   stamps `configVersion`/`profiles`; every tripwire key survives the split
   verbatim, so the pre-split map trips if and only if the post-split map
-  trips. Refusing at the head keeps the chain transactional — the directory
-  never enters a half-migrated state the chain itself could predict — and
-  zero writes is the stronger, cheaper-to-verify guarantee.
+  trips — and the arm only fires where the split would actually run.
+  Refusing at the head keeps the chain transactional — the directory never
+  enters a half-migrated state the chain itself could predict — and zero
+  writes is the stronger, cheaper-to-verify guarantee.
 - **Rejected alternative (the issue's other sanctioned arm):** a
-  shape-aware remedy on the post-split tripwire ("delete the field").
-  It would keep the write-then-refuse state, require the tripwire to tell
-  a hand-made v3 file from a post-split v2 file (same field, different
-  surrounding shape), and leave the user editing a v2 file the chain just
-  wrote instead of the one they hand-damaged.
-- The reshape's own tripwire arm (no inline credentials → that arm also
-  writes nothing) keeps its "set `configVersion: 3`" remedy — honest for
-  the genuinely v3-shaped files it exists to catch. Its advice can still
-  misfit a hand-made v2/v1-shaped file carrying a stray `defaultProfile`
-  (nothing is written there either); that no-write neighboring class is a
-  conscious non-goal of this amendment.
+  shape-aware remedy on the post-split tripwire ("delete the field") for
+  the not-v3-shaped class. It would keep the write-then-refuse state and
+  leave the user editing a v2 file the chain just wrote instead of the one
+  they hand-damaged.
+- **Pre-existing neighbors, unchanged and consciously out of scope (all
+  no-loss; review round 1, P2/P3):** `reject_endpoint_keyed`'s
+  write-then-refuse (its "set `configVersion: 3`" arm can dead-end on a
+  v2-shaped settings, though its "fix `keys.json5` by hand" arm
+  converges); the reshape tripwire's marker advice for a hand-made
+  no-inline-credentials v2/v1-shaped file with a stray `defaultProfile`
+  (nothing is written, the advice can misfit); a multi-provider
+  providers-carrying interleave, where the flat key strands under a
+  warning that names the hand fix (nest it under the baseUrl).
 
 ### Carried over unchanged (ADR 0008 / #31)
 

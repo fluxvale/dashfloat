@@ -132,11 +132,13 @@ The error's remedies are real: add the key under its profile name to
 the moved file to 0600 automatically) so the next start can write
 a fresh one. A `settings.json5.bak` that is a symlink is never read
 through or replaced — it counts as no backup, and the split refuses if a
-key would be lost. A v1 file that also carries v3-only fields — a
-hand-merged `defaultProfile`, or `providers`/`mcp` inside a profile — is
+key would be lost. A v1 file whose profiles carry no `providers` tree but
+mix in v3-only fields — a hand-merged `defaultProfile`, or `mcp` — is
 refused before anything is written; remove those fields and re-run (the
-chain then migrates the file to v3 and re-derives `defaultProfile`
-itself). The v2→v3 reshape follows the same invariant (dead
+chain then migrates the file to v3 and re-derives `defaultProfile`;
+re-add anything you removed). A file whose profiles already carry
+`providers` keeps the set-`configVersion: 3` remedy, inline keys included
+— it converges there. The v2→v3 reshape follows the same invariant (dead
 keys only drop behind a fresh `keys.json5.bak`; duplicate profile names
 with keys, keyless endpoints, and v3-shaped files missing
 `configVersion: 3` all refuse with remedies in the message). Details:

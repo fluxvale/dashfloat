@@ -2131,11 +2131,17 @@ defmodule DashFloat.ConfigTest do
     @interleave "{ profiles: [{ name: 'work', baseUrl: 'https://p.example/v1', apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'm1' }] }], defaultProfile: 'work', }"
 
     defp dir_snapshot(dir) do
-      for name <- File.ls!(dir),
-          path = Path.join(dir, name),
-          File.exists?(path),
-          into: %{},
-          do: {name, File.read!(path)}
+      for name <- File.ls!(dir), path = Path.join(dir, name), into: %{} do
+        {:ok, stat} = File.lstat(path)
+        {name, {stat.type, snapshot_text(path)}}
+      end
+    end
+
+    defp snapshot_text(path) do
+      case File.read(path) do
+        {:ok, text} -> text
+        _unreadable -> nil
+      end
     end
 
     test "real load refuses naming both facts, and the directory is byte-identical" do
@@ -2190,22 +2196,131 @@ defmodule DashFloat.ConfigTest do
       refute live =~ "PLACEHOLDER"
     end
 
-    test "profile-level providers/mcp on a v1 inline-keys file refuse the same way" do
-      files = [
-        "{ profiles: [{ name: 'work', baseUrl: 'https://p.example/v1', apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'm1' }], providers: [{ baseUrl: 'https://other.example/v1' }] }], }",
+    test "mcp with no providers tree is refused at the head; the remedy converges (re-add included)" do
+      dir = tmp_dir()
+
+      file =
         "{ profiles: [{ name: 'work', baseUrl: 'https://p.example/v1', apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'm1' }], mcp: [{ name: 'fetch', command: 'uvx' }] }], }"
-      ]
 
-      for file <- files do
-        dir = tmp_dir()
-        write!(dir, file)
-        before = dir_snapshot(dir)
+      write!(dir, file)
+      before = dir_snapshot(dir)
 
-        assert {:error, message} = Config.load(dir, %{}, [])
-        assert message =~ "v3-only fields"
-        assert message =~ "nothing was written"
-        assert dir_snapshot(dir) == before
-      end
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "v3-only fields"
+      assert message =~ "mcp"
+      assert message =~ "nothing was written"
+      assert dir_snapshot(dir) == before
+
+      # Follow the remedy verbatim: remove the field, re-run…
+      without_mcp = String.replace(file, ", mcp: [{ name: 'fetch', command: 'uvx' }]", "")
+      settings = settings_path(dir)
+      File.write!(settings, without_mcp)
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert config.api_key == "PLACEHOLDER-work-key"
+
+      # …and re-add what was removed — the migrated v3 file takes the mcp
+      # entry back and still loads.
+      {:ok, migrated} = read_settings(dir)
+
+      readded =
+        put_in(migrated, ["profiles", Access.at(0), "mcp"], [
+          %{"name" => "fetch", "command" => "uvx"}
+        ])
+
+      {:ok, text} = JSON5.render(readded)
+
+      File.write!(settings, text <> "\n")
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
+    end
+
+    test "a providers-carrying interleave keeps the marker path — followed, it converges with the tree intact" do
+      # Review P1-1: the head-refusal must not fire for a v3-shaped file —
+      # the split preserves the provider tree, the flat key nests under its
+      # single endpoint, and the tripwire's marker remedy converges. The
+      # refusal's removal-remedy would instead invite deleting the authored
+      # provider menu.
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 1,
+          defaultProfile: 'work',
+          profiles: [
+            { name: 'work',
+              providers: [{ baseUrl: 'https://p.example/v1', models: [{ model: 'm1' }, { model: 'm2' }] }],
+              apiKey: 'PLACEHOLDER-work-key' },
+          ],
+        }
+        """
+      )
+
+      # The chain splits (writes), then the tripwire refuses with the marker
+      # remedy — the sanctioned post-split arm, whose remedy fits this file.
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "set configVersion: 3 by hand"
+      refute message =~ "nothing was written"
+      keys = keys_path(dir)
+      assert File.exists?(keys)
+
+      # Follow that remedy verbatim.
+      settings = settings_path(dir)
+
+      marked =
+        settings
+        |> File.read!()
+        |> String.replace("configVersion: 2", "configVersion: 3")
+
+      File.write!(settings, marked)
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert %Config{profile: "work", base_url: "https://p.example/v1"} = config
+      assert config.api_key == "PLACEHOLDER-work-key"
+
+      # The authored two-model menu survived the whole route.
+      assert {:ok, %{"profiles" => [%{"providers" => [%{"models" => models}]}]}} =
+               read_settings(dir)
+
+      assert Enum.map(models, & &1["model"]) == ["m1", "m2"]
+
+      assert {:ok, %{"work" => %{"https://p.example/v1" => "PLACEHOLDER-work-key"}}} =
+               read_keys(dir)
+    end
+
+    test "a symlinked keys.json5 beside a providers-carrying interleave still loads (no new refusal)" do
+      # Review P1-2: the head-refusal is gated on the split's regular-file
+      # precondition — a non-regular keys.json5 keeps the base behavior
+      # (the split stands down and the v3-shaped file loads through the
+      # link) instead of refusing a layout that already worked.
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          defaultProfile: 'work',
+          profiles: [
+            { name: 'work',
+              providers: [{ baseUrl: 'https://p.example/v1', models: [{ model: 'm1' }] }],
+              apiKey: 'PLACEHOLDER-leftover-key' },
+          ],
+        }
+        """
+      )
+
+      target = Path.join(dir, "dotfiles-keys.json5")
+      File.write!(target, "{work: {'https://p.example/v1': 'PLACEHOLDER-work-key'}}")
+      File.chmod!(target, 0o600)
+      File.ln_s!(target, keys_path(dir))
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert config.api_key == "PLACEHOLDER-work-key"
+      keys = keys_path(dir)
+      assert File.lstat!(keys).type == :symlink
+      assert File.exists?(target)
     end
   end
 
