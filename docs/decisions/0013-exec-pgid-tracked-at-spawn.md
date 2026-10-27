@@ -27,15 +27,19 @@ window is a preemption race, not a guarantee.
 The pgid is captured at spawn, independent of the port
 (`DashFloat.Tools.Exec.Group`):
 
-1. **Arm** — `Group.arm/0` pre-writes a tracker file holding the sentinel
-   `"0\n"` ("wrapper has not reported yet"). The path is absolute (a relative
-   `TMPDIR` resolves against the command's cwd inside the wrapper and against
-   the BEAM's cwd at reap — the two diverge, so the sentinel would be read
-   where the report never landed), the name is 64 bits of crypto-random, the
-   create is `O_EXCL`, and the mode is 0600: a pre-planted symlink is never
-   followed and no other local user can write the file — the same hardening
-   `Runner.write_file/3` applies to its temp files. An unusable tmp refuses
-   the spawn: without a tracker the kill would again depend on the port's
+1. **Arm** — `Group.arm/0` pre-writes a tracker file holding a per-run
+   random nonce (prefixed so it can never parse as the wrapper's pid
+   report). The path is absolute (a relative `TMPDIR` resolves against the
+   command's cwd inside the wrapper and against the BEAM's cwd at reap —
+   the two diverge, so the sentinel would be read where the report never
+   landed), the name is 64 bits of crypto-random, the create is `O_EXCL`,
+   and the mode is 0600: a pre-planted symlink is never followed and no
+   other local user can write the file — the same hardening
+   `Runner.write_file/3` applies to its temp files. A tmp that cannot take
+   the file refuses the spawn — as an error return, never a raise, and
+   never with a partial file left behind (a full disk can make the write
+   raise instead of answering an error tuple; the refusal catches both
+   shapes): without a tracker the kill would again depend on the port's
    lifetime, and a known-leaky fallback is worse than an honest refusal.
 2. **Wrap** — `Group.wrap/2` spawns a wrapper shell that writes `$$` into
    the tracker and then execs the user command. A `{:spawn, …}` child is a
@@ -47,18 +51,24 @@ The pgid is captured at spawn, independent of the port
    report is trusted only in the exact shape the wrapper writes it: digits,
    newline-terminated, naming a real group (≥ 2 — group 1 would make the
    kill target `-1`, every process the uid can signal), in a regular file.
-   Anything else — file missing, sentinel still present, garbage, a torn
-   prefix — cannot prove the group is dead:
-   - sentinel + dead port is the *one* positive nothing-to-kill proof: the
-     wrapper's `&&` never passed, so the user command was never exec'd and
-     the group only ever held the wrapper itself;
+   Anything else — file missing, garbage, a torn prefix, the fixed sentinels
+   a command could write — cannot prove the group is dead:
+   - a tracker still holding the run's nonce plus a dead port is the *one*
+     positive nothing-to-kill proof: the wrapper's `&&` never passed, so the
+     user command was never exec'd and the group only ever held the wrapper
+     itself. The nonce makes the proof unforgeable by the tracked command —
+     the wrapper's report overwrites it before the command starts, and it is
+     never exposed again;
    - a live port answers the belt (`Port.info` os_pid == the pgid), which
      also covers a `:cancel` landing before the wrapper's report;
    - anything else with a dead port is *unknown*, and is said so: a warning
      is logged instead of a silent `:ok`, because the pgid may have been
      reported and then lost (a tmp cleaner, or the command deleting its own
      tracker — `rm -f /tmp/dashfloat-exec-*.pgid` in the executed line
-     reproduces it with no external actor).
+     reproduces it with no external actor). The warning is a diagnostic
+     signal, not a user-facing surface — the TUI does not render it; the
+     user-facing story stays "the group kill is best-effort at this
+     boundary", the same acceptance as a `setsid` escape.
 
 ## Alternatives considered
 
@@ -84,7 +94,9 @@ The pgid is captured at spawn, independent of the port
   overwrite its own tracker with a foreign well-formed pgid; the reap will
   kill that group. Accepted residual: the command could signal any of those
   processes directly, so the tracker grants no new privilege — the same
-  boundary ADR 0007 draws at `setsid` escapes.
+  boundary ADR 0007 draws at `setsid` escapes. A same-user process that
+  reads the nonce inside the arm-to-report window could likewise forge the
+  sentinel state; the same acceptance applies.
 - The tiny pid-reuse window between a group's death and the kill is
   accepted, unchanged from ADR 0007.
 - Children that escape via `setsid` (own session, untracked pgid) remain out

@@ -29,9 +29,11 @@ means the body never reported, which is cancelled.**
    or a `tool crashed: <reason>` map built from the rescued exception. A crash
    therefore reaches the agent as a *result* through the existing
    `:tool_done` clauses (running or running-cancelled), with its true reason,
-   whatever the monitor window does. `Runner.run`'s anticipated error classes
-   already return result maps (ADR 0007); the rescue is the belt for the
-   unanticipated ones.
+   whatever the monitor window does. `Runner.run` already carries its own
+   function-level rescue (anticipated raises degrade to result maps there);
+   the dispatch-level wrapper is the belt over that belt, and the
+   load-bearing change is that the agent no longer trusts the DOWN reason to
+   say what ran.
 2. **`:noproc` semantics.** A `:noproc` DOWN reaching a still-`{:running}`
    slot means the body produced no report. The ordering half of that inference
    is happens-before: the body's `send` precedes its exit, which precedes the

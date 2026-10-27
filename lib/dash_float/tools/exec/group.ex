@@ -14,9 +14,9 @@ defmodule DashFloat.Tools.Exec.Group do
 
   require Logger
 
-  defstruct [:path]
+  defstruct [:path, :nonce]
 
-  @type t :: %__MODULE__{path: String.t()}
+  @type t :: %__MODULE__{path: String.t(), nonce: String.t()}
 
   @report_tries 3
   @report_grace_ms 15
@@ -24,14 +24,15 @@ defmodule DashFloat.Tools.Exec.Group do
   @kill_executable "/bin/kill"
 
   @doc """
-  Pre-writes the tracker file, holding the sentinel `"0\n"` until the wrapper
+  Pre-writes the tracker file holding a per-run nonce until the wrapper
   reports. The path is absolute (a relative `TMPDIR` resolves differently in
   the wrapper, which runs under the command's cwd), the name is unguessable,
   and the create is exclusive with 0600 — the same hardening
   `Runner.write_file/3` applies to its temp files — so a pre-planted symlink
-  is never followed and no other user can write the file. Fails rather than
-  degrading: a spawn without a tracker would again learn its pgid from the
-  port and leak on fast exit.
+  is never followed and no other user can write the file. A tmp dir that
+  cannot take the file refuses the spawn — as an error return, never a raise,
+  and never with a partial file left behind: a spawn without a tracker would
+  again learn its pgid from the port and leak on fast exit.
   """
   @spec arm() :: {:ok, t()} | {:error, String.t()}
   def arm do
@@ -39,18 +40,43 @@ defmodule DashFloat.Tools.Exec.Group do
 
     rand = :crypto.strong_rand_bytes(8)
     name = "dashfloat-exec-" <> Base.encode16(rand, case: :lower) <> ".pgid"
+    # The "n" prefix guarantees the nonce can never collide with the
+    # wrapper's report (a bare pgid is all digits).
+    seed = :crypto.strong_rand_bytes(8)
+    nonce = "n" <> Base.encode16(seed, case: :lower)
     path = Path.join(dir, name)
 
-    case File.open(path, [:write, :exclusive], &IO.write(&1, "0\n")) do
-      {:ok, :ok} ->
-        case File.chmod(path, 0o600) do
-          :ok -> {:ok, %__MODULE__{path: path}}
-          {:error, reason} -> {:error, to_string(:file.format_error(reason))}
+    case create(path, nonce) do
+      :ok -> {:ok, %__MODULE__{path: path, nonce: nonce}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # A full or failing tmp can make the write raise instead of answering an
+  # error tuple (verified against /dev/full): the refusal is a return, never
+  # a raise, and no partial file may linger for a failed arm.
+  defp create(path, nonce) do
+    case File.open(path, [:write, :exclusive]) do
+      {:ok, file} ->
+        written = IO.write(file, nonce <> "\n")
+        File.close(file)
+
+        with :ok <- written,
+             :ok <- File.chmod(path, 0o600) do
+          :ok
+        else
+          {:error, reason} ->
+            File.rm(path)
+            {:error, to_string(:file.format_error(reason))}
         end
 
       {:error, reason} ->
         {:error, to_string(:file.format_error(reason))}
     end
+  rescue
+    exception ->
+      File.rm(path)
+      {:error, Exception.message(exception)}
   end
 
   @doc """
@@ -73,7 +99,7 @@ defmodule DashFloat.Tools.Exec.Group do
   """
   @spec reap(t(), port()) :: :ok
   def reap(tracker, port) do
-    case read_pgid(tracker.path, @report_tries) do
+    case read_pgid(tracker.path, tracker.nonce, @report_tries) do
       {:ok, pgid} ->
         kill_group(pgid)
 
@@ -84,10 +110,12 @@ defmodule DashFloat.Tools.Exec.Group do
           {:os_pid, os_pid} ->
             kill_group(os_pid)
 
-          # Dead port AND the sentinel never left the tracker: the wrapper's
-          # `&&` never passed, so the user command was never exec'd — the
-          # group only ever held the wrapper itself. Provably nothing to kill;
-          # this is the proof issue #59's silent skip cannot come back.
+          # Dead port AND the tracker still holds the nonce arm wrote: the
+          # wrapper's `&&` never passed, so the user command was never
+          # exec'd — the group only ever held the wrapper itself. Provably
+          # nothing to kill; and the proof is unforgeable by the tracked
+          # command, which never sees the nonce (the wrapper's report
+          # overwrites it before the command starts).
           _gone ->
             :ok
         end
@@ -120,14 +148,14 @@ defmodule DashFloat.Tools.Exec.Group do
   # that window can read the sentinel while the write is still in flight —
   # give it a moment before treating the sentinel as final. Anything else
   # that is not a well-formed report is final immediately.
-  defp read_pgid(path, tries) do
-    case parse_pgid(path) do
+  defp read_pgid(path, nonce, tries) do
+    case parse_pgid(path, nonce) do
       {:ok, pgid} ->
         {:ok, pgid}
 
       :sentinel when tries > 1 ->
         Process.sleep(@report_grace_ms)
-        read_pgid(path, tries - 1)
+        read_pgid(path, nonce, tries - 1)
 
       final ->
         final
@@ -139,18 +167,23 @@ defmodule DashFloat.Tools.Exec.Group do
   # trailing newline is required — a torn prefix would otherwise be signalled
   # as a live pgid — and a non-regular file (a swapped-in FIFO would hang the
   # read) is never trusted.
-  defp parse_pgid(path) do
+  defp parse_pgid(path, nonce) do
     with {:ok, %File.Stat{type: :regular}} <- File.stat(path),
          {:ok, content} <- File.read(path) do
-      classify(content)
+      classify(content, nonce)
     else
       _unreadable -> :unknown
     end
   end
 
-  defp classify("0\n"), do: :sentinel
+  # The tracker still holding the nonce is the sentinel: the wrapper has not
+  # reported yet. Matching the exact nonce + newline (not a fixed "0\n") is
+  # what makes the sentinel state impossible for the tracked command to
+  # forge — the nonce is random per run and overwritten before the command
+  # starts.
+  defp classify(content, nonce) when content == nonce <> "\n", do: :sentinel
 
-  defp classify(content) do
+  defp classify(content, _nonce) do
     case Integer.parse(content) do
       {pgid, "\n"} when pgid >= 2 -> {:ok, pgid}
       _unparsed -> :unknown

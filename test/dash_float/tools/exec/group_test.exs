@@ -59,10 +59,11 @@ defmodule DashFloat.Tools.Exec.GroupTest do
 
   # Hostile-content guards: a well-formed report is the ONLY thing that may
   # carry a kill. "1\n" would make the kill target -1 (every process the uid
-  # can signal), and a torn prefix without the newline would kill a wrong
-  # group — both must read as unknown and warn, killing nothing.
+  # can signal), "123456" is a torn prefix, "0\n" is the fixed sentinel a
+  # pre-nonce revision trusted (and a command could forge) — all must read as
+  # unknown and warn, killing nothing.
   test "reap never kills on tracker content the wrapper could not have written" do
-    for hostile <- ["1\n", "123456", "garbage\n", "0"] do
+    for hostile <- ["1\n", "123456", "garbage\n", "0", "0\n"] do
       {:ok, tracker} = Group.arm()
       File.write!(tracker.path, hostile)
 
@@ -89,6 +90,22 @@ defmodule DashFloat.Tools.Exec.GroupTest do
 
     assert_eventually_gone(marker)
     refute File.exists?(tracker.path)
+  end
+
+  # Cancel-time deletion: the tracker vanished while the port is still alive
+  # — the belt kills by the live port's os_pid, and the kill itself is the
+  # verification, so no warning is owed.
+  test "reap with a deleted tracker and a live port kills by the port" do
+    {:ok, tracker} = Group.arm()
+    File.rm!(tracker.path)
+
+    duration = 300_000 + System.unique_integer([:positive])
+    marker = "sleep #{duration}"
+
+    port = Port.open({:spawn, "/bin/sh -c '#{marker}'"}, [:exit_status, {:cd, System.tmp_dir!()}])
+    assert Group.reap(tracker, port) == :ok
+
+    assert_eventually_gone(marker)
   end
 
   # A relative TMPDIR resolves against the BEAM cwd at arm/reap but against
