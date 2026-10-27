@@ -13,7 +13,7 @@ what the LGPL's relinking requirement asks for.
 
 The GNU Lesser General Public License 2.1 is available at
 https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html, and its full text ships
-with any distribution that packages this library (on Debian-based systems:
+beside this notice as LGPL-2.1 (on Debian-based systems it is also at
 /usr/share/common-licenses/LGPL-2.1).
 
 DashFloat itself does not link against this library; the Erlang VM loads it at

@@ -142,9 +142,11 @@ that the boot prints no `sctp` line.
   directory stays self-contained, so installing and upgrading (ADR 0010) are
   unaffected.
 - The bundled library is LGPL-2.1+ (`lksctp-tools`). Redistributing it means
-  shipping its licence in the artifact, which `bundle_sctp/1` does by copying
-  the upstream copyright text in beside it; the file stays user-replaceable on
-  disk, which is what preserves the licence's relinking freedom.
+  shipping its licence in the artifact, which `bundle_sctp/1` does: the
+  upstream copyright notice (`COPYING`) and the full LGPL-2.1 text
+  (`LGPL-2.1`) sit beside the library in `lib/sctp/`. The file stays
+  user-replaceable on disk, which is what preserves the licence's relinking
+  freedom.
 - The SCTP warning returns if a future artifact is built without the library
   bundled; the release job's smoke assertion is what catches that.
 - `:prim_tty` is an OTP-internal module (`-moduledoc false`). It is the only

@@ -14,7 +14,9 @@ defmodule DashFloat.Release do
     "/usr/lib/libsctp.so.1"
   ]
 
-  @license Path.expand("../../rel/sctp-COPYING", __DIR__)
+  # LGPL-2.1+ obligations for the bundled library: the notice AND the full
+  # licence text travel with it in the artifact.
+  @notices [{"COPYING", "sctp-COPYING"}, {"LGPL-2.1", "sctp-LGPL-2.1.txt"}]
 
   @doc false
   @spec bundle_sctp(Mix.Release.t(), String.t() | nil) :: Mix.Release.t()
@@ -32,8 +34,11 @@ defmodule DashFloat.Release do
     if src && File.exists?(src) do
       File.mkdir_p!(dir)
       File.cp!(src, Path.join(dir, "libsctp.so.1"))
-      # LGPL-2.1+: the licence travels with the redistributed library.
-      File.cp!(@license, Path.join(dir, "COPYING"))
+
+      for {dest, file} <- @notices do
+        source = Path.expand("../../rel/#{file}", __DIR__)
+        File.cp!(source, Path.join(dir, dest))
+      end
     end
 
     release
