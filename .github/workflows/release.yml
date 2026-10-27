@@ -95,6 +95,10 @@ jobs:
         env:
           MIX_ENV: prod
         run: |
+          # bundle_sctp needs a libsctp.so.1 to bundle: ERTS in this image is
+          # built with SCTP support and warns on every boot without it.
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends libsctp1 >/dev/null
           mix deps.get --check-locked
           mix release --overwrite
 
@@ -107,7 +111,9 @@ jobs:
           # stays untouched and the floor check runs against the real artifact.
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends binutils >/dev/null
-          ./_build/prod/rel/dashfloat/bin/dashfloat --version
+          test -f _build/prod/rel/dashfloat/lib/sctp/libsctp.so.1
+          ./_build/prod/rel/dashfloat/bin/dashfloat --version | tee /tmp/v.txt
+          ! grep -qi sctp /tmp/v.txt
           ./_build/prod/rel/dashfloat/bin/dashfloat eval \
             'IO.puts(Base.encode16(:crypto.hash(:sha256, "dashfloat")))'
           # Fail the build if the artifact ever needs a newer glibc than the
