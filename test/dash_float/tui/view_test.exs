@@ -658,6 +658,59 @@ defmodule DashFloat.TUI.ViewTest do
       refute loop_buffer =~ "All set"
     end
 
+    test "a remedy longer than the row wraps at glyph boundaries — never silently clipped (issue #42)" do
+      # Width 40: the box's inner width is 36, and the mv remedy's paths are
+      # longer than a row. The wrapper must fall back to glyph boundaries so
+      # every character lands on screen (ADR 0009's never-clipped remedy).
+      message =
+        "settings.json5 already exists and is not empty — rename it aside " <>
+          "(mv /tmp/very/long/path/to/settings.json5 /tmp/very/long/path/to/settings.json5.old) and re-run setup to write a fresh one"
+
+      state = new_state(setup: %Onboarding{step: :loop, error: message})
+      rows = error_rows(state, 40)
+
+      assert rows != []
+      Enum.each(rows, fn row -> assert Wrap.width(row) <= 36 end)
+
+      # No character lost, none invented: rows joined without the wrap's
+      # dropped spaces re-form the message.
+      assert Enum.map_join(rows, &String.replace(&1, " ", "")) ==
+               String.replace(message, " ", "")
+
+      # Drawn buffer at 40 columns: the .old tail is readable on screen —
+      # the glyph fallback breaks mid-path, never drops the tail.
+      term = ExRatatui.init_test_terminal(40, 24)
+      widgets = View.render(state, %ExRatatui.Frame{width: 40, height: 24})
+      assert :ok = ExRatatui.draw(term, widgets)
+      buffer = ExRatatui.get_buffer_content(term)
+      assert buffer =~ "old) and re-run setup"
+      assert buffer =~ "fresh one"
+    end
+
+    test "a single-token remedy starts on the first row — no leading blank line (issue #42)" do
+      # The old wrapper emitted a spurious blank first line when one word
+      # exceeded the width (wrap_words("oneword", 1) → ["", "oneword"]).
+      message = String.duplicate("x", 50)
+      state = new_state(setup: %Onboarding{step: :key, draft: "k", error: message})
+
+      rows = error_rows(state, 40)
+      assert hd(rows) != ""
+      assert Enum.map_join(rows, &String.replace(&1, " ", "")) == message
+
+      # Drawn buffer at 40 columns: all 50 characters reach the screen.
+      term = ExRatatui.init_test_terminal(40, 24)
+      widgets = View.render(state, %ExRatatui.Frame{width: 40, height: 24})
+      assert :ok = ExRatatui.draw(term, widgets)
+      buffer = ExRatatui.get_buffer_content(term)
+
+      x_count =
+        buffer
+        |> String.graphemes()
+        |> Enum.count(&(&1 == "x"))
+
+      assert x_count == 50, "lost characters to clipping"
+    end
+
     test "the wizard renders its steps, masking secret inputs" do
       wizard = %DashFloat.Config.Onboarding{step: :welcome}
 
@@ -818,6 +871,19 @@ defmodule DashFloat.TUI.ViewTest do
   end
 
   ## helpers
+
+  # The error-styled rows of a rendered setup box (issue #42 probes): the
+  # wizard wraps the refusal message itself, so the rows ARE the wrap output.
+  defp error_rows(state, width) do
+    [{%ExRatatui.Widgets.Paragraph{text: lines}, _rect}] =
+      View.render(state, %ExRatatui.Frame{width: width, height: 24})
+
+    error = Theme.style(:error)
+
+    for %ExRatatui.Text.Line{spans: [%ExRatatui.Text.Span{content: content, style: ^error}]} <-
+          lines,
+        do: content
+  end
 
   # The full drawn frame as text (the setup screens render one widget).
   defp drawn_text(state) do

@@ -1842,6 +1842,87 @@ defmodule DashFloat.ConfigTest do
       refute File.exists?(keys)
     end
 
+    test "write_keys_entry blames a pre-existing unquotable value, not the clean entry (issue #42)" do
+      # Backslash strings decode (only escaped quotes fail decode), so the
+      # file on disk can hold a value the dialect cannot re-emit: the
+      # refusal must name the stored value, not the profile/endpoint the
+      # user just entered — and the bounced :key screen's hint no longer
+      # promises that fixing the typed key fixes the write.
+      dir = tmp_dir()
+      keys = keys_path(dir)
+      write_keys!(dir, "{personal: {'https://other/v1': 'a\\b'}}")
+
+      assert {:error, message} =
+               Config.write_keys_entry(dir, "personal", @base_url, "PLACEHOLDER-k")
+
+      assert message =~ "already holds a name or value"
+      assert message =~ "backslash or both quote kinds"
+      assert message =~ "by hand"
+      refute message =~ "profile name or endpoint"
+      refute message =~ "PLACEHOLDER-k"
+      assert File.read!(keys) == "{personal: {'https://other/v1': 'a\\b'}}"
+
+      # Stored text in any decodable shape blames the file the same way: a
+      # value inside a nested list (hand damage), and a stored ENDPOINT KEY
+      # — the same honesty gap one level up, never the clean entry's fields.
+      write_keys!(dir, "{personal: {'https://other/v1': ['a', 'a\\b']}}")
+
+      assert {:error, nested} =
+               Config.write_keys_entry(dir, "personal", @base_url, "PLACEHOLDER-k")
+
+      assert nested =~ "already holds a name or value"
+
+      write_keys!(dir, "{personal: {'https://other/v1': 'k', 'https://bad\\url': 'k2'}}")
+
+      assert {:error, bad_key} =
+               Config.write_keys_entry(dir, "personal", @base_url, "PLACEHOLDER-k")
+
+      assert bad_key =~ "already holds a name or value"
+      refute bad_key =~ "profile name or endpoint"
+      assert File.read!(keys) == "{personal: {'https://other/v1': 'k', 'https://bad\\url': 'k2'}}"
+
+      # The remedy works: fix the file by hand, re-enter the key — it lands
+      # beside the repaired entry, both intact.
+      File.write!(keys, "{personal: {'https://other/v1': 'ab'}}")
+
+      assert :ok = Config.write_keys_entry(dir, "personal", @base_url, "PLACEHOLDER-k")
+
+      assert {:ok, %{"personal" => merged}} = JSON5.read_map(keys)
+      assert merged["https://other/v1"] == "ab"
+      assert merged[@base_url] == "PLACEHOLDER-k"
+    end
+
+    test "write_settings names model ids and nicknames in the unquotable enumeration (issue #42)" do
+      # A backslashed manual model id refuses while every named field is
+      # clean: the enumeration must cover model ids and nicknames.
+      dir = tmp_dir()
+
+      assert {:error, message} =
+               Config.write_settings(dir, %{
+                 "configVersion" => 3,
+                 "defaultProfile" => "personal",
+                 "profiles" => [
+                   %{
+                     "name" => "personal",
+                     "providers" => [
+                       %{
+                         "label" => "zai",
+                         "baseUrl" => @base_url,
+                         "models" => [%{"nickname" => "m\\x", "model" => "m\\x"}]
+                       }
+                     ]
+                   }
+                 ]
+               })
+
+      assert message =~ "cannot store that text"
+      assert message =~ "model id"
+      assert message =~ "nickname"
+      assert message =~ "backslash or both quote kinds"
+      settings = settings_path(dir)
+      refute File.exists?(settings)
+    end
+
     test "write_settings refuses an unquotable document with the remedy (issue #39)" do
       dir = tmp_dir()
 

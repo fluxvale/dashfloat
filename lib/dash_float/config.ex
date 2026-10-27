@@ -134,24 +134,31 @@ defmodule DashFloat.Config do
     with :ok <- ensure_dir(dir),
          {:ok, keys} <- JSON5.read_map(keys_path),
          {:ok, merged} <- nest_key(keys, profile, base_url, value),
-         {:ok, doc} <- render_keys(merged, value) do
+         {:ok, doc} <- render_keys(merged, profile, base_url, value) do
       Posture.write_private(keys_path, doc <> "\n")
     end
   end
 
   # A string the JSON5 dialect cannot quote (a backslash, or both quote
   # kinds) refuses with the remedy in the message — never the value (issue
-  # #39: the wizard surfaces this on screen). The value is quotable-checkable
-  # up front; a render failure despite a quotable value means the profile
-  # NAME or the endpoint is the unquotable string, and the remedy names those
-  # fields instead of blaming the key the user just typed (hostile review).
-  defp render_keys(merged, value) do
+  # #39: the wizard surfaces this on screen). The strings the user JUST
+  # entered (key value, profile name, endpoint) are checked up front, each
+  # with its own refusal. Everything else in the merged document is
+  # pre-existing text from the file on disk (backslash strings decode —
+  # only escaped quotes fail decode — so it can hold a name or value the
+  # render cannot re-emit), so a render failure past the up-front checks is
+  # exactly that stored text, and its refusal blames the file, not fields
+  # the user cannot fix (issue #42).
+  defp render_keys(merged, profile, base_url, value) do
     with :ok <- quotable(value),
+         :ok <- quotable_name(profile),
+         :ok <- quotable_name(base_url),
          {:ok, doc} <- JSON5.render(merged) do
       {:ok, doc}
     else
       {:error, :unrepresentable} -> {:error, unquotable_key_message()}
-      {:error, _path} -> {:error, unquotable_name_message()}
+      {:error, :name} -> {:error, unquotable_name_message()}
+      {:error, _path} -> {:error, unquotable_stored_message()}
     end
   end
 
@@ -159,6 +166,13 @@ defmodule DashFloat.Config do
     case JSON5.quote_value(value) do
       {:ok, _quoted} -> :ok
       {:error, :unrepresentable} -> {:error, :unrepresentable}
+    end
+  end
+
+  defp quotable_name(name) do
+    case quotable(name) do
+      :ok -> :ok
+      {:error, :unrepresentable} -> {:error, :name}
     end
   end
 
@@ -179,10 +193,16 @@ defmodule DashFloat.Config do
       "#{@keys_file} cannot store the profile name or endpoint — one contains " <>
         "a backslash or both quote kinds; rename the profile or re-enter the URL"
 
+  defp unquotable_stored_message,
+    do:
+      "#{@keys_file} already holds a name or value it cannot re-write — one " <>
+        "contains a backslash or both quote kinds; fix or remove it by hand, then retry the key"
+
   defp unquotable_settings_message,
     do:
-      "#{@main_file} cannot store that text — a profile name, label, URL, or MCP " <>
-        "field contains a backslash or both quote kinds; remove the character and run setup again"
+      "#{@main_file} cannot store that text — a profile name, label, URL, model " <>
+        "id, nickname, or MCP field contains a backslash or both quote kinds; " <>
+        "remove the character and run setup again"
 
   # A profile slot that is not an object is pre-v3 damage holding who-knows-
   # what — refuse rather than clobber it; nil and nested maps merge cleanly.
