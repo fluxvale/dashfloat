@@ -152,7 +152,7 @@ defmodule DashFloat.TUITest do
     script = [http_ok(models_body(["glm-loopback", "other-one"])), :close]
 
     {:ok, server} = SSEServer.start_link(script)
-    on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
     base = SSEServer.base_url(server)
 
     dir =
@@ -499,7 +499,7 @@ defmodule DashFloat.TUITest do
     script = [http_ok(models_body(["glm-env"])), :close]
 
     {:ok, server} = SSEServer.start_link(script)
-    on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
     base = SSEServer.base_url(server)
 
     dir = Path.join(System.tmp_dir!(), "dashfloat-tui-ref-#{System.unique_integer([:positive])}")
