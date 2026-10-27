@@ -1269,18 +1269,52 @@ defmodule DashFloat.TUI.StateTest do
     # Regression (hostile review P1-3): wrapping an unbreakable run used to
     # re-measure the whole remainder per row (quadratic); a CJK reply near
     # the live cap drove one tick to 1.6 s — 13x the 125 ms tick budget.
-    # The wrap is single-pass now; this guards the tick well inside budget.
-    test "a tick wrapping a large unbreakable CJK reply stays well under budget" do
-      cjk = String.duplicate("日本語の長い返事が続きます。", 1_500)
+    # The wrap is single-pass now.
+    #
+    # The guard is the scaling LAW, not a wall-clock budget (issue #51): a
+    # single-run millisecond assert on a loaded runner is a false-red
+    # generator — the original 400 ms bound fired at 418 ms on CI while the
+    # same tree was green on a plain rerun. Work is measured in reductions,
+    # which the BEAM counts deterministically per function call and which
+    # therefore does not move with scheduler contention: doubling the input
+    # doubles the work for a single pass (measured 1.97-2.01 over 10 runs
+    # quiet and under 24 CPU hogs) and quadruples it for the quadratic shape
+    # (measured 3.96 on a replica of the pre-fix wrap). The bound below
+    # leaves room for constant overhead and still separates 2x from 4x.
+    test "a tick wrapping a large unbreakable CJK reply stays linear in its input" do
+      phrase = "日本語の長い返事が続きます。"
+      small = String.duplicate(phrase, 500)
+      large = String.duplicate(phrase, 1_000)
 
+      assert byte_size(large) < 64 * 1024,
+             "both inputs must stay under the live render cap or tick stops re-wrapping"
+
+      {small_work, small_ticked} = tick_work(small)
+      {large_work, large_ticked} = tick_work(large)
+
+      assert State.log_line_count(small_ticked) > 100
+      assert State.log_line_count(large_ticked) > 2 * State.log_line_count(small_ticked) - 10
+
+      ratio = large_work / small_work
+
+      assert ratio < 3.0,
+             "tick work grew #{Float.round(ratio, 2)}x for a 2x input — the wrap is " <>
+               "quadratic again (#{small_work} -> #{large_work} reductions)"
+    end
+
+    # Reductions the calling process spends inside one tick, and the ticked
+    # state. Deterministic: no clock, no scheduler, no CPU contention.
+    defp tick_work(text) do
       state =
         new_state()
         |> Map.put(:phase, :streaming)
-        |> State.stream_message({:token, cjk}, 1_000)
+        |> State.stream_message({:token, text}, 1_000)
 
-      {micros, {ticked, :cont}} = :timer.tc(State, :tick, [state, 1_100])
-      assert div(micros, 1000) < 400
-      assert State.log_line_count(ticked) > 100
+      {:reductions, before} = Process.info(self(), :reductions)
+      {ticked, :cont} = State.tick(state, 1_100)
+      {:reductions, after_} = Process.info(self(), :reductions)
+
+      {after_ - before, ticked}
     end
   end
 

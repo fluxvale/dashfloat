@@ -1,6 +1,12 @@
 defmodule DashFloat.CLITest do
   @moduledoc false
-  use ExUnit.Case, async: true
+  # Sync: this module asserts TOTAL log silence (a --version parse must warn
+  # about nothing). ExUnit's capture is unscoped — its handler writes every
+  # event to every active capture — so an async run here can read a
+  # concurrent test's CLI warnings (issue #55). Sync modules start only
+  # after every async module has finished, which makes the silence real
+  # without weakening the assertion to a partial match.
+  use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
 

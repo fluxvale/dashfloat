@@ -36,7 +36,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
   defp start_server(script) do
     {:ok, server} = SSEServer.start_link(script)
-    on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
     server
   end
 

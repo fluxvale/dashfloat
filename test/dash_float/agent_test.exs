@@ -68,7 +68,7 @@ defmodule DashFloat.AgentTest do
 
   defp start_server(scripts) do
     {:ok, server} = SSEServer.start_link(:per_connection, scripts)
-    on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
     server
   end
 
@@ -92,7 +92,7 @@ defmodule DashFloat.AgentTest do
       )
 
     on_exit(fn ->
-      if Process.alive?(agent), do: GenServer.stop(agent)
+      DashFloat.TestTeardown.stop(agent)
       if Process.alive?(sup), do: Process.exit(sup, :kill)
     end)
 
@@ -699,7 +699,7 @@ defmodule DashFloat.AgentTest do
         name: nil
       )
 
-    on_exit(fn -> if Process.alive?(agent), do: GenServer.stop(agent) end)
+    on_exit(fn -> DashFloat.TestTeardown.stop(agent) end)
 
     send(agent, {:prompt, self(), "hello"})
 
@@ -716,7 +716,7 @@ defmodule DashFloat.AgentTest do
         name: nil
       )
 
-    on_exit(fn -> if Process.alive?(agent), do: GenServer.stop(agent) end)
+    on_exit(fn -> DashFloat.TestTeardown.stop(agent) end)
 
     send(agent, {:prompt, self(), "hello"})
 
@@ -823,7 +823,7 @@ defmodule DashFloat.AgentTest do
       )
 
     on_exit(fn ->
-      if Process.alive?(agent), do: GenServer.stop(agent)
+      DashFloat.TestTeardown.stop(agent)
       if Process.alive?(sup), do: Process.exit(sup, :kill)
     end)
 
@@ -852,7 +852,7 @@ defmodule DashFloat.AgentTest do
       )
 
     on_exit(fn ->
-      if Process.alive?(agent), do: GenServer.stop(agent)
+      DashFloat.TestTeardown.stop(agent)
       if Process.alive?(sup), do: Process.exit(sup, :kill)
     end)
 
