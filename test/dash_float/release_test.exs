@@ -25,6 +25,25 @@ defmodule DashFloat.ReleaseTest do
 
     assert DashFloat.Release.bundle_sctp(release, source) == release
     assert File.read!(bundled) == "fake libsctp"
+    # LGPL-2.1+: the licence ships with the redistributed library.
+    license = Path.join(release.path, "lib/sctp/COPYING")
+    assert File.exists?(license)
+  end
+
+  # A rebuild without a library must not keep exporting a stale one: env.sh
+  # exports the directory whenever it exists.
+  test "a rebuild with no source removes a previously bundled library" do
+    source = tmp_path("source")
+    File.write!(source, "fake libsctp")
+    release = tmp_release()
+    sctp_dir = Path.join(release.path, "lib/sctp")
+
+    DashFloat.Release.bundle_sctp(release, source)
+    lib = Path.join(sctp_dir, "libsctp.so.1")
+    assert File.exists?(lib)
+
+    assert DashFloat.Release.bundle_sctp(release, "/nonexistent/libsctp.so.1") == release
+    refute File.exists?(sctp_dir)
   end
 
   test "a missing explicit source leaves the release untouched" do

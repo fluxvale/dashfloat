@@ -208,7 +208,8 @@ On Linux the release needs glibc 2.34+, OpenSSL 3 (libcrypto.so.3),
 libtinfo.so.6, and libstdc++.so.6; the error above names what is missing."
 fi
 
-# stderr warnings (locale, optional libsctp) are not a failed install.
+# stderr warnings (locale) are not a failed install; the artifact bundles the
+# libraries the VM needs, so nothing SCTP-related should appear either.
 installed=$(printf '%s\n' "$installed" | grep -E '^dashfloat ' | head -1)
 
 say ""

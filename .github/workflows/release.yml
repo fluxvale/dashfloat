@@ -386,6 +386,48 @@ jobs:
           command -v dashfloat
           dashfloat --version
 
+      # The issue #56 symptoms, on the installed artifact, in the Debian
+      # container whose ERTS is built with SCTP support (so the warning is
+      # possible here and nowhere else in CI). ADR 0011.
+      - name: "Smoke the first run (fresh config: pty wizard, clean headless exit)"
+        run: |
+          set -eu
+          export PATH="$HOME/.local/bin:$PATH"
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+
+          # Headless: the friendly refusal, exit 1, no crash dump, no spew.
+          mkdir -p "$work/headless/config" "$work/headless/cwd"
+          cd "$work/headless/cwd"
+          set +e
+          XDG_CONFIG_HOME="$work/headless/config" \
+            dashfloat </dev/null >out.txt 2>err.txt
+          status=$?
+          set -e
+          echo "exit=$status"
+          cat out.txt err.txt
+          test "$status" -eq 1
+          test ! -e erl_crash.dump
+          ! grep -qi 'Kernel pid terminated' out.txt err.txt
+          grep -q 'needs an interactive terminal' err.txt
+
+          # SCTP: the warning must never appear on any boot.
+          ! grep -qi sctp out.txt err.txt
+
+          # A real pty reaches the wizard. `script` gives a 0x0 pty by default
+          # (nothing renders), so the size is set explicitly; the app stays up,
+          # so the harness kills it — the assertion is the rendered first
+          # screen, not the exit. Redraws interleave cursor moves, so the grep
+          # is a single word, not a sentence.
+          mkdir -p "$work/pty/config"
+          timeout 8 script -qec \
+            "stty rows 40 cols 120; TERM=xterm-256color XDG_CONFIG_HOME=$work/pty/config dashfloat" \
+            /dev/null >pty.txt 2>&1 || true
+          cat pty.txt
+          grep -q 'Welcome' pty.txt
+          ! grep -qi 'needs an interactive terminal' pty.txt
+          ! grep -qi sctp pty.txt
+
   # The DoD proof, on the published assets, through the real installer — the
   # same command a user runs. debian:stable is the ticket's clean container;
   # debian:bookworm is the declared floor, so that claim is tested too;

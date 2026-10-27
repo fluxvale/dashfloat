@@ -14,6 +14,8 @@ defmodule DashFloat.Release do
     "/usr/lib/libsctp.so.1"
   ]
 
+  @license Path.expand("../../rel/sctp-COPYING", __DIR__)
+
   @doc false
   @spec bundle_sctp(Mix.Release.t(), String.t() | nil) :: Mix.Release.t()
   def bundle_sctp(release, source \\ nil) do
@@ -21,11 +23,17 @@ defmodule DashFloat.Release do
       source || System.get_env("DASHFLOAT_LIBSCTP") ||
         Enum.find_value(@fallback_sources, fn path -> File.exists?(path) && path end)
 
+    dir = Path.join(release.path, "lib/sctp")
+    # A rebuild that no longer bundles must not leave the previous library
+    # behind: env.sh exports the directory whenever it exists, so a stale copy
+    # would keep being loaded.
+    File.rm_rf(dir)
+
     if src && File.exists?(src) do
-      dir = Path.join(release.path, "lib/sctp")
       File.mkdir_p!(dir)
-      bundled = Path.join(dir, "libsctp.so.1")
-      File.cp!(src, bundled)
+      File.cp!(src, Path.join(dir, "libsctp.so.1"))
+      # LGPL-2.1+: the licence travels with the redistributed library.
+      File.cp!(@license, Path.join(dir, "COPYING"))
     end
 
     release

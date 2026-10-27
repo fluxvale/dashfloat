@@ -21,7 +21,7 @@ not just on a pipe. Measured inside the built release in a 120×40 pty:
 | probe | real pty | headless |
 | --- | --- | --- |
 | `:io.columns(:standard_input)` | `{:error, :enotsup}` | `{:error, :enotsup}` |
-| `:io.columns(:user)` | `{:ok, 120}` | `{:error, :enotsup}` |
+| `:io.columns(:user)` | `{:ok, 120}` with a sized pty, `{:error, :enotsup}` with an unsized one | `{:error, :enotsup}` |
 | `:prim_tty.isatty(:stdin)` | `true` | `false` |
 | `:prim_tty.isatty(:stdout)` | `true` | `false` |
 
@@ -30,8 +30,10 @@ guaranteed for every first run of the installed artifact — while the same fres
 state booted the wizard under `mix test` (which runs a normal shell-started
 VM) and the TUI booted fine in the same binary once config existed (crossterm
 reads the terminal directly, never consulting `:io`). `:io.columns(:user)` is
-also the wrong device: `:user` is the *group leader*, which in a release is a
-terminal only by coincidence of redirection.
+not a usable substitute either: it answers about the *group leader*, and only
+reports a size when the terminal's winsize is actually set (a default
+`script -qec` pty is 0×0 and answers `{:error, :enotsup}` just like headless),
+so it would have been a second, differently-shaped bug.
 
 **2. The refusal crashed the VM.** The refusal returned
 `{:error, :interactive_setup_required}` from `Application.start/2`. A release
@@ -63,8 +65,14 @@ stdout-only → `false/true`, neither → `false/false`.
 
 The two false arms are deliberate and tested. stdin-only is a real terminal
 whose output is redirected (`dashfloat > log`); stdout-only is a real terminal
-with input redirected. Both mean a human is at the terminal, which is exactly
-the question the wizard needs answered.
+with input redirected. Both mean a human is at the terminal, which is what the
+wizard needs to know before it draws. The stdin-only arm is the weaker of the
+two: the wizard does start, but its escape sequences go into the redirect and
+the terminal stays blank until the user redirects differently — the same
+behaviour any full-screen TUI has under `> log` (measured: 131 bytes into the
+file, nothing readable on the terminal). We take that over refusing an
+interactive session, because the alternative — demanding both fds — would
+refuse the common `| tee` / `> log` case outright.
 
 ### The refusal halts at the boot boundary
 
@@ -91,11 +99,11 @@ that the boot prints no `sctp` line.
 ## Alternatives considered
 
 - **Keep `:io.columns/1`, add a `:user` fallback.** `:io.columns(:user)`
-  answers `{:ok, _}` in the pty and `{:error, :enotsup}` headless, so a
-  fallback would have "worked" — but it answers about the group leader, not
-  the terminal the user is typing into, and it silently changes meaning under
-  redirection. Asking the fds is the same amount of code and is actually
-  correct.
+  answers `{:ok, _}` on a pty *with a winsize set* and `{:error, :enotsup}` on
+  a 0×0 pty or headless, so a fallback would have worked only sometimes — a
+  second bug shaped exactly like the first. It also answers about the group
+  leader rather than the terminal the user is typing into. Asking the fds is
+  the same amount of code and is actually correct.
 - **`System.get_env("TERM")`.** Set in non-tty contexts (CI, SSH commands) and
   unset in some real terminals. A worse proxy for the same question.
 - **Keep the `{:error, _}` return and silence the crash dump via
@@ -126,8 +134,17 @@ that the boot prints no `sctp` line.
   user's CWD, no kernel spew. Scripted/dotfile boots keep working — the
   instructions on stderr are unchanged.
 - Release artifacts gain an 18 KB library and one `LD_LIBRARY_PATH` export.
-  The whole release directory stays self-contained, so installing and
-  upgrading (ADR 0010) are unaffected.
+  The export is inherited by every child process the VM spawns — and DashFloat
+  is an agent harness that spawns shell tools — so `lib/sctp/` is deliberately
+  a single-library directory: only an SCTP-using child could resolve a
+  different library there than the host intends, and the SCTP ABI is stable.
+  Nothing else in the release's search path is shadowed. The release
+  directory stays self-contained, so installing and upgrading (ADR 0010) are
+  unaffected.
+- The bundled library is LGPL-2.1+ (`lksctp-tools`). Redistributing it means
+  shipping its licence in the artifact, which `bundle_sctp/1` does by copying
+  the upstream copyright text in beside it; the file stays user-replaceable on
+  disk, which is what preserves the licence's relinking freedom.
 - The SCTP warning returns if a future artifact is built without the library
   bundled; the release job's smoke assertion is what catches that.
 - `:prim_tty` is an OTP-internal module (`-moduledoc false`). It is the only

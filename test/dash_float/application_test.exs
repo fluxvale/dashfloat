@@ -152,33 +152,34 @@ defmodule DashFloat.ApplicationTest do
     end
   end
 
-  # ADR 0011: the headless refusal exits through the halt seam at the boot
-  # boundary. Returning {:error, _} from Application.start/2 is what makes
-  # OTP terminate the kernel and write erl_crash.dump into the user's CWD —
-  # this is the regression assert for that dump.
+  # ADR 0011: the headless refusal halts at the boot boundary, so the
+  # {:error, _} return never reaches OTP (which is what terminates the kernel
+  # and writes erl_crash.dump). The halt here THROWS: control must leave
+  # Application.start/2 through the seam, so catching it proves the error
+  # return was never produced. The no-dump assertion itself belongs to the
+  # release smoke (.github/workflows/release.yml), the only place a real
+  # start_permanent boot exists.
   test "a zero-profile headless boot refuses with instructions instead of a hung wizard" do
     dir = tmp_dir()
-    parent = self()
-    halt = fn code -> send(parent, {:halted, code}) end
+    halt = fn code -> throw({:halted, code}) end
 
     stderr =
       capture_io(:stderr, fn ->
-        assert {:error, :interactive_setup_required} =
-                 Application.start(:normal,
-                   test?: false,
-                   config_dir: dir,
-                   env: %{},
-                   argv: [],
-                   interactive?: false,
-                   halt: halt
+        assert {:halted, 1} =
+                 catch_throw(
+                   Application.start(:normal,
+                     test?: false,
+                     config_dir: dir,
+                     env: %{},
+                     argv: [],
+                     interactive?: false,
+                     halt: halt
+                   )
                  )
       end)
 
-    assert_received {:halted, 1}
     assert stderr =~ "DashFloat needs an interactive terminal"
     assert stderr =~ "DASHFLOAT_API_KEY"
-    # The clean boundary exit means no kernel-termination crash dump.
-    refute File.exists?("erl_crash.dump")
     # No files were written by the refused boot.
     settings = Path.join(dir, "settings.json5")
     refute File.exists?(settings)
