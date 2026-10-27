@@ -250,6 +250,20 @@ defmodule DashFloat.Agent do
     abort_tool_run(state, call)
   end
 
+  # A runner dead before its monitor went up (the spawn window in
+  # dispatch_runner/2): Process.monitor/1 on an already-dead pid fires with
+  # reason :noproc. The child sends :tool_done before exiting, so by
+  # happens-before a :noproc DOWN reaching a still-{:running} slot proves no
+  # result was ever sent — the tool never ran, so nothing crashed; the honest
+  # status is cancelled (ADR 0012).
+  def handle_info(
+        {:DOWN, ref, :process, _down_pid, :noproc},
+        %__MODULE__{tool_slot: {:running, ref, _pid, call}} = state
+      ) do
+    state = %{state | tool_slot: :none}
+    abort_tool_run(state, call)
+  end
+
   def handle_info(
         {:DOWN, ref, :process, _down_pid, reason},
         %__MODULE__{tool_slot: {:running, ref, _pid, call}} = state
@@ -423,7 +437,9 @@ defmodule DashFloat.Agent do
   # The mutating runner starts ONLY after the approval keypress (ADR 0007 §4).
   # Re-announcing :executing_tool here keeps the activity line truthful for the
   # whole execution (the confirmation phase would otherwise linger while the
-  # command runs) and re-arms Esc's interrupt.
+  # command runs) and re-arms Esc's interrupt. The monitor goes up after
+  # start_child returns: a child already dead by then delivers :noproc, which
+  # the monitor clauses report as cancelled — see ADR 0012.
   defp dispatch_runner(state, call) do
     display(state.ui, {:phase, :executing_tool})
     agent = self()
