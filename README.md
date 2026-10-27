@@ -132,9 +132,16 @@ The error's remedies are real: add the key under its profile name to
 the moved file to 0600 automatically) so the next start can write
 a fresh one. A `settings.json5.bak` that is a symlink is never read
 through or replaced — it counts as no backup, and the split refuses if a
-key would be lost. The v2→v3 reshape follows the same invariant (dead
-keys only drop behind a fresh `keys.json5.bak`; duplicate profile names
-with keys, keyless endpoints, and v3-shaped files missing
+key would be lost. A v1 file whose profiles carry no `providers` tree but
+mix in v3-only fields — a hand-merged `defaultProfile`, or `mcp` — is
+refused before anything is written; remove those fields and re-run (the
+chain then migrates the file to v3 and re-derives `defaultProfile`;
+re-add anything you removed, and move a root-level `apiKey` into
+`keys.json5` under the profile the refusal names). A file whose profiles
+already carry `providers` keeps the set-`configVersion: 3` remedy, inline
+keys included — it converges there. The v2→v3 reshape follows the same
+invariant (dead keys only drop behind a fresh `keys.json5.bak`; duplicate
+profile names with keys, keyless endpoints, and v3-shaped files missing
 `configVersion: 3` all refuse with remedies in the message). Details:
 [ADR 0008](docs/decisions/0008-config-layout-profiles-json5.md) and
 [ADR 0009](docs/decisions/0009-config-v3-persona-profiles.md). Then:

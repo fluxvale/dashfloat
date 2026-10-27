@@ -6,7 +6,10 @@
   now records it. The merged keys-split (#31) matched everything this record
   anticipated — no Phase A decision needed adjusting against the merged
   reality. The onboarding write-refusal surface amendment below landed with
-  [issue #39](https://github.com/fluxvale/dashfloat/issues/39).
+  [issue #39](https://github.com/fluxvale/dashfloat/issues/39) (before the
+  tracker crossing was untangled — it shipped as PR #41's wizard work); the
+  v1+interleave pre-split refusal amendment below lands with the reopened
+  issue #39, the migration defect that issue actually carries.
 - **Date:** 2026-10-26
 - **Implements:** [issue #32](https://github.com/fluxvale/dashfloat/issues/32).
 - **Supersedes:** the *schema*, *model addressing and selection*, *effective
@@ -437,6 +440,88 @@ load; a v1-era refusal surfaces with #31's message before this step runs.
   regular-file guard never reached — both backup paths lstat first now, so a
   `.bak` symlink (live or dangling) survives every migration with a warning
   and counts as no backup for the loss decision.
+
+### The v1+interleave split refuses before it writes (issue #39, migration amendment)
+
+The chain composes split → reshape in one load, and each step refused only on
+its own catalog. That left a seam: a v1 file carrying BOTH an inline
+credential AND a v3-only field — a hand-merged file, the shape a user gets
+halfway through following two generations of docs — split cleanly (the
+v3-only field rides verbatim by design), and the reshape's ambiguity
+tripwire then refused on that same preserved field AFTER the split had
+written `configVersion: 2` to disk. The tripwire's remedy ("set
+`configVersion: 3`") is computed for a genuinely v3-shaped file missing its
+marker; applied to the post-split file whose profiles are still v1/v2-shaped
+(`baseUrl` at profile level, no `providers`) it yields a provider-less
+config that fails to load, with the flat key stranded in `keys.json5` and
+the real recovery named nowhere on screen. No value was ever lost — backups
+and `keys.json5` hold everything — but the printed remedy was a dead end:
+the remedy for state N was computed against state N-1.
+
+- **Decision (the issue's first sanctioned arm, narrowed by hostile
+  review):** the split refuses the interleave at the head of the chain,
+  before any write — but only the interleave whose remedy would actually
+  dead-end: inline credentials beside v3-only fields (`defaultProfile`,
+  `mcp`) while NO profile carries a `providers` tree. The refusal names
+  both facts and an explicit nothing-was-written guarantee; the directory
+  stays byte-identical. Remedy in the message: remove the v3-only fields
+  and re-run — the chain then carries the file to v3 in one load and
+  re-derives `defaultProfile` itself (the first profile); re-add anything
+  removed (`mcp` is authored content the migration cannot compute) — or
+  reshape the file to v3 by hand. A **root-level `apiKey`** gets its own
+  remedy clause (review round 2, P1-1): the split has no profile name for
+  it, so removing the fields alone would strand that credential in a
+  backup — the message says to move it into `keys.json5` under the FIRST
+  named profile (the same `first_profile_name` rule the reshape uses to
+  re-derive `defaultProfile`, so the named home is exactly the profile
+  that will load), then remove it with the v3-only fields. A file with no
+  named profile gets the by-hand arm only — there is nothing to move the
+  key under and no `defaultProfile` to re-derive. Convergence is pinned by
+  tests for the single- and multi-profile shapes.
+- **Why providers-carrying interleaves are excluded (review round 1,
+  P1-1):** when a profile already carries a `providers` tree, the split
+  preserves it and the flat key nests under its single provider endpoint —
+  the tripwire's "set `configVersion: 3`" remedy converges there, ending
+  loadable with the tree intact (pinned by test). Refusing those at the
+  head would trade a working automatic path for manual work, and a
+  removal-remedy there would invite deleting the authored provider/mcp
+  trees — exactly the half-migrated damage this amendment exists to
+  prevent. They keep the chain's write-then-refuse with its fitting
+  remedy (the issue's second arm). The providers test is deliberately
+  coarse (`Map.has_key?`): a file whose `providers` is empty/null, or one
+  sitting on a nameless profile, keeps the marker path — listed with the
+  neighbors below.
+- **The refusal is gated on the split's own precondition (review round 1
+  P1-2; round 2 made it structural):** regularity is decided once, before
+  both the refusal and the split, so the arm can only fire where the split
+  itself would run. A symlinked or otherwise non-regular layout keeps the
+  stand-down: the split was already left by hand there, and some such
+  directories (a v3-shaped file completed by a symlinked keys file) load
+  fine without any migration.
+- **Why the prediction is sound:** `de_secret/1` only strips `apiKey` and
+  stamps `configVersion`/`profiles`; every tripwire key survives the split
+  verbatim, so the pre-split map trips if and only if the post-split map
+  trips — and the arm only fires where the split would actually run.
+  Refusing at the head keeps the chain transactional — the directory never
+  enters a half-migrated state the chain itself could predict — and zero
+  writes is the stronger, cheaper-to-verify guarantee.
+- **Rejected alternative (the issue's other sanctioned arm):** a
+  shape-aware remedy on the post-split tripwire ("delete the field") for
+  the not-v3-shaped class. It would keep the write-then-refuse state and
+  leave the user editing a v2 file the chain just wrote instead of the one
+  they hand-damaged.
+- **Pre-existing neighbors, unchanged and consciously out of scope (no
+  credential value is lost in any of them; reviews round 1 P2/P3, round 2
+  P3):** `reject_endpoint_keyed`'s write-then-refuse (its "set
+  `configVersion: 3`" arm can dead-end on a v2-shaped settings, though its
+  "fix `keys.json5` by hand" arm converges); the reshape tripwire's marker
+  advice for a hand-made no-inline-credentials v2/v1-shaped file with a
+  stray `defaultProfile` (nothing is written, the advice can misfit); a
+  multi-provider providers-carrying interleave, where the flat key strands
+  under a warning that names the hand fix (nest it under the baseUrl);
+  an empty/null `providers` key or one on a nameless profile (the coarse
+  providers test counts them as v3-shaped — they keep the marker path and
+  can end load-failing).
 
 ### Carried over unchanged (ADR 0008 / #31)
 

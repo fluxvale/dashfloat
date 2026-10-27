@@ -2121,6 +2121,334 @@ defmodule DashFloat.ConfigTest do
     end
   end
 
+  describe "the v1+interleave recovery path (issue #39)" do
+    # A hand-merged file: inline keys (v1) AND a v3-only field. Pre-fix the
+    # split wrote configVersion: 2 to disk and the reshape's tripwire then
+    # refused advising "set configVersion: 3" — advice that, followed on the
+    # now-v2-shaped file, produced a provider-less config with the flat key
+    # stranded in keys.json5. The designed end state (ADR 0009 amendment):
+    # refuse at the head of the chain, zero writes.
+    @interleave "{ profiles: [{ name: 'work', baseUrl: 'https://p.example/v1', apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'm1' }] }], defaultProfile: 'work', }"
+
+    defp dir_snapshot(dir) do
+      for name <- File.ls!(dir), path = Path.join(dir, name), into: %{} do
+        {:ok, stat} = File.lstat(path)
+        {name, {stat.type, snapshot_text(path)}}
+      end
+    end
+
+    defp snapshot_text(path) do
+      case File.read(path) do
+        {:ok, text} -> text
+        _unreadable -> nil
+      end
+    end
+
+    test "real load refuses naming both facts, and the directory is byte-identical" do
+      dir = tmp_dir()
+      write!(dir, @interleave)
+      before = dir_snapshot(dir)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+
+      # Both facts named, the no-write guarantee stated, no value echoed.
+      assert message =~ "settings.json5"
+      assert message =~ "inline apiKey"
+      assert message =~ "v3-only fields"
+      assert message =~ "defaultProfile"
+      assert message =~ "nothing was written"
+      refute message =~ "PLACEHOLDER"
+
+      # Zero writes: every file byte-identical and no new file (no keys.json5,
+      # no .bak) — proven on the whole directory, not just settings.json5.
+      assert dir_snapshot(dir) == before
+    end
+
+    test "the printed remedy converges: remove the field, re-run, the config loads" do
+      dir = tmp_dir()
+      write!(dir, @interleave)
+
+      assert {:error, _message} = Config.load(dir, %{}, [])
+
+      # Follow the remedy verbatim: delete the v3-only field, re-run.
+      edited =
+        dir
+        |> settings_path()
+        |> File.read!()
+        |> String.replace(", defaultProfile: 'work'", "")
+
+      settings = settings_path(dir)
+      File.write!(settings, edited)
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert %Config{profile: "work", base_url: "https://p.example/v1"} = config
+      assert config.api_key == "PLACEHOLDER-work-key"
+      assert config.model == "m1"
+
+      # The chain finished v1 → v3 in the re-run: defaultProfile re-derived,
+      # keys endpoint-keyed, no credential left in live settings.
+      assert {:ok, %{"configVersion" => 3, "defaultProfile" => "work"}} = read_settings(dir)
+
+      assert {:ok, %{"work" => %{"https://p.example/v1" => "PLACEHOLDER-work-key"}}} =
+               read_keys(dir)
+
+      live = File.read!(settings)
+      refute live =~ "PLACEHOLDER"
+    end
+
+    test "mcp with no providers tree is refused at the head; the remedy converges (re-add included)" do
+      dir = tmp_dir()
+
+      file =
+        "{ profiles: [{ name: 'work', baseUrl: 'https://p.example/v1', apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'm1' }], mcp: [{ name: 'fetch', command: 'uvx' }] }], }"
+
+      write!(dir, file)
+      before = dir_snapshot(dir)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "v3-only fields"
+      assert message =~ "mcp"
+      assert message =~ "nothing was written"
+      assert dir_snapshot(dir) == before
+
+      # Follow the remedy verbatim: remove the field, re-run…
+      without_mcp = String.replace(file, ", mcp: [{ name: 'fetch', command: 'uvx' }]", "")
+      settings = settings_path(dir)
+      File.write!(settings, without_mcp)
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert config.api_key == "PLACEHOLDER-work-key"
+
+      # …and re-add what was removed — the migrated v3 file takes the mcp
+      # entry back and still loads.
+      {:ok, migrated} = read_settings(dir)
+
+      readded =
+        put_in(migrated, ["profiles", Access.at(0), "mcp"], [
+          %{"name" => "fetch", "command" => "uvx"}
+        ])
+
+      {:ok, text} = JSON5.render(readded)
+
+      File.write!(settings, text <> "\n")
+
+      assert {:ok, %Config{api_key: "PLACEHOLDER-work-key"}} = Config.load(dir, %{}, [])
+    end
+
+    test "a providers-carrying interleave keeps the marker path — followed, it converges with the tree intact" do
+      # Review P1-1: the head-refusal must not fire for a v3-shaped file —
+      # the split preserves the provider tree, the flat key nests under its
+      # single endpoint, and the tripwire's marker remedy converges. The
+      # refusal's removal-remedy would instead invite deleting the authored
+      # provider menu.
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 1,
+          defaultProfile: 'work',
+          profiles: [
+            { name: 'work',
+              providers: [{ baseUrl: 'https://p.example/v1', models: [{ model: 'm1' }, { model: 'm2' }] }],
+              apiKey: 'PLACEHOLDER-work-key' },
+          ],
+        }
+        """
+      )
+
+      # The chain splits (writes), then the tripwire refuses with the marker
+      # remedy — the sanctioned post-split arm, whose remedy fits this file.
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "set configVersion: 3 by hand"
+      refute message =~ "nothing was written"
+      keys = keys_path(dir)
+      assert File.exists?(keys)
+
+      # Follow that remedy verbatim.
+      settings = settings_path(dir)
+
+      marked =
+        settings
+        |> File.read!()
+        |> String.replace("configVersion: 2", "configVersion: 3")
+
+      File.write!(settings, marked)
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert %Config{profile: "work", base_url: "https://p.example/v1"} = config
+      assert config.api_key == "PLACEHOLDER-work-key"
+
+      # The authored two-model menu survived the whole route.
+      assert {:ok, %{"profiles" => [%{"providers" => [%{"models" => models}]}]}} =
+               read_settings(dir)
+
+      assert Enum.map(models, & &1["model"]) == ["m1", "m2"]
+
+      assert {:ok, %{"work" => %{"https://p.example/v1" => "PLACEHOLDER-work-key"}}} =
+               read_keys(dir)
+    end
+
+    test "a root-level apiKey interleave is refused with its own converging remedy" do
+      # Review round 2, P1-1: a root-level credential has no profile name,
+      # so removing the v3-only field alone would strand it in a backup —
+      # the message names the move instead.
+      dir = tmp_dir()
+
+      file =
+        "{ configVersion: 1, apiKey: 'PLACEHOLDER-root-key', defaultProfile: 'work', profiles: [{ name: 'work', baseUrl: 'https://p.example/v1', models: [{ model: 'm1' }] }], }"
+
+      write!(dir, file)
+      before = dir_snapshot(dir)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "root-level apiKey"
+      assert message =~ "nothing was written"
+      assert dir_snapshot(dir) == before
+
+      # Follow the remedy verbatim: move the root key under the profile's
+      # name (flat), remove it and the v3-only field, re-run.
+      write_keys!(dir, "{work: 'PLACEHOLDER-root-key'}")
+
+      edited =
+        file
+        |> String.replace("apiKey: 'PLACEHOLDER-root-key', ", "")
+        |> String.replace(", defaultProfile: 'work'", "")
+
+      settings = settings_path(dir)
+      File.write!(settings, edited)
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert config.api_key == "PLACEHOLDER-root-key"
+      assert config.base_url == "https://p.example/v1"
+
+      assert {:ok, %{"configVersion" => 3, "defaultProfile" => "work"}} = read_settings(dir)
+
+      assert {:ok, %{"work" => %{"https://p.example/v1" => "PLACEHOLDER-root-key"}}} =
+               read_keys(dir)
+    end
+
+    test "a root-level apiKey with several profiles names the profile the reshape will load" do
+      # Review round 3, P2-1: "its profile's name" is ambiguous when
+      # defaultProfile names a non-first profile — the converging home is
+      # the FIRST profile, the one the reshape re-derives as defaultProfile.
+      # The message names it explicitly.
+      dir = tmp_dir()
+
+      file =
+        "{ configVersion: 1, apiKey: 'PLACEHOLDER-root-key', defaultProfile: 'personal', profiles: [{ name: 'work', baseUrl: 'https://one.example/v1', models: [{ model: 'm1' }] }, { name: 'personal', baseUrl: 'https://two.example/v1', models: [{ model: 'm2' }] }], }"
+
+      write!(dir, file)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ ~s(under "work")
+      assert message =~ "root-level apiKey"
+
+      # Following it verbatim converges on that profile.
+      write_keys!(dir, "{work: 'PLACEHOLDER-root-key'}")
+
+      edited =
+        file
+        |> String.replace("apiKey: 'PLACEHOLDER-root-key', ", "")
+        |> String.replace(", defaultProfile: 'personal'", "")
+
+      settings = settings_path(dir)
+      File.write!(settings, edited)
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert config.profile == "work"
+      assert config.api_key == "PLACEHOLDER-root-key"
+    end
+
+    test "a root-level apiKey with no named profile gets only the by-hand route" do
+      # Review round 3, P2-1: profiles: [] has nothing to move the key
+      # under and no first profile to re-derive defaultProfile from — the
+      # move instruction and the migration promise would both be false.
+      dir = tmp_dir()
+
+      file =
+        "{ configVersion: 1, apiKey: 'PLACEHOLDER-root-key', defaultProfile: 'ghost', profiles: [], }"
+
+      write!(dir, file)
+      before = dir_snapshot(dir)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "nothing was written"
+      assert message =~ "reshape it to v3 by hand"
+      refute message =~ ~s(under ")
+      refute message =~ "re-derives defaultProfile"
+      assert dir_snapshot(dir) == before
+    end
+
+    test "non-regular files keep the stand-down: no interleave refusal on symlinked layouts" do
+      # Review round 1 P1-2 + round 2 P2-1: the refusal shares the split's
+      # regular-file precondition. Case A is arm-INeligible (providers tree)
+      # and loads through the link exactly as before the fix. Case B is
+      # arm-ELIGIBLE (mcp interleave, no providers) — the arm must stay
+      # silent there and let the loader produce its own outcome, pinning
+      # the gate a dropped regular? guard would silently remove.
+      dir_a = tmp_dir()
+
+      write!(
+        dir_a,
+        """
+        {
+          defaultProfile: 'work',
+          profiles: [
+            { name: 'work',
+              providers: [{ baseUrl: 'https://p.example/v1', models: [{ model: 'm1' }] }],
+              apiKey: 'PLACEHOLDER-leftover-key' },
+          ],
+        }
+        """
+      )
+
+      target = Path.join(dir_a, "dotfiles-keys.json5")
+      File.write!(target, "{work: {'https://p.example/v1': 'PLACEHOLDER-work-key'}}")
+      File.chmod!(target, 0o600)
+      File.ln_s!(target, keys_path(dir_a))
+
+      assert {:ok, config} = Config.load(dir_a, %{}, [])
+      assert config.api_key == "PLACEHOLDER-work-key"
+
+      keys_a = keys_path(dir_a)
+      assert File.lstat!(keys_a).type == :symlink
+
+      dir_b = tmp_dir()
+
+      write!(
+        dir_b,
+        """
+        {
+          defaultProfile: 'work',
+          profiles: [
+            { name: 'work', baseUrl: 'https://p.example/v1',
+              apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'm1' }],
+              mcp: [{ name: 'fetch', command: 'uvx' }] },
+          ],
+        }
+        """
+      )
+
+      other_target = Path.join(dir_b, "dotfiles-keys.json5")
+      File.write!(other_target, "{}")
+      File.chmod!(other_target, 0o600)
+      File.ln_s!(other_target, keys_path(dir_b))
+
+      # The split always stood down for a non-regular keys file; the v2
+      # profiles then degrade at load. The interleave refusal must not
+      # replace that outcome with its own.
+      assert {:error, message} = Config.load(dir_b, %{}, [])
+      refute message =~ "v3-only fields"
+      assert message =~ "missing provider config"
+
+      keys_b = keys_path(dir_b)
+      assert File.lstat!(keys_b).type == :symlink
+      assert File.exists?(other_target)
+    end
+  end
+
   describe "keys.json5 as a non-regular file" do
     test "a directory named keys.json5 is a loud read error, never clobbered" do
       dir = fleet_dir()

@@ -612,6 +612,22 @@ defmodule DashFloat.Config.MigrationTest do
         """,
         values: ["PLACEHOLDER-root-key", "PLACEHOLDER-work-key"],
         collected: %{"work" => "PLACEHOLDER-work-key"}
+      },
+      # Issue #39: the interleave — inline keys AND a v3-only field on one
+      # pre-v2 file. The chain must refuse before the split writes anything.
+      interleave: %{
+        file: """
+        {
+          configVersion: 1,
+          defaultProfile: 'work',
+          profiles: [
+            { name: 'work', baseUrl: 'https://provider.example/v1',
+              apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'glm-5.3' }] },
+          ],
+        }
+        """,
+        values: ["PLACEHOLDER-work-key"],
+        collected: %{"work" => "PLACEHOLDER-work-key"}
       }
     }
 
