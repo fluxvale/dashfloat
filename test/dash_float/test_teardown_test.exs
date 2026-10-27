@@ -10,7 +10,7 @@ defmodule DashFloat.TestTeardownTest do
     Agent.stop(pid)
 
     # The old shape raises; this is the mechanism, pinned.
-    assert catch_exit(GenServer.stop(pid)) |> elem(0) == :noproc
+    assert {:noproc, _call} = catch_exit(GenServer.stop(pid))
     assert DashFloat.TestTeardown.stop(pid) == :ok
   end
 

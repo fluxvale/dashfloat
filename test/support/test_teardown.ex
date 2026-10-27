@@ -17,7 +17,7 @@ defmodule DashFloat.TestTeardown do
   def stop(pid) when is_pid(pid) do
     GenServer.stop(pid)
   catch
-    :exit, {:noproc, _} -> :ok
-    :exit, {:normal, _} -> :ok
+    :exit, {:noproc, _reason} -> :ok
+    :exit, {:normal, _reason} -> :ok
   end
 end
