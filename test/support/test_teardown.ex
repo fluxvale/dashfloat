@@ -8,16 +8,22 @@ defmodule DashFloat.TestTeardown do
   with `:noproc`. Observed as a suite flake (chat_stream's malformed-usage
   cell, and on plain main).
 
-  Race shapes measured on OTP 29 over ~32k aggressive iterations: a death
-  concurrent with `stop/1` surfaces as `:noproc` (the common case) or, when
-  the server began terminating first, as the process's own exit reason —
-  `:shutdown` or `{:shutdown, term}`. `stop/1` therefore treats "already
-  gone" and the shutdown family as success: both mean "not running, and not
-  because it crashed". A genuine crash reason still propagates, so a
-  server that died from a bug keeps failing the suite instead of being
-  silently swept up.
+  A concurrent death reaches the caller as `{reason, {GenServer, :stop, _}}`,
+  where `reason` is `:noproc` for an already-dead process or the dying
+  process's own exit reason. `reason` is itself `{inner, {:sys, :terminate,
+  _}}` when the server was already inside `terminate/2` — so one level of
+  both wrappers is unwrapped before deciding.
 
-  No hang risk is added: `GenServer.stop/1` here is the same call the old
+  The rule is about the INNER reason: "already gone" (`:noproc`) and the
+  `:shutdown` family mean "not running, and not because it crashed";
+  everything else propagates. The family's term payload is deliberately not
+  inspected — OTP reserves `:shutdown`/`{:shutdown, term}` for controlled
+  termination (supervisors do not count it toward restart intensity, and a
+  supervisor stopping a child is exactly the case teardown wants), so it
+  cannot hide a crash. A genuine crash surfaces as its own reason and still
+  fails the suite loudly.
+
+  No hang risk is added: this is the same `GenServer.stop/1` call the old
   shape made, and ExUnit runs on_exit callbacks under the test timeout.
   """
 
@@ -26,9 +32,21 @@ defmodule DashFloat.TestTeardown do
   def stop(pid) when is_pid(pid) do
     GenServer.stop(pid)
   catch
-    # GenServer.stop/1 exits with {reason, {GenServer, :stop, [pid, ...]}}.
-    :exit, {:noproc, _call} -> :ok
-    :exit, {:shutdown, _call} -> :ok
-    :exit, {{:shutdown, _term}, _call} -> :ok
+    :exit, payload ->
+      if controlled_exit?(payload), do: :ok, else: :erlang.raise(:exit, payload, [])
   end
+
+  # GenServer.stop/1 raises `{reason, {GenServer, :stop, _}}`; `reason` gains
+  # another `{_inner, {:sys, :terminate, _}}` wrap when the server had already
+  # begun terminating. Unwrap both, then judge the innermost reason.
+  defp controlled_exit?({reason, {GenServer, :stop, _call}}), do: shutdown_family?(unwrap(reason))
+  defp controlled_exit?(_payload), do: false
+
+  defp unwrap({inner, {:sys, :terminate, _call}}), do: inner
+  defp unwrap(reason), do: reason
+
+  defp shutdown_family?(:noproc), do: true
+  defp shutdown_family?(:shutdown), do: true
+  defp shutdown_family?({:shutdown, _term}), do: true
+  defp shutdown_family?(_other), do: false
 end
