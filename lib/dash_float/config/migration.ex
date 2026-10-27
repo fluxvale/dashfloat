@@ -20,7 +20,10 @@ defmodule DashFloat.Config.Migration do
       leaves the original in place to re-trigger), `keys.json5` is written
       from the collected keys, then the settings file is rewritten de-secreted
       at `configVersion` 2. A v1 file with no inline credential field is
-      byte-untouched.
+      byte-untouched. A v1 file that also carries a v3-only field
+      (`defaultProfile`, profile-level `providers`/`mcp`) refuses before any
+      write — the reshape would refuse the split's own output (issue #39,
+      ADR 0009 amendment).
     * **v3 reshape** — a `settings.json5` older than `configVersion` 3
       becomes the persona layout: each profile's `baseUrl`+`models` move into
       `providers[0]`, `keys[profile]` becomes `keys[profile][baseUrl]`, and
@@ -145,6 +148,14 @@ defmodule DashFloat.Config.Migration do
       # input refuses before any write, byte-unchanged.
       unshapeable?(map) ->
         {:error, unshapeable_message(main)}
+
+      # Issue #39: the split preserves v3-only fields verbatim, so the
+      # reshape's tripwire would refuse the split's own output — a
+      # guaranteed write-then-refuse. Refuse at the head instead; the
+      # prediction is exact (de_secret touches only apiKey and the
+      # version/profiles stamps). See ADR 0009's issue #39 amendment.
+      v3_tripwire?(map) ->
+        {:error, interleave_message(main)}
 
       regular?(main, @main_file) and regular?(keys_path, @keys_file) ->
         do_split(dir, main, keys_path, map, raw)
@@ -541,6 +552,16 @@ defmodule DashFloat.Config.Migration do
     "#{main}: the profiles field is not a shape the v3 migration can represent " <>
       "(profiles must be a list of objects, providers/mcp lists) — nothing was " <>
       "written; fix the file by hand (or set configVersion: 3 if it is already v3)"
+  end
+
+  # Both facts and the no-write guarantee (issue #39, ADR 0009 amendment):
+  # the v3-only fields are named as a class, never their values.
+  defp interleave_message(main) do
+    "#{main}: the file carries both inline apiKey fields and v3-only fields " <>
+      "(defaultProfile, providers, or mcp) — the split would preserve them " <>
+      "and the v3 reshape would refuse them; nothing was written. Remove the " <>
+      "v3-only fields and re-run (the chain then migrates the file to v3 and " <>
+      "re-derives defaultProfile), or reshape it to v3 by hand"
   end
 
   defp version?(%{"configVersion" => version}, version) when is_integer(version), do: true

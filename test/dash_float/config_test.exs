@@ -2121,6 +2121,94 @@ defmodule DashFloat.ConfigTest do
     end
   end
 
+  describe "the v1+interleave recovery path (issue #39)" do
+    # A hand-merged file: inline keys (v1) AND a v3-only field. Pre-fix the
+    # split wrote configVersion: 2 to disk and the reshape's tripwire then
+    # refused advising "set configVersion: 3" — advice that, followed on the
+    # now-v2-shaped file, produced a provider-less config with the flat key
+    # stranded in keys.json5. The designed end state (ADR 0009 amendment):
+    # refuse at the head of the chain, zero writes.
+    @interleave "{ profiles: [{ name: 'work', baseUrl: 'https://p.example/v1', apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'm1' }] }], defaultProfile: 'work', }"
+
+    defp dir_snapshot(dir) do
+      for name <- File.ls!(dir),
+          path = Path.join(dir, name),
+          File.exists?(path),
+          into: %{},
+          do: {name, File.read!(path)}
+    end
+
+    test "real load refuses naming both facts, and the directory is byte-identical" do
+      dir = tmp_dir()
+      write!(dir, @interleave)
+      before = dir_snapshot(dir)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+
+      # Both facts named, the no-write guarantee stated, no value echoed.
+      assert message =~ "settings.json5"
+      assert message =~ "inline apiKey"
+      assert message =~ "v3-only fields"
+      assert message =~ "defaultProfile"
+      assert message =~ "nothing was written"
+      refute message =~ "PLACEHOLDER"
+
+      # Zero writes: every file byte-identical and no new file (no keys.json5,
+      # no .bak) — proven on the whole directory, not just settings.json5.
+      assert dir_snapshot(dir) == before
+    end
+
+    test "the printed remedy converges: remove the field, re-run, the config loads" do
+      dir = tmp_dir()
+      write!(dir, @interleave)
+
+      assert {:error, _message} = Config.load(dir, %{}, [])
+
+      # Follow the remedy verbatim: delete the v3-only field, re-run.
+      edited =
+        dir
+        |> settings_path()
+        |> File.read!()
+        |> String.replace(", defaultProfile: 'work'", "")
+
+      settings = settings_path(dir)
+      File.write!(settings, edited)
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert %Config{profile: "work", base_url: "https://p.example/v1"} = config
+      assert config.api_key == "PLACEHOLDER-work-key"
+      assert config.model == "m1"
+
+      # The chain finished v1 → v3 in the re-run: defaultProfile re-derived,
+      # keys endpoint-keyed, no credential left in live settings.
+      assert {:ok, %{"configVersion" => 3, "defaultProfile" => "work"}} = read_settings(dir)
+
+      assert {:ok, %{"work" => %{"https://p.example/v1" => "PLACEHOLDER-work-key"}}} =
+               read_keys(dir)
+
+      live = File.read!(settings)
+      refute live =~ "PLACEHOLDER"
+    end
+
+    test "profile-level providers/mcp on a v1 inline-keys file refuse the same way" do
+      files = [
+        "{ profiles: [{ name: 'work', baseUrl: 'https://p.example/v1', apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'm1' }], providers: [{ baseUrl: 'https://other.example/v1' }] }], }",
+        "{ profiles: [{ name: 'work', baseUrl: 'https://p.example/v1', apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'm1' }], mcp: [{ name: 'fetch', command: 'uvx' }] }], }"
+      ]
+
+      for file <- files do
+        dir = tmp_dir()
+        write!(dir, file)
+        before = dir_snapshot(dir)
+
+        assert {:error, message} = Config.load(dir, %{}, [])
+        assert message =~ "v3-only fields"
+        assert message =~ "nothing was written"
+        assert dir_snapshot(dir) == before
+      end
+    end
+  end
+
   describe "keys.json5 as a non-regular file" do
     test "a directory named keys.json5 is a loud read error, never clobbered" do
       dir = fleet_dir()
