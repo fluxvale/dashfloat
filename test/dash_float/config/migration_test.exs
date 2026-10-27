@@ -6,7 +6,13 @@ defmodule DashFloat.Config.MigrationTest do
   # (byte-exact 0600 backup first), and re-runs are no-ops. Every backup of
   # a file that ever held credentials is 0600. Placeholders only — never a
   # real key.
-  use ExUnit.Case, async: true
+  # Sync: two cells here assert TOTAL log silence (a refused .tmp symlink and
+  # an unrepresentable value must warn about nothing). ExUnit's capture is
+  # unscoped — its handler writes every event to every active capture — so an
+  # async run can read a concurrent module's warning (issues #54/#55). Sync
+  # modules start only after every async module has finished, so the silence
+  # is real and the assertion stays strict rather than a partial match.
+  use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
 
@@ -22,9 +28,15 @@ defmodule DashFloat.Config.MigrationTest do
     dir
   end
 
+  # 0600 at creation: the load-path perms repair warns about anything more
+  # permissive, and a plain File.write! inherits the runner's umask (0666
+  # under 000, 0644 under 022) — an unrelated warning on this module's own
+  # noise floor, and the one #54 caught in a neighbouring test's capture.
+  # Tests that need the permissive shape chmod explicitly.
   defp write_legacy!(dir, map) do
     path = Path.join(dir, "config.json")
     File.write!(path, Jason.encode!(map))
+    File.chmod!(path, 0o600)
     dir
   end
 
@@ -341,6 +353,7 @@ defmodule DashFloat.Config.MigrationTest do
       dir = tmp_dir()
       legacy = Path.join(dir, "config.json")
       File.write!(legacy, ~s({"api_key": "PLACEHOLDER-x",))
+      File.chmod!(legacy, 0o600)
 
       assert {:error, message} = @migration.maybe_migrate(dir)
       assert message =~ "invalid JSON"
@@ -370,6 +383,7 @@ defmodule DashFloat.Config.MigrationTest do
       dir = tmp_dir()
       legacy = Path.join(dir, "config.json")
       File.write!(legacy, "[1, 2, 3]")
+      File.chmod!(legacy, 0o600)
 
       assert {:error, message} = @migration.maybe_migrate(dir)
       assert message =~ "expected a JSON object"
@@ -457,6 +471,7 @@ defmodule DashFloat.Config.MigrationTest do
       dir = tmp_dir()
       legacy = Path.join(dir, "config.json")
       File.write!(legacy, Jason.encode!(full_legacy()))
+      File.chmod!(legacy, 0o600)
       backup = Path.join(dir, "config.json.bak")
       File.write!(backup, ~s({"base_url": "https://older.example", "api_key": "PLACEHOLDER-old"}))
 
@@ -518,6 +533,7 @@ defmodule DashFloat.Config.MigrationTest do
       dir = tmp_dir()
       legacy = Path.join(dir, "config.json")
       File.write!(legacy, Jason.encode!(full_legacy()))
+      File.chmod!(legacy, 0o600)
       backup = Path.join(dir, "config.json.bak")
       File.mkdir(backup)
       File.chmod!(backup, 0o700)

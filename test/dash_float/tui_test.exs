@@ -1078,7 +1078,25 @@ defmodule DashFloat.TUITest do
       end)
 
     max_ms = Enum.max(timings_ms)
-    assert max_ms < 100, "input round-trips #{inspect(timings_ms)}ms while streaming at cadence"
+
+    # The property under test is interleaving, asserted without a clock
+    # (issue #51's discipline): all five synchronous round-trips have
+    # RETURNED while the stream is still mid-flight. A UI that serialised
+    # input behind the stream would service the presses only after draining
+    # every token, so the buffer would already be complete. Comparing
+    # against the finished length — not a duration — makes this immune to
+    # contention: slow tokens and slow presses slow together, and the check
+    # only fires when input genuinely waited for the stream to end.
+    mid_flight = get_state(pid)
+
+    assert String.length(mid_flight.in_flight || "") < String.length(burst_text) + cadence_count,
+           "every cadence token had landed before the presses returned — input was " <>
+             "serialised behind the stream"
+
+    # Wall clock survives only as a coarse backstop: 100 ms is 3.5x the worst
+    # round-trip measured on this host under 24 CPU hogs (28 ms). The fragile
+    # assert was #51's 400 ms tick budget at 1.05x headroom, not this one.
+    assert max_ms < 100, "input round-tripped in #{max_ms}ms, over the backstop"
 
     ref = Process.monitor(cadence)
     assert_receive {:DOWN, ^ref, :process, ^cadence, :normal}, 2_000
