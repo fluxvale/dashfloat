@@ -33,3 +33,4 @@ their replacement.
 | [0008](0008-config-layout-profiles-json5.md) | Config layout v2: single-file JSON5 with profiles | Accepted |
 | [0009](0009-config-v3-persona-profiles.md) | Config layout v3: persona profiles, endpoint-keyed keys, deliberate selection, onboarding | Accepted |
 | [0010](0010-release-packaging.md) | Release packaging: core `mix release` tarballs, installer, Homebrew | Accepted |
+| [0011](0011-boot-tty-and-clean-refusal.md) | Boot-time terminal detection, the clean refusal, and libsctp in the release | Accepted |

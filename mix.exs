@@ -12,13 +12,14 @@ defmodule DashFloat.MixProject do
       deps: deps(),
       # One release, named for the binary users type (the OTP app stays
       # :dash_float). Release packaging is core `mix release` per ADR 0010.
-      # The step after :assemble forwards CLI arguments on `start` — the
+      # The steps after :assemble bundle libsctp for ERTS's dlopen (see
+      # DashFloat.Release) and forward CLI arguments on `start` — the
       # generated launcher drops them, which would silently break --version
       # and the --profile/--model selection flags (see the function below).
       releases: [
         dashfloat: [
           include_executables_for: [:unix],
-          steps: [:assemble, &patch_launcher/1]
+          steps: [:assemble, &DashFloat.Release.bundle_sctp/1, &patch_launcher/1]
         ]
       ],
       # coveralls.multiple writes cover/excoveralls.json (Codecov) and

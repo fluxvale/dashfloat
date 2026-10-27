@@ -121,18 +121,22 @@ defmodule DashFloat.ApplicationTest do
              )
   end
 
-  test "a headless setup boot without an explicit interactive override probes stdin" do
+  test "a headless setup boot without an explicit interactive override probes the tty" do
     dir = tmp_dir()
+    parent = self()
+    halt = fn code -> send(parent, {:halted, code}) end
 
-    # Either arm is correct (the probe depends on this process's stdin); the
-    # PROBE itself is the covered behavior.
+    # Either arm is correct (the probe depends on this process's fds); the
+    # PROBE itself is the covered behavior. The refusal arm now halts at the
+    # boot boundary (ADR 0011), so the seam must be injected either way.
     result =
       Application.start(:normal,
         test?: false,
         config_dir: dir,
         env: %{},
         argv: [],
-        interactive?: nil
+        interactive?: nil,
+        halt: halt
       )
 
     assert result in [
@@ -140,20 +144,37 @@ defmodule DashFloat.ApplicationTest do
              {:error, {:already_started, :unknown}}
            ] or
              match?({:error, {:already_started, _pid}}, result)
+
+    if match?({:error, :interactive_setup_required}, result) do
+      assert_received {:halted, 1}
+    else
+      refute_received {:halted, _}
+    end
   end
 
+  # ADR 0011: the headless refusal halts at the boot boundary, so the
+  # {:error, _} return never reaches OTP (which is what terminates the kernel
+  # and writes erl_crash.dump). The halt here THROWS: control must leave
+  # Application.start/2 through the seam, so catching it proves the error
+  # return was never produced. The no-dump assertion itself belongs to the
+  # release smoke (.github/workflows/release.yml), the only place a real
+  # start_permanent boot exists.
   test "a zero-profile headless boot refuses with instructions instead of a hung wizard" do
     dir = tmp_dir()
+    halt = fn code -> throw({:halted, code}) end
 
     stderr =
       capture_io(:stderr, fn ->
-        assert {:error, :interactive_setup_required} =
-                 Application.start(:normal,
-                   test?: false,
-                   config_dir: dir,
-                   env: %{},
-                   argv: [],
-                   interactive?: false
+        assert {:halted, 1} =
+                 catch_throw(
+                   Application.start(:normal,
+                     test?: false,
+                     config_dir: dir,
+                     env: %{},
+                     argv: [],
+                     interactive?: false,
+                     halt: halt
+                   )
                  )
       end)
 
@@ -162,6 +183,35 @@ defmodule DashFloat.ApplicationTest do
     # No files were written by the refused boot.
     settings = Path.join(dir, "settings.json5")
     refute File.exists?(settings)
+  end
+
+  # ADR 0011: the interactivity probe is the fd primitive (:prim_tty.isatty),
+  # not :io.columns/1 — under a release's -noshell boot the latter is always
+  # {:error, :enotsup} on stdin, tty or not. The mixed cases below are the
+  # measured truths.
+  describe "tty?/1" do
+    test "true when only stdin is a tty" do
+      isatty = fn
+        :stdin -> true
+        :stdout -> false
+      end
+
+      assert Application.tty?(isatty)
+    end
+
+    test "true when only stdout is a tty" do
+      isatty = fn
+        :stdin -> false
+        :stdout -> true
+      end
+
+      assert Application.tty?(isatty)
+    end
+
+    test "false when neither fd is a tty" do
+      isatty = fn _device -> false end
+      refute Application.tty?(isatty)
+    end
   end
 
   test "a headless boot with a complete env is fine — no setup needed" do

@@ -1,0 +1,20 @@
+DashFloat bundles the lksctp-tools shared library (libsctp.so.1) in the Linux
+release. It is unmodified, redistributed under the GNU Lesser General Public
+License, version 2.1 or later.
+
+  Upstream:  lksctp-tools — https://github.com/sctp/lksctp-tools/
+  Copyright: 2001, 2003, 2005 IBM Corp.
+             2001-2003 Intel Corp.
+             and other contributors, see the upstream source for the full list
+
+The library is a separate, replaceable file on disk (lib/sctp/libsctp.so.1), so
+it can be substituted with any compatible build of the same library — which is
+what the LGPL's relinking requirement asks for.
+
+The GNU Lesser General Public License 2.1 is available at
+https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html, and its full text ships
+beside this notice as LGPL-2.1 (on Debian-based systems it is also at
+/usr/share/common-licenses/LGPL-2.1).
+
+DashFloat itself does not link against this library; the Erlang VM loads it at
+startup only to probe for SCTP socket support, which DashFloat does not use.
