@@ -150,25 +150,26 @@ defmodule DashFloat.Config.Migration do
       unshapeable?(map) ->
         {:error, unshapeable_message(main)}
 
+      # Regularity is decided once, here: the interleave refusal below and
+      # the split itself share the same precondition (review round 2,
+      # P2-2), and a non-regular layout is left to the loader's path — some
+      # such directories load fine with no migration at all.
+      not (regular?(main, @main_file) and regular?(keys_path, @keys_file)) ->
+        {:ok, :not_needed}
+
       # Issue #39: a NOT-v3-shaped interleave — inline credentials beside a
-      # v3-only field (defaultProfile, mcp) with no providers tree anywhere.
+      # v3-only field (defaultProfile, mcp) with no providers key anywhere.
       # The split would preserve the field verbatim and the reshape's
       # tripwire would then refuse the split's own output with a marker
       # remedy that, set on the post-split file, loads provider-less — a
       # guaranteed write-then-refuse with a dead-end remedy. Refuse at the
-      # head instead, nothing written, and only where the split itself
-      # would run (a non-regular file keeps the loader's path — review
-      # P1-2). A providers-carrying interleave keeps the chain's own path:
-      # the tripwire's marker remedy converges there (review P1-1). See
-      # ADR 0009's issue #39 amendment.
-      v3_interleave?(map) and regular?(main, @main_file) and regular?(keys_path, @keys_file) ->
-        {:error, interleave_message(main)}
-
-      regular?(main, @main_file) and regular?(keys_path, @keys_file) ->
-        do_split(dir, main, keys_path, map, raw)
+      # head instead, nothing written (review round 1 P1-1/P1-2; ADR 0009's
+      # issue #39 amendment).
+      v3_interleave?(map) ->
+        {:error, interleave_message(main, map)}
 
       true ->
-        {:ok, :not_needed}
+        do_split(dir, main, keys_path, map, raw)
     end
   end
 
@@ -563,16 +564,26 @@ defmodule DashFloat.Config.Migration do
 
   # Both facts and the no-write guarantee (issue #39, ADR 0009 amendment):
   # the v3-only fields are named as a class, never their values. The remedy
-  # converges for every shape that reaches this message: defaultProfile is
-  # re-derived by the reshape; mcp survives only as the re-add the message
-  # names.
-  defp interleave_message(main) do
-    "#{main}: the file carries both inline apiKey fields and v3-only fields " <>
-      "(defaultProfile or mcp) — the split would preserve them and the v3 " <>
-      "reshape would refuse them; nothing was written. Remove the v3-only " <>
-      "fields and re-run (the chain then migrates the file to v3 and " <>
-      "re-derives defaultProfile — re-add anything you removed), or reshape " <>
-      "it to v3 by hand"
+  # names the root-level apiKey's move when one is present — the split has
+  # no profile name for it, so removing the fields alone would strand that
+  # credential in a backup (review round 2, P1-1).
+  defp interleave_message(main, map) do
+    header =
+      "#{main}: the file carries both inline apiKey fields and v3-only fields " <>
+        "(defaultProfile or mcp) — the split would preserve them and the v3 " <>
+        "reshape would refuse them; nothing was written. "
+
+    tail =
+      "The chain then migrates the file to v3 and re-derives defaultProfile " <>
+        "— re-add anything you removed — or reshape it to v3 by hand"
+
+    if usable?(map["apiKey"]) do
+      header <>
+        "Move the root-level apiKey into #{@keys_file} under its profile's " <>
+        "name, then remove it and the v3-only fields and re-run. " <> tail
+    else
+      header <> "Remove the v3-only fields and re-run. " <> tail
+    end
   end
 
   defp version?(%{"configVersion" => version}, version) when is_integer(version), do: true
@@ -602,10 +613,11 @@ defmodule DashFloat.Config.Migration do
   end
 
   # The interleave the head-refusal covers (issue #39): the tripwire fired
-  # but NO profile carries a providers tree, so the file is not v3-shaped
+  # but NO profile carries a providers key, so the file is not v3-shaped
   # and the tripwire's "set configVersion: 3" remedy cannot converge — its
-  # profiles would load provider-less. mcp-only and defaultProfile-only
-  # shapes land here; a providers-carrying file keeps the marker path.
+  # profiles would load provider-less. The providers test is deliberately
+  # coarse (Map.has_key?): an empty/null providers, or one on a nameless
+  # profile, keeps the marker path — a documented neighbor (ADR 0009).
   defp v3_interleave?(map) do
     providers_shaped? =
       map

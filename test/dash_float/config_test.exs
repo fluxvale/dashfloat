@@ -2290,15 +2290,56 @@ defmodule DashFloat.ConfigTest do
                read_keys(dir)
     end
 
-    test "a symlinked keys.json5 beside a providers-carrying interleave still loads (no new refusal)" do
-      # Review P1-2: the head-refusal is gated on the split's regular-file
-      # precondition — a non-regular keys.json5 keeps the base behavior
-      # (the split stands down and the v3-shaped file loads through the
-      # link) instead of refusing a layout that already worked.
+    test "a root-level apiKey interleave is refused with its own converging remedy" do
+      # Review round 2, P1-1: a root-level credential has no profile name,
+      # so removing the v3-only field alone would strand it in a backup —
+      # the message names the move instead.
       dir = tmp_dir()
 
+      file =
+        "{ configVersion: 1, apiKey: 'PLACEHOLDER-root-key', defaultProfile: 'work', profiles: [{ name: 'work', baseUrl: 'https://p.example/v1', models: [{ model: 'm1' }] }], }"
+
+      write!(dir, file)
+      before = dir_snapshot(dir)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "root-level apiKey"
+      assert message =~ "nothing was written"
+      assert dir_snapshot(dir) == before
+
+      # Follow the remedy verbatim: move the root key under the profile's
+      # name (flat), remove it and the v3-only field, re-run.
+      write_keys!(dir, "{work: 'PLACEHOLDER-root-key'}")
+
+      edited =
+        file
+        |> String.replace("apiKey: 'PLACEHOLDER-root-key', ", "")
+        |> String.replace(", defaultProfile: 'work'", "")
+
+      settings = settings_path(dir)
+      File.write!(settings, edited)
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert config.api_key == "PLACEHOLDER-root-key"
+      assert config.base_url == "https://p.example/v1"
+
+      assert {:ok, %{"configVersion" => 3, "defaultProfile" => "work"}} = read_settings(dir)
+
+      assert {:ok, %{"work" => %{"https://p.example/v1" => "PLACEHOLDER-root-key"}}} =
+               read_keys(dir)
+    end
+
+    test "non-regular files keep the stand-down: no interleave refusal on symlinked layouts" do
+      # Review round 1 P1-2 + round 2 P2-1: the refusal shares the split's
+      # regular-file precondition. Case A is arm-INeligible (providers tree)
+      # and loads through the link exactly as before the fix. Case B is
+      # arm-ELIGIBLE (mcp interleave, no providers) — the arm must stay
+      # silent there and let the loader produce its own outcome, pinning
+      # the gate a dropped regular? guard would silently remove.
+      dir_a = tmp_dir()
+
       write!(
-        dir,
+        dir_a,
         """
         {
           defaultProfile: 'work',
@@ -2311,16 +2352,48 @@ defmodule DashFloat.ConfigTest do
         """
       )
 
-      target = Path.join(dir, "dotfiles-keys.json5")
+      target = Path.join(dir_a, "dotfiles-keys.json5")
       File.write!(target, "{work: {'https://p.example/v1': 'PLACEHOLDER-work-key'}}")
       File.chmod!(target, 0o600)
-      File.ln_s!(target, keys_path(dir))
+      File.ln_s!(target, keys_path(dir_a))
 
-      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert {:ok, config} = Config.load(dir_a, %{}, [])
       assert config.api_key == "PLACEHOLDER-work-key"
-      keys = keys_path(dir)
-      assert File.lstat!(keys).type == :symlink
-      assert File.exists?(target)
+
+      keys_a = keys_path(dir_a)
+      assert File.lstat!(keys_a).type == :symlink
+
+      dir_b = tmp_dir()
+
+      write!(
+        dir_b,
+        """
+        {
+          defaultProfile: 'work',
+          profiles: [
+            { name: 'work', baseUrl: 'https://p.example/v1',
+              apiKey: 'PLACEHOLDER-work-key', models: [{ model: 'm1' }],
+              mcp: [{ name: 'fetch', command: 'uvx' }] },
+          ],
+        }
+        """
+      )
+
+      other_target = Path.join(dir_b, "dotfiles-keys.json5")
+      File.write!(other_target, "{}")
+      File.chmod!(other_target, 0o600)
+      File.ln_s!(other_target, keys_path(dir_b))
+
+      # The split always stood down for a non-regular keys file; the v2
+      # profiles then degrade at load. The interleave refusal must not
+      # replace that outcome with its own.
+      assert {:error, message} = Config.load(dir_b, %{}, [])
+      refute message =~ "v3-only fields"
+      assert message =~ "missing provider config"
+
+      keys_b = keys_path(dir_b)
+      assert File.lstat!(keys_b).type == :symlink
+      assert File.exists?(other_target)
     end
   end
 

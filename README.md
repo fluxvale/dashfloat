@@ -136,9 +136,10 @@ key would be lost. A v1 file whose profiles carry no `providers` tree but
 mix in v3-only fields — a hand-merged `defaultProfile`, or `mcp` — is
 refused before anything is written; remove those fields and re-run (the
 chain then migrates the file to v3 and re-derives `defaultProfile`;
-re-add anything you removed). A file whose profiles already carry
-`providers` keeps the set-`configVersion: 3` remedy, inline keys included
-— it converges there. The v2→v3 reshape follows the same invariant (dead
+re-add anything you removed, and move a root-level `apiKey` into
+`keys.json5` first — the split has no name for it). A file whose profiles
+already carry `providers` keeps the set-`configVersion: 3` remedy, inline
+keys included — it converges there. The v2→v3 reshape follows the same invariant (dead
 keys only drop behind a fresh `keys.json5.bak`; duplicate profile names
 with keys, keyless endpoints, and v3-shaped files missing
 `configVersion: 3` all refuse with remedies in the message). Details:

@@ -468,7 +468,11 @@ the remedy for state N was computed against state N-1.
   and re-run — the chain then carries the file to v3 in one load and
   re-derives `defaultProfile` itself (the first profile); re-add anything
   removed (`mcp` is authored content the migration cannot compute) — or
-  reshape the file to v3 by hand.
+  reshape the file to v3 by hand. A **root-level `apiKey`** gets its own
+  remedy clause (review round 2, P1-1): the split has no profile name for
+  it, so removing the fields alone would strand that credential in a
+  backup — the message says to move it into `keys.json5` under its
+  profile's name first (pinned to convergence by test).
 - **Why providers-carrying interleaves are excluded (review round 1,
   P1-1):** when a profile already carries a `providers` tree, the split
   preserves it and the flat key nests under its single provider endpoint —
@@ -478,13 +482,17 @@ the remedy for state N was computed against state N-1.
   removal-remedy there would invite deleting the authored provider/mcp
   trees — exactly the half-migrated damage this amendment exists to
   prevent. They keep the chain's write-then-refuse with its fitting
-  remedy (the issue's second arm).
-- **The refusal is gated on the split's own precondition (review round 1,
-  P1-2):** it fires only where the split itself would run — regular
-  `settings.json5` and `keys.json5`. A symlinked or otherwise non-regular
-  layout keeps the stand-down: the split was already left by hand there,
-  and some such directories (a v3-shaped file completed by a symlinked
-  keys file) load fine without any migration.
+  remedy (the issue's second arm). The providers test is deliberately
+  coarse (`Map.has_key?`): a file whose `providers` is empty/null, or one
+  sitting on a nameless profile, keeps the marker path — listed with the
+  neighbors below.
+- **The refusal is gated on the split's own precondition (review round 1
+  P1-2; round 2 made it structural):** regularity is decided once, before
+  both the refusal and the split, so the arm can only fire where the split
+  itself would run. A symlinked or otherwise non-regular layout keeps the
+  stand-down: the split was already left by hand there, and some such
+  directories (a v3-shaped file completed by a symlinked keys file) load
+  fine without any migration.
 - **Why the prediction is sound:** `de_secret/1` only strips `apiKey` and
   stamps `configVersion`/`profiles`; every tripwire key survives the split
   verbatim, so the pre-split map trips if and only if the post-split map
@@ -497,15 +505,18 @@ the remedy for state N was computed against state N-1.
   the not-v3-shaped class. It would keep the write-then-refuse state and
   leave the user editing a v2 file the chain just wrote instead of the one
   they hand-damaged.
-- **Pre-existing neighbors, unchanged and consciously out of scope (all
-  no-loss; review round 1, P2/P3):** `reject_endpoint_keyed`'s
-  write-then-refuse (its "set `configVersion: 3`" arm can dead-end on a
-  v2-shaped settings, though its "fix `keys.json5` by hand" arm
-  converges); the reshape tripwire's marker advice for a hand-made
-  no-inline-credentials v2/v1-shaped file with a stray `defaultProfile`
-  (nothing is written, the advice can misfit); a multi-provider
-  providers-carrying interleave, where the flat key strands under a
-  warning that names the hand fix (nest it under the baseUrl).
+- **Pre-existing neighbors, unchanged and consciously out of scope (no
+  credential value is lost in any of them; reviews round 1 P2/P3, round 2
+  P3):** `reject_endpoint_keyed`'s write-then-refuse (its "set
+  `configVersion: 3`" arm can dead-end on a v2-shaped settings, though its
+  "fix `keys.json5` by hand" arm converges); the reshape tripwire's marker
+  advice for a hand-made no-inline-credentials v2/v1-shaped file with a
+  stray `defaultProfile` (nothing is written, the advice can misfit); a
+  multi-provider providers-carrying interleave, where the flat key strands
+  under a warning that names the hand fix (nest it under the baseUrl);
+  an empty/null `providers` key or one on a nameless profile (the coarse
+  providers test counts them as v3-shaped — they keep the marker path and
+  can end load-failing).
 
 ### Carried over unchanged (ADR 0008 / #31)
 
