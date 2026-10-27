@@ -563,10 +563,12 @@ defmodule DashFloat.Config.Migration do
   end
 
   # Both facts and the no-write guarantee (issue #39, ADR 0009 amendment):
-  # the v3-only fields are named as a class, never their values. The remedy
-  # names the root-level apiKey's move when one is present — the split has
-  # no profile name for it, so removing the fields alone would strand that
-  # credential in a backup (review round 2, P1-1).
+  # the v3-only fields are named as a class, never their values. A root-level
+  # apiKey (which has no profile name of its own) names the profile it moves
+  # under — the FIRST named profile, the same rule the reshape uses to
+  # re-derive defaultProfile, so the named home is the one that loads; with
+  # no named profile there is nothing to move under and only the by-hand
+  # route is honest (review rounds 2 and 3).
   defp interleave_message(main, map) do
     header =
       "#{main}: the file carries both inline apiKey fields and v3-only fields " <>
@@ -577,12 +579,18 @@ defmodule DashFloat.Config.Migration do
       "The chain then migrates the file to v3 and re-derives defaultProfile " <>
         "— re-add anything you removed — or reshape it to v3 by hand"
 
-    if usable?(map["apiKey"]) do
-      header <>
-        "Move the root-level apiKey into #{@keys_file} under its profile's " <>
-        "name, then remove it and the v3-only fields and re-run. " <> tail
-    else
-      header <> "Remove the v3-only fields and re-run. " <> tail
+    case first_profile_name(profiles_list(map)) do
+      nil ->
+        header <> "reshape it to v3 by hand"
+
+      name ->
+        if usable?(map["apiKey"]) do
+          header <>
+            "Move the root-level apiKey into #{@keys_file} under \"#{name}\", " <>
+            "then remove it and the v3-only fields and re-run. " <> tail
+        else
+          header <> "Remove the v3-only fields and re-run. " <> tail
+        end
     end
   end
 

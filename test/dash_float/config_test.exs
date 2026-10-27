@@ -2329,6 +2329,58 @@ defmodule DashFloat.ConfigTest do
                read_keys(dir)
     end
 
+    test "a root-level apiKey with several profiles names the profile the reshape will load" do
+      # Review round 3, P2-1: "its profile's name" is ambiguous when
+      # defaultProfile names a non-first profile — the converging home is
+      # the FIRST profile, the one the reshape re-derives as defaultProfile.
+      # The message names it explicitly.
+      dir = tmp_dir()
+
+      file =
+        "{ configVersion: 1, apiKey: 'PLACEHOLDER-root-key', defaultProfile: 'personal', profiles: [{ name: 'work', baseUrl: 'https://one.example/v1', models: [{ model: 'm1' }] }, { name: 'personal', baseUrl: 'https://two.example/v1', models: [{ model: 'm2' }] }], }"
+
+      write!(dir, file)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ ~s(under "work")
+      assert message =~ "root-level apiKey"
+
+      # Following it verbatim converges on that profile.
+      write_keys!(dir, "{work: 'PLACEHOLDER-root-key'}")
+
+      edited =
+        file
+        |> String.replace("apiKey: 'PLACEHOLDER-root-key', ", "")
+        |> String.replace(", defaultProfile: 'personal'", "")
+
+      settings = settings_path(dir)
+      File.write!(settings, edited)
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert config.profile == "work"
+      assert config.api_key == "PLACEHOLDER-root-key"
+    end
+
+    test "a root-level apiKey with no named profile gets only the by-hand route" do
+      # Review round 3, P2-1: profiles: [] has nothing to move the key
+      # under and no first profile to re-derive defaultProfile from — the
+      # move instruction and the migration promise would both be false.
+      dir = tmp_dir()
+
+      file =
+        "{ configVersion: 1, apiKey: 'PLACEHOLDER-root-key', defaultProfile: 'ghost', profiles: [], }"
+
+      write!(dir, file)
+      before = dir_snapshot(dir)
+
+      assert {:error, message} = Config.load(dir, %{}, [])
+      assert message =~ "nothing was written"
+      assert message =~ "reshape it to v3 by hand"
+      refute message =~ ~s(under ")
+      refute message =~ "re-derives defaultProfile"
+      assert dir_snapshot(dir) == before
+    end
+
     test "non-regular files keep the stand-down: no interleave refusal on symlinked layouts" do
       # Review round 1 P1-2 + round 2 P2-1: the refusal shares the split's
       # regular-file precondition. Case A is arm-INeligible (providers tree)

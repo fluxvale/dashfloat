@@ -471,8 +471,13 @@ the remedy for state N was computed against state N-1.
   reshape the file to v3 by hand. A **root-level `apiKey`** gets its own
   remedy clause (review round 2, P1-1): the split has no profile name for
   it, so removing the fields alone would strand that credential in a
-  backup — the message says to move it into `keys.json5` under its
-  profile's name first (pinned to convergence by test).
+  backup — the message says to move it into `keys.json5` under the FIRST
+  named profile (the same `first_profile_name` rule the reshape uses to
+  re-derive `defaultProfile`, so the named home is exactly the profile
+  that will load), then remove it with the v3-only fields. A file with no
+  named profile gets the by-hand arm only — there is nothing to move the
+  key under and no `defaultProfile` to re-derive. Convergence is pinned by
+  tests for the single- and multi-profile shapes.
 - **Why providers-carrying interleaves are excluded (review round 1,
   P1-1):** when a profile already carries a `providers` tree, the split
   preserves it and the flat key nests under its single provider endpoint —
