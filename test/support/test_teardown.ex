@@ -3,13 +3,22 @@ defmodule DashFloat.TestTeardown do
   Teardown helpers for processes a test hands to `on_exit`.
 
   `if Process.alive?(pid), do: GenServer.stop(pid)` is a check-then-act race:
-  a server that dies between the two calls (an SSE server finishing its
-  script, an agent whose stream already degraded) makes `GenServer.stop`
-  exit the on_exit handler — the test then fails in teardown, after passing,
+  a server that dies between the two calls makes `GenServer.stop` exit the
+  on_exit handler, failing the test in teardown after its assertions passed
   with `:noproc`. Observed as a suite flake (chat_stream's malformed-usage
-  cell). `stop/1` treats an already-dead process as success, which is the
-  intent: teardown guarantees "not running", not "we were the one who
-  stopped it".
+  cell, and on plain main).
+
+  Race shapes measured on OTP 29 over ~32k aggressive iterations: a death
+  concurrent with `stop/1` surfaces as `:noproc` (the common case) or, when
+  the server began terminating first, as the process's own exit reason —
+  `:shutdown` or `{:shutdown, term}`. `stop/1` therefore treats "already
+  gone" and the shutdown family as success: both mean "not running, and not
+  because it crashed". A genuine crash reason still propagates, so a
+  server that died from a bug keeps failing the suite instead of being
+  silently swept up.
+
+  No hang risk is added: `GenServer.stop/1` here is the same call the old
+  shape made, and ExUnit runs on_exit callbacks under the test timeout.
   """
 
   @doc "Stops `pid` if it is still running; an already-dead process is fine."
@@ -17,7 +26,9 @@ defmodule DashFloat.TestTeardown do
   def stop(pid) when is_pid(pid) do
     GenServer.stop(pid)
   catch
-    :exit, {:noproc, _reason} -> :ok
-    :exit, {:normal, _reason} -> :ok
+    # GenServer.stop/1 exits with {reason, {GenServer, :stop, [pid, ...]}}.
+    :exit, {:noproc, _call} -> :ok
+    :exit, {:shutdown, _call} -> :ok
+    :exit, {{:shutdown, _term}, _call} -> :ok
   end
 end
