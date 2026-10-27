@@ -2,6 +2,7 @@ defmodule DashFloat.Tools.Exec.GroupTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
+  alias DashFloat.Tools.Exec
   alias DashFloat.Tools.Exec.Group
 
   # The deterministic window proof of issue #59: the wrapper reported its pgid,
@@ -38,6 +39,33 @@ defmodule DashFloat.Tools.Exec.GroupTest do
     refute File.exists?(tracker.path)
   end
 
+  # The belt: a :cancel landing inside the spawn window reaps before the
+  # wrapper's report lands — sentinel unwritten, port alive, so the live
+  # port's os_pid (== the pgid) carries the kill.
+  test "reap falls back to the live port's os_pid when the report has not landed" do
+    {:ok, tracker} = Group.arm()
+    duration = 300_000 + System.unique_integer([:positive])
+    marker = "sleep #{duration}"
+
+    port = Port.open({:spawn, "/bin/sh -c '#{marker}'"}, [:exit_status, {:cd, System.tmp_dir!()}])
+    assert Group.reap(tracker, port) == :ok
+
+    assert_eventually_gone(marker)
+    refute File.exists?(tracker.path)
+  end
+
+  # A tracker file that vanished (only possible if something else deleted it)
+  # must not crash reap; with the port dead it is the same proven no-op.
+  test "reap with a deleted tracker file and a dead port is a no-op" do
+    {:ok, tracker} = Group.arm()
+    File.rm!(tracker.path)
+
+    port = Port.open({:spawn, "/bin/sh -c 'true'"}, [:exit_status, {:cd, System.tmp_dir!()}])
+    assert_receive {^port, {:exit_status, 0}}, 5_000
+
+    assert Group.reap(tracker, port) == :ok
+  end
+
   test "arm fails cleanly when no tmp dir is writable" do
     # 0o200 (write-only, no search bit): System.tmp_dir/0 itself skips dirs
     # whose access is not :read_write/:write, so a 0o500 dir never reaches
@@ -54,6 +82,32 @@ defmodule DashFloat.Tools.Exec.GroupTest do
       assert is_binary(reason)
     after
       if old, do: System.put_env("TMPDIR", old), else: System.delete_env("TMPDIR")
+      File.chmod!(dir, 0o700)
+      File.rm_rf(dir)
+    end
+  end
+
+  # The honest refusal through the public API: without a tracker the group
+  # kill would again depend on the port's lifetime (issue #59), so an
+  # unusable tmp dir refuses the spawn instead of running untracked.
+  test "Exec.run refuses the spawn when the tracker cannot be armed" do
+    dir = Path.join(System.tmp_dir!(), "df-group-refuse-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    File.chmod!(dir, 0o200)
+
+    old = System.get_env("TMPDIR")
+    System.put_env("TMPDIR", dir)
+
+    try do
+      result = Exec.run("echo hi", dir, 5_000, 4_096)
+
+      assert result[:ok] == false
+      assert result[:exit] == nil
+      assert result[:error] =~ "spawn failed: cannot arm the process-group tracker"
+    after
+      if old, do: System.put_env("TMPDIR", old), else: System.delete_env("TMPDIR")
+      File.chmod!(dir, 0o700)
+      File.rm_rf(dir)
     end
   end
 
