@@ -282,7 +282,13 @@ machine is otherwise untouched.
 - **Refusal messages carry remedies** (the migration tradition, extended to
   the wizard's writers): an unquotable value names the character class (a
   backslash, or both quote kinds) and the `$ENV_VAR` alternative — never the
-  value; the non-empty-file refusal keeps its `mv` remedy verbatim.
+  value; the non-empty-file refusal keeps its `mv` remedy verbatim. A
+  refusal whose culprit is PRE-EXISTING text in the file (backslash strings
+  decode — only escaped quotes fail decode — so keys.json5 can hold a name
+  or value the dialect cannot re-emit) blames the file with the by-hand
+  remedy, never the fields the user just entered; while a refusal shows at
+  `:key` the hint is that generic retry wording, since the draft is not
+  always the culprit (issue #42).
 
 ### Presets (first-class, verified)
 

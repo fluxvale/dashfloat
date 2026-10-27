@@ -628,6 +628,59 @@ defmodule DashFloat.TUITest do
     assert {:ok, %{"personal" => %{^zai => "k-19"}}} = JSON5.read_map(keys_file)
   end
 
+  test "a pre-existing unquotable keys value refuses naming it; the hint matches the remedy (issue #42)" do
+    # A hand-edited keys.json5 holding a backslashed value on ANOTHER
+    # endpoint: the wizard's own entry is clean, so the refusal must blame
+    # the stored value — and the bounce hint must not claim that fixing the
+    # typed key fixes the write (the error/remedy contradiction).
+    dir = wizard_dir("dashfloat-tui-p42")
+    keys_file = Path.join(dir, "keys.json5")
+    File.write!(keys_file, "{personal: {'https://other/v1': 'a\\b'}}")
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no provider configured"},
+        setup: Onboarding.new(),
+        config_dir: dir
+      )
+
+    # To the key step (zai preset, suggested label), then a CLEAN key.
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("clean-key"), do: press(pid, ch)
+    press(pid, "enter")
+
+    refused =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :key and s.setup.error != nil
+      end)
+
+    assert refused.setup.error =~ "already holds a name or value"
+    assert refused.setup.error =~ "by hand"
+    assert refused.setup.error =~ "backslash or both quote kinds"
+    # The typed key is masked and unblamed; the hint is the generic retry
+    # wording, not "fix or empty the value" (the draft is not the culprit).
+    screen = screen_text(refused)
+    assert screen =~ "retries the write"
+    refute screen =~ "fix or empty"
+    refute screen =~ "clean-key"
+    assert File.read!(keys_file) == "{personal: {'https://other/v1': 'a\\b'}}"
+
+    # Apply the remedy by hand, retry the same key — the write lands.
+    File.write!(keys_file, "{personal: {'https://other/v1': 'ab'}}")
+    press(pid, "enter")
+
+    eventually(pid, fn s -> s.setup != nil and s.setup.step == :model_choice end)
+
+    zai = "https://api.z.ai/api/coding/paas/v4"
+
+    assert {:ok, %{"personal" => merged}} = JSON5.read_map(keys_file)
+    assert merged["https://other/v1"] == "ab"
+    assert merged[zai] == "clean-key"
+  end
+
   defp wizard_dir(prefix) do
     dir = Path.join(System.tmp_dir!(), "#{prefix}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)

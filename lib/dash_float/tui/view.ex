@@ -10,6 +10,7 @@ defmodule DashFloat.TUI.View do
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Theme
+  alias DashFloat.TUI.Wrap
   alias ExRatatui.Layout.Rect
   alias ExRatatui.Text.Line
   alias ExRatatui.Text.Span
@@ -173,7 +174,10 @@ defmodule DashFloat.TUI.View do
 
   # A refused write pending: the hint matches file state — nothing was
   # written, and the screen says so instead of repeating the promise
-  # (issue #39's hint contract).
+  # (issue #39's hint contract). The remedy lives in the error text — for a
+  # pre-existing-value or unparseable-file refusal it is NOT the typed key,
+  # so the hint stays generic instead of promising that fixing the draft
+  # fixes the write (issue #42).
 
   defp wizard_lines(%{step: :key, draft: draft, error: error}, width) do
     [
@@ -183,7 +187,7 @@ defmodule DashFloat.TUI.View do
       input_line(draft, true)
     ] ++
       error_lines(error, width) ++
-      [blank(), hint("fix or empty the value · ⏎ retries the write")]
+      [blank(), hint("apply the remedy · ⏎ retries the write")]
   end
 
   defp wizard_lines(%{step: :model_choice} = wizard, _width) do
@@ -362,24 +366,20 @@ defmodule DashFloat.TUI.View do
   # A refused write's message (issue #39): error and remedy, word-wrapped to
   # the setup box's inner width (frame minus margin and borders) so the
   # remedy is never clipped — floored at 1 for degenerate frames, never above
-  # the true inner width.
+  # the true inner width. The log view's wrapper supplies the semantics
+  # (ADR 0009's never-clipped remedy): word wrap with a glyph-boundary
+  # fallback for tokens wider than the row — paths in remedies — so nothing
+  # is silently clipped mid-token (issue #42).
   defp error_lines(message, width) do
     message
-    |> wrap_words(max(width - 4, 1))
+    |> wrap_remedy(max(width - 4, 1))
     |> Enum.map(&{&1, :error})
   end
 
-  defp wrap_words(text, width) do
-    text
-    |> String.split(" ")
-    |> Enum.reduce([""], fn word, [line | rest] ->
-      candidate = if line == "", do: word, else: line <> " " <> word
-
-      if String.length(candidate) <= width,
-        do: [candidate | rest],
-        else: [word, line | rest]
-    end)
-    |> Enum.reverse()
+  defp wrap_remedy(text, width) do
+    [Line.new([Span.new(text)])]
+    |> Wrap.wrap(width)
+    |> Enum.map(fn %Line{spans: spans} -> Enum.map_join(spans, & &1.content) end)
   end
 
   defp setup_line({:option, true, text}),
