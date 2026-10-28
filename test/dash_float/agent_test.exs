@@ -1165,6 +1165,38 @@ defmodule DashFloat.AgentTest do
     assert List.last(next.messages)["content"] == "picked up where we left off"
   end
 
+  @tag :tmp_dir
+  test "a resumed agent writes the hand-off's created_at verbatim on its first save", ctx do
+    server = start_server([final_episode("resumed fine")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {resumed, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        resume: %{
+          id: "20261001-000000-aabbcc",
+          created_at: "2026-10-01T00:00:00Z",
+          pin: %{profile: nil, model: "test-model", base_url: SSEServer.base_url(server)},
+          messages: [%{"role" => "user", "content" => "earlier"}]
+        }
+      )
+
+    send(resumed, {:prompt, self(), "continue"})
+    assert_receive {:phase, :idle}, 2_000
+
+    # The same file, under the adopted id, with the adopted created_at.
+    assert session_id(sessions) == "20261001-000000-aabbcc"
+
+    {:ok, session} = Session.load(sessions, "20261001-000000-aabbcc")
+    assert session.created_at == "2026-10-01T00:00:00Z"
+
+    assert session.messages == [
+             %{"role" => "user", "content" => "earlier"},
+             %{"role" => "user", "content" => "continue"},
+             %{"role" => "assistant", "content" => "resumed fine"}
+           ]
+  end
+
   # The tool_call row is announced before the runner task is spawned; poll
   # until the supervisor holds it.
   defp await_task(sup, tries \\ 50) do

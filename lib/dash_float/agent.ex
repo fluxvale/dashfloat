@@ -70,8 +70,9 @@ defmodule DashFloat.Agent do
       (default: `DashFloat.TaskSupervisor`)
     * `:session_dir` — the sessions directory; transcript persistence stays
       off unless it is set (default: nil — deliberate, ADR 0014 §5)
-    * `:resume` — `%{id: _, pin: _, messages: _}` from `DashFloat.Session.load/2`;
-      the agent adopts the id, pin, and history (default: nil)
+    * `:resume` — `%{id: _, pin: _, messages: _}` from `DashFloat.Session.load/2`,
+      optionally with the session's `:created_at`; the agent adopts them
+      (default: nil)
     * `:name` — GenServer name (default: `__MODULE__`)
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -90,13 +91,16 @@ defmodule DashFloat.Agent do
 
   @impl GenServer
   def init({provider, cwd, supervisor, exec_timeout, session_dir, resume}) do
-    # A resumed agent adopts the loaded session's id, pin, and history in one
-    # move: the first prompt streams the restored transcript and the next
-    # save rewrites the same file under the same id (ADR 0014 §6).
-    {session_id, session_pin, messages} =
+    # A resumed agent adopts the loaded session's id, pin, created_at, and
+    # history in one move: the first prompt streams the restored transcript
+    # and the next save rewrites the same file under the same id (ADR 0014 §6).
+    {session_id, session_pin, session_created_at, messages} =
       case resume do
-        %{id: id, pin: pin, messages: messages} -> {id, pin, messages}
-        nil -> {nil, nil, []}
+        %{id: id, pin: pin, messages: messages} ->
+          {id, pin, Map.get(resume, :created_at), messages}
+
+        nil ->
+          {nil, nil, nil, []}
       end
 
     {:ok,
@@ -108,6 +112,7 @@ defmodule DashFloat.Agent do
        session_dir: session_dir,
        session_id: session_id,
        session_pin: session_pin,
+       session_created_at: session_created_at,
        messages: messages
      }}
   end
@@ -624,8 +629,7 @@ defmodule DashFloat.Agent do
     })
   end
 
-  # A resumed agent adopts the loaded id and pin; the :resume hand-off
-  # carries no created_at, so the first post-resume save stamps it.
+  # A hand-built resume map may carry no created_at; the first save stamps it.
   defp persist(%__MODULE__{session_created_at: nil} = state) do
     persist(%{state | session_created_at: now_iso8601_utc()})
   end
