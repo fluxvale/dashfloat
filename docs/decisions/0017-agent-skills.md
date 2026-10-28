@@ -1,4 +1,4 @@
-# 0014 — Agent Skills: discovery, progressive disclosure, and the skill tool
+# 0017 — Agent Skills: discovery, progressive disclosure, and the skill tool
 
 - **Status:** Proposed — design gate for [issue #76](https://github.com/fluxvale/dashfloat/issues/76);
   implementation waits for the owner's go.
@@ -258,9 +258,10 @@ rejected); `mix ci` green.
 
 ### S3 — system-prompt catalog section (blocked on #71)
 
-`catalog_section/1` per §7 in `DashFloat.Skills`, wired into whatever seam ADR-0071's
-implementation lands (re-check its name there before wiring; the contract in §7 is
-fixed). Catalog is rendered once at session start and rides every request's system
+`catalog_section/1` per §7 in `DashFloat.Skills`, wired into whatever seam the
+sysprompt lane's implementation of
+[issue #71](https://github.com/fluxvale/dashfloat/issues/71) lands (re-check the
+landed seam's name before wiring; the contract in §7 is fixed). Catalog is rendered once at session start and rides every request's system
 content; omitted entirely when no skills.
 
 **Done when:** a driven e2e test asserts, via the request seam, that the outbound
