@@ -302,6 +302,7 @@ defmodule DashFloat.AgentTest do
     messages = request_messages(second_body)
 
     assert [
+             %{"role" => "system", "content" => _system_prompt},
              %{"role" => "user"},
              %{"role" => "assistant", "tool_calls" => [assistant_call]},
              %{"role" => "tool", "tool_call_id" => "call_1", "content" => result_json}
@@ -316,6 +317,19 @@ defmodule DashFloat.AgentTest do
     # The final episode streams into the log and returns the UI to idle.
     assert_receive {:token, "wrote it"}, 2_000
     assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "the first request message is the session system prompt", ctx do
+    server = start_server([final_episode()])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+
+    assert [%{"role" => "system", "content" => content} | _rest] = request_messages(body)
+    assert content =~ "You are DashFloat"
+    assert content =~ "Working directory:"
   end
 
   @tag :tmp_dir
