@@ -2,7 +2,7 @@ defmodule DashFloat.SystemPrompt do
   @moduledoc """
   Assembles the session system prompt once, at session start: identity, tool
   discipline, edit rules, environment facts, and project instructions, with
-  named seams for per-mode prompt sections and skills injection. See ADR 0014.
+  named seams for per-mode prompt sections and skills injection. See ADR 0018.
   """
 
   @identity """
