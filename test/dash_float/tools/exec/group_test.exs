@@ -10,12 +10,16 @@ defmodule DashFloat.Tools.Exec.GroupTest do
   # The deterministic window proof of issue #59: the wrapper reported its pgid,
   # then the command exited 0 leaving a background child — the port is dead
   # (Port.info would answer nil) and the child survives until reap kills the
-  # reported group.
+  # reported group. The marker is pre-cleaned like the reap cell in
+  # exec_test: pgrep -f is a substring match over the whole machine, and a
+  # stale survivor from ANY earlier broken run (ours or a review experiment)
+  # with a colliding duration must not read as ours.
   test "wrap reports the pgid before exec and reap kills a surviving group with the port already dead" do
     {:ok, tracker} = Group.arm()
 
     duration = 300_000 + System.unique_integer([:positive])
     marker = "sleep #{duration}"
+    clear_marker(marker)
 
     port =
       Port.open(
@@ -84,6 +88,7 @@ defmodule DashFloat.Tools.Exec.GroupTest do
     {:ok, tracker} = Group.arm()
     duration = 300_000 + System.unique_integer([:positive])
     marker = "sleep #{duration}"
+    clear_marker(marker)
 
     port = Port.open({:spawn, "/bin/sh -c '#{marker}'"}, [:exit_status, {:cd, System.tmp_dir!()}])
     assert Group.reap(tracker, port) == :ok
@@ -101,6 +106,7 @@ defmodule DashFloat.Tools.Exec.GroupTest do
 
     duration = 300_000 + System.unique_integer([:positive])
     marker = "sleep #{duration}"
+    clear_marker(marker)
 
     port = Port.open({:spawn, "/bin/sh -c '#{marker}'"}, [:exit_status, {:cd, System.tmp_dir!()}])
     assert Group.reap(tracker, port) == :ok
@@ -125,6 +131,7 @@ defmodule DashFloat.Tools.Exec.GroupTest do
 
     duration = 300_000 + System.unique_integer([:positive])
     marker = "sleep #{duration}"
+    clear_marker(marker)
 
     old = System.get_env("TMPDIR")
     System.put_env("TMPDIR", rel)
@@ -187,6 +194,14 @@ defmodule DashFloat.Tools.Exec.GroupTest do
       File.rm_rf(dir)
       File.rm_rf(cwd)
     end
+  end
+
+  # A stale survivor from an earlier, broken run must not read as ours
+  # (pgrep -f is a substring match over every process on the machine) — the
+  # same pre-clean the reap cell in exec_test.exs carries.
+  defp clear_marker(marker) do
+    System.cmd("pkill", ["-9", "-f", marker])
+    :timer.sleep(50)
   end
 
   # pgrep exits 1 on no matches — which is exactly what we want to see.

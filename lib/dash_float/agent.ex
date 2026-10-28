@@ -461,10 +461,10 @@ defmodule DashFloat.Agent do
           try do
             send(agent, {:tool_done, call.id, Runner.run(call.name, args, cwd, opts)})
           rescue
+            # coveralls-ignore-start
             # Belt over Runner.run's own rescue (runner.ex): reachable only
             # if that inner rescue is stripped — the crash-report shape was
             # probe-verified in review, not suite-reachable.
-            # coveralls-ignore-start
             reason ->
               send(
                 agent,
