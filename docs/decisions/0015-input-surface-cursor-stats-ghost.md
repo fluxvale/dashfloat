@@ -85,7 +85,8 @@ interprets intents (the submit-action pattern — side effects never in
 
 - **Trigger** — one arm-intent flag set by the finalize of an assistant
   turn (`{:phase, :idle}` with a finalized `:assistant` entry), only when
-  the draft is empty, suggestions are enabled, and a provider is resolved.
+  the draft is empty, suggestions are enabled (`suggest != false`), and a
+  provider is resolved.
   The intent is one-shot: draft churn (type, backspace to empty) never
   re-arms — at most **one side-request per completed turn**.
 - **Debounce** — the choke point converts arm-intent into a single
@@ -94,17 +95,22 @@ interprets intents (the submit-action pattern — side effects never in
   one bounded one-shot per completed turn, whose dispatch draws no frame.
 - **Request** — `POST {base_url}/chat/completions` through `Req` (the
   `Catalog` precedent: fail-open, no retries, 5 s timeout, secrets never in
-  errors), **on the active provider's model**: no new config surface, the
-  key is already resolved, and the model that just answered knows the
-  conversation — quality a designated cheap model would not have. A
-  designated cheap model stays a future option (multi-provider profiles can
-  address one); the cost control now is the budget below. The body carries
-  `max_tokens: 48` and a fixed instruction plus the last assistant reply
-  tail capped at 2 KiB.
-- **Budget / opt-out** — profile `settings.suggest` (boolean, default
-  `true`, tolerate-and-warn like every settings key) with env override
-  `DASHFLOAT_SUGGEST`; `false` suppresses all side-requests. Bounds by
-  construction: ≤ 1 request per completed turn, ≤ 48 completion tokens,
+  errors), **on the cheap model by default, user-configurable, or off
+  entirely** (`settings.suggest`, tri-state, env override
+  `DASHFLOAT_SUGGEST`):
+  - `false` — opt-out, the hard stop: no side-request is ever built;
+  - a model id string — the suggester targets exactly that id;
+  - absent — the **provider's default cheap model**
+    (`Config.Presets.suggest_model/1`, keyed by base URL): the officially
+    supported presets ship one each (`glm-5.3-flash` on Z.AI,
+    `glm-4.7-flash` on Synthetic) — the owner's budget call (cheap tier =
+    low spend by default). A custom OpenAI-compatible provider has no
+    official cheap tier and falls back to the active model.
+  The body carries `max_tokens: 48` and a fixed instruction plus the last
+  assistant reply tail capped at 2 KiB.
+- **Budget / opt-out** — the tri-state above IS the budget control:
+  `false` spends nothing; the default spends only cheap-tier tokens. Bounds
+  by construction: ≤ 1 request per completed turn, ≤ 48 completion tokens,
   ≤ ~3 KiB prompt.
 - **Cancel** — every draft-changing transition (typed or pasted input,
   history navigation, submit) and every new phase sets a reap-intent; the
@@ -147,14 +153,20 @@ interprets intents (the submit-action pattern — side effects never in
 - **Suggestions through the agent seam** — grows ADR 0007's contract for a
   UI concern; the wizard/catalog precedent (supervised task + plain send)
   does it without touching the agent.
+- **Active-model-first (this ADR's first cut)** — best conversation quality
+  but spends flagship tokens by default; the owner's refinement (Oct 29)
+  inverts the default to the cheap tier with the active model only as the
+  custom-provider fallback, and puts the quality choice in the user's hands
+  via the model-id override.
 - **Recompute-on-empty-display** — a stored suggestion cleared once on
   input has no staleness bug class; recomputing invites request churn.
 
 ## Consequences
 
 - `regions/3` returns a five-key map (breaking for direct callers — all
-  in-tree); `Theme` grows `:cursor`; `Config` grows `suggest` (field,
-  settings key, env var); `TUI.Suggest` is new.
+  in-tree); `Theme` grows `:cursor`; `Config` grows `suggest` (tri-state
+  field, settings key, env var) and `Config.Presets` grows the
+  provider→cheap-model table; `TUI.Suggest` is new.
 - One new timer class exists (the suggest debounce): one-shot, turn-paced,
   render-suppressed at dispatch. The render-rate metric of record
   (`Runtime.snapshot/1`) still shows zero idle renders: the only idle
