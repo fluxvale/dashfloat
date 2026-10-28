@@ -141,6 +141,9 @@ defmodule DashFloat.Tools do
 
   @order ["read_file", "write_file", "edit_file", "execute_command", "list_directory"]
 
+  # Display excerpt for tool-result rows; the model gets the bounded full result.
+  @display_lines 30
+
   @doc "The OpenAI `tools` array advertising the catalogue."
   @spec schema() :: [map()]
   def schema do
@@ -264,4 +267,51 @@ defmodule DashFloat.Tools do
 
   defp type_name(:string), do: "string"
   defp type_name(:integer), do: "integer"
+
+  ## Result display derivation
+  #
+  # One derivation of tool-result display data, shared by the agent's
+  # display messages and the session's replay paths. See ADR 0014.
+
+  @doc "The result recorded for tool calls that never ran — what the agent's cancel path writes and what session load synthesizes for calls a crash left dangling."
+  @spec cancelled_result() :: %{ok: false, cancelled: true}
+  def cancelled_result, do: %{ok: false, cancelled: true}
+
+  @doc """
+  The tool-result row's status word: `"rejected"`, `"cancelled"`, `"ok"`, or
+  `"error: …"` with the message capped at 160 characters.
+  """
+  @spec display_status(map()) :: String.t()
+  def display_status(%{rejected: true}), do: "rejected"
+  def display_status(%{cancelled: true}), do: "cancelled"
+  def display_status(%{ok: true}), do: "ok"
+
+  def display_status(%{error: error}) when is_binary(error),
+    do: "error: " <> String.slice(error, 0, 160)
+
+  def display_status(_other), do: "error"
+
+  @doc """
+  The tool-result row's display body: the result's `:output` (falling back to
+  `:content`) capped at #{@display_lines} lines, or nil when the result
+  carries neither.
+  """
+  @spec display_excerpt(map()) :: String.t() | nil
+  def display_excerpt(result) do
+    case result[:output] || result[:content] do
+      nil ->
+        nil
+
+      body ->
+        lines = String.split(body, "\n")
+
+        if length(lines) <= @display_lines do
+          body
+        else
+          lines
+          |> Enum.take(@display_lines)
+          |> Enum.join("\n")
+        end
+    end
+  end
 end
