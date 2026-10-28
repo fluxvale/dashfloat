@@ -542,6 +542,19 @@ configs; newer-version best-effort load; the status-bar label
 `nickname (profile)` (ADR 0006 contract — provider ambiguity in that label is
 noted below as a future slice); the README's no-provider TUI mode.
 
+### Wizard model step: the fetch is the primary path (issue #64 amendment)
+
+The owner hit the manual path because the fetched list was an aside behind a
+three-option menu. Entering a working key now goes straight to the fetch: the
+key write and the `/models` fetch travel as one ordered action pair the runner
+executes in order, and a refused key write drops the fetch behind it (the
+issue #39 bounce gate — a key that is not on disk must not fetch). The
+`:model_choice` step is deleted. Manual entry is the explicit fallback — esc
+while fetching, the picker's last option, or the keyless path — and a failed
+fetch (including an empty list) lands on manual entry with a short reason on
+screen. Reasons are classes or statuses from the fetch layer ("HTTP 500",
+"timed out"), never response-body content.
+
 ## Alternatives considered
 
 - **Amending ADR 0008 in place** (the #31 style) — v3 rewrites the schema,

@@ -210,13 +210,6 @@ defmodule DashFloat.TUI.View do
       [blank(), hint("apply the remedy · ⏎ retries the write")]
   end
 
-  defp wizard_lines(%{step: :model_choice} = wizard, _width) do
-    [
-      {"Pick a model.", :assistant},
-      blank() | option_lines(wizard, &model_choice_option/2)
-    ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
-  end
-
   defp wizard_lines(%{step: :fetching}, _width) do
     [
       {"Fetching models…", :assistant},
@@ -232,13 +225,26 @@ defmodule DashFloat.TUI.View do
     ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
   end
 
-  defp wizard_lines(%{step: :model_manual, draft: draft}, _width) do
+  # Manual entry is the explicit fallback (issue #64): a failed fetch lands
+  # here with its reason as a dim note between the title and the input —
+  # informational, never styled as an error.
+
+  defp wizard_lines(%{step: :model_manual, draft: draft, note: nil}, _width) do
     [
       {"The model id.", :assistant},
       blank(),
       input_line(draft, false),
-      hint("⏎ accept · the nickname defaults to the id")
+      hint("⏎ accept · empty skips · nickname defaults to the id")
     ]
+  end
+
+  defp wizard_lines(%{step: :model_manual, draft: draft, note: note}, width) do
+    [
+      {"The model id.", :assistant}
+      | note_lines(note, width)
+    ] ++
+      [blank(), input_line(draft, false)] ++
+      [hint("⏎ accept · empty skips · nickname defaults to the id")]
   end
 
   defp wizard_lines(%{step: :loop, error: nil} = wizard, _width) do
@@ -345,15 +351,6 @@ defmodule DashFloat.TUI.View do
   defp provider_option(_wizard, :skip),
     do: "Skip — configure later"
 
-  defp model_choice_option(_wizard, :fetch),
-    do: "Fetch the model list from the provider"
-
-  defp model_choice_option(_wizard, :manual),
-    do: "Type a model id"
-
-  defp model_choice_option(_wizard, :skip),
-    do: "Skip — hand-edit later"
-
   defp model_pick_option(_wizard, {:model, id}), do: id
 
   defp model_pick_option(_wizard, :manual), do: "Type a model id"
@@ -394,6 +391,15 @@ defmodule DashFloat.TUI.View do
     message
     |> wrap_remedy(max(width - 4, 1))
     |> Enum.map(&{&1, :error})
+  end
+
+  # The manual-fallback note (issue #64): the fetch's failure reason, word-
+  # wrapped like a refusal but in the dim style — informational, not an
+  # error.
+  defp note_lines(message, width) do
+    message
+    |> wrap_remedy(max(width - 4, 1))
+    |> Enum.map(&{&1, :dim})
   end
 
   defp wrap_remedy(text, width) do

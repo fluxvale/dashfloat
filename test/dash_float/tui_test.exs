@@ -188,6 +188,7 @@ defmodule DashFloat.TUITest do
     press(pid, "enter")
     for ch <- String.codepoints("PLACEHOLDER-wizard-key"), do: press(pid, ch)
 
+    # The key Enter writes AND fires the /models fetch (issue #64).
     press(pid, "enter")
 
     # The key landed IMMEDIATELY (ADR 0009: per-step writes, 0600).
@@ -195,9 +196,7 @@ defmodule DashFloat.TUITest do
     eventually(pid, fn _s -> File.exists?(keys_path) end)
     assert match?({:ok, %File.Stat{}}, File.stat(keys_path))
 
-    # Model: fetch from the provider (the loopback above), pick the second id.
-    press(pid, "enter")
-
+    # The fetch lands on the picker; pick the second id.
     picker =
       eventually(pid, fn s ->
         s.setup != nil and s.setup.step == :model_pick
@@ -233,6 +232,77 @@ defmodule DashFloat.TUITest do
 
     assert {:ok, %File.Stat{mode: settings_mode}} = File.stat(settings_path)
     assert Bitwise.band(settings_mode, 0o777) == 0o600
+  end
+
+  test "a failed /models fetch falls back to manual entry with the reason on screen (issue #64)" do
+    # The loopback answers HTTP 500: the key Enter's automatic fetch must
+    # land the wizard on manual entry — the fetch layer's short reason on
+    # screen, never an error screen — and manual entry completes the wizard.
+    script = [{:send, "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n"}, :close]
+
+    {:ok, server} = SSEServer.start_link(script)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    base = SSEServer.base_url(server)
+
+    dir = wizard_dir("dashfloat-tui-fetch-fail")
+    resolver = fn _nil_or_name -> DashFloat.Config.load(dir, %{}, []) end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile configured"},
+        setup: Onboarding.new(),
+        config_dir: dir,
+        resolve: resolver
+      )
+
+    # welcome → profile name (accept the prefill) → provider: custom → its
+    # URL (the loopback) → label (accept) → key — this Enter writes AND
+    # fetches (issue #64).
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+
+    for ch <- String.codepoints(base), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("PLACEHOLDER-fallback-key"), do: press(pid, ch)
+    press(pid, "enter")
+
+    manual =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :model_manual and s.setup.note != nil
+      end)
+
+    assert manual.setup.note == "Couldn't fetch the model list — HTTP 500."
+
+    screen = screen_text(manual)
+    assert screen =~ "Couldn't fetch the model list"
+    assert screen =~ "HTTP 500"
+
+    # Manual entry completes the provider; done writes the config.
+    for ch <- String.codepoints("manual-model"), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+
+    # The done screen hands off (ADR 0009: any Enter finishes).
+    press(pid, "enter")
+
+    assert_receive {:set_provider, {:ok, config}}, 2_000
+    assert config.base_url == base
+    assert config.api_key == "PLACEHOLDER-fallback-key"
+    assert config.model == "manual-model"
+
+    state = eventually(pid, fn s -> s.setup == nil end)
+    assert state.provider == {:ok, config}
+
+    dir
+    |> Path.join("settings.json5")
+    |> File.exists?()
+    |> assert()
   end
 
   test "a failing settings write at wizard-done surfaces the refusal and gates :done (issue #39)" do
@@ -526,12 +596,11 @@ defmodule DashFloat.TUITest do
     press(pid, "enter")
     press(pid, "enter")
     for ch <- String.codepoints("$" <> var), do: press(pid, ch)
+
+    # The key Enter writes the reference AND fires the fetch; the reference
+    # is resolved from the environment for the fetch only.
     press(pid, "enter")
 
-    # Model: fetch from the provider (the loopback above).
-    press(pid, "enter")
-
-    # The reference is stored verbatim; the fetch resolves the env var.
     picker =
       eventually(pid, fn s ->
         s.setup != nil and s.setup.step == :model_pick
@@ -620,13 +689,19 @@ defmodule DashFloat.TUITest do
     refute screen =~ "immediately"
     refute screen =~ "k-1"
 
-    # Fix in place: backspace out the backslash, re-accept — the retry writes.
+    # Fix in place: backspace out the backslash, re-accept — the retry writes
+    # and its fetch fires (issue #64). No loopback stands in here, so the
+    # wizard leaves :fetching for whichever arm the live endpoint yields.
     press(pid, "backspace")
     press(pid, "backspace")
     press(pid, "9")
     press(pid, "enter")
 
-    eventually(pid, fn s -> s.setup != nil and s.setup.step == :model_choice end)
+    eventually(
+      pid,
+      fn s -> s.setup != nil and s.setup.step != :fetching end,
+      600
+    )
 
     zai = "https://api.z.ai/api/coding/paas/v4"
     assert {:ok, %{"personal" => %{^zai => "k-19"}}} = JSON5.read_map(keys_file)
@@ -672,11 +747,17 @@ defmodule DashFloat.TUITest do
     refute screen =~ "clean-key"
     assert File.read!(keys_file) == "{personal: {'https://other/v1': 'a\\b'}}"
 
-    # Apply the remedy by hand, retry the same key — the write lands.
+    # Apply the remedy by hand, retry the same key — the write lands and its
+    # fetch fires (issue #64). The wizard leaves :fetching for whichever arm
+    # the live endpoint yields; the assertions below are about the file.
     File.write!(keys_file, "{personal: {'https://other/v1': 'ab'}}")
     press(pid, "enter")
 
-    eventually(pid, fn s -> s.setup != nil and s.setup.step == :model_choice end)
+    eventually(
+      pid,
+      fn s -> s.setup != nil and s.setup.step != :fetching end,
+      600
+    )
 
     zai = "https://api.z.ai/api/coding/paas/v4"
 

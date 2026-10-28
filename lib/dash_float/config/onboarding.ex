@@ -7,19 +7,24 @@ defmodule DashFloat.Config.Onboarding do
   (becomes `defaultProfile`) → add a provider (Z.AI / Synthetic presets or a
   custom OpenAI-compatible URL) → the key (paste, a `$ENV_VAR` reference, or
   skip — a paste is written straight into `keys.json5` at 0600, immediately,
-  merging into any existing file) → pick a model (live `/models` fetch with
-  manual fallback; nickname defaults to the model id) → optional loops (more
+  merging into any existing file) → pick a model (the key is written, then
+  the `/models` fetch runs automatically; the fetched list is the picker —
+  Enter selects; manual entry is the explicit fallback — esc while fetching
+  or the picker's last option; failures fall back to manual with the reason
+  on screen; nickname defaults to the model id) → optional loops (more
   providers, MCP servers; every step skippable) → done: `settings.json5`
   written and the app starts under the new profile.
 
   This module is pure: it never touches the filesystem or the network.
   `handle_key/2` returns `{state, action}` where the RUNNER executes the
-  side-effecting actions — `{:write_key, {profile, base_url, value}}`
-  (atomic 0600 merge into keys.json5), `{:fetch_models, {base_url, raw_key}}`
-  (the standing catalog fetch), `{:write_settings, map}` (atomic 0600 write),
-  `:finish` (hand the freshly-written config to the app), `:quit` (abort —
-  nothing further is written). `models_arrived/2` feeds the fetch result
-  back. Key inputs render masked; this module never echoes a value.
+  side-effecting actions — `action` is a single action or an ordered LIST of
+  actions, executed in order. Actions: `{:write_key, {profile, base_url,
+  value}}` (atomic 0600 merge into keys.json5), `{:fetch_models, {base_url,
+  raw_key}}` (the standing catalog fetch), `{:write_settings, map}` (atomic
+  0600 write), `:finish` (hand the freshly-written config to the app),
+  `:quit` (abort — nothing further is written). `models_arrived/2` feeds the
+  fetch result back. Key inputs render masked; this module never echoes a
+  value.
   """
 
   alias DashFloat.Config.Catalog
@@ -34,7 +39,6 @@ defmodule DashFloat.Config.Onboarding do
           | :custom_url
           | :label
           | :key
-          | :model_choice
           | :fetching
           | :model_pick
           | :model_manual
@@ -60,7 +64,8 @@ defmodule DashFloat.Config.Onboarding do
           fetched: [String.t()],
           profile_name: String.t(),
           providers: [provider_draft()],
-          mcp: [%{name: String.t(), command: String.t(), args: [String.t()], token: nil | :ref}]
+          mcp: [%{name: String.t(), command: String.t(), args: [String.t()], token: nil | :ref}],
+          note: String.t() | nil
         }
 
   # Inspected standalone (logs, IEx): the draft and the pending provider can
@@ -80,7 +85,11 @@ defmodule DashFloat.Config.Onboarding do
             mcp_args: [],
             # A refused write's message, shown at the step that issued the
             # write (issue #39): paths and remedies only, never values.
-            error: nil
+            error: nil,
+            # The manual-fallback screen's gentle note (issue #64): the
+            # fetch failure's short class phrase — informational, never an
+            # error, and never response-body content.
+            note: nil
 
   @doc "The initial wizard state."
   @spec new() :: t()
@@ -192,7 +201,9 @@ defmodule DashFloat.Config.Onboarding do
   defp step_key(state, :label, code), do: {edit(state, code), nil}
 
   ## The key: paste, `$ENV_VAR`, or skip. A non-empty value is written to
-  ## keys.json5 IMMEDIATELY (ADR 0009: abort-resume for free).
+  ## keys.json5 IMMEDIATELY (ADR 0009: abort-resume for free) — and its
+  ## fetch fires with it (issue #64): the fetched list is the primary model
+  ## path, so the write and the fetch travel as one ordered action pair.
 
   defp step_key(state, :key, "enter") do
     pending = state.pending
@@ -200,37 +211,21 @@ defmodule DashFloat.Config.Onboarding do
 
     case nonblank(state.draft) do
       nil ->
-        {model_choice(%{state | pending: pending}), nil}
-
-      value ->
-        action = {:write_key, {profile, pending.base_url, value}}
-        {model_choice(%{state | pending: %{pending | key: value}}), action}
-    end
-  end
-
-  defp step_key(state, :key, "esc"), do: {model_choice(state), nil}
-  defp step_key(state, :key, code), do: {edit(state, code), nil}
-
-  ## Model: live fetch (only with a key), manual entry, or skip
-
-  defp step_key(state, :model_choice, "up"), do: {move(state, -1), nil}
-  defp step_key(state, :model_choice, "down"), do: {move(state, 1), nil}
-
-  defp step_key(state, :model_choice, "enter") do
-    case option(state) do
-      :fetch ->
-        {%{step(state, :fetching, "") | fetched: []},
-         {:fetch_models, {state.pending.base_url, state.pending.key}}}
-
-      :manual ->
         {step(state, :model_manual, ""), nil}
 
-      :skip ->
-        {finish_provider(state), nil}
+      value ->
+        actions = [
+          {:write_key, {profile, pending.base_url, value}},
+          {:fetch_models, {pending.base_url, value}}
+        ]
+
+        {%{step(state, :fetching, "") | pending: %{pending | key: value}, fetched: []}, actions}
     end
   end
 
-  defp step_key(state, :model_choice, _code), do: {state, nil}
+  # No key, no fetch possible: esc skips the key like a blank Enter.
+  defp step_key(state, :key, "esc"), do: {step(state, :model_manual, ""), nil}
+  defp step_key(state, :key, code), do: {edit(state, code), nil}
 
   # Waiting on the fetch: Esc falls back to manual entry (the fetch result,
   # when it lands, is ignored — a fresh choice would only re-enter here).
@@ -330,23 +325,31 @@ defmodule DashFloat.Config.Onboarding do
 
   @doc """
   Feeds the `/models` fetch result back into the picker: ids populate the
-  picker, an empty list or any failure falls back to manual entry (ADR 0009:
-  the fetch is failure-soft, never an error screen).
+  picker, an empty list or any failure falls back to manual entry with a
+  gentle `note` on screen (ADR 0009: the fetch is failure-soft, never an
+  error screen). The reason is a class phrase from the fetch layer — an HTTP
+  status or an error class — never response-body content. Stale results (the
+  wizard moved on) are inert.
   """
-  @spec models_arrived(t(), {:ok, [Catalog.entry()]} | :error) :: t()
+  @spec models_arrived(t(), {:ok, [Catalog.entry()]} | {:error, String.t()} | :error | term()) ::
+          t()
   def models_arrived(%__MODULE__{step: :fetching} = state, {:ok, entries})
       when is_list(entries) do
     ids = Enum.map(entries, & &1.model)
 
     if ids == [] do
-      step(state, :model_manual, "")
+      manual_with_note(state, "The provider returned no models.")
     else
       %{step(state, :model_pick, "") | fetched: ids, choice: 0}
     end
   end
 
+  def models_arrived(%__MODULE__{step: :fetching} = state, {:error, reason})
+      when is_binary(reason),
+      do: manual_with_note(state, "Couldn't fetch the model list — " <> reason <> ".")
+
   def models_arrived(%__MODULE__{step: :fetching} = state, _failure),
-    do: step(state, :model_manual, "")
+    do: manual_with_note(state, "Couldn't fetch the model list.")
 
   def models_arrived(%__MODULE__{} = state, _result), do: state
 
@@ -354,14 +357,14 @@ defmodule DashFloat.Config.Onboarding do
   A wizard write refused (issue #39): the TUI runner feeds the config layer's
   error message back, and the wizard bounces to the step that issued the
   write — the key step re-takes its draft (masked on screen) so the value can
-  be edited and retried, and `pending.key` resets: the fetch offer must not
-  appear for a key that is not on disk. The settings write lands back at
-  `:loop`, so `:done` and its handoff are reachable only by a write that
-  actually succeeded. Stale feedback (the wizard moved on) is inert.
+  be edited and retried, and `pending.key` resets: the fetch must not fire
+  for a key that is not on disk. The settings write lands back at `:loop`,
+  so `:done` and its handoff are reachable only by a write that actually
+  succeeded. Stale feedback (the wizard moved on) is inert.
   """
   @spec write_failed(t(), String.t()) :: t()
   def write_failed(
-        %__MODULE__{step: :model_choice, pending: %{key: value} = pending} = state,
+        %__MODULE__{step: :fetching, pending: %{key: value} = pending} = state,
         message
       )
       when is_binary(value),
@@ -425,10 +428,6 @@ defmodule DashFloat.Config.Onboarding do
   def options(%__MODULE__{step: :provider} = _state),
     do: Enum.map(Presets.all(), &{:preset, &1}) ++ [:custom, :skip]
 
-  def options(%__MODULE__{step: :model_choice, pending: pending}) do
-    if pending && pending.key, do: [:fetch, :manual, :skip], else: [:manual, :skip]
-  end
-
   def options(%__MODULE__{step: :model_pick, fetched: fetched}),
     do: Enum.map(fetched, &{:model, &1}) ++ [:manual]
 
@@ -465,10 +464,11 @@ defmodule DashFloat.Config.Onboarding do
     if count == 0, do: state, else: %{state | choice: rem(state.choice + delta + count, count)}
   end
 
-  # Every transition clears the step's error: the message belongs to the step
-  # that produced it (issue #39).
+  # Every transition clears the step's messages: the error belongs to the
+  # step that produced it (issue #39), the note to the manual-fallback land
+  # it came from (issue #64).
   defp step(state, step, draft),
-    do: %{state | step: step, draft: draft, choice: 0, error: nil}
+    do: %{state | step: step, draft: draft, choice: 0, error: nil, note: nil}
 
   defp edit(state, code) do
     cond do
@@ -499,9 +499,7 @@ defmodule DashFloat.Config.Onboarding do
     end
   end
 
-  defp model_choice(state) do
-    step(state, :model_choice, "")
-  end
+  defp manual_with_note(state, note), do: %{step(state, :model_manual, "") | note: note}
 
   defp add_model(state, id), do: %{state | pending: add_model_to(state.pending, id)}
 
