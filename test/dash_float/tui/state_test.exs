@@ -3,6 +3,7 @@ defmodule DashFloat.TUI.StateTest do
   use ExUnit.Case, async: true
 
   alias DashFloat.Config.Onboarding
+  alias DashFloat.Tools
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.State
   alias DashFloat.TUI.View
@@ -1960,4 +1961,204 @@ defmodule DashFloat.TUI.StateTest do
 
   # Runs one animation tick (rendering dirty in-flight lines), keeping state.
   defp tick_once(state), do: elem(State.tick(state, 1_100), 0)
+
+  # ADR 0014 §6: the resumed log is derived by replaying the loaded transcript
+  # through the exact render path live entries use — the differential tests
+  # below build a live state through the contract messages and assert the
+  # replayed entries match it.
+  describe "transcript replay" do
+    # The persisted transcript shape, exactly as Session.load returns it:
+    # string-keyed messages, opaque `function.arguments` JSON.
+    defp transcript do
+      [
+        %{"role" => "user", "content" => "fix the bug"},
+        %{
+          "role" => "assistant",
+          "content" => "Reading the file.",
+          "tool_calls" => [
+            %{
+              "id" => "t1",
+              "type" => "function",
+              "function" => %{"name" => "read_file", "arguments" => ~s({"path": "lib/foo.ex"})}
+            },
+            %{
+              "id" => "t2",
+              "type" => "function",
+              "function" => %{
+                "name" => "execute_command",
+                "arguments" => ~s({"command": "mix test"})
+              }
+            }
+          ]
+        },
+        %{
+          "role" => "tool",
+          "tool_call_id" => "t1",
+          "content" => Jason.encode!(%{ok: true, output: "line one\nline two"})
+        },
+        %{
+          "role" => "tool",
+          "tool_call_id" => "t2",
+          "content" => Jason.encode!(Tools.cancelled_result())
+        },
+        %{"role" => "assistant", "content" => "Done."}
+      ]
+    end
+
+    # The same turn as `transcript/0`, built live through the contract
+    # messages: the submit echo, tokens, phase transitions, tool rows.
+    defp live_state(size \\ {80, 24}) do
+      ok = %{ok: true, output: "line one\nline two"}
+      cancelled = Tools.cancelled_result()
+      base = new_state(test_mode: size)
+
+      base
+      |> idle_submit("fix the bug")
+      |> Map.put(:phase, :streaming)
+      |> State.stream_message({:token, "Reading the file."}, 1_000)
+      |> State.stream_message({:phase, :executing_tool}, 1_100)
+      |> State.stream_message(
+        {:tool_call, %{id: "t1", name: "read_file", args: %{"path" => "lib/foo.ex"}}}
+      )
+      |> State.stream_message(
+        {:tool_call, %{id: "t2", name: "execute_command", args: %{"command" => "mix test"}}}
+      )
+      |> State.stream_message({:tool_result, display_msg("t1", "read_file", ok)})
+      |> State.stream_message({:tool_result, display_msg("t2", "execute_command", cancelled)})
+      |> Map.put(:phase, :streaming)
+      |> State.stream_message({:token, "Done."}, 2_000)
+      |> State.stream_message({:phase, :idle}, 2_100)
+    end
+
+    # The tool_result message the agent derives from a result: status and
+    # excerpt come from the same Tools helpers the replay uses (ADR 0014 §6).
+    defp display_msg(id, name, result) do
+      %{
+        id: id,
+        name: name,
+        ok: result[:ok] == true,
+        status: Tools.display_status(result),
+        output: Tools.display_excerpt(result)
+      }
+    end
+
+    test "replayed entries match the live contract kind-for-kind, text-for-text" do
+      replayed = new_state(transcript: transcript())
+
+      assert pairs(replayed) == pairs(live_state())
+      # Same render pipeline at the same width: logical and wrapped lines too.
+      assert replayed.entries == live_state().entries
+    end
+
+    test "entries wrap at the construction width, exactly like live entries" do
+      wide = new_state(transcript: transcript())
+      narrow = new_state(test_mode: {20, 24}, transcript: transcript())
+
+      assert State.log_line_count(narrow) > State.log_line_count(wide)
+      assert narrow.entries == live_state({20, 24}).entries
+    end
+
+    test "assistant rows ride the markdown path" do
+      md = "# Title\n\nSome **bold** text."
+
+      state = new_state(transcript: [%{"role" => "assistant", "content" => md}])
+
+      live =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, md}, 1_000)
+        |> State.stream_message({:phase, :idle}, 1_100)
+
+      assert state.entries == live.entries
+    end
+
+    test "arguments that do not decode render the (invalid arguments) arm" do
+      transcript = [
+        %{
+          "role" => "assistant",
+          "content" => nil,
+          "tool_calls" => [
+            %{
+              "id" => "t1",
+              "type" => "function",
+              "function" => %{"name" => "read_file", "arguments" => "{not json"}
+            }
+          ]
+        }
+      ]
+
+      assert pairs(new_state(transcript: transcript)) == [
+               {:tool, "⚙ read_file (invalid arguments)"}
+             ]
+    end
+
+    test "a tool result that does not decode renders an error row, never a crash" do
+      transcript = [
+        %{
+          "role" => "assistant",
+          "content" => nil,
+          "tool_calls" => [
+            %{
+              "id" => "t1",
+              "type" => "function",
+              "function" => %{"name" => "read_file", "arguments" => "{}"}
+            }
+          ]
+        },
+        %{"role" => "tool", "tool_call_id" => "t1", "content" => "garbage"}
+      ]
+
+      assert pairs(new_state(transcript: transcript)) == [
+               {:tool, "⚙ read_file"},
+               {:tool, "⚙ read_file → error"}
+             ]
+    end
+
+    test "a nil-content assistant with calls produces no empty assistant entry" do
+      transcript = [
+        %{
+          "role" => "assistant",
+          "content" => nil,
+          "tool_calls" => [
+            %{
+              "id" => "t1",
+              "type" => "function",
+              "function" => %{"name" => "list_directory", "arguments" => "{}"}
+            }
+          ]
+        },
+        %{"role" => "tool", "tool_call_id" => "t1", "content" => Jason.encode!(%{ok: true})}
+      ]
+
+      assert pairs(new_state(transcript: transcript)) == [
+               {:tool, "⚙ list_directory"},
+               {:tool, "⚙ list_directory → ok"}
+             ]
+    end
+
+    test "the resumed log opens pinned at the bottom" do
+      state = new_state(transcript: transcript())
+
+      assert state.follow?
+      assert state.scroll == 0
+
+      height = 5
+      bottom = State.effective_scroll(state, height)
+      assert bottom == State.log_line_count(state) - height
+      assert bottom > 0
+    end
+
+    test "the resume note lands last as a system entry" do
+      note = "[resuming session pinned to a/m under b/m — continuing]"
+      state = new_state(transcript: transcript(), resume_note: note)
+
+      assert pairs(state) == pairs(new_state(transcript: transcript())) ++ [{:system, note}]
+    end
+
+    test "an empty transcript behaves exactly as today" do
+      assert new_state().entries == []
+      assert new_state(transcript: []).entries == []
+      assert new_state(transcript: [], resume_note: nil).entries == []
+    end
+  end
 end
