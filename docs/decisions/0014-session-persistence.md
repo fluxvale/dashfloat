@@ -134,7 +134,11 @@ receives display-contract messages.
   migration's discipline per file.
 - **Shape validation:** the top level must be a map with `version` (above),
   a string `id` equal to the requested id (a renamed or shuffled file
-  refuses), and a `messages` list. Each message must match its role's
+  refuses), a string `created_at` (our writer always records it; a file
+  without it is malformed), and a `messages` list. The `pin` degrades
+  tolerantly — missing, non-map, or non-string fields compare as nil
+  (§6's nil-compare rule) rather than refusing. Each message must match
+  its role's
   provider shape — `user`: binary `content`; `assistant`: binary-or-nil
   `content` and an optional list `tool_calls` (each with binary `id`,
   `type`, `function.name`, `function.arguments`); `tool`: binary
