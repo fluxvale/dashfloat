@@ -113,7 +113,7 @@ jobs:
           apt-get install -y -qq --no-install-recommends binutils >/dev/null
           test -f _build/prod/rel/dashfloat/lib/sctp/libsctp.so.1
           ./_build/prod/rel/dashfloat/bin/dashfloat --version | tee /tmp/v.txt
-          ! grep -qi sctp /tmp/v.txt
+          if grep -qi sctp /tmp/v.txt; then exit 1; fi
           ./_build/prod/rel/dashfloat/bin/dashfloat eval \
             'IO.puts(Base.encode16(:crypto.hash(:sha256, "dashfloat")))'
           # Fail the build if the artifact ever needs a newer glibc than the
@@ -263,7 +263,7 @@ jobs:
         run: |
           set -eu
           cat > notes.md <<EOF
-          DashFloat $VERSION — the first packaged release.
+          DashFloat $VERSION.
 
           ## Install
 
@@ -315,6 +315,17 @@ jobs:
           not necessarily in a minimal container — the installer checks first
           and names the package. Debian 11 and Alpine/musl are not supported,
           nor is Linux arm64.
+
+          ## Bundled SCTP library (Linux)
+
+          The Linux tarball bundles an unmodified \`libsctp.so.1\` from Debian
+          12's \`libsctp1\` package
+          ([lksctp-tools](https://github.com/sctp/lksctp-tools/)),
+          redistributed under the LGPL-2.1-or-later. Corresponding source is
+          available upstream and as the Debian \`lksctp-tools\` source package;
+          the full licence text and a redistribution notice travel inside the
+          tarball (\`lib/sctp/\`), where the library sits as a separate,
+          replaceable file.
 
           ## Verify
 
@@ -408,11 +419,11 @@ jobs:
           cat out.txt err.txt
           test "$status" -eq 1
           test ! -e erl_crash.dump
-          ! grep -qi 'Kernel pid terminated' out.txt err.txt
+          if grep -qi 'Kernel pid terminated' out.txt err.txt; then exit 1; fi
           grep -q 'needs an interactive terminal' err.txt
 
           # SCTP: the warning must never appear on any boot.
-          ! grep -qi sctp out.txt err.txt
+          if grep -qi sctp out.txt err.txt; then exit 1; fi
 
           # A real pty reaches the wizard. `script` gives a 0x0 pty by default
           # (nothing renders), so the size is set explicitly; the app stays up,
@@ -425,8 +436,8 @@ jobs:
             /dev/null >pty.txt 2>&1 || true
           cat pty.txt
           grep -q 'Welcome' pty.txt
-          ! grep -qi 'needs an interactive terminal' pty.txt
-          ! grep -qi sctp pty.txt
+          if grep -qi 'needs an interactive terminal' pty.txt; then exit 1; fi
+          if grep -qi sctp pty.txt; then exit 1; fi
 
   # The DoD proof, on the published assets, through the real installer — the
   # same command a user runs. debian:stable is the ticket's clean container;
@@ -496,6 +507,40 @@ jobs:
           "$root/bin/dashfloat" eval 'IO.puts(Base.encode16(:crypto.hash(:sha256, "dashfloat")))'
           echo "--- ex_ratatui NIF in the installed tree ---"
           ls -l "$root"/lib/ex_ratatui-*/priv/native/
+
+      # The clean-refusal path from the rehearsal smoke (issue #56), proved
+      # on every tag against the published artifact (issue #61): fresh
+      # config, no terminal -> friendly message, exit 1, no crash dump.
+      # ADR 0011.
+      - name: Smoke the headless first run (fresh config, clean refusal)
+        if: matrix.expect_failure != true
+        run: |
+          set -eu
+          export PATH="$HOME/.local/bin:$PATH"
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+
+          # Headless: the friendly refusal, exit 1, no crash dump, no spew.
+          mkdir -p "$work/headless/config" "$work/headless/cwd"
+          cd "$work/headless/cwd"
+          set +e
+          XDG_CONFIG_HOME="$work/headless/config" \
+            dashfloat </dev/null >out.txt 2>err.txt
+          status=$?
+          set -e
+          echo "exit=$status"
+          cat out.txt err.txt
+          test "$status" -eq 1
+          test ! -e erl_crash.dump
+          # `! grep` is errexit-exempt, so the negative asserts are if/exit:
+          # a hit must fail this step, not fall through to the last command.
+          if grep -qi 'Kernel pid terminated' out.txt err.txt; then exit 1; fi
+          grep -q 'needs an interactive terminal' err.txt
+
+          # SCTP: the warning must never appear on any boot — and this
+          # container ships no system libsctp, so only the bundled copy can
+          # satisfy the dlopen.
+          if grep -qi sctp out.txt err.txt; then exit 1; fi
 
   # macOS has no container: the runner is the clean machine, and both
   # architectures install from the real installer.

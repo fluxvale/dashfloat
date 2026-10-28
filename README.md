@@ -32,7 +32,7 @@ No Erlang or Elixir toolchain needed: the release bundles ERTS. The installer
 verifies the tarball's sha256 before extracting, installs into
 `~/.local/share/dashfloat/versions/<version>` behind a `current` symlink, puts
 a shim in `~/.local/bin`, and prunes the previous version on upgrade. Pin a
-version with `DASHFLOAT_VERSION=0.1.0`. On macOS, Homebrew is the native path
+version with `DASHFLOAT_VERSION=0.1.1`. On macOS, Homebrew is the native path
 (`brew install fluxvale/tap/dashfloat`), and unsigned builds need a one-time
 right-click-open — see the [release notes](https://github.com/fluxvale/dashfloat/releases).
 Linux builds need glibc 2.34+ (Debian 12+, Ubuntu 22.04+), OpenSSL 3,
