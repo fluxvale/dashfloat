@@ -86,4 +86,53 @@ defmodule DashFloat.CLITest do
   test "an equals-looking value for one flag does not confuse the other" do
     assert CLI.parse(["--profile", "--model=Sol"]) == [profile: "--model=Sol"]
   end
+
+  # ADR 0014 §6: --resume rides the same parse discipline as the selection
+  # flags; the boot consumes the id after config classification.
+  test "--resume parses in space and equals forms" do
+    assert CLI.parse(["--resume", "20261027-143052-a1b2c3"]) == [
+             resume: "20261027-143052-a1b2c3"
+           ]
+
+    assert CLI.parse(["--resume=20261027-143052-a1b2c3"]) == [
+             resume: "20261027-143052-a1b2c3"
+           ]
+  end
+
+  test "--resume sits alongside the selection flags in argv order" do
+    assert CLI.parse(["--profile", "work", "--resume=abc123", "--model", "Sol"]) == [
+             profile: "work",
+             resume: "abc123",
+             model: "Sol"
+           ]
+  end
+
+  test "--resume without a value warns and is ignored" do
+    logs =
+      capture_log(fn ->
+        assert CLI.parse(["--resume"]) == []
+      end)
+
+    assert logs =~ "--resume given without a value"
+  end
+
+  test "a repeated --resume keeps the first value and warns" do
+    logs =
+      capture_log(fn ->
+        assert CLI.parse(["--resume", "first-id", "--resume", "second-id"]) == [
+                 resume: "first-id"
+               ]
+      end)
+
+    assert logs =~ "given more than once"
+  end
+
+  test "a version flag around --resume is skipped by the parser, not taken as its value" do
+    logs =
+      capture_log(fn ->
+        assert CLI.parse(["--resume", "abc123", "--version"]) == [resume: "abc123"]
+      end)
+
+    assert logs == ""
+  end
 end

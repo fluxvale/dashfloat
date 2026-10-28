@@ -5,6 +5,13 @@ defmodule DashFloat.Application do
 
   alias DashFloat.Config
   alias DashFloat.Config.Onboarding
+  alias DashFloat.Session
+
+  require Logger
+
+  # The resume hand-off (ADR 0014 §6): one load, two consumers — the agent
+  # adopts the transcript, the TUI replays it.
+  @typep resume :: %{session: Session.t(), note: String.t() | nil} | nil
 
   # `args` exists purely as the test seam for the non-test arms: MIX_ENV=test
   # boots with `test?: true` (below), so the real classification wiring —
@@ -32,6 +39,11 @@ defmodule DashFloat.Application do
 
     env = Keyword.get(args, :env, System.get_env())
     config_dir = Keyword.get(args, :config_dir, Config.config_dir())
+
+    # Mirrors :config_dir — a test must never touch the real XDG data dir
+    # (ADR 0014 §5).
+    sessions_dir = Keyword.get(args, :sessions_dir, Session.dir())
+
     interactive? = Keyword.get(args, :interactive?)
 
     # Selection flags (--profile/--model) are parsed once here (ADR 0008);
@@ -61,16 +73,24 @@ defmodule DashFloat.Application do
 
       {:error, :interactive_setup_required}
     else
-      children = [
-        # Streams and tool runners: temporary tasks under one supervisor
-        # (renamed from StreamSupervisor in ADR 0007 — it hosts both kinds).
-        {Task.Supervisor, name: DashFloat.TaskSupervisor}
-        | engine_children(test?, classification) ++
-            tui_child(test?, classification, config_dir, env, cli)
-      ]
+      case boot_resume(cli, classification, sessions_dir, test?) do
+        {:error, message} ->
+          # The user named a conversation; silently starting blank is the one
+          # outcome a resume must never produce (ADR 0014 §6). Same refusal
+          # shape as the interactive-setup refusal above: stderr, then the
+          # boundary halt, with the error tuple as the test seam's value.
+          IO.binwrite(:stderr, message <> "\n")
+          halt.(1)
 
-      opts = [strategy: :one_for_one, name: DashFloat.Supervisor]
-      Supervisor.start_link(children, opts)
+          {:error, :session_resume_failed}
+
+        {:ok, resume} ->
+          children =
+            boot_children(test?, classification, config_dir, env, cli, resume, sessions_dir)
+
+          opts = [strategy: :one_for_one, name: DashFloat.Supervisor]
+          Supervisor.start_link(children, opts)
+      end
     end
   end
 
@@ -132,18 +152,129 @@ defmodule DashFloat.Application do
     """
   end
 
+  # ADR 0014 §6: after classification, before children — the user asked for a
+  # specific conversation, so every load failure is a loud refusal and a
+  # successful load is handed to both children. Under a setup classification
+  # the session still hands off; the pin compare is skipped (nothing to
+  # compare yet) and setup proceeds as today. The refused file is untouched:
+  # a load never writes.
+  @doc false
+  # Public so the boot tests drive the real load-and-compare the boot runs
+  # (see boot_resolver).
+  @spec boot_resume(keyword(), Config.classification(), Path.t()) ::
+          {:ok, resume()} | {:error, String.t()}
+  def boot_resume(cli, classification, sessions_dir) do
+    case Keyword.get(cli, :resume) do
+      nil -> {:ok, nil}
+      id -> resume_session(Session.load(sessions_dir, id), classification)
+    end
+  end
+
+  defp resume_session({:ok, session}, classification) do
+    # Warnings the user must see ride both surfaces: the alt screen swallows
+    # Logger, so the note also mounts on the replayed log (ADR 0014 §6).
+    note = pin_note(session, classification)
+    if note, do: Logger.warning(note)
+
+    {:ok, %{session: session, note: note}}
+  end
+
+  defp resume_session({:error, message}, _classification), do: {:error, message}
+
+  defp boot_resume(_cli, _classification, _sessions_dir, true), do: {:ok, nil}
+
+  defp boot_resume(cli, classification, sessions_dir, false),
+    do: boot_resume(cli, classification, sessions_dir)
+
+  # ADR 0014 §6: warn, never refuse, never rewrite. A field compares only
+  # when both sides are non-nil (an env-only session pins nil profile fields
+  # and compares nothing); the note names both sides of every mismatched
+  # field, omitting the ones that matched or are nil-pinned.
+  @doc false
+  @spec pin_note(%{pin: Session.pin()} | Session.t(), Config.classification()) ::
+          String.t() | nil
+  def pin_note(%{pin: pin}, {:ok, config}) do
+    mismatched =
+      for {field, pinned, active} <- [
+            {:profile, Map.get(pin, :profile), config.profile},
+            {:model, Map.get(pin, :model), config.model}
+          ],
+          pinned != nil and active != nil and pinned != active do
+        {field, pinned, active}
+      end
+
+    case mismatched do
+      [] ->
+        nil
+
+      mismatched ->
+        pinned =
+          Enum.map_join(mismatched, ", ", fn {field, value, _active} -> "#{field} #{value}" end)
+
+        active =
+          Enum.map_join(mismatched, ", ", fn {field, _pinned, value} -> "#{field} #{value}" end)
+
+        "[resuming session pinned to #{pinned} under active #{active} — continuing; the session keeps its pin]"
+    end
+  end
+
+  def pin_note(_session, _classification), do: nil
+
+  # The full child list the boot starts. Public so the boot tests instantiate
+  # the exact mount opts the children start with (see boot_resolver).
+  @doc false
+  @spec boot_children(
+          boolean(),
+          Config.classification(),
+          Path.t(),
+          map(),
+          keyword(),
+          resume(),
+          Path.t()
+        ) ::
+          [:supervisor.child_spec() | {module(), keyword()}]
+  def boot_children(true, _classification, _config_dir, _env, _cli, _resume, _sessions_dir) do
+    # Streams and tool runners: temporary tasks under one supervisor
+    # (renamed from StreamSupervisor in ADR 0007 — it hosts both kinds).
+    [{Task.Supervisor, name: DashFloat.TaskSupervisor}]
+  end
+
+  def boot_children(false, classification, config_dir, env, cli, resume, sessions_dir) do
+    [
+      {Task.Supervisor, name: DashFloat.TaskSupervisor}
+      | engine_children(classification, resume, sessions_dir) ++
+          tui_child(classification, config_dir, env, cli, resume)
+    ]
+  end
+
   # The agent owns the conversation and the tool loop; it is started with the
   # boot-time classification outside test (tests start their own agents, ADR
   # 0007). Setup states boot it on the error arm — the setup completion
   # delivers the resolved provider via {:set_provider, _} (ADR 0009).
-  defp engine_children(true, _classification), do: []
+  # Persistence is always on outside test (ADR 0014 §5); a resume additionally
+  # carries the loaded id/pin/messages/created_at, so the next save rewrites
+  # the same file under the same id (ADR 0014 §6).
+  defp engine_children(classification, resume, sessions_dir) do
+    resume_opts =
+      case resume do
+        nil ->
+          []
 
-  defp engine_children(false, classification) do
+        %{session: session} ->
+          [
+            resume: %{
+              id: session.id,
+              pin: session.pin,
+              messages: session.messages,
+              created_at: session.created_at
+            }
+          ]
+      end
+
     [
       {DashFloat.Agent,
-       provider: agent_provider(classification),
-       name: DashFloat.Agent,
-       supervisor: DashFloat.TaskSupervisor}
+       [provider: agent_provider(classification), session_dir: sessions_dir] ++
+         resume_opts ++ [name: DashFloat.Agent, supervisor: DashFloat.TaskSupervisor]}
     ]
   end
 
@@ -161,17 +292,27 @@ defmodule DashFloat.Application do
   # Provider config is loaded once, here, so the UI process performs no file
   # I/O (ADR 0005); the agent name rides in as a mount opt (ADR 0007). Setup
   # states ride in as mount opts too (ADR 0009), with the resolver the setup
-  # phase calls to deliver the completed selection.
-  defp tui_child(true, _classification, _config_dir, _env, _cli), do: []
+  # phase calls to deliver the completed selection. A resumed boot mounts the
+  # loaded transcript and the pin warning, if any (ADR 0014 §6).
+  defp tui_child(classification, config_dir, env, cli, resume) do
+    resume_opts =
+      case resume do
+        nil ->
+          []
 
-  defp tui_child(false, classification, config_dir, env, cli) do
+        %{session: session, note: note} ->
+          [transcript: session.messages, resume_note: note]
+      end
+
     [
       {DashFloat.TUI,
-       provider: agent_provider(classification),
-       agent: DashFloat.Agent,
-       config_dir: config_dir,
-       setup: setup_state(classification),
-       resolve: boot_resolver(config_dir, env, cli)}
+       [
+         provider: agent_provider(classification),
+         agent: DashFloat.Agent,
+         config_dir: config_dir,
+         setup: setup_state(classification),
+         resolve: boot_resolver(config_dir, env, cli)
+       ] ++ resume_opts}
     ]
   end
 
