@@ -12,6 +12,7 @@ defmodule DashFloat.AgentTest do
 
   alias DashFloat.Agent
   alias DashFloat.Config
+  alias DashFloat.Session
   alias DashFloat.SSEServer
   alias DashFloat.TUI.State
 
@@ -88,6 +89,8 @@ defmodule DashFloat.AgentTest do
         cwd: cwd,
         exec_timeout: Keyword.get(opts, :exec_timeout, 500),
         supervisor: sup,
+        session_dir: Keyword.get(opts, :session_dir),
+        resume: Keyword.get(opts, :resume),
         name: nil
       )
 
@@ -97,6 +100,18 @@ defmodule DashFloat.AgentTest do
     end)
 
     {agent, sup}
+  end
+
+  # The id of the single session file in a test's sessions dir.
+  defp session_id(dir) do
+    [file] = File.ls!(dir)
+    Path.rootname(file)
+  end
+
+  defp read_session(dir) do
+    dir
+    |> Path.join(session_id(dir) <> ".json")
+    |> File.read!()
   end
 
   # Decodes the messages array of a forwarded request body.
@@ -811,6 +826,343 @@ defmodule DashFloat.AgentTest do
     refute_receive {:token, _text}, 100
     refute_receive {:entry, :system, _text}, 100
     assert Process.alive?(agent)
+  end
+
+  ## Session persistence (ADR 0014 §5)
+
+  @tag :tmp_dir
+  test "no session file appears before the first prompt", ctx do
+    server = start_server([final_episode("unused")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    # The directory is created on demand at the first save — a launch that
+    # never prompts leaves nothing.
+    refute File.exists?(sessions)
+
+    DashFloat.TestTeardown.stop(agent)
+  end
+
+  @tag :tmp_dir
+  test "a completed read_file turn persists the full transcript, untruncated", ctx do
+    # 40 lines: the log row shows a 30-line excerpt, the transcript must hold
+    # the whole result the model received.
+    body = Enum.map_join(1..40, "\n", &"line #{&1}")
+    write_sandbox(ctx, "long.txt", body <> "\n")
+
+    server =
+      start_server([
+        call_tool_episode("call_1", "read_file", %{"path" => "long.txt"}),
+        final_episode("read it all")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "read it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+    assert_receive {:tool_result, %{id: "call_1", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    id = session_id(sessions)
+    {:ok, session} = Session.load(sessions, id)
+
+    assert session.version == 1
+    assert session.id == id
+    assert is_binary(session.created_at)
+
+    assert session.pin == %{
+             profile: nil,
+             model: "test-model",
+             base_url: SSEServer.base_url(server)
+           }
+
+    args_json = Jason.encode!(%{"path" => "long.txt"})
+
+    result_json =
+      Jason.encode!(%{
+        ok: true,
+        path: "long.txt",
+        content: body,
+        lines: 40,
+        total_lines: 40,
+        total_bytes: byte_size(body) + 1,
+        truncated: false
+      })
+
+    assert session.messages == [
+             %{"role" => "user", "content" => "read it"},
+             %{
+               "role" => "assistant",
+               "content" => nil,
+               "tool_calls" => [
+                 %{
+                   "id" => "call_1",
+                   "type" => "function",
+                   "function" => %{"name" => "read_file", "arguments" => args_json}
+                 }
+               ]
+             },
+             %{"role" => "tool", "tool_call_id" => "call_1", "content" => result_json},
+             %{"role" => "assistant", "content" => "read it all"}
+           ]
+  end
+
+  @tag :tmp_dir
+  test "paused at the confirmation the file holds the dangling batch; approval completes it",
+       ctx do
+    args = %{"path" => "out/hello.txt", "content" => "hi there"}
+
+    server =
+      start_server([
+        call_tool_episode("call_1", "write_file", args),
+        final_episode("wrote it")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "create the file"})
+    assert_receive {:confirm, ref, %{id: "call_1"}}, 2_000
+
+    id = session_id(sessions)
+    bytes = read_session(sessions)
+
+    # The deliberately-dangling write: the batch is on disk with no tool
+    # message yet — exactly the shape load repairs after a kill.
+    assert %{
+             "version" => 1,
+             "id" => ^id,
+             "created_at" => created_at,
+             "pin" => %{"profile" => nil, "model" => "test-model"},
+             "messages" => [
+               %{"role" => "user", "content" => "create the file"},
+               %{
+                 "role" => "assistant",
+                 "content" => nil,
+                 "tool_calls" => [
+                   %{
+                     "id" => "call_1",
+                     "type" => "function",
+                     "function" => %{"name" => "write_file", "arguments" => args_json}
+                   }
+                 ]
+               }
+             ]
+           } = Jason.decode!(bytes)
+
+    assert is_binary(created_at)
+    assert args_json == Jason.encode!(args)
+    assert String.ends_with?(bytes, "\n")
+
+    send(agent, {:confirm_decision, ref, :approved})
+    assert_receive {:tool_result, %{id: "call_1", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    {:ok, session} = Session.load(sessions, id)
+
+    assert [%{"role" => "user"}, %{"role" => "assistant"}, tool, final] = session.messages
+
+    assert Jason.decode!(tool["content"]) == %{
+             "ok" => true,
+             "path" => "out/hello.txt",
+             "bytes" => 8,
+             "created" => true
+           }
+
+    assert final["content"] == "wrote it"
+  end
+
+  @tag :tmp_dir
+  test "a mid-batch cancel persists cancelled results for the whole batch", ctx do
+    frames =
+      tool_frames("call_run", "execute_command", [~s({"command":"sleep 10"})]) ++
+        tool_frames_1("call_read", "read_file", [~s({"path":"never.txt"})])
+
+    server = start_server([[{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close]])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir, session_dir: sessions, exec_timeout: 30_000)
+
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:confirm, ref, %{id: "call_run"}}, 2_000
+    send(agent, {:confirm_decision, ref, :approved})
+    assert_receive {:phase, :executing_tool}, 1_000
+
+    send(agent, {:cancel})
+
+    assert_receive {:tool_result, %{id: "call_run", status: "cancelled"}}, 3_000
+    assert_receive {:entry, :system, "[tool run cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+
+    assert [
+             %{"role" => "user"},
+             %{"role" => "assistant", "tool_calls" => calls},
+             tool_run,
+             tool_read
+           ] = session.messages
+
+    assert Enum.map(calls, & &1["id"]) == ["call_run", "call_read"]
+    assert tool_run["tool_call_id"] == "call_run"
+    assert tool_read["tool_call_id"] == "call_read"
+
+    # The executed call keeps Exec's own cancelled report; the queued call is
+    # filled with the bare cancelled result — both real JSON, never "null".
+    assert %{"ok" => false, "cancelled" => true} = Jason.decode!(tool_run["content"])
+    assert Jason.decode!(tool_read["content"]) == %{"ok" => false, "cancelled" => true}
+  end
+
+  @tag :tmp_dir
+  test "a save failure degrades to a system entry and the turn still completes", ctx do
+    # A regular file where the sessions directory should be: mkdir_p refuses.
+    blocked = Path.join(ctx.tmp_dir, "not-a-dir")
+    File.write!(blocked, "a file, not a directory")
+
+    server = start_server([final_episode("still fine")])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: blocked)
+
+    send(agent, {:prompt, self(), "hello"})
+
+    # Each failing save warns once and names the path; the episode continues.
+    assert_receive {:entry, :system, text}, 2_000
+    assert String.starts_with?(text, "[session not saved: ")
+    assert text =~ blocked
+
+    assert_receive {:token, "still fine"}, 2_000
+    assert_receive {:entry, :system, "[session not saved: " <> _}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+    assert Process.alive?(agent)
+  end
+
+  @tag :tmp_dir
+  test "session_dir nil (the default) writes no session file anywhere", ctx do
+    write_sandbox(ctx, "notes.md", "seed\n")
+
+    server =
+      start_server([
+        call_tool_episode("call_1", "read_file", %{"path" => "notes.md"}),
+        final_episode()
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    send(agent, {:prompt, self(), "read it"})
+    assert_receive {:tool_result, %{id: "call_1", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # The sandbox holds only what the tool itself wrote.
+    assert File.ls!(ctx.tmp_dir) == ["notes.md"]
+  end
+
+  @tag :tmp_dir
+  test "the provider's api_key never reaches the session file", ctx do
+    sentinel = "sentinel-key-" <> String.duplicate("x", 32)
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {:ok, sup} = Task.Supervisor.start_link()
+
+    {:ok, agent} =
+      Agent.start_link(
+        provider:
+          {:ok,
+           %Config{base_url: SSEServer.base_url(server), model: "test-model", api_key: sentinel}},
+        cwd: ctx.tmp_dir,
+        session_dir: sessions,
+        supervisor: sup,
+        name: nil
+      )
+
+    on_exit(fn ->
+      DashFloat.TestTeardown.stop(agent)
+      if Process.alive?(sup), do: Process.exit(sup, :kill)
+    end)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+
+    bytes = read_session(sessions)
+    refute bytes =~ sentinel
+    refute bytes =~ "api_key"
+  end
+
+  @tag :tmp_dir
+  test "kill round-trip: a mid-batch kill resumes with the repaired transcript", ctx do
+    args = %{"path" => "out/killed.txt", "content" => "never finished"}
+
+    server =
+      start_server([
+        call_tool_episode("call_k", "write_file", args),
+        final_episode("picked up where we left off")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "write it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+    assert_receive {:confirm, _ref, %{id: "call_k"}}, 2_000
+
+    # Uncatchable: no terminate callback runs, so the on-disk truth is the
+    # last completed atomic write — the dangling batch. Unlink first: the
+    # test process started the agent, and :kill rides links.
+    Process.unlink(agent)
+    Process.exit(agent, :kill)
+
+    id = session_id(sessions)
+    bytes = read_session(sessions)
+    decoded = Jason.decode!(bytes)
+
+    assert %{
+             "messages" => [
+               %{"role" => "user", "content" => "write it"},
+               %{"role" => "assistant", "tool_calls" => [call]}
+             ]
+           } = decoded
+
+    assert call["id"] == "call_k"
+
+    # Load repaired the dangling batch in memory: one synthesized cancelled
+    # result, the file itself untouched.
+    {:ok, session} = Session.load(sessions, id)
+
+    assert [%{"role" => "user"}, %{"role" => "assistant"}, tool] = session.messages
+
+    assert %{"role" => "tool", "tool_call_id" => "call_k", "content" => repair_json} = tool
+    assert Jason.decode!(repair_json) == %{"ok" => false, "cancelled" => true}
+
+    # A fresh agent adopts the repaired history; its first request carries
+    # the original ids, the matching tool_call_ids, and the message order.
+    {resumed, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        resume: %{id: session.id, pin: session.pin, messages: session.messages}
+      )
+
+    send(resumed, {:prompt, self(), "continue"})
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+
+    assert [
+             %{"role" => "user", "content" => "write it"},
+             %{"role" => "assistant", "content" => nil, "tool_calls" => [resumed_call]},
+             %{"role" => "tool", "tool_call_id" => "call_k", "content" => content},
+             %{"role" => "user", "content" => "continue"}
+           ] = request_messages(body)
+
+    assert resumed_call == call
+    assert Jason.decode!(content) == %{"ok" => false, "cancelled" => true}
+
+    assert_receive {:phase, :idle}, 2_000
+
+    # The next save rewrites the same file under the same id.
+    assert session_id(sessions) == id
+
+    {:ok, next} = Session.load(sessions, id)
+    assert length(next.messages) == 5
+    assert List.last(next.messages)["content"] == "picked up where we left off"
   end
 
   # The tool_call row is announced before the runner task is spawned; poll
