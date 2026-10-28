@@ -1,4 +1,4 @@
-# 0014 — LSP support: client supervision, per-filetype servers, diagnostics feedback
+# 0015 — LSP support: client supervision, per-filetype servers, diagnostics feedback
 
 - **Status:** Accepted
 - **Date:** 2026-10-29
