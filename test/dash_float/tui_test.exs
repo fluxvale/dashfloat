@@ -17,6 +17,7 @@ defmodule DashFloat.TUITest do
   alias DashFloat.SSEServer
   alias DashFloat.TUI
   alias DashFloat.TUI.State
+  alias DashFloat.TUI.Theme
   alias DashFloat.TUI.View
   alias ExRatatui.Runtime
 
@@ -1223,6 +1224,33 @@ defmodule DashFloat.TUITest do
     assert State.input_text(after_stray) == "pasted text"
   end
 
+  # Focus events gate the composer's cursor artifact (ADR 0015 §1): an
+  # unfocused pane shows no cursor at all.
+  test "focus events toggle the composer cursor" do
+    {:ok, pid} = start_tui()
+
+    inject(pid, %ExRatatui.Event.FocusLost{})
+    lost = get_state(pid)
+    refute lost.focused?
+
+    {widget, _rect} =
+      lost
+      |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+      |> Enum.at(3)
+
+    assert widget.cursor_style == %ExRatatui.Style{}
+
+    inject(pid, %ExRatatui.Event.FocusGained{})
+    gained = eventually(pid, & &1.focused?)
+
+    {gained_widget, _rect} =
+      gained
+      |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+      |> Enum.at(3)
+
+    assert gained_widget.cursor_style == Theme.style(:cursor)
+  end
+
   # ADR 0006 paste hardening: CRLF/lone-CR normalize to LF, insertion at the
   # cursor, and wrap stays visual (the draft keeps one logical line).
   test "a multi-line bracketed paste with CRLF normalizes to LF at the cursor" do
@@ -1340,6 +1368,65 @@ defmodule DashFloat.TUITest do
     assert Runtime.snapshot(pid).render_count == before
     assert get_state(pid).tick_ref == nil
   end
+
+  # The composer cursor's blink (ADR 0015 §1): while a turn is live it
+  # toggles on the existing activity tick; at idle it is static reversed —
+  # a further sampling window never sees the off half, and the idle render
+  # discipline (no frames on a timer) still holds.
+  test "the blink toggles over ticks while a turn is live and stops at idle" do
+    {:ok, pid} = start_tui()
+    submit(pid, "blink")
+    assert_receive {:prompt, ui_pid, "blink"}, 1_000
+
+    send(ui_pid, {:token, "x"})
+    eventually(pid, fn s -> s.phase == :streaming and s.tick_ref != nil end)
+
+    # Sample across >= 1.1 s of streaming (one full blink period at the
+    # 125 ms tick): both halves of the blink must appear.
+    streaming_seen = sample_cursor_styles(pid, 1_100)
+    assert :reversed in streaming_seen, "blink never showed the on half"
+    assert :empty in streaming_seen, "blink never showed the off half"
+
+    # Idle: static reversed — sampling never sees the artifact toggle.
+    send(ui_pid, {:phase, :idle})
+    eventually(pid, fn s -> s.phase == :idle and s.tick_ref == nil end)
+    idle_seen = sample_cursor_styles(pid, 600)
+    assert MapSet.to_list(idle_seen) == [:reversed]
+
+    # The idle render discipline still holds (ADR 0006).
+    settled = Runtime.snapshot(pid).render_count
+    Process.sleep(300)
+    assert Runtime.snapshot(pid).render_count == settled
+  end
+
+  # Samples the input widget's cursor_style over `window_ms` of wall clock
+  # (a pure View.render in this process — no frames drawn), returning the
+  # observed shapes: :reversed (the cursor artifact) or :empty (absent).
+  defp sample_cursor_styles(pid, window_ms) do
+    deadline = System.monotonic_time(:millisecond) + window_ms
+    do_sample_cursor(pid, deadline, MapSet.new())
+  end
+
+  defp do_sample_cursor(pid, deadline, acc) do
+    state = get_state(pid)
+
+    {widget, _rect} =
+      state
+      |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+      |> Enum.at(3)
+
+    acc = MapSet.put(acc, cursor_kind(widget.cursor_style))
+
+    if System.monotonic_time(:millisecond) < deadline do
+      Process.sleep(30)
+      do_sample_cursor(pid, deadline, acc)
+    else
+      acc
+    end
+  end
+
+  defp cursor_kind(%ExRatatui.Style{modifiers: [:reversed]}), do: :reversed
+  defp cursor_kind(%ExRatatui.Style{}), do: :empty
 
   # ADR 0006 extension along ADR 0007: a confirm phase is active (it ticks),
   # and the tick must die again the moment the agent ends the turn.
@@ -1931,6 +2018,28 @@ defmodule DashFloat.TUITest do
     {:ok, _pid} = start_tui()
     assert_receive {:connect_meta, meta}, 1_000
     assert meta[:mouse_capture] == true
+  end
+
+  # Focus reporting gates the composer's cursor (ADR 0015 §1) — the same
+  # connect-span pattern as mouse capture above.
+  test "the TUI starts with focus reporting enabled" do
+    handler_id = {:focus_events_test, make_ref()}
+    test_pid = self()
+
+    :telemetry.attach(
+      handler_id,
+      [:ex_ratatui, :transport, :connect, :start],
+      fn _event, _measurements, meta, _config ->
+        send(test_pid, {:connect_meta, meta})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    {:ok, _pid} = start_tui()
+    assert_receive {:connect_meta, meta}, 1_000
+    assert meta[:focus_events] == true
   end
 
   test "child_spec/1 is temporary and a worker" do

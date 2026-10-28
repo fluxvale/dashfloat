@@ -49,6 +49,11 @@ defmodule DashFloat.TUI do
     # history eats them. A default here — not an Application opt — so the
     # connect-span test can pin it for every starter.
     |> Keyword.put_new(:mouse_capture, true)
+    # Focus reporting is the TUI's own policy too (ADR 0015 §1) — the same
+    # pattern as mouse capture (issue #21): it gates the composer's cursor,
+    # and terminals that ignore the request send nothing, so the state
+    # stays focused — the status quo ante.
+    |> Keyword.put_new(:focus_events, true)
     |> Keyword.put(:mod, __MODULE__)
     |> ExRatatui.App.dispatch_start()
   end
@@ -152,6 +157,15 @@ defmodule DashFloat.TUI do
 
   def handle_event(%ExRatatui.Event.Resize{width: w, height: h}, state),
     do: schedule(State.resize(state, w, h))
+
+  # Focus events gate the composer's cursor artifact (ADR 0015 §1): an
+  # unfocused pane shows no cursor, so a multiplexer glance shows which
+  # pane holds focus. User-paced events — they may draw a frame, like keys.
+  def handle_event(%ExRatatui.Event.FocusGained{}, state),
+    do: schedule(%{state | focused?: true})
+
+  def handle_event(%ExRatatui.Event.FocusLost{}, state),
+    do: schedule(%{state | focused?: false})
 
   def handle_event(_event, state), do: schedule(state)
 

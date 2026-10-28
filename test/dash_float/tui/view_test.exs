@@ -918,6 +918,42 @@ defmodule DashFloat.TUI.ViewTest do
     end
   end
 
+  # The composer's cursor artifact (ADR 0015 §1): focus-gated, static at
+  # idle, blink-riding-the-tick in active phases.
+  describe "input cursor" do
+    defp cursor_style(state) do
+      {widget, _rect} = input(state)
+      widget.cursor_style
+    end
+
+    test "unfocused: the artifact is absent in every phase" do
+      for phase <- [:idle, :streaming, :executing_tool, :confirming] do
+        state = %{new_state() | phase: phase, focused?: false}
+        assert cursor_style(state) == %ExRatatui.Style{}, "phase #{phase}"
+      end
+    end
+
+    test "focused and idle: static reversed, regardless of anim_step (zero timers)" do
+      for step <- 0..7 do
+        state = %{new_state() | phase: :idle, anim_step: step}
+        assert cursor_style(state) == Theme.style(:cursor), "step #{step}"
+      end
+    end
+
+    test "focused and streaming: the blink alternates 4 ticks on / 4 ticks off" do
+      base = new_state()
+
+      for step <- 0..7 do
+        state = %{base | phase: :streaming, anim_step: step}
+
+        expected =
+          if step < 4, do: Theme.style(:cursor), else: %ExRatatui.Style{}
+
+        assert cursor_style(state) == expected, "step #{step}"
+      end
+    end
+  end
+
   ## helpers
 
   # The error-styled rows of a rendered setup box (issue #42 probes): the

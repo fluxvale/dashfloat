@@ -11,6 +11,7 @@ defmodule DashFloat.TUI.Theme do
 
   @styles %{
     accent: @accent,
+    cursor: %Style{modifiers: [:reversed]},
     dim: @dim,
     dim_italic: %Style{fg: :dark_gray, modifiers: [:italic]},
     user: @dim,

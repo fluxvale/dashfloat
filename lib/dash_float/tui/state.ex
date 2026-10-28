@@ -108,6 +108,10 @@ defmodule DashFloat.TUI.State do
     },
     scroll: 0,
     follow?: true,
+    # Terminal-pane focus (ADR 0015 §1): gates the composer's cursor
+    # artifact. Terminals without focus reporting send nothing, so the
+    # default keeps the status quo ante.
+    focused?: true,
     history: [],
     history_index: nil,
     draft: "",
@@ -135,6 +139,7 @@ defmodule DashFloat.TUI.State do
           stats: stats(),
           scroll: non_neg_integer(),
           follow?: boolean(),
+          focused?: boolean(),
           history: [String.t()],
           history_index: non_neg_integer() | nil,
           draft: String.t(),

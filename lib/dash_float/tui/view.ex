@@ -12,6 +12,7 @@ defmodule DashFloat.TUI.View do
   alias DashFloat.TUI.Theme
   alias DashFloat.TUI.Wrap
   alias ExRatatui.Layout.Rect
+  alias ExRatatui.Style
   alias ExRatatui.Text.Line
   alias ExRatatui.Text.Span
   alias ExRatatui.Widgets.Block
@@ -615,7 +616,19 @@ defmodule DashFloat.TUI.View do
       placeholder:
         "ask anything — Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit",
       placeholder_style: Theme.style(:dim),
-      wrap_mode: :word_or_glyph
+      wrap_mode: :word_or_glyph,
+      cursor_style: cursor_style(state)
     }
+  end
+
+  # The composer's cursor artifact (ADR 0015 §1): absent while the pane is
+  # unfocused, static reversed while idle (zero timers — ADR 0006's idle
+  # discipline stands), and a 500 ms on/off blink in active phases riding
+  # the existing 125 ms tick — 4 anim_steps on, 4 off at the 8 Hz budget.
+  defp cursor_style(%State{focused?: false}), do: %Style{}
+  defp cursor_style(%State{phase: :idle}), do: Theme.style(:cursor)
+
+  defp cursor_style(%State{anim_step: step}) do
+    if rem(div(step, 4), 2) == 0, do: Theme.style(:cursor), else: %Style{}
   end
 end
