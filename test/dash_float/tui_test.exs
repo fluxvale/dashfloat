@@ -745,11 +745,45 @@ defmodule DashFloat.TUITest do
     assert state.history == ["hello tui"]
     assert system_entries(state) == []
 
-    # The status bar names the configured model (label fallback chain) and
-    # reports phase truth.
+    # The footer under the composer names the configured model (label
+    # fallback chain, ADR 0015 §2); the status bar keeps phase truth.
     assert State.provider_label(state) == "test-model"
-    assert status_text(state) =~ "test-model"
+    assert footer_text(state) =~ "test-model"
+    refute status_text(state) =~ "test-model"
     assert status_text(state) =~ "Idle"
+  end
+
+  test "the footer under the composer carries cwd, model, and the live rate during a stream" do
+    {:ok, pid} = start_tui(provider: provider())
+    submit(pid, "stream for the footer")
+
+    assert_receive {:prompt, ui_pid, "stream for the footer"}, 1_000
+    send(ui_pid, {:token, "x"})
+    Process.sleep(20)
+    send(ui_pid, {:token, "x"})
+
+    # The tick recomputes the rate while streaming; give it a few frames.
+    Process.sleep(300)
+
+    state = get_state(pid)
+    assert state.stats.rate != nil
+
+    # (a) Render-output seam: the footer line carries cwd, model, and rate.
+    text = footer_text(state)
+    assert text =~ State.cwd_label(state)
+    assert text =~ "test-model"
+    assert text =~ "tok/s"
+
+    # (b) Drawn-buffer probe: the footer reaches the screen.
+    term = ExRatatui.init_test_terminal(80, 24)
+    widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+    assert :ok = ExRatatui.draw(term, widgets)
+    buffer = ExRatatui.get_buffer_content(term)
+    assert buffer =~ "test-model"
+    assert buffer =~ "tok/s"
+
+    send(ui_pid, {:phase, :idle})
+    eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
   end
 
   test "Esc during streaming sends {:cancel} to the agent and the agent's ack lands" do
@@ -1931,6 +1965,16 @@ defmodule DashFloat.TUITest do
       state
       |> View.render(%ExRatatui.Frame{width: 80, height: 24})
       |> List.first()
+
+    [line] = widget.text
+    Enum.map_join(line.spans, "", & &1.content)
+  end
+
+  defp footer_text(state) do
+    {widget, _rect} =
+      state
+      |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+      |> Enum.at(4)
 
     [line] = widget.text
     Enum.map_join(line.spans, "", & &1.content)

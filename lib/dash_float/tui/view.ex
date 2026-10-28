@@ -33,29 +33,32 @@ defmodule DashFloat.TUI.View do
   @doc """
   Splits `width` x `height` into status (1 row), log (rest), activity
   (1 row while an overlay exists — an active phase or the exit prompt —
-  else 0), and input (`2 + input_lines` rows, clamped to a third of the
-  frame) — the whole chrome inset by one cell per side.
+  else 0), input (`2 + input_lines` rows, clamped to a third of the
+  frame), and the permanent stats footer (1 row, ADR 0015) — the whole
+  chrome inset by one cell per side.
   """
   @spec regions({integer(), integer()}, integer(), boolean()) :: %{
           status: Rect.t(),
           log: Rect.t(),
           activity: Rect.t(),
-          input: Rect.t()
+          input: Rect.t(),
+          footer: Rect.t()
         }
   def regions({width, height}, input_lines, active?)
       when is_integer(width) and is_integer(height) and is_integer(input_lines) and
              is_boolean(active?) do
     area = inset_area(width, height)
 
-    [status, log, activity, input] =
+    [status, log, activity, input, footer] =
       ExRatatui.Layout.split(area, :vertical, [
         {:length, 1},
         {:min, 0},
         {:length, if(active?, do: 1, else: 0)},
-        {:length, input_height(input_lines, area.height)}
+        {:length, input_height(input_lines, area.height)},
+        {:length, 1}
       ])
 
-    %{status: status, log: log, activity: activity, input: input}
+    %{status: status, log: log, activity: activity, input: input, footer: footer}
   end
 
   @doc """
@@ -109,7 +112,8 @@ defmodule DashFloat.TUI.View do
       {status_widget(state, regions.log.height), regions.status},
       {log_widget(state, regions.log.height), regions.log},
       {activity_widget(state), regions.activity},
-      {input_widget(state), regions.input}
+      {input_widget(state), regions.input},
+      {footer_widget(state), regions.footer}
     ]
   end
 
@@ -392,39 +396,49 @@ defmodule DashFloat.TUI.View do
 
   ## Status bar
 
-  # One left-flowing line, ADR order: cwd, model, context, rate, phase, log
-  # position. Token fields are omitted entirely until something streamed.
+  # One left-flowing line: context, phase, log position. cwd, model, and
+  # rate moved to the stats footer (ADR 0015 §2) — moved, not duplicated.
   defp status_widget(state, log_height) do
     {label, role} = Map.fetch!(@phases, state.phase)
 
     %Paragraph{
       text: [
         Line.new(
-          [Span.new("❯ " <> State.cwd_label(state), style: Theme.style(:dim))] ++
-            model_spans(state) ++
-            context_spans(state) ++
-            rate_spans(state) ++
+          context_spans(state) ++
             phase_spans(label, role) ++ position_spans(state, log_height)
         )
       ]
     }
   end
 
-  defp model_spans(state) do
-    [separator(), Span.new(State.provider_label(state) || "—", style: Theme.style(:assistant))]
+  # The stats footer under the composer (ADR 0015 §2): cwd, model, live
+  # tok/s in the old status-bar span vocabulary. Static data read at render
+  # time — live while streaming because the tick recomputes the rate; the
+  # rate span is omitted entirely until a rate exists.
+  defp footer_widget(state) do
+    rate_spans =
+      case State.rate_label(state) do
+        nil -> []
+        rate -> [separator(), Span.new("#{rate} tok/s", style: Theme.style(:dim))]
+      end
+
+    %Paragraph{
+      text: [
+        Line.new(
+          [Span.new("❯ " <> State.cwd_label(state), style: Theme.style(:dim))] ++
+            [
+              separator(),
+              Span.new(State.provider_label(state) || "—", style: Theme.style(:assistant))
+            ] ++ rate_spans
+        )
+      ]
+    }
   end
 
   defp context_spans(%{stats: %{context_total: 0}}), do: []
 
   defp context_spans(state) do
     [separator(), Span.new("ctx " <> State.context_label(state), style: Theme.style(:dim))]
-  end
-
-  defp rate_spans(state) do
-    case State.rate_label(state) do
-      nil -> []
-      rate -> [separator(), Span.new("#{rate} tok/s", style: Theme.style(:dim))]
-    end
   end
 
   defp phase_spans(label, role) do

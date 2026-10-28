@@ -371,7 +371,7 @@ defmodule DashFloat.TUI.StateTest do
 
       scrolled = State.wheel_scroll(state, :up)
       refute scrolled.follow?
-      top = State.effective_scroll(scrolled, 18)
+      top = State.effective_scroll(scrolled, 17)
       assert top > 0
 
       # Click on the status bar (screen row 0): anchors the viewport's
@@ -380,9 +380,10 @@ defmodule DashFloat.TUI.StateTest do
       assert above.selection.anchor == {top, 0}
 
       # Drag into the input pane (screen row 23): the viewport's last
-      # visible row (18-row idle viewport: rows top..top + 17).
+      # visible row (17-row idle viewport, ADR 0015's footer: rows
+      # top..top + 16).
       {below, _nil} = State.select_mouse(scrolled, "down", 1, 23)
-      assert below.selection.anchor == {top + 17, 0}
+      assert below.selection.anchor == {top + 16, 0}
     end
 
     test "click jitter below the drag threshold clears instead of copying" do
@@ -1338,15 +1339,16 @@ defmodule DashFloat.TUI.StateTest do
       assert State.log_line_count(state) == 2
     end
 
-    test "page_up on a viewport-sized log is a no-op (stays pinned)" do
-      # The real idle viewport at 80x24 is 18 rows with the margin (issue #28);
-      # 9 entries = blank + line each = exactly one viewport.
-      base = full_state(9)
-      assert State.log_line_count(base) == 18
+    test "page_up on a viewport-fitting log is a no-op (stays pinned)" do
+      # The real idle viewport at 80x24 is 17 rows with the margin (issue
+      # #28; ADR 0015's footer took one more row); 8 entries = blank + line
+      # each fit inside one viewport.
+      base = full_state(8)
+      assert State.log_line_count(base) == 16
 
       {paged, nil} = State.handle_key(base, "page_up", [])
       assert paged.follow?
-      assert State.effective_scroll(paged, 18) == 0
+      assert State.effective_scroll(paged, 17) == 0
     end
 
     test "submit re-pins the log so the new reply is visible" do
@@ -1368,46 +1370,47 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up unfollows and pages back; page_down re-pins at the bottom" do
-      # 200 lines, 18-row viewport (the padded 80x24 layout) → bottom 182.
+      # 200 lines, 17-row viewport (the padded 80x24 layout with ADR 0015's
+      # footer) → bottom 183.
       base = full_state(100)
       {up_one, nil} = State.handle_key(base, "page_up", [])
       refute up_one.follow?
-      assert State.effective_scroll(up_one, 18) == 164
+      assert State.effective_scroll(up_one, 17) == 166
 
       {up_two, nil} = State.handle_key(up_one, "page_up", [])
-      assert State.effective_scroll(up_two, 18) == 146
+      assert State.effective_scroll(up_two, 17) == 149
 
       {down_one, nil} = State.handle_key(up_two, "page_down", [])
-      assert State.effective_scroll(down_one, 18) == 164
+      assert State.effective_scroll(down_one, 17) == 166
 
       {down_two, nil} = State.handle_key(down_one, "page_down", [])
       assert down_two.follow?
-      assert State.effective_scroll(down_two, 18) == 182
+      assert State.effective_scroll(down_two, 17) == 183
     end
 
     test "wheel_scroll: one notch is three lines; up unfollows, down re-pins at the bottom" do
       base = full_state(100)
-      assert State.effective_scroll(base, 18) == 182
+      assert State.effective_scroll(base, 17) == 183
 
       wheeled = State.wheel_scroll(base, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 18) == 179
+      assert State.effective_scroll(wheeled, 17) == 180
 
       again = State.wheel_scroll(wheeled, :up)
-      assert State.effective_scroll(again, 18) == 176
+      assert State.effective_scroll(again, 17) == 177
 
       down = State.wheel_scroll(again, :down)
       refute down.follow?
-      assert State.effective_scroll(down, 18) == 179
+      assert State.effective_scroll(down, 17) == 180
 
       pinned = State.wheel_scroll(down, :down)
       assert pinned.follow?
-      assert State.effective_scroll(pinned, 18) == 182
+      assert State.effective_scroll(pinned, 17) == 183
     end
 
-    test "wheel up on a viewport-sized log is a no-op (stays pinned)" do
-      base = full_state(9)
-      assert State.log_line_count(base) == 18
+    test "wheel up on a viewport-fitting log is a no-op (stays pinned)" do
+      base = full_state(8)
+      assert State.log_line_count(base) == 16
       assert State.wheel_scroll(base, :up) == base
     end
 
@@ -1422,11 +1425,12 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.phase == :confirming
 
-      # The activity row is up while confirming: the viewport is 17 rows.
-      bottom = State.effective_scroll(state, 17)
+      # The activity row is up while confirming: the viewport is 16 rows
+      # (ADR 0015's footer took one from the log).
+      bottom = State.effective_scroll(state, 16)
       wheeled = State.wheel_scroll(state, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 17) == bottom - 3
+      assert State.effective_scroll(wheeled, 16) == bottom - 3
     end
 
     test "new content does not move an unfollowed view, but clamping still holds" do
