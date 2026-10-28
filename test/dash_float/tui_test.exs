@@ -2133,7 +2133,7 @@ defmodule DashFloat.TUITest do
   ## suggest side-request is the ONLY traffic the server sees, riding the
   ## real HTTP path via `suggest_fetcher: {DashFloat.TUI.Suggest, :request}`.
 
-  defp suggest_provider(base, overrides \\ []) do
+  defp suggest_provider(base, overrides) do
     {:ok,
      struct!(
        Config,
