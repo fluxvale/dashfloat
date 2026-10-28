@@ -636,6 +636,46 @@ defmodule DashFloat.AgentTest do
   end
 
   @tag :tmp_dir
+  test "a runner dying before its monitor is placed reports cancelled, not crashed", ctx do
+    # The spawn window in dispatch_runner/2: the monitor goes up after
+    # start_child returns, and Process.monitor/1 on a pid that already died
+    # fires immediately with reason :noproc. Forged here with the slot's real
+    # ref and the real runner pid — the live window is scheduler-dependent —
+    # and the equivalence holds post-ADR-0012: the runner self-reports every
+    # death its body can observe (the try/rescue in dispatch_runner/2), so a
+    # :noproc DOWN reaching a still-{:running} slot means the body never
+    # reported: it never started, or died to an external kill — both are the
+    # deaths the :killed clause already reports as cancelled.
+    server =
+      start_server([
+        call_tool_episode("call_w", "execute_command", %{"command" => "sleep 5"}),
+        final_episode()
+      ])
+
+    {agent, sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
+    send(agent, {:prompt, self(), "run it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:confirm, ref, %{name: "execute_command"}}, 2_000
+    send(agent, {:confirm_decision, ref, :approved})
+    assert_receive {:phase, :executing_tool}, 1_000
+
+    runner = await_task(sup)
+    state = :sys.get_state(agent)
+    {:running, mon_ref, ^runner, _call} = state.tool_slot
+
+    send(agent, {:DOWN, mon_ref, :process, runner, :noproc})
+
+    assert_receive {:tool_result, %{id: "call_w", status: "cancelled"}}, 2_000
+    assert_receive {:entry, :system, "[tool run cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+    refute_receive {:sse_request, "POST", _, _, _second}, 300
+
+    # The still-live runner's eventual death is stray, never a second result.
+    Process.exit(runner, :kill)
+  end
+
+  @tag :tmp_dir
   test "a crashed runner degrades to an error result and the loop continues", ctx do
     server =
       start_server([

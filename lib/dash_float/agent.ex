@@ -250,6 +250,21 @@ defmodule DashFloat.Agent do
     abort_tool_run(state, call)
   end
 
+  # A runner dead before its monitor went up (the spawn window in
+  # dispatch_runner/2): Process.monitor/1 on an already-dead pid fires with
+  # reason :noproc. The runner self-reports every death its body can observe
+  # (the try/rescue in dispatch_runner/2), so a :noproc reaching a
+  # still-{:running} slot means the body never reported — it never started,
+  # or died to a kill the body could not catch — the same deaths the :killed
+  # clause already reports as cancelled (ADR 0012).
+  def handle_info(
+        {:DOWN, ref, :process, _down_pid, :noproc},
+        %__MODULE__{tool_slot: {:running, ref, _pid, call}} = state
+      ) do
+    state = %{state | tool_slot: :none}
+    abort_tool_run(state, call)
+  end
+
   def handle_info(
         {:DOWN, ref, :process, _down_pid, reason},
         %__MODULE__{tool_slot: {:running, ref, _pid, call}} = state
@@ -423,7 +438,10 @@ defmodule DashFloat.Agent do
   # The mutating runner starts ONLY after the approval keypress (ADR 0007 §4).
   # Re-announcing :executing_tool here keeps the activity line truthful for the
   # whole execution (the confirmation phase would otherwise linger while the
-  # command runs) and re-arms Esc's interrupt.
+  # command runs) and re-arms Esc's interrupt. The monitor goes up after
+  # start_child returns; the runner self-reports its own crash before dying,
+  # so a death inside that window still reaches the agent as a result and the
+  # monitor clauses only ever see what the body could not report (ADR 0012).
   defp dispatch_runner(state, call) do
     display(state.ui, {:phase, :executing_tool})
     agent = self()
@@ -431,10 +449,32 @@ defmodule DashFloat.Agent do
     cwd = state.cwd
     opts = [exec_timeout: state.exec_timeout]
 
+    # A crash is reported by the dying process itself, as a result — the
+    # monitor's DOWN reason carries no information about whether the body
+    # ran, and a crash in the spawn window would otherwise surface as :noproc
+    # and be misreported (ADR 0012). Deaths the body cannot observe (an
+    # external kill) still take the DOWN clauses.
     {:ok, pid} =
       Task.Supervisor.start_child(
         state.supervisor,
-        fn -> send(agent, {:tool_done, call.id, Runner.run(call.name, args, cwd, opts)}) end,
+        fn ->
+          try do
+            send(agent, {:tool_done, call.id, Runner.run(call.name, args, cwd, opts)})
+          rescue
+            # coveralls-ignore-start
+            # Belt over Runner.run's own rescue (runner.ex): reachable only
+            # if that inner rescue is stripped — the crash-report shape was
+            # probe-verified in review, not suite-reachable.
+            reason ->
+              send(
+                agent,
+                {:tool_done, call.id,
+                 %{ok: false, error: "tool crashed: " <> inspect_slice(reason)}}
+              )
+
+              # coveralls-ignore-stop
+          end
+        end,
         restart: :temporary
       )
 

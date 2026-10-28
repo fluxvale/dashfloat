@@ -192,6 +192,29 @@ defmodule DashFloat.Tools.ExecTest do
     assert_eventually_gone(marker)
   end
 
+  # Wiring guard, not a window reproduction: this exercises that run/4's
+  # completion paths really reap (a mutation removing the reap call fails
+  # here), against a command whose parent exits instantly leaving a child.
+  # The spawn-window mechanism itself is deterministic only at the Group unit
+  # level (GroupTest); through run/4 the window is a load-shaped preemption
+  # race — see ADR 0013 for the reproduction story.
+  test "a fast-exiting command's background children do not outlive the run" do
+    duration = 300_000 + System.unique_integer([:positive])
+    marker = "sleep #{duration}"
+
+    # A stale survivor from an earlier, broken run must not read as ours.
+    System.cmd("pkill", ["-9", "-f", marker])
+    :timer.sleep(50)
+
+    result =
+      Exec.run("sh -c '#{marker} >/dev/null 2>&1 & echo done'", sandbox("fastreap"), 5_000, 4_096)
+
+    assert result.ok == true
+    assert result.exit == 0
+    assert result.output == "done\n"
+    assert_eventually_gone(marker)
+  end
+
   test "binary output is scrubbed to valid UTF-8" do
     result = Exec.run("printf a\\\\377b", sandbox("binary"), 5_000, 4_096)
 
