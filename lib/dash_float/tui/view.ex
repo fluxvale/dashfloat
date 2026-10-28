@@ -31,6 +31,9 @@ defmodule DashFloat.TUI.View do
   # which IS the wrap width — shrinks with it.
   @margin 1
 
+  # The composer's static key hint (the placeholder when no ghost shows).
+  @input_hint "ask anything — Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit"
+
   @doc """
   Splits `width` x `height` into status (1 row), log (rest), activity
   (1 row while an overlay exists — an active phase or the exit prompt —
@@ -613,8 +616,10 @@ defmodule DashFloat.TUI.View do
         border_type: :rounded,
         border_style: Theme.style(:dim)
       },
-      placeholder:
-        "ask anything — Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit",
+      # The ghost (ADR 0015 §3) rides the placeholder slot in the existing
+      # placeholder styling; the textarea only shows a placeholder while the
+      # draft is empty, which is the display gate.
+      placeholder: state.suggestion || @input_hint,
       placeholder_style: Theme.style(:dim),
       wrap_mode: :word_or_glyph,
       cursor_style: cursor_style(state)

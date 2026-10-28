@@ -2127,4 +2127,246 @@ defmodule DashFloat.TUITest do
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
   end
+
+  ## Ghost-text suggestion (issue #70; ADR 0015 §3) — the Done-when proofs,
+  ## at the loopback seam. The agent is the fake (the test process); the
+  ## suggest side-request is the ONLY traffic the server sees, riding the
+  ## real HTTP path via `suggest_fetcher: {DashFloat.TUI.Suggest, :request}`.
+
+  defp suggest_provider(base, overrides \\ []) do
+    {:ok,
+     struct!(
+       Config,
+       Keyword.merge([base_url: base, model: "active-m", api_key: "k"], overrides)
+     )}
+  end
+
+  # A completion whose content carries surrounding quotes — normalize strips them.
+  defp ghost_completion do
+    Jason.encode!(%{choices: [%{message: %{content: "\"tell me more\""}}]})
+  end
+
+  # The loopback server replays one script per connection; the suggest
+  # side-request is the only traffic it ever sees.
+  defp start_suggest_tui(provider_overrides, debounce_ms, scripts) do
+    {:ok, server} = SSEServer.start_link(:per_connection, scripts)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+
+    start_tui(
+      provider: suggest_provider(SSEServer.base_url(server), provider_overrides),
+      suggest_fetcher: {DashFloat.TUI.Suggest, :request},
+      suggest_debounce_ms: debounce_ms
+    )
+  end
+
+  # One fake-agent turn: submit, answer, finalize. The idle finalize is what
+  # arms the one-shot ghost.
+  defp complete_turn(pid) do
+    submit(pid, "hi")
+    assert_receive {:prompt, ui, "hi"}, 1_000
+    send(ui, {:token, "hello there"})
+    send(ui, {:phase, :idle})
+    eventually(pid, &(&1.entries != [] and &1.phase == :idle))
+    ui
+  end
+
+  describe "ghost-text suggestion (issue #70, ADR 0015 §3)" do
+    test "the side-request hits the loopback seam and the ghost lands as the placeholder" do
+      {:ok, pid} = start_suggest_tui([], 25, [[http_ok(ghost_completion()), :close]])
+
+      complete_turn(pid)
+
+      # The seam: a custom provider falls back to the ACTIVE model (the
+      # preset→cheap-id mapping is proven at the body seam in suggest_test —
+      # together they prove the default cheap model reaches the wire).
+      assert_receive {:sse_request, "POST", "/chat/completions", headers, body}, 1_000
+      payload = Jason.decode!(body)
+      assert payload["model"] == "active-m"
+      assert payload["max_tokens"] == 48
+
+      assert [
+               %{"role" => "system", "content" => instruction},
+               %{"role" => "user", "content" => tail}
+             ] = payload["messages"]
+
+      assert tail =~ "hello there"
+      assert instruction =~ "next message"
+      assert headers["authorization"] == "Bearer k"
+
+      state = eventually(pid, &(&1.suggestion == "tell me more"))
+      assert State.input_text(state) == ""
+      # The drawn buffer shows the ghost while the draft is empty.
+      assert screen_text(state) =~ "tell me more"
+    end
+
+    test "settings.suggest pins the exact model id on the wire" do
+      {:ok, pid} =
+        start_suggest_tui([suggest: "cheap-override-m"], 25, [
+          [http_ok(ghost_completion()), :close]
+        ])
+
+      complete_turn(pid)
+
+      assert_receive {:sse_request, "POST", "/chat/completions", _headers, body}, 1_000
+      assert Jason.decode!(body)["model"] == "cheap-override-m"
+    end
+
+    test "suggest: false never builds a side-request at all" do
+      {:ok, pid} =
+        start_suggest_tui([suggest: false], 20, [[http_ok(ghost_completion()), :close]])
+
+      complete_turn(pid)
+      # Wait well past a generous debounce window.
+      Process.sleep(200)
+
+      refute_receive {:sse_request, _, _, _, _}
+      assert get_state(pid).suggestion == nil
+    end
+
+    test "the debounce delays the side-request, then it fires" do
+      {:ok, pid} =
+        start_suggest_tui([], 150, [[http_ok(ghost_completion()), :close]])
+
+      complete_turn(pid)
+
+      # Inside the window: nothing on the wire yet (75 + 40 < 150).
+      Process.sleep(75)
+      refute_receive {:sse_request, _, _, _, _}, 40
+
+      assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 1_000
+    end
+
+    test "typing kills the in-flight side-request; the straggler never lands" do
+      {:ok, pid} =
+        start_suggest_tui([], 20, [[{:sleep, 600}, http_ok(ghost_completion()), :close]])
+
+      complete_turn(pid)
+      %{suggest_task: task} = eventually(pid, &(&1.suggest_task != nil))
+
+      type(pid, "x")
+
+      # The late response would have landed by now.
+      Process.sleep(800)
+      state = get_state(pid)
+      assert state.suggestion == nil
+      assert State.input_text(state) == "x"
+      refute Process.alive?(task)
+      # The app never crashes — the composer still works.
+      assert Process.alive?(pid)
+      assert state.phase == :idle
+    end
+
+    test "Tab materializes the ghost; the draft edits and sends through the unchanged submit" do
+      {:ok, pid} = start_suggest_tui([], 25, [[http_ok(ghost_completion()), :close]])
+
+      complete_turn(pid)
+      eventually(pid, &(&1.suggestion == "tell me more"))
+      # The ghost displaced the hint in the placeholder slot.
+      refute screen_text(get_state(pid)) =~ "ask anything"
+
+      press(pid, "tab")
+      state = eventually(pid, &(State.input_text(&1) == "tell me more"))
+      assert state.suggestion == nil
+
+      # It is EDITABLE text: type "!" onto it, then Enter sends it.
+      type(pid, "!")
+
+      assert pid
+             |> get_state()
+             |> State.input_text() == "tell me more!"
+
+      press(pid, "enter")
+      assert_receive {:prompt, ui, "tell me more!"}, 1_000
+    end
+
+    test "typing over a landed ghost dismisses it; the late response is dropped (epoch stale)" do
+      {:ok, pid} =
+        start_suggest_tui([], 20, [[{:sleep, 400}, http_ok(ghost_completion()), :close]])
+
+      complete_turn(pid)
+      eventually(pid, &(&1.suggest_task != nil))
+      type(pid, "h")
+
+      Process.sleep(700)
+      state = get_state(pid)
+      assert state.suggestion == nil
+      assert State.input_text(state) == "h"
+      # The ghost is gone from the drawn buffer too.
+      refute screen_text(state) =~ "tell me more"
+    end
+
+    test "a failed side-request fails open: no suggestion, no crash, composer usable" do
+      {:ok, pid} = start_suggest_tui([], 20, [[:close]])
+
+      complete_turn(pid)
+      assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 1_000
+
+      Process.sleep(150)
+      state = get_state(pid)
+      assert state.suggestion == nil
+      assert Process.alive?(pid)
+
+      type(pid, "still here")
+
+      assert pid
+             |> get_state()
+             |> State.input_text() == "still here"
+    end
+
+    test "a 2xx with a non-OpenAI body fails open too" do
+      {:ok, pid} = start_suggest_tui([], 20, [[http_ok("{}"), :close]])
+
+      complete_turn(pid)
+      assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 1_000
+
+      Process.sleep(150)
+      state = get_state(pid)
+      assert state.suggestion == nil
+      assert Process.alive?(pid)
+
+      type(pid, "usable")
+
+      assert pid
+             |> get_state()
+             |> State.input_text() == "usable"
+    end
+
+    test "the debounce is stale without an armed timer; the opt-out clears it at dispatch" do
+      off =
+        {:ok, %Config{base_url: "http://127.0.0.1:1", model: "m", api_key: "k", suggest: false}}
+
+      state =
+        State.new(provider: off, suggest_fetcher: {DashFloat.TUI.Suggest, :request})
+
+      # No timer of ours pending: the message is stale and inert.
+      assert {:noreply, ^state, %{render?: false}} =
+               TUI.handle_info(:dashfloat_suggest, state)
+
+      # A fired-but-unprocessed timer is live; the opt-out just clears the ref.
+      fired = Process.send_after(self(), :ignore, 1)
+      Process.sleep(5)
+      armed = %{state | suggest_ref: fired}
+
+      assert {:noreply, dispatched, %{render?: false}} =
+               TUI.handle_info(:dashfloat_suggest, armed)
+
+      assert dispatched.suggest_ref == nil
+    end
+
+    test "a provider error at dispatch clears the armed timer" do
+      state =
+        State.new(
+          provider: {:error, "no provider"},
+          suggest_fetcher: {DashFloat.TUI.Suggest, :request}
+        )
+
+      fired = Process.send_after(self(), :ignore, 1)
+      Process.sleep(5)
+
+      assert {:noreply, dispatched, %{render?: false}} =
+               TUI.handle_info(:dashfloat_suggest, %{state | suggest_ref: fired})
+
+      assert dispatched.suggest_ref == nil
+    end
+  end
 end

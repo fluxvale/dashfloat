@@ -1963,6 +1963,142 @@ defmodule DashFloat.TUI.StateTest do
     end
   end
 
+  describe "ghost text (ADR 0015 §3)" do
+    @provider {:ok, %DashFloat.Config{base_url: "http://x", model: "m", api_key: "k"}}
+
+    test "new/1 wires the suggest fetcher and debounce opts; the ghost fields start empty" do
+      fetcher = {DashFloat.TUI.Suggest, :request}
+      state = new_state(suggest_fetcher: fetcher, suggest_debounce_ms: 25)
+
+      assert state.suggest_fetcher == fetcher
+      assert state.suggest_debounce_ms == 25
+
+      fresh = new_state()
+      assert fresh.suggest_fetcher == nil
+      assert fresh.suggest_debounce_ms == 600
+      assert fresh.suggestion == nil
+      assert fresh.suggest_epoch == 0
+      assert fresh.suggest_arm == false
+      assert fresh.suggest_reap == false
+    end
+
+    # One completed assistant turn (no usage frame — the rate is not the
+    # subject here).
+    defp turn_with_reply(state, reply) do
+      state
+      |> Map.put(:phase, :streaming)
+      |> State.stream_message({:token, reply}, 1_000)
+      |> State.stream_message({:phase, :idle}, 2_000)
+    end
+
+    test "a finalized assistant turn with an empty draft arms the one-shot" do
+      base = new_state(provider: @provider)
+      state = turn_with_reply(base, "all done")
+      assert state.suggest_arm == true
+    end
+
+    test "a typed draft never arms" do
+      base = new_state(provider: @provider)
+      typed = type(base, "question")
+      state = turn_with_reply(typed, "answer")
+
+      assert state.suggest_arm == false
+    end
+
+    test "suggest: false never arms" do
+      off =
+        {:ok, %DashFloat.Config{base_url: "http://x", model: "m", api_key: "k", suggest: false}}
+
+      state = turn_with_reply(new_state(provider: off), "answer")
+
+      assert state.suggest_arm == false
+    end
+
+    test "a non-assistant last entry never arms" do
+      base = new_state(provider: @provider)
+      streaming = %{base | phase: :streaming}
+
+      state =
+        streaming
+        |> State.stream_message({:token, "answer"}, 1_000)
+        |> State.stream_message({:phase, :executing_tool}, 1_100)
+        |> State.stream_message({:entry, :system, "note"}, 1_500)
+        |> State.stream_message({:phase, :idle}, 2_000)
+
+      assert state.suggest_arm == false
+    end
+
+    test "Tab materializes the ghost into the draft and dismisses it" do
+      ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
+
+      {state, nil} = State.handle_key(ghosted, "tab", [])
+
+      assert State.input_text(state) == "tell me more"
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+    end
+
+    test "Tab with a non-empty draft falls through — the draft is not replaced" do
+      typed = type(new_state(provider: @provider), "h")
+      ghosted = %{typed | suggestion: "tell me more"}
+
+      {state, nil} = State.handle_key(ghosted, "tab", [])
+
+      refute State.input_text(state) == "tell me more"
+    end
+
+    test "typing dismisses the ghost" do
+      ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
+      state = type(ghosted, "x")
+
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+    end
+
+    test "a paste dismisses the ghost" do
+      ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
+      state = State.paste(ghosted, "hello")
+
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+    end
+
+    test "a submit dismisses the ghost" do
+      ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
+      typed = type(ghosted, "q")
+
+      {state, {:submit, "q"}} = State.handle_key(typed, "enter", [])
+
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+      assert state.phase == :streaming
+    end
+
+    test "a new streaming phase dismisses the ghost" do
+      ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
+      state = State.stream_message(ghosted, {:phase, :streaming}, 1_000)
+
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+    end
+
+    test "history navigation dismisses the ghost" do
+      ghosted = %{
+        new_state(provider: @provider)
+        | suggestion: "tell me more",
+          history: ["older"]
+      }
+
+      after_up = press(ghosted, "up", [])
+      assert after_up.suggestion == nil
+      assert after_up.suggest_reap == true
+
+      # Down at the newest restores the draft — still a dismiss.
+      after_down = press(after_up, "down", [])
+      assert after_down.suggest_reap == true
+    end
+  end
+
   # Runs one animation tick (rendering dirty in-flight lines), keeping state.
   defp tick_once(state), do: elem(State.tick(state, 1_100), 0)
 
