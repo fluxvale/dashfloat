@@ -6,7 +6,7 @@ defmodule DashFloat.SessionTest do
 
   alias DashFloat.Session
 
-  @id "20261027-143052-a1b2c3"
+  @id "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5c"
   @created_at "2026-10-27T14:30:52Z"
 
   defp session(messages, overrides \\ []) do
@@ -75,13 +75,31 @@ defmodule DashFloat.SessionTest do
       assert String.ends_with?(dir, "dashfloat/sessions")
     end
 
-    test "new_id/0 is UTC YYYYMMDD-HHMMSS plus six lowercase hex chars" do
-      assert Regex.match?(~r/^\d{8}-\d{6}-[0-9a-f]{6}$/, Session.new_id())
+    test "new_id/0 is a canonical lowercase UUIDv7: 36 chars, 8-4-4-4-12, version 7" do
+      id = Session.new_id()
+      assert String.length(id) == 36
+
+      assert Regex.match?(
+               ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/,
+               id
+             )
+
+      # The version nibble sits at offset 14, after group one plus its dash.
+      assert binary_part(id, 14, 1) == "7"
     end
 
-    test "two ids minted in the same second differ" do
+    test "25 mints are unique and their unix-ms prefixes never sort backwards" do
       ids = for _i <- 1..25, do: Session.new_id()
       assert Enum.uniq(ids) == ids
+
+      # The 48-bit unix-ms prefix ascends, so lexical order is recency order
+      # (ADR 0014 §2). Same-millisecond mints tie on the prefix and are broken
+      # by their random tail — no order claim within a millisecond.
+      prefixes = Enum.map(ids, &binary_part(&1, 0, 13))
+
+      assert prefixes
+             |> Enum.chunk_every(2, 1, :discard)
+             |> Enum.all?(fn [a, b] -> a <= b end)
     end
   end
 
@@ -167,6 +185,7 @@ defmodule DashFloat.SessionTest do
                  },
                  %{"role" => "assistant", "content" => "Done — ✓"}
                ],
+               title: nil,
                context: nil,
                compactions: []
              }
@@ -284,6 +303,37 @@ defmodule DashFloat.SessionTest do
       assert {:error, msg} = load(ctx)
       assert msg =~ "message 0"
       assert msg =~ ~s("content")
+    end
+  end
+
+  describe "title (ADR 0014 §3's additive seam, #80)" do
+    @tag :tmp_dir
+    test "a titled session round-trips verbatim, case-preserved", ctx do
+      save_ok(ctx, [%{role: "user", content: "hi"}], title: "Fix the  Login Bug ")
+      assert {:ok, loaded} = load(ctx)
+      assert loaded.title == "Fix the  Login Bug "
+      file = path(ctx)
+      contents = File.read!(file)
+      decoded = Jason.decode!(contents)
+      assert decoded["title"] == "Fix the  Login Bug "
+    end
+
+    @tag :tmp_dir
+    test "an untitled session file carries no title key at all", ctx do
+      save_ok(ctx, [%{role: "user", content: "hi"}])
+      assert {:ok, loaded} = load(ctx)
+      assert loaded.title == nil
+      # Byte-level: the encoded JSON has no "title" outside messages.
+      file = path(ctx)
+      contents = File.read!(file)
+      refute contents =~ "title"
+    end
+
+    @tag :tmp_dir
+    test "a non-string title in a hand-written file loads as nil, never a refusal", ctx do
+      write_body(ctx, body_with([], %{"title" => 42}))
+      assert {:ok, loaded} = load(ctx)
+      assert loaded.title == nil
     end
   end
 
@@ -647,7 +697,7 @@ defmodule DashFloat.SessionTest do
       dir = Path.join(ctx.tmp_dir, "never-created")
 
       assert {:error, msg} = Session.save(dir, session([], id: "../escape"))
-      assert msg == "session ids look like 20261027-143052-a1b2c3"
+      assert msg == "session ids look like 0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c"
       refute File.exists?(dir)
     end
 
@@ -656,7 +706,7 @@ defmodule DashFloat.SessionTest do
       assert {:error, msg} = Session.load(ctx.tmp_dir, "../escape")
 
       assert msg ==
-               "no session ../escape under #{ctx.tmp_dir} — session ids look like 20261027-143052-a1b2c3; list sessions with: ls #{ctx.tmp_dir}"
+               "no session ../escape under #{ctx.tmp_dir} — session ids look like 0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c; list sessions with: ls #{ctx.tmp_dir}"
 
       assert File.ls!(ctx.tmp_dir) == []
     end
@@ -664,12 +714,12 @@ defmodule DashFloat.SessionTest do
     @tag :tmp_dir
     test "a non-string id returns the shape error on both paths, never a raise", ctx do
       assert {:error, msg} = Session.save(ctx.tmp_dir, session([], id: 123))
-      assert msg == "session ids look like 20261027-143052-a1b2c3"
+      assert msg == "session ids look like 0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c"
 
       assert {:error, msg} = Session.load(ctx.tmp_dir, 123)
 
       assert msg ==
-               "no session 123 under #{ctx.tmp_dir} — session ids look like 20261027-143052-a1b2c3; list sessions with: ls #{ctx.tmp_dir}"
+               "no session 123 under #{ctx.tmp_dir} — session ids look like 0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c; list sessions with: ls #{ctx.tmp_dir}"
 
       # No String.Chars implementation: interpolation would raise here.
       assert {:error, _msg} = Session.load(ctx.tmp_dir, self())
@@ -683,6 +733,143 @@ defmodule DashFloat.SessionTest do
       assert {:ok, loaded} = Session.load(ctx.tmp_dir, @id <> ".json")
       assert loaded.id == @id
       assert loaded.messages == [%{"role" => "user", "content" => "hi"}]
+    end
+  end
+
+  describe "migrate_legacy_ids/1" do
+    # The suite's one deliberate legacy-shaped id: the sweep's input.
+    @legacy_id "20261027-090000-abc123"
+    @bad_legacy_id "20261027-090500-bad000"
+
+    defp legacy_body(overrides \\ []) do
+      Map.merge(
+        %{
+          "version" => 1,
+          "id" => @legacy_id,
+          "created_at" => "2026-10-27T09:00:00Z",
+          "pin" => %{"profile" => "personal", "model" => "glm-5.3", "base_url" => nil},
+          "messages" => [%{"role" => "user", "content" => "legacy"}]
+        },
+        Map.new(overrides)
+      )
+    end
+
+    defp write_legacy(ctx, body \\ legacy_body()) do
+      file = legacy_path(ctx)
+      File.write!(file, Jason.encode!(body))
+    end
+
+    defp legacy_path(ctx, id \\ @legacy_id), do: Path.join(ctx.tmp_dir, id <> ".json")
+
+    @tag :tmp_dir
+    test "a fully-loading legacy file is rewritten under a fresh id, fields verbatim", ctx do
+      body =
+        Map.merge(legacy_body(), %{
+          "title" => "Kept Title",
+          "context" => %{"prompt_tokens" => 3, "messages" => 1}
+        })
+
+      write_legacy(ctx, body)
+
+      assert {:ok, 1} = Session.migrate_legacy_ids(ctx.tmp_dir)
+      legacy = legacy_path(ctx)
+      refute File.exists?(legacy)
+
+      assert [new_name] = File.ls!(ctx.tmp_dir)
+      new_id = Path.rootname(new_name)
+      new_file = Path.join(ctx.tmp_dir, new_name)
+      assert mode(new_file) == 0o600
+
+      assert {:ok, loaded} = Session.load(ctx.tmp_dir, new_id)
+      assert loaded.id == new_id
+      assert loaded.created_at == "2026-10-27T09:00:00Z"
+      assert loaded.pin == %{profile: "personal", model: "glm-5.3", base_url: nil}
+      assert loaded.messages == [%{"role" => "user", "content" => "legacy"}]
+      assert loaded.title == "Kept Title"
+      assert loaded.context == %{prompt_tokens: 3, messages: 1}
+    end
+
+    @tag :tmp_dir
+    test "a legacy file that does not fully load is left untouched", ctx do
+      file = legacy_path(ctx)
+      File.write!(file, "definitely {{{ not json")
+
+      assert {:ok, 0} = Session.migrate_legacy_ids(ctx.tmp_dir)
+      assert File.read!(file) == "definitely {{{ not json"
+    end
+
+    @tag :tmp_dir
+    test "an all-uuid directory is steady state: zero writes", ctx do
+      save_ok(ctx, [%{role: "user", content: "hi"}])
+      file = path(ctx)
+      {:ok, stat_before} = File.stat(file)
+
+      assert {:ok, 0} = Session.migrate_legacy_ids(ctx.tmp_dir)
+
+      {:ok, stat_after} = File.stat(file)
+      assert stat_after.mtime == stat_before.mtime
+      assert stat_after.size == stat_before.size
+    end
+
+    @tag :tmp_dir
+    test "a missing directory is {:ok, 0} and stays missing", ctx do
+      dir = Path.join(ctx.tmp_dir, "does-not-exist")
+      assert {:ok, 0} = Session.migrate_legacy_ids(dir)
+      refute File.exists?(dir)
+    end
+
+    @tag :tmp_dir
+    test "a mixed directory migrates only the legacy names", ctx do
+      save_ok(ctx, [%{role: "user", content: "already uuid"}])
+      write_legacy(ctx)
+      bad = legacy_path(ctx, @bad_legacy_id)
+      File.write!(bad, "garbage {{{")
+      notes = Path.join(ctx.tmp_dir, "notes.txt")
+      File.write!(notes, "not a session file")
+
+      assert {:ok, 1} = Session.migrate_legacy_ids(ctx.tmp_dir)
+
+      assert File.read!(bad) == "garbage {{{"
+      assert File.read!(notes) == "not a session file"
+      assert {:ok, _loaded} = Session.load(ctx.tmp_dir, @id)
+      legacy = legacy_path(ctx)
+      refute File.exists?(legacy)
+
+      kept = [@id <> ".json", @bad_legacy_id <> ".json", "notes.txt"]
+      rest = File.ls!(ctx.tmp_dir) -- kept
+      assert [new_name] = rest
+      new_id = Path.rootname(new_name)
+
+      assert {:ok, %{messages: [%{"role" => "user", "content" => "legacy"}]}} =
+               Session.load(ctx.tmp_dir, new_id)
+    end
+
+    @tag :tmp_dir
+    test "a uuid-named file is exempt by name shape alone, even when its body is damaged",
+         ctx do
+      file = path(ctx)
+      body = %{"version" => 1, "id" => "another-session", "created_at" => @created_at}
+      File.write!(file, Jason.encode!(body))
+
+      assert {:ok, 0} = Session.migrate_legacy_ids(ctx.tmp_dir)
+      assert File.read!(file) == Jason.encode!(body)
+    end
+
+    # The one deterministic save-failure trigger: a read-only directory (the
+    # suite runs unprivileged — local user and the CI runner — so chmod bites;
+    # the directory trick cannot work here, the file must exist to load).
+    @tag :tmp_dir
+    test "a save failure during the sweep errors naming the path", ctx do
+      write_legacy(ctx)
+      dir = ctx.tmp_dir
+      on_exit(fn -> File.chmod(dir, 0o755) end)
+
+      File.chmod!(dir, 0o555)
+      assert {:error, error} = Session.migrate_legacy_ids(dir)
+      assert error =~ dir
+      # The legacy file survived the failed rewrite.
+      legacy = legacy_path(ctx)
+      assert File.exists?(legacy)
     end
   end
 

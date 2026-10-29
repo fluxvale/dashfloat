@@ -176,10 +176,16 @@ loopback server).
 **Sessions persist.** Every turn is saved under
 `~/.local/share/dashfloat/sessions/` (`XDG_DATA_HOME` respected) — one JSON
 file per session, mode 0600, because a transcript carries code and tool
-output read from your disk. Ids sort by time; list them with
-`ls ~/.local/share/dashfloat/sessions/` and pick a conversation back up with
-`dashfloat --resume <id>` — the transcript replays in the log and your next
-send continues it. A session records the profile and model it started under;
+output read from your disk. Each session is named by a time-sorting UUID id
+(`0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c`); list them with
+`ls ~/.local/share/dashfloat/sessions/`. Name a new session at start with
+`dashfloat --title "My session"`, and pick a conversation back up with
+`dashfloat --resume <id-or-title>` — the id is the UUID file name, the title
+is the session's unique title (a title that would duplicate another session's
+is refused at creation or rename, so a title resolves to one session or the
+resume refuses) — the transcript replays in the log and your next send continues
+it. Sessions created by older versions are renamed to UUID ids automatically
+at startup. A session records the profile and model it started under;
 resuming under a different one warns and continues, and the session keeps its
 pin. When the configured context window is roughly 80% full, the oldest
 complete turns are dropped to stay inside it — a visible notice names the

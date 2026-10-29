@@ -75,11 +75,15 @@ receives display-contract messages.
   at a predictable staging name has nothing to intercept. Transcripts
   carry source code and tool output read off the user's disk — the mode is
   mandatory, not courtesy.
-- **Session ids:** `YYYYMMDD-HHMMSS-xxxxxx` — UTC wall clock plus six hex
-  chars of `:crypto.strong_rand_bytes/1`. Name-sortable ≈ time-sortable,
-  typeable, collision-safe in practice. Discovery is the filesystem: the
-  README documents `ls ~/.local/share/dashfloat/sessions/`; `--continue`
-  (latest) and an in-TUI picker are future slices.
+- **Session ids:** *(Superseded 2026-10-30, [ADR 0023](0023-session-titles-and-uuid-ids.md):
+  ids are UUIDv7 — validatable, still name-sortable ≈ time-sortable, minted
+  in-module; a boot-time sweep renames timestamp-named files once and
+  steady-state boots write nothing. See 0023 §1–§2.)* `YYYYMMDD-HHMMSS-xxxxxx`
+  — UTC wall clock plus six hex chars of `:crypto.strong_rand_bytes/1`.
+  Name-sortable ≈ time-sortable, typeable, collision-safe in practice.
+  Discovery is the filesystem: the README documents
+  `ls ~/.local/share/dashfloat/sessions/`; `--continue` (latest) and an
+  in-TUI picker are future slices.
 
 ### 3. File schema (version 1)
 
@@ -124,7 +128,12 @@ receives display-contract messages.
   [ADR 0022](0022-context-accounting-and-compaction.md): the additive-evolution
   seam below is now in use — the file may additionally carry `context` and
   `compactions`, written only once they exist and tolerated the `pin` way at
-  load. Still never a credential, and nothing display-shaped.)* The writer
+  load. Still never a credential, and nothing display-shaped.)*
+  *(Amended 2026-10-30, [ADR 0023](0023-session-titles-and-uuid-ids.md): the
+  seam carries a second addition — an optional top-level `title`, the same
+  write-only-once-non-nil / load-tolerantly discipline. Uniqueness of titles
+  is enforced at the set paths by scanning, not by the file schema; see 0023
+  §3–§4.)* The writer
   receives
   the message list and three pin strings, never the key: `api_key` values,
   keys.json5 contents, and environment values have no path into what the
@@ -245,6 +254,13 @@ Application always passes the real directory outside test.
 
 **UX:** `dashfloat --resume 20261027-143052-a1b2c3` continues that session.
 `--continue` (latest) and an in-TUI picker are future slices.
+*(Amended 2026-10-30, [ADR 0023](0023-session-titles-and-uuid-ids.md): the
+id is a UUIDv7 now, and the flag accepts EITHER the id OR the session's
+unique title — UUID-valid ? id : title, decided by validation alone; the
+title-path refusals mirror the unknown-id refusal, and a two-holder title
+refuses naming both ids. The boot additionally runs a one-shot sweep
+renaming legacy timestamp-named files before any resolution — carving the
+never-touches clause below only while legacy files remain. See 0023 §2, §5.)*
 
 **Boot (`DashFloat.Application`, after classification, before children):**
 

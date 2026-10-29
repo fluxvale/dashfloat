@@ -40,3 +40,4 @@ their replacement.
 | [0015](0015-input-surface-cursor-stats-ghost.md) | Input surface: blinking cursor, stats footer, model-driven ghost text | Accepted |
 | [0016](0016-interaction-modes.md) | Interaction modes: the confirmation boundary becomes a mode setting (Plan / Build / Auto / Unchained) | Accepted |
 | [0022](0022-context-accounting-and-compaction.md) | Context accounting and compaction: usage-frame anchor, chars/4 growth, 80% whole-turn eviction | Accepted |
+| [0023](0023-session-titles-and-uuid-ids.md) | Session titles and UUID session ids: title normalization, uniqueness, resume by title, the auto-title nudge | Accepted |

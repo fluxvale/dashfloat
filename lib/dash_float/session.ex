@@ -13,8 +13,10 @@ defmodule DashFloat.Session do
 
   @version 1
 
-  @id_shape ~r/\A[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\z/
-  @id_example "20261027-143052-a1b2c3"
+  # Strict lowercase — we mint lowercase; a typed uppercase value fails this
+  # check (and is handled as a title by the boot, a later slice). See #80.
+  @id_shape ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/
+  @id_example "0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c"
   @id_shape_error "session ids look like #{@id_example}"
 
   @type pin :: %{
@@ -34,6 +36,7 @@ defmodule DashFloat.Session do
           required(:created_at) => String.t(),
           required(:pin) => pin(),
           required(:messages) => [map()],
+          optional(:title) => String.t(),
           optional(:context) => context() | nil,
           optional(:compactions) => [map()]
         }
@@ -46,15 +49,34 @@ defmodule DashFloat.Session do
   end
 
   @doc """
-  A fresh session id: UTC `YYYYMMDD-HHMMSS` plus six random hex chars —
-  name-sortable ≈ time-sortable, collision-safe in practice.
+  A fresh session id: UUIDv7 — a 48-bit unix-ms prefix plus 74 random bits,
+  canonical lowercase. Name-sortable ≈ time-sortable (ADR 0014 §2) survives:
+  the lexical order of ids is their recency order. Elixir 1.20 / OTP 29 ship
+  no UUID module (#80), so v7 is minted here in a few lines — no dependency.
   """
   @spec new_id() :: String.t()
   def new_id do
-    stamp = Calendar.strftime(DateTime.utc_now(), "%Y%m%d-%H%M%S")
-    bytes = :crypto.strong_rand_bytes(3)
-    rand = Base.encode16(bytes, case: :lower)
-    stamp <> "-" <> rand
+    ts = System.system_time(:millisecond)
+    <<rand_a::12, rand_b::62, _spare::22>> = :crypto.strong_rand_bytes(12)
+    uuid_hex(<<ts::48, 7::4, rand_a::12, 2::2, rand_b::62>>)
+  end
+
+  @doc """
+  Whether `id` is the canonical shape `new_id/0` mints (strict lowercase).
+  The one source of the shape: `--resume`'s id-or-title routing (ADR 0023
+  §5) and the title reservation (§3) ask here rather than keeping regex
+  copies that could drift apart.
+  """
+  @spec valid_id?(String.t()) :: boolean()
+  def valid_id?(id) when is_binary(id), do: Regex.match?(@id_shape, id)
+
+  # RFC 9562: 48-bit unix ms, version 7, variant `10`, 62 random bits —
+  # collision safety is those 62 bits per millisecond.
+  defp uuid_hex(<<payload::binary-size(16)>>) do
+    <<a::binary-size(8), b::binary-size(4), c::binary-size(4), d::binary-size(4),
+      e::binary-size(12)>> = Base.encode16(payload, case: :lower)
+
+    <<a::binary, ?-, b::binary, ?-, c::binary, ?-, d::binary, ?-, e::binary>>
   end
 
   @doc """
@@ -71,11 +93,12 @@ defmodule DashFloat.Session do
     end
   end
 
-  # The additive diagnostics are written only once they exist (ADR 0022 §6),
-  # so a loaded map — which always carries `context: nil, compactions: []` —
-  # re-saves byte-identically to a pre-compaction file (hostile review m3).
+  # The additive fields are written only once they exist (ADR 0022 §6, plus
+  # the title — #80), so a loaded map re-saves byte-identically to a file
+  # that never carried them (hostile review m3).
   defp normalize(session) do
     session
+    |> drop_empty(:title, &is_nil/1)
     |> drop_empty(:context, &is_nil/1)
     |> drop_empty(:compactions, &(&1 == []))
   end
@@ -87,6 +110,85 @@ defmodule DashFloat.Session do
       Map.delete(session, key)
     else
       session
+    end
+  end
+
+  @doc """
+  One-shot legacy-id sweep (#80): rewrites timestamp-named session files
+  under fresh UUIDv7 ids, preserving every other field verbatim, then
+  removes the old file — write-before-delete, so a kill in the microsecond
+  window can orphan a duplicate that a later sweep rewrites again
+  (accepted). Only a fully-loading file is rewritten; one that refuses is
+  hand damage the load path will report — skipped silently. A UUID-named
+  file is exempt by name shape alone and never decoded. `{:ok, 0}` — zero
+  writes — for a missing directory (creation belongs to save) and an
+  all-UUID directory, so a steady-state boot touches no session files.
+  """
+  @spec migrate_legacy_ids(Path.t()) :: {:ok, non_neg_integer()} | {:error, String.t()}
+  def migrate_legacy_ids(dir) do
+    case File.ls(dir) do
+      {:error, _reason} -> {:ok, 0}
+      {:ok, names} -> migrate_names(dir, names)
+    end
+  end
+
+  defp migrate_names(dir, names) do
+    legacy =
+      names
+      |> Enum.filter(fn name -> json_name?(name) and not uuid_name?(name) end)
+      |> Enum.sort()
+
+    Enum.reduce_while(legacy, {:ok, 0}, fn name, {:ok, count} ->
+      case rewrite_legacy(dir, name) do
+        :ok -> {:cont, {:ok, count + 1}}
+        :skipped -> {:cont, {:ok, count}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp json_name?(name), do: String.ends_with?(name, ".json")
+
+  defp uuid_name?(name), do: Regex.match?(@id_shape, String.replace_suffix(name, ".json", ""))
+
+  defp rewrite_legacy(dir, name) do
+    case load_by_path(dir, String.replace_suffix(name, ".json", "")) do
+      {:ok, session} -> rewrite(dir, session)
+      {:error, _reason} -> :skipped
+    end
+  end
+
+  defp rewrite(dir, session) do
+    fresh_id = new_id()
+
+    case save(dir, %{session | id: fresh_id}) do
+      :ok -> remove_legacy(dir, session.id, path_for(dir, fresh_id))
+      {:error, _reason} = error -> error
+    end
+  end
+
+  # If the old name cannot be removed, remove the fresh copy instead: a
+  # persistently un-removable legacy file must not mint one orphan UUID
+  # duplicate per boot (ADR 0023 §2 accepts a ONE-TIME kill-window
+  # duplicate, not a multiplier) — the next boot retries the rewrite whole.
+  # Only the failure arm is ignore-marked: the success arm is exercised by
+  # every sweep-migration test and must keep its coverage honest.
+  defp remove_legacy(dir, old_id, new_path) do
+    old_path = path_for(dir, old_id)
+
+    case File.rm(old_path) do
+      :ok ->
+        :ok
+
+      # coveralls-ignore-start
+      # Deterministic rm-failure with a successful save needs a filesystem
+      # condition the suite cannot produce unprivileged (immutable file —
+      # a read-only directory fails the save first); probe-verified in
+      # review, not suite-reachable.
+      {:error, _reason} ->
+        _removed = File.rm(new_path)
+        {:error, "cannot remove #{old_path}"}
+        # coveralls-ignore-stop
     end
   end
 
@@ -126,11 +228,14 @@ defmodule DashFloat.Session do
   @spec load(Path.t(), String.t()) :: {:ok, t()} | {:error, String.t()}
   def load(dir, requested) do
     with :ok <- check_load_id(dir, requested) do
-      do_load(dir, String.replace_suffix(requested, ".json", ""))
+      load_by_path(dir, String.replace_suffix(requested, ".json", ""))
     end
   end
 
-  defp do_load(dir, id) do
+  # The UUID gate lives in load/2; the legacy-id sweep (#80) reuses the
+  # validation below — version, id-field-equals-filename, created_at,
+  # messages shape — with the gate bypassed.
+  defp load_by_path(dir, id) do
     path = path_for(dir, id)
 
     with {:ok, body} <- read_file(path, dir, id),
@@ -146,6 +251,7 @@ defmodule DashFloat.Session do
          version: @version,
          id: id,
          created_at: created_at,
+         title: build_title(decoded),
          pin: build_pin(decoded),
          messages: repair(messages),
          context: build_context(decoded),
@@ -440,6 +546,12 @@ defmodule DashFloat.Session do
 
   defp tool_message?(%{"role" => "tool"}), do: true
   defp tool_message?(_other), do: false
+
+  # The title rides along tolerantly (the pin precedent, #80): absent or not
+  # a string it loads as nil — never a refusal.
+  defp build_title(%{"title" => title}) when is_binary(title), do: title
+
+  defp build_title(_decoded), do: nil
 
   # The pin rides along as diagnostics for the resume compare (ADR 0014 §6);
   # a missing or malformed pin compares nothing.

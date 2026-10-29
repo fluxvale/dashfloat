@@ -15,6 +15,7 @@ defmodule DashFloat.Agent do
   alias DashFloat.LLM.ChatStream
   alias DashFloat.Mode
   alias DashFloat.Session
+  alias DashFloat.Session.Title
   alias DashFloat.Tools
   alias DashFloat.Tools.Preview
   alias DashFloat.Tools.Runner
@@ -46,6 +47,13 @@ defmodule DashFloat.Agent do
     :session_id,
     :session_pin,
     :session_created_at,
+    # The session title (#80): the boot/resume/rename-adopted value, the
+    # in-flight guard ref, and the side-request's fetcher seam for tests —
+    # with the one-shot auto-title latch, false until the request fires.
+    :session_title,
+    :title_ref,
+    :title_fetcher,
+    title_fired?: false,
     # :idle | :streaming | :tools
     status: :idle,
     messages: [],
@@ -90,7 +98,13 @@ defmodule DashFloat.Agent do
     * `:resume` — `%{id: _, pin: _, messages: _}` from `DashFloat.Session.load/2`,
       optionally with the session's `:created_at` plus the ADR 0022 §6
       diagnostics `:context` (the persisted anchor) and `:compactions` (the
-      eviction history); the agent adopts them (default: nil)
+      eviction history); the agent adopts them (default: nil). A `:title`
+      entry — the loaded session's title (#80) — is adopted the same way
+    * `:title` — a boot-normalized session title, adopted verbatim into
+      `session_title` (default: nil)
+    * `:title_fetcher` — the auto-title side-request's fetcher (an `{m, f}`
+      MFA or fun/2; default `{DashFloat.Session.Title, :request}`; the
+      injection seam for tests)
     * `:mode` — the interaction mode (ADR 0016): `:plan`, `:build`, `:auto`,
       or `:unchained` (default: `:build`; anything else raises `ArgumentError`)
     * `:vetter` — the AUTO safety-check module implementing `verdict/4`
@@ -115,7 +129,9 @@ defmodule DashFloat.Agent do
       Keyword.get(opts, :resume),
       mode,
       Keyword.get(opts, :vetter, DashFloat.Tools.Vetter),
-      Keyword.get(opts, :vet_timeout, @default_vet_timeout)
+      Keyword.get(opts, :vet_timeout, @default_vet_timeout),
+      Keyword.get(opts, :title),
+      Keyword.get(opts, :title_fetcher)
     }
 
     GenServer.start_link(__MODULE__, init_args, name: Keyword.get(opts, :name, __MODULE__))
@@ -123,23 +139,25 @@ defmodule DashFloat.Agent do
 
   @impl GenServer
   def init(
-        {provider, cwd, supervisor, exec_timeout, session_dir, resume, mode, vetter, vet_timeout}
+        {provider, cwd, supervisor, exec_timeout, session_dir, resume, mode, vetter, vet_timeout,
+         title, title_fetcher}
       ) do
     # A resumed agent adopts the loaded session's id, pin, created_at, and
     # history in one move: the first prompt streams the restored transcript
     # and the next save rewrites the same file under the same id (ADR 0014 §6).
     # The ADR 0022 §6 diagnostics ride the same map: the persisted context
     # shape converts to the accounting anchor at this boundary, and the
-    # eviction history is adopted verbatim.
-    {session_id, session_pin, session_created_at, messages, anchor, compactions} =
+    # eviction history is adopted verbatim. The title too (#80) — a resume
+    # without one stays nil.
+    {session_id, session_pin, session_created_at, messages, anchor, compactions, resumed_title} =
       case resume do
         %{id: id, pin: pin, messages: messages} ->
           {id, pin, Map.get(resume, :created_at), messages,
            anchor_from_context(Map.get(resume, :context), messages),
-           list_or_empty(Map.get(resume, :compactions))}
+           list_or_empty(Map.get(resume, :compactions)), Map.get(resume, :title)}
 
         nil ->
-          {nil, nil, nil, [], nil, []}
+          {nil, nil, nil, [], nil, [], nil}
       end
 
     {:ok,
@@ -152,6 +170,8 @@ defmodule DashFloat.Agent do
        session_id: session_id,
        session_pin: session_pin,
        session_created_at: session_created_at,
+       session_title: title || resumed_title,
+       title_fetcher: title_fetcher,
        messages: messages,
        anchor: anchor,
        compactions: compactions,
@@ -380,6 +400,52 @@ defmodule DashFloat.Agent do
   # reused the id.
   def handle_info({:vet_done, _ref, _id, _verdict}, state), do: {:noreply, state}
 
+  ## Session title (#80)
+
+  # The auto-title proposal lands. The guard ref matches the live request
+  # (the stale-straggler discipline); a nil text is a spent one-shot; a
+  # title that arrived while in flight wins — that check is the entire
+  # user-intent-wins precedence.
+  def handle_info({:title_proposal, ref, text}, %__MODULE__{title_ref: ref} = state) do
+    cond do
+      is_nil(text) ->
+        {:noreply, %{state | title_ref: nil}}
+
+      is_binary(state.session_title) ->
+        {:noreply, %{state | title_ref: nil}}
+
+      true ->
+        adopt_title(state, text)
+    end
+  end
+
+  # A stale proposal (its guard ref was superseded) is ignored, never a crash.
+  def handle_info({:title_proposal, _ref, _text}, state), do: {:noreply, state}
+
+  # The rename seam: the UI sends, the agent validates against the same
+  # rules the store enforces, resolves a holder, persists. A non-pid ui or
+  # a non-binary title is a UI bug: ignored, never a crash.
+  def handle_info({:set_title, ui, title}, state) when is_pid(ui) and is_binary(title) do
+    case Title.normalize(title) do
+      {:ok, cleaned} ->
+        resolve_title(%{state | ui: ui}, cleaned)
+
+      {:error, :empty} ->
+        display(ui, {:entry, :system, "[title not set: may not be empty]"})
+        {:noreply, state}
+
+      {:error, :too_long} ->
+        display(ui, {:entry, :system, "[title not set: may not exceed 80 characters]"})
+        {:noreply, state}
+
+      {:error, :reserved} ->
+        display(ui, {:entry, :system, "[title not set: may not look like a session id]"})
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:set_title, _ui, _title}, state), do: {:noreply, state}
+
   ## Monitors
 
   # A runner dying after the user cancelled (however it died): abort the batch
@@ -499,6 +565,9 @@ defmodule DashFloat.Agent do
 
   # The turn's end without tools: bank the (final-episode-only) usage, finalize,
   # idle (ADR 0007 §5 amends ADR 0006: intermediate episodes' usage is dropped).
+  # The auto-title side-request (#80) fires here and only here — the first
+  # settled assistant turn — before the idle display and never on its critical
+  # path: fetch_async returns as soon as the task starts.
   defp end_turn_final(state, content) do
     if content == "" do
       display(state.ui, {:entry, :system, "[model returned nothing]"})
@@ -508,6 +577,7 @@ defmodule DashFloat.Agent do
       state
       |> finalize_episode(content)
       |> reset_turn()
+      |> maybe_fire_title(content)
 
     if state.pending_usage, do: display(state.ui, {:usage, state.pending_usage})
     display(state.ui, {:phase, :idle})
@@ -1016,6 +1086,159 @@ defmodule DashFloat.Agent do
 
   ## Session persistence
 
+  # The auto-title trigger (#80): the first settled turn with content,
+  # persistence on, no title yet, the one-shot unspent, and the tri-state
+  # not opted out. A failed task start just doesn't fire — fail-open.
+  defp maybe_fire_title(
+         %__MODULE__{
+           session_dir: dir,
+           session_title: nil,
+           title_fired?: false,
+           title_fetcher: fetcher,
+           supervisor: supervisor,
+           messages: messages,
+           provider: {:ok, %Config{auto_title: auto_title} = config}
+         } = state,
+         content
+       )
+       when content != "" and not is_nil(dir) and auto_title != false do
+    ref = make_ref()
+
+    # The task rides the agent's own supervisor (the :supervisor opt's
+    # constituency — embedded starters — must not depend on the global
+    # name), and fetch_async catches the cannot-start exit: a supervisor
+    # that cannot start the task is a miss, never a crash (ADR 0023 §8).
+    case Title.fetch_async(config, first_exchange_context(messages),
+           ref: ref,
+           fetcher: fetcher,
+           supervisor: supervisor
+         ) do
+      {:ok, _pid} ->
+        %{state | title_fired?: true, title_ref: ref}
+
+      # coveralls-ignore-start
+      # A supervisor that could not start the task (dead, absent, full) —
+      # the latch stays unarmed, the next settled turn retries. The failure
+      # class is unit-proven (Title.fetch_async's bogus-supervisor test);
+      # this arm is the pattern match consuming it, and forcing it here
+      # needs a supervisor dead between the stream's end and the settle —
+      # a race, not a test.
+      {:error, _reason} ->
+        state
+        # coveralls-ignore-stop
+    end
+  end
+
+  defp maybe_fire_title(state, _content), do: state
+
+  # The first exchange: the first user message's content and the first
+  # assistant REPLY's content (a tool_calls-only announcement carries nil —
+  # the common first assistant message in a coding harness — so the find
+  # skips to the first message with real content) — atom-keyed in-session,
+  # string-keyed after a resume. A missing side reads "" (the instruction
+  # alone can still title).
+  defp first_exchange_context(messages) do
+    %{
+      user: first_content(messages, "user"),
+      assistant: first_content(messages, "assistant")
+    }
+  end
+
+  defp first_content(messages, role) do
+    case Enum.find(messages, fn
+           %{role: ^role, content: content} when is_binary(content) and content != "" ->
+             true
+
+           %{"role" => ^role, "content" => content} when is_binary(content) and content != "" ->
+             true
+
+           _other ->
+             false
+         end) do
+      %{content: content} when is_binary(content) ->
+        content
+
+      %{"content" => content} when is_binary(content) ->
+        content
+
+      # coveralls-ignore-start
+      # Unreachable in a settled exchange (the trigger fires only after the
+      # assistant content was appended, and the user message precedes it);
+      # the belt exists for hand-shaped transcripts.
+      _other ->
+        ""
+        # coveralls-ignore-stop
+    end
+  end
+
+  # Collision resolution: the proposal, else the proposal truncated under
+  # the display cap plus " (n)" — first candidate no other session holds
+  # wins; after 8, give up silently (the title is a courtesy, fail-open).
+  # coveralls-ignore-start
+  # The nil-dir arm is unreachable through the trigger (it fires only with a
+  # session_dir); belt over a future trigger regression — a landing must
+  # never raise.
+  defp adopt_title(%__MODULE__{session_dir: nil} = state, _proposal) do
+    {:noreply, %{state | title_ref: nil}}
+  end
+
+  # coveralls-ignore-stop
+  defp adopt_title(%__MODULE__{session_dir: dir, session_id: id} = state, proposal) do
+    n = Enum.find(1..8, fn n -> is_nil(Title.title_holder(dir, candidate(proposal, n), id)) end)
+
+    case n do
+      nil ->
+        {:noreply, %{state | title_ref: nil}}
+
+      n ->
+        title = candidate(proposal, n)
+        new_state = persist(%{state | session_title: title, title_ref: nil})
+        display(new_state.ui, {:entry, :system, "[session titled: #{title}]"})
+        {:noreply, new_state}
+    end
+  end
+
+  # Candidate 1 is the proposal; candidate n>1 fits " (n)" under the cap.
+  defp candidate(proposal, 1), do: proposal
+
+  defp candidate(proposal, n) do
+    suffix = " (#{n})"
+    String.slice(proposal, 0, Title.display_cap() - String.length(suffix)) <> suffix
+  end
+
+  # The normalized title: a holder names itself, a free title sets, persists,
+  # and confirms. Persistence off — or no session yet — still normalizes,
+  # sets, and confirms; persist just has no file to rewrite.
+  defp resolve_title(%__MODULE__{session_dir: nil} = state, cleaned) do
+    new_state = persist_if_started(%{state | session_title: cleaned})
+    display(state.ui, {:entry, :system, "[session titled: #{cleaned}]"})
+    {:noreply, new_state}
+  end
+
+  defp resolve_title(%__MODULE__{session_dir: dir, session_id: id} = state, cleaned) do
+    case Title.title_holder(dir, cleaned, id) do
+      nil ->
+        new_state = persist_if_started(%{state | session_title: cleaned})
+        display(state.ui, {:entry, :system, "[session titled: #{cleaned}]"})
+        {:noreply, new_state}
+
+      holder ->
+        display(
+          state.ui,
+          {:entry, :system,
+           ~s([title not set: "#{cleaned}" is already taken by session #{holder}])}
+        )
+
+        {:noreply, state}
+    end
+  end
+
+  # A title set before the first prompt has no file to rewrite: the id is
+  # minted at the first save (ADR 0014 §5 — a launch that never prompts
+  # leaves nothing), so the title waits in state for that save.
+  defp persist_if_started(%__MODULE__{session_id: nil} = state), do: state
+  defp persist_if_started(state), do: persist(state)
+
   # A full-file rewrite at every message-list mutation, opt-in via
   # :session_dir — the nil default keeps tests and embedded starters off the
   # user's XDG dir. A failed save degrades to a warning plus one system
@@ -1052,6 +1275,7 @@ defmodule DashFloat.Agent do
        ) do
     session =
       %{version: 1, id: id, created_at: created_at, pin: pin, messages: messages}
+      |> put_title(state.session_title)
       |> put_context(state.anchor)
       |> put_compactions(state.compactions)
 
@@ -1076,6 +1300,11 @@ defmodule DashFloat.Agent do
 
   defp put_compactions(session, []), do: session
   defp put_compactions(session, compactions), do: Map.put(session, :compactions, compactions)
+
+  # The title rides every full-file rewrite once it exists (#80) — nil keeps
+  # the pre-title file shape exactly (Session's drop-nil normalize).
+  defp put_title(session, nil), do: session
+  defp put_title(session, title), do: Map.put(session, :title, title)
 
   defp now_iso8601_utc, do: DateTime.to_iso8601(DateTime.utc_now())
 
