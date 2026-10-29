@@ -17,18 +17,29 @@ defmodule DashFloat.Accounting do
   never a count.
   """
   @spec estimate([map()], anchor()) :: non_neg_integer()
-  def estimate(messages, nil), do: sum_weights(messages)
+  def estimate(messages, anchor), do: estimate_trusted(messages, trust(anchor, messages))
 
-  def estimate(messages, %{tokens: tokens, index: index})
-      when is_integer(tokens) and tokens >= 0 and is_integer(index) and index >= 0 do
+  defp estimate_trusted(messages, nil), do: sum_weights(messages)
+
+  defp estimate_trusted(messages, %{tokens: tokens, index: index}) do
     tokens + sum_weights(Enum.drop(messages, index))
   end
 
   # Total on purpose (hostile review B1): a hand-built or hand-edited anchor
   # must degrade to the pure heuristic, never raise out of a prompt. The
-  # session loader refuses nothing here (ADR 0022 §6), so this public API —
-  # which #67 will bind to — cannot assume its callers validated.
-  def estimate(messages, _malformed_anchor), do: sum_weights(messages)
+  # session loader refuses nothing here (ADR 0022 §6), so these public APIs —
+  # which #67 will bind to — cannot assume their callers validated. An index
+  # past the list is hand damage, not growth (M1): a legitimate frame never
+  # covered more messages than exist, and honouring it would let a small
+  # `tokens` vouch for an unbounded history and switch eviction off.
+  defp trust(nil, _messages), do: nil
+
+  defp trust(%{tokens: tokens, index: index}, messages)
+       when is_integer(tokens) and tokens >= 0 and is_integer(index) and index >= 0 and
+              index <= length(messages),
+       do: %{tokens: tokens, index: index}
+
+  defp trust(_malformed, _messages), do: nil
 
   @doc """
   The stage-2 read the stats footer binds to (ADR 0022 §7): the estimate of
@@ -55,7 +66,7 @@ defmodule DashFloat.Accounting do
           %{kept: [map()], anchor: anchor(), dropped: non_neg_integer(), oversize: boolean()}
   def compact(messages, anchor, window) do
     threshold = div(window * 4, 5)
-    {groups, anchor, dropped} = evict(turns(messages), anchor, threshold, 0)
+    {groups, anchor, dropped} = evict(turns(messages), trust(anchor, messages), threshold, 0)
     kept = Enum.concat(groups)
 
     %{

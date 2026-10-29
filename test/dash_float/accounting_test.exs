@@ -138,11 +138,40 @@ defmodule DashFloat.AccountingTest do
       assert Accounting.estimate(messages, %{tokens: 1000, index: 2}) == 1000 + 100 + 200
     end
 
-    test "an index at or past the end adds no growth" do
+    test "an index at the end adds no growth" do
       messages = [user(400), assistant(800)]
 
       assert Accounting.estimate(messages, %{tokens: 750, index: 2}) == 750
-      assert Accounting.estimate(messages, %{tokens: 750, index: 9}) == 750
+    end
+
+    test "an index past the end is no anchor, not free growth (M1)" do
+      messages = [user(400), assistant(800)]
+
+      # A frame can never have covered more messages than exist; honouring the
+      # stale count would report 750 for 300 tokens of history.
+      assert Accounting.estimate(messages, %{tokens: 750, index: 9}) == 300
+    end
+
+    # The totality contract (hostile review B1): these are the two public
+    # functions #67 binds to, so no caller's anchor shape may raise a prompt.
+    test "a malformed anchor degrades to the heuristic in estimate/2 and compact/3" do
+      messages = [user(400), assistant(800), user(100), assistant(200)]
+      heuristic = Accounting.estimate(messages, nil)
+
+      for anchor <- [
+            %{tokens: nil, index: 2},
+            %{tokens: "412", index: 2},
+            %{tokens: 412, index: "2"},
+            %{"tokens" => 412, "index" => 2},
+            %{tokens: -5, index: 2},
+            %{tokens: 1.5, index: 2},
+            :junk
+          ] do
+        assert Accounting.estimate(messages, anchor) == heuristic
+
+        assert %{dropped: dropped} = Accounting.compact(messages, anchor, 400)
+        assert dropped >= 0
+      end
     end
   end
 
