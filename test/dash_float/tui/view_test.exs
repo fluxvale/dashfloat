@@ -3,6 +3,8 @@ defmodule DashFloat.TUI.ViewTest do
   use ExUnit.Case, async: true
 
   alias DashFloat.Config.Onboarding
+  alias DashFloat.TUI.Commands
+  alias DashFloat.TUI.Palette
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Theme
@@ -1087,6 +1089,65 @@ defmodule DashFloat.TUI.ViewTest do
         assert reversed_cells(%{base | phase: :streaming, anim_step: step}) == 0,
                "step #{step}"
       end
+    end
+  end
+
+  describe "the command palette (ADR 0020)" do
+    test "a filter popup draws the matched commands over the frame" do
+      palette = %Palette{
+        mode: :filter,
+        kind: :commands,
+        items: Commands.match("model"),
+        selected: 0
+      }
+
+      state = %{new_state() | palette: palette}
+
+      assert drawn_text(state) =~ "/model — pick a model"
+    end
+
+    test "a models picker draws ids, context detail, and the current marker" do
+      entries = [%{model: "m1", context: 128_000}, %{model: "m2", context: nil}]
+
+      palette = %Palette{mode: :modal, kind: :models, items: entries, selected: 1}
+      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "m2", api_key: "k"}}
+      state = %{new_state(provider: provider) | palette: palette}
+
+      buffer = drawn_text(state)
+
+      assert buffer =~ "Models"
+      assert buffer =~ "m1 (128k)"
+      assert buffer =~ "m2 · current"
+    end
+
+    test "the context detail rides the status bar's humanize ladder" do
+      entries = [%{model: "tiny", context: 999}, %{model: "big", context: 1_048_576}]
+      palette = %Palette{mode: :modal, kind: :models, items: entries, selected: 0}
+      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "tiny", api_key: "k"}}
+      state = %{new_state(provider: provider) | palette: palette}
+
+      buffer = drawn_text(state)
+
+      assert buffer =~ "tiny (999)"
+      assert buffer =~ "big (1m)"
+    end
+
+    test "a profiles picker draws the names" do
+      palette = %Palette{mode: :modal, kind: :profiles, items: ["personal", "work"], selected: 0}
+      state = %{new_state() | palette: palette}
+
+      buffer = drawn_text(state)
+
+      assert buffer =~ "Profiles"
+      assert buffer =~ "personal"
+    end
+
+    test "a filter palette is idle-only: an active phase renders no palette widgets" do
+      palette = %Palette{mode: :filter, kind: :commands, items: Commands.all(), selected: 0}
+      state = %{new_state() | phase: :streaming, palette: palette}
+
+      widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+      assert length(widgets) == 5
     end
   end
 

@@ -205,6 +205,28 @@ defmodule DashFloat.TUI do
   defp run_action({:write_settings, doc}, state),
     do: write_wizard_settings(state, doc)
 
+  # The command surface's deliveries (ADR 0020). /title rides ADR 0023 §7's
+  # rename seam — the agent owns normalization, uniqueness, and persistence
+  # after the send.
+  defp run_action({:set_title, title}, state) do
+    send(state.agent, {:set_title, self(), title})
+    state
+  end
+
+  # /model's switch is a plain send and NOTHING else: the agent reads its
+  # provider per episode, so the swap lands on the NEXT request; no local
+  # change (State already swapped its provider copy) and no catalog restart
+  # (same provider set — the sweep stays).
+  defp run_action({:switch_model, classification}, state) do
+    send(state.agent, {:set_provider, classification})
+    state
+  end
+
+  # /profile's list: a fast local read of settings.json5; profiles_arrived
+  # opens the picker or warns when there is nothing to list (ADR 0020).
+  defp run_action(:list_profiles, state),
+    do: State.profiles_arrived(state, Config.profile_names(state.config_dir))
+
   # The refusal detection the list-stop keys on: the bounce leaves the
   # wizard's error set (issue #39).
   defp write_refused?(%State{setup: %Onboarding{error: error}}) when error != nil, do: true

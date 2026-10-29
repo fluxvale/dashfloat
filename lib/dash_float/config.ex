@@ -329,6 +329,28 @@ defmodule DashFloat.Config do
     end
   end
 
+  @doc """
+  Profile names in a config dir, read-only (`[]` when the dir is nil or
+  settings.json5 is unreadable/unparseable). The /profile picker's list
+  (ADR 0020).
+  """
+  @spec profile_names(String.t() | nil) :: [String.t()]
+  def profile_names(nil), do: []
+
+  def profile_names(dir) when is_binary(dir) do
+    main_path = Path.join(dir, @main_file)
+
+    case JSON5.read_map(main_path) do
+      {:ok, main} ->
+        main
+        |> parse_profiles()
+        |> Enum.map(& &1.name)
+
+      {:error, _reason} ->
+        []
+    end
+  end
+
   ## Classification — the deliberate-selection state machine (ADR 0009)
 
   defp classify(main, profiles, keys, env, cli) do
