@@ -386,6 +386,8 @@ defmodule DashFloat.Agent do
   end
 
   defp begin_tool_batch(state, content, calls) do
+    calls = dedup_ids(calls)
+
     assistant = %{
       role: "assistant",
       content: if(content == "", do: nil, else: content),
@@ -414,6 +416,24 @@ defmodule DashFloat.Agent do
 
     display(state.ui, {:phase, :executing_tool})
     next_call(state)
+  end
+
+  # Id uniqueness is owned at the batch boundary (ADR 0014 §4): persistence
+  # makes ids load-bearing across processes, and `state.results` is keyed by
+  # call id, so a repeated id would serve one call's answer to two calls.
+  # Each repeat after its first use renames in place (id, id-2, id-3, …)
+  # BEFORE the assistant message is built, so the assistant `tool_calls`, the
+  # dispatch, the results map, and the flushed tool messages all carry the
+  # renamed ids consistently.
+  defp dedup_ids(calls) do
+    {renamed, _counts} =
+      Enum.map_reduce(calls, %{}, fn %{id: id} = call, counts ->
+        n = Map.get(counts, id, 0) + 1
+        call = if n == 1, do: call, else: %{call | id: "#{id}-#{n}"}
+        {call, Map.put(counts, id, n)}
+      end)
+
+    renamed
   end
 
   defp next_call(%__MODULE__{call_index: index, calls: calls} = state)

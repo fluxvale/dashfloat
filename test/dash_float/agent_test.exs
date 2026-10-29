@@ -974,6 +974,53 @@ defmodule DashFloat.AgentTest do
   end
 
   @tag :tmp_dir
+  test "a batch announcing the SAME id twice: both calls execute and persist distinct ids", ctx do
+    write_sandbox(ctx, "notes.md", "seed\n")
+
+    # Both parallel calls announce the same id — a sloppy provider's batch.
+    frames =
+      tool_frames("call_dup", "read_file", [~s({"path":"notes.md"})]) ++
+        tool_frames_1("call_dup", "list_directory", [~s({"path":"."})])
+
+    server =
+      start_server([
+        [{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close],
+        final_episode("both done")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "run both"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    # Both calls execute; the repeat carries its occurrence rename.
+    assert_receive {:tool_result, %{id: "call_dup", ok: true}}, 2_000
+    assert_receive {:tool_result, %{id: "call_dup-2", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # The persisted transcript carries distinct ids, answered one-to-one —
+    # a file with a repeated id would refuse to load at all (ADR 0014 §4).
+    id = session_id(sessions)
+    {:ok, session} = Session.load(sessions, id)
+
+    assert [
+             %{"role" => "user"},
+             %{"role" => "assistant", "content" => nil, "tool_calls" => calls},
+             tool_a,
+             tool_b,
+             %{"role" => "assistant", "content" => "both done"}
+           ] = session.messages
+
+    assert Enum.map(calls, & &1["id"]) == ["call_dup", "call_dup-2"]
+    assert Enum.map([tool_a, tool_b], & &1["tool_call_id"]) == ["call_dup", "call_dup-2"]
+
+    # Each answer is its own call's result, not one call's twice.
+    assert Jason.decode!(tool_a["content"])["path"] == "notes.md"
+    assert Map.has_key?(Jason.decode!(tool_b["content"]), "entries")
+  end
+
+  @tag :tmp_dir
   test "a mid-batch cancel persists cancelled results for the whole batch", ctx do
     frames =
       tool_frames("call_run", "execute_command", [~s({"command":"sleep 10"})]) ++
