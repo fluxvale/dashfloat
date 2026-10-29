@@ -265,14 +265,17 @@ defmodule DashFloat.TUI.State do
     end)
   end
 
-  # The call name comes from the announcing batch (the loader guarantees no
-  # orphans); status and display excerpt re-derive through the same Tools
-  # helpers the live display messages use — one derivation, two callers.
+  # The call name comes from the announcing batch; an id no batch announced
+  # (hand damage the loader's refusals exist to catch) degrades the row to
+  # the literal name "tool" — a malformed transcript must never kill the
+  # mount (ADR 0014 §6). Status and display excerpt re-derive through the
+  # same Tools helpers the live display messages use — one derivation, two
+  # callers.
   defp replay_message(
          %{"role" => "tool", "tool_call_id" => id, "content" => content},
          {state, names}
        ) do
-    {name, names} = Map.pop(names, id)
+    {name, names} = Map.pop(names, id, "tool")
     result = replay_result(content)
 
     {text, lines} =

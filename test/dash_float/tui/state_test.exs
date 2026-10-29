@@ -2114,6 +2114,20 @@ defmodule DashFloat.TUI.StateTest do
              ]
     end
 
+    test "a tool message answering an id no batch announced degrades to the literal name" do
+      # Belt over the loader's orphan refusal: a hand-built transcript handed
+      # straight to new/1 must render a row, never raise on the mount.
+      transcript = [
+        %{"role" => "user", "content" => "go"},
+        %{"role" => "tool", "tool_call_id" => "ghost", "content" => ~s({"ok":true})}
+      ]
+
+      assert pairs(new_state(transcript: transcript)) == [
+               {:user, "go"},
+               {:tool, "⚙ tool → ok"}
+             ]
+    end
+
     test "a nil-content assistant with calls produces no empty assistant entry" do
       transcript = [
         %{
