@@ -245,7 +245,12 @@ defmodule DashFloat.TUI do
     do: {:noreply, state, %{render?: false}}
 
   def handle_info({:suggestion, epoch, text}, state) do
-    if accept_suggestion?(state, epoch) and is_binary(text) and String.trim(text) != "" do
+    # The visible-remainder test is the module's own normalize: it refuses
+    # not just blank but INVISIBLE ghosts (soft hyphen, word joiner, bare
+    # combining marks) — anything that would blank the placeholder or
+    # materialize an unseen submit on Tab.
+    if accept_suggestion?(state, epoch) and is_binary(text) and
+         Suggest.normalize({:ok, text}) != nil do
       {:noreply, %{state | suggestion: text, suggest_task: nil}}
     else
       {:noreply, %{state | suggest_task: nil}, %{render?: false}}

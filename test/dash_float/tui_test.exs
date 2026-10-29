@@ -2458,5 +2458,17 @@ defmodule DashFloat.TUITest do
       assert {:noreply, ^state, %{render?: false}} =
                TUI.handle_info({:suggestion, 5, "   "}, state)
     end
+
+    # Invisible-but-non-whitespace ghosts (soft hyphen, word joiner, a bare
+    # combining mark) pass a plain trim test — the module's own normalize
+    # is the visible-remainder gate.
+    test "an invisible-character ghost is refused: it would blank the placeholder unseen" do
+      for ghost <- ["\u00AD", "\u2060", "\u0301"] do
+        state = %{State.new(provider: provider()) | suggest_epoch: 5}
+
+        assert {:noreply, ^state, %{render?: false}} =
+                 TUI.handle_info({:suggestion, 5, ghost}, state)
+      end
+    end
   end
 end
