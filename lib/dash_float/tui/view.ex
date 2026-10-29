@@ -152,7 +152,7 @@ defmodule DashFloat.TUI.View do
       {"Name your first profile — it becomes the default.", :assistant},
       blank(),
       input_line(draft, false),
-      hint("⏎ accept · backspace edit")
+      hint("⏎ accept · backspace edit · esc back")
     ]
   end
 
@@ -160,7 +160,7 @@ defmodule DashFloat.TUI.View do
     [
       {"Add a provider.", :assistant},
       blank() | option_lines(wizard, &provider_option/2)
-    ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
+    ] ++ [blank(), hint("↑↓ move · ⏎ choose · esc back")]
   end
 
   defp wizard_lines(%{step: :custom_url, draft: draft}, _width) do
@@ -176,7 +176,8 @@ defmodule DashFloat.TUI.View do
     [
       {"Label this provider (optional — defaults to the URL host).", :assistant},
       blank(),
-      input_line(draft, false)
+      input_line(draft, false),
+      hint("⏎ accept · esc back")
     ]
   end
 
@@ -188,7 +189,7 @@ defmodule DashFloat.TUI.View do
       {"or leave it empty to skip.", :assistant},
       blank(),
       input_line(draft, true),
-      hint("⏎ accept · written to keys.json5 (0600) immediately")
+      hint("⏎ accept · written to keys.json5 (0600) immediately · esc back")
     ]
   end
 
@@ -222,7 +223,7 @@ defmodule DashFloat.TUI.View do
     [
       {"Pick a model.", :assistant},
       blank() | option_lines(wizard, &model_pick_option/2)
-    ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
+    ] ++ [blank(), hint("↑↓ move · ⏎ choose · esc back")]
   end
 
   # Manual entry is the explicit fallback (issue #64): a failed fetch lands
@@ -234,7 +235,7 @@ defmodule DashFloat.TUI.View do
       {"The model id.", :assistant},
       blank(),
       input_line(draft, false),
-      hint("⏎ accept · empty skips · nickname defaults to the id")
+      hint("⏎ accept · empty skips · nickname defaults to the id · esc back")
     ]
   end
 
@@ -244,14 +245,14 @@ defmodule DashFloat.TUI.View do
       | note_lines(note, width)
     ] ++
       [blank(), input_line(draft, false)] ++
-      [hint("⏎ accept · empty skips · nickname defaults to the id")]
+      [hint("⏎ accept · empty skips · nickname defaults to the id · esc back")]
   end
 
   defp wizard_lines(%{step: :loop, error: nil} = wizard, _width) do
     [
       {"Anything else? The profile works as-is.", :assistant},
       blank() | option_lines(wizard, &loop_option/2)
-    ] ++ [blank(), hint("↑↓ move · ⏎ choose")]
+    ] ++ [blank(), hint("↑↓ move · ⏎ choose · esc back")]
   end
 
   # A refused settings write lands here: the remedy is on screen, and picking
@@ -263,7 +264,7 @@ defmodule DashFloat.TUI.View do
       blank() | error_lines(error, width)
     ] ++
       [blank() | option_lines(wizard, &loop_option/2)] ++
-      [blank(), hint("apply the remedy · ⏎ on done retries the write")]
+      [blank(), hint("apply the remedy · ⏎ on done retries the write · esc back")]
   end
 
   defp wizard_lines(%{step: :mcp_name, draft: draft}, _width) do
@@ -271,7 +272,7 @@ defmodule DashFloat.TUI.View do
       {"MCP server name.", :assistant},
       blank(),
       input_line(draft, false),
-      hint("⏎ accept · empty skips")
+      hint("⏎ accept · empty skips · esc back")
     ]
   end
 
@@ -280,7 +281,7 @@ defmodule DashFloat.TUI.View do
       {"MCP command (e.g. uvx).", :assistant},
       blank(),
       input_line(draft, false),
-      hint("⏎ accept · empty cancels")
+      hint("⏎ accept · empty cancels · esc back")
     ]
   end
 
@@ -288,7 +289,8 @@ defmodule DashFloat.TUI.View do
     [
       {"MCP arguments (space-separated, optional).", :assistant},
       blank(),
-      input_line(draft, false)
+      input_line(draft, false),
+      hint("⏎ accept · esc back")
     ]
   end
 
@@ -297,7 +299,7 @@ defmodule DashFloat.TUI.View do
       {"Token environment variable (optional).", :assistant},
       blank(),
       input_line(draft, true),
-      hint("stored as $VAR — the value never lands in a file")
+      hint("stored as $VAR — the value never lands in a file · esc back")
     ]
   end
 

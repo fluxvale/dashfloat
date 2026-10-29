@@ -13,7 +13,11 @@ defmodule DashFloat.Config.Onboarding do
   or the picker's last option; failures fall back to manual with the reason
   on screen; nickname defaults to the model id) → optional loops (more
   providers, MCP servers; every step skippable) → done: `settings.json5`
-  written and the app starts under the new profile.
+  written and the app starts under the new profile. Esc at any other step
+  walks BACK to the previous one, side-effect-free, the step's remembered
+  draft/choice restored (issue #65; ADR 0009's back-navigation amendment):
+  `:welcome` and `:done` are no-ops, `:fetching`'s esc stays the manual
+  fallback, and esc at `:loop` pops the last finished provider.
 
   This module is pure: it never touches the filesystem or the network.
   `handle_key/2` returns `{state, action}` where the RUNNER executes the
@@ -53,7 +57,10 @@ defmodule DashFloat.Config.Onboarding do
           label: String.t(),
           base_url: String.t(),
           key: String.t() | nil,
-          models: [%{nickname: String.t(), model: String.t()}]
+          models: [%{nickname: String.t(), model: String.t()}],
+          # The fetch snapshot at finish (issue #65): what the loop's esc-pop
+          # restores. Never written out — settings_doc/1 maps explicit fields.
+          fetched: [String.t()]
         }
 
   @type t :: %__MODULE__{
@@ -65,13 +72,15 @@ defmodule DashFloat.Config.Onboarding do
           profile_name: String.t(),
           providers: [provider_draft()],
           mcp: [%{name: String.t(), command: String.t(), args: [String.t()], token: nil | :ref}],
+          memory: %{optional(step()) => %{draft: String.t(), choice: non_neg_integer()}},
           note: String.t() | nil
         }
 
-  # Inspected standalone (logs, IEx): the draft and the pending provider can
-  # hold the plaintext key — ADR 0005's never-echo rule, belt to
-  # DashFloat.TUI.State's own :setup exclusion (P1-3, hostile review).
-  @derive {Inspect, except: [:draft, :pending]}
+  # Inspected standalone (logs, IEx): the draft, the pending provider, and
+  # the back-nav memory can hold the plaintext key — ADR 0005's never-echo
+  # rule, belt to DashFloat.TUI.State's own :setup exclusion (P1-3, hostile
+  # review).
+  @derive {Inspect, except: [:draft, :pending, :memory]}
   defstruct step: :welcome,
             draft: "",
             pending: nil,
@@ -83,6 +92,9 @@ defmodule DashFloat.Config.Onboarding do
             mcp_name: nil,
             mcp_command: nil,
             mcp_args: [],
+            # Per-step draft/choice snapshots (issue #65): what esc-back
+            # restores — a back-then-forward round trip is lossless.
+            memory: %{},
             # A refused write's message, shown at the step that issued the
             # write (issue #39): paths and remedies only, never values.
             error: nil,
@@ -115,7 +127,8 @@ defmodule DashFloat.Config.Onboarding do
                :mcp_args,
                :mcp_token
              ] do
-    %{state | draft: draft <> normalize(content)}
+    # A paste is an edit: it feeds the back-nav memory like typing (issue #65).
+    remember(%{state | draft: draft <> normalize(content)})
   end
 
   def paste(%__MODULE__{} = state, _content), do: state
@@ -130,8 +143,11 @@ defmodule DashFloat.Config.Onboarding do
   @doc """
   One keypress: `{state, action}`. `code` is an `ExRatatui` key code; the
   global Ctrl+C/Ctrl+Q quits live in the TUI router, not here. Line steps
-  type (single chars), backspace, Enter to accept, Esc to skip where a skip
-  is sensible; selection steps move with up/down and pick with Enter.
+  type (single chars), backspace, Enter to accept; Esc steps BACK to the
+  previous step — side-effect-free, the destination's remembered draft and
+  choice restored — except at `:fetching`, where Esc is the manual fallback,
+  and at `:welcome`/`:done`, where it is a no-op. Selection steps move with
+  up/down and pick with Enter.
   """
   @spec handle_key(t(), String.t()) :: {t(), term()}
   def handle_key(%__MODULE__{step: step} = state, code), do: step_key(state, step, code)
@@ -145,23 +161,35 @@ defmodule DashFloat.Config.Onboarding do
 
   ## Profile name (becomes defaultProfile; blank keeps the prefill)
 
+  # Esc back (issue #65): the welcome screen's ctrl+q stays the taught,
+  # deliberate abort — esc here is navigation, not a quit.
+  defp step_key(state, :profile_name, "esc"), do: {step(state, :welcome, ""), nil}
+
   defp step_key(state, :profile_name, "enter") do
     name = nonblank(state.draft) || state.profile_name
-    {%{step(state, :provider, "") | profile_name: name, choice: 0}, nil}
+    {%{step(state, :provider, "") | profile_name: name}, nil}
   end
 
   defp step_key(state, :profile_name, code), do: {edit(state, code), nil}
 
   ## Provider choice (presets + custom + skip)
 
+  defp step_key(state, :provider, "esc"), do: {step(state, :profile_name, ""), nil}
   defp step_key(state, :provider, "up"), do: {move(state, -1), nil}
   defp step_key(state, :provider, "down"), do: {move(state, 1), nil}
 
   defp step_key(state, :provider, "enter") do
     case option(state) do
       {:preset, preset} ->
-        pending = %{label: preset.label, base_url: preset.base_url, key: nil, models: []}
-        {%{step(state, :label, preset.label) | pending: pending}, nil}
+        pending = %{
+          label: preset.label,
+          base_url: preset.base_url,
+          key: nil,
+          models: [],
+          fetched: []
+        }
+
+        {enter_provider(state, pending, preset.label), nil}
 
       :custom ->
         {step(state, :custom_url, ""), nil}
@@ -181,10 +209,8 @@ defmodule DashFloat.Config.Onboarding do
         {state, nil}
 
       url ->
-        {%{
-           step(state, :label, host(url))
-           | pending: %{label: host(url), base_url: url, key: nil, models: []}
-         }, nil}
+        pending = %{label: host(url), base_url: url, key: nil, models: [], fetched: []}
+        {enter_provider(state, pending, host(url)), nil}
     end
   end
 
@@ -192,6 +218,8 @@ defmodule DashFloat.Config.Onboarding do
   defp step_key(state, :custom_url, code), do: {edit(state, code), nil}
 
   ## Provider label (optional; blank keeps the suggested/host default)
+
+  defp step_key(state, :label, "esc"), do: {step(state, :provider, ""), nil}
 
   defp step_key(state, :label, "enter") do
     label = nonblank(state.draft) || state.pending.label
@@ -211,7 +239,7 @@ defmodule DashFloat.Config.Onboarding do
 
     case nonblank(state.draft) do
       nil ->
-        {step(state, :model_manual, ""), nil}
+        {to_manual(state), nil}
 
       value ->
         actions = [
@@ -223,17 +251,23 @@ defmodule DashFloat.Config.Onboarding do
     end
   end
 
-  # No key, no fetch possible: esc skips the key like a blank Enter.
-  defp step_key(state, :key, "esc"), do: {step(state, :model_manual, ""), nil}
+  # Esc walks back to the label (issue #65 — it no longer skips; a blank
+  # Enter above still skips forward). The pending label prefills — the
+  # value a blank Enter would keep, what the write-failed bounce shows too.
+  # Re-accepting re-executes nothing here; at the key it re-executes the
+  # write, an idempotent merge into keys.json5.
+  defp step_key(state, :key, "esc"), do: {step(state, :label, state.pending.label), nil}
   defp step_key(state, :key, code), do: {edit(state, code), nil}
 
-  # Waiting on the fetch: Esc falls back to manual entry (the fetch result,
-  # when it lands, is ignored — a fresh choice would only re-enter here).
-  defp step_key(state, :fetching, "esc"), do: {step(state, :model_manual, ""), nil}
+  # Waiting on the fetch: Esc is the manual fallback, not back navigation
+  # (issue #65's documented exception — a fetch result landing after this
+  # esc is ignored), and entering manual always clears `fetched`.
+  defp step_key(state, :fetching, "esc"), do: {to_manual(state), nil}
   defp step_key(state, :fetching, _code), do: {state, nil}
 
   # The picker over fetched ids (nickname defaults to the id), manual entry
   # as the last option.
+  defp step_key(state, :model_pick, "esc"), do: {step(state, :key, ""), nil}
   defp step_key(state, :model_pick, "up"), do: {move(state, -1), nil}
   defp step_key(state, :model_pick, "down"), do: {move(state, 1), nil}
 
@@ -243,11 +277,13 @@ defmodule DashFloat.Config.Onboarding do
         {finish_provider(add_model(state, id)), nil}
 
       :manual ->
-        {step(state, :model_manual, ""), nil}
+        {to_manual(state), nil}
     end
   end
 
   defp step_key(state, :model_pick, _code), do: {state, nil}
+
+  defp step_key(state, :model_manual, "esc"), do: {step(state, :key, ""), nil}
 
   defp step_key(state, :model_manual, "enter") do
     case nonblank(state.draft) do
@@ -259,6 +295,27 @@ defmodule DashFloat.Config.Onboarding do
   defp step_key(state, :model_manual, code), do: {edit(state, code), nil}
 
   ## The optional loops: another provider, an MCP server, or done
+
+  # Esc back (issue #65): with a finished provider, undo the finish — the
+  # provider returns as pending with its pick cleared (that is what is being
+  # undone) and its fetch snapshot restored, landing at the step it finished
+  # from: the picker when the snapshot is non-empty, manual otherwise. With
+  # no providers, back to the provider choice.
+
+  defp step_key(%__MODULE__{providers: []} = state, :loop, "esc"),
+    do: {step(state, :provider, ""), nil}
+
+  defp step_key(%__MODULE__{providers: providers} = state, :loop, "esc") do
+    last = List.last(providers)
+    fetched = last.fetched
+
+    {%{
+       step(state, if(fetched == [], do: :model_manual, else: :model_pick), "")
+       | pending: %{last | models: []},
+         fetched: fetched,
+         providers: :lists.sublist(providers, length(providers) - 1)
+     }, nil}
+  end
 
   defp step_key(state, :loop, "up"), do: {move(state, -1), nil}
   defp step_key(state, :loop, "down"), do: {move(state, 1), nil}
@@ -275,6 +332,8 @@ defmodule DashFloat.Config.Onboarding do
 
   ## MCP server sub-flow (name → command → args → optional token env var)
 
+  defp step_key(state, :mcp_name, "esc"), do: {step(state, :loop, ""), nil}
+
   defp step_key(state, :mcp_name, "enter") do
     case nonblank(state.draft) do
       nil -> {step(state, :loop, ""), nil}
@@ -284,6 +343,8 @@ defmodule DashFloat.Config.Onboarding do
 
   defp step_key(state, :mcp_name, code), do: {edit(state, code), nil}
 
+  defp step_key(state, :mcp_command, "esc"), do: {step(state, :mcp_name, ""), nil}
+
   defp step_key(state, :mcp_command, "enter") do
     case nonblank(state.draft) do
       nil -> {abandon_mcp(state), nil}
@@ -292,6 +353,8 @@ defmodule DashFloat.Config.Onboarding do
   end
 
   defp step_key(state, :mcp_command, code), do: {edit(state, code), nil}
+
+  defp step_key(state, :mcp_args, "esc"), do: {step(state, :mcp_command, ""), nil}
 
   defp step_key(state, :mcp_args, "enter") do
     args =
@@ -303,6 +366,8 @@ defmodule DashFloat.Config.Onboarding do
   end
 
   defp step_key(state, :mcp_args, code), do: {edit(state, code), nil}
+
+  defp step_key(state, :mcp_token, "esc"), do: {step(state, :mcp_args, ""), nil}
 
   defp step_key(state, :mcp_token, "enter") do
     entry = %{
@@ -340,7 +405,12 @@ defmodule DashFloat.Config.Onboarding do
     if ids == [] do
       manual_with_note(state, "The provider returned no models.")
     else
-      %{step(state, :model_pick, "") | fetched: ids, choice: 0}
+      # The picker's highlight is step/3's restore job: choice 0 on a first
+      # arrival, the remembered position on a back-then-forward return —
+      # clamped to the list that just arrived, which a refetch may have
+      # SHRUNK under a remembered position (issue #65).
+      landed = step(state, :model_pick, "")
+      %{landed | fetched: ids, choice: min(landed.choice, length(ids))}
     end
   end
 
@@ -367,8 +437,11 @@ defmodule DashFloat.Config.Onboarding do
         %__MODULE__{step: :fetching, pending: %{key: value} = pending} = state,
         message
       )
-      when is_binary(value),
-      do: %{step(state, :key, value) | pending: %{pending | key: nil}, error: message}
+      when is_binary(value) do
+    # The restored draft feeds the memory too (issue #65): a bounce without
+    # an edit still round-trips through esc-back losslessly.
+    remember(%{step(state, :key, value) | pending: %{pending | key: nil}, error: message})
+  end
 
   def write_failed(%__MODULE__{step: :done} = state, message) do
     # The highlight stays on Done, the option that refused: Enter retries
@@ -436,6 +509,23 @@ defmodule DashFloat.Config.Onboarding do
 
   ## Internals
 
+  # A new provider's pending (the provider-enter preset arm and the
+  # custom_url-enter arm, issue #65): the provider-scoped memory drops with
+  # it, so a stale label/key/model edit never leaks into the next provider —
+  # the profile/provider/custom-url memory survives across providers.
+  @provider_scoped [:label, :key, :model_pick, :model_manual]
+
+  defp fresh_provider(state, pending),
+    do: %{state | pending: pending, memory: Map.drop(state.memory, @provider_scoped)}
+
+  # Entering a new provider's label: the pending built above, provider-scoped
+  # memory dropped, the suggested label as the prefill.
+  defp enter_provider(state, pending, label) do
+    state
+    |> fresh_provider(pending)
+    |> step(:label, label)
+  end
+
   # A token reference the loader cannot resolve back ($lowercase etc.) is
   # stored as NO token rather than a value the loader would drop the whole
   # entry for (P3-3, hostile review — the strict $[A-Z_][A-Z0-9_]* shape is
@@ -461,22 +551,43 @@ defmodule DashFloat.Config.Onboarding do
 
   defp move(state, delta) do
     count = length(options(state))
-    if count == 0, do: state, else: %{state | choice: rem(state.choice + delta + count, count)}
+
+    if count == 0 do
+      state
+    else
+      remember(%{state | choice: rem(state.choice + delta + count, count)})
+    end
   end
 
   # Every transition clears the step's messages: the error belongs to the
   # step that produced it (issue #39), the note to the manual-fallback land
-  # it came from (issue #64).
-  defp step(state, step, draft),
-    do: %{state | step: step, draft: draft, choice: 0, error: nil, note: nil}
+  # it came from (issue #64). A remembered draft/choice for the destination
+  # (issue #65's memory) overrides the passed-in prefill — the prefill is
+  # the default, not an override — so back-then-forward is lossless.
+  defp step(state, step, draft) do
+    remembered = Map.get(state.memory, step, %{draft: draft, choice: 0})
+
+    %{
+      state
+      | step: step,
+        draft: remembered.draft,
+        choice: remembered.choice,
+        error: nil,
+        note: nil
+    }
+  end
+
+  # One edit or move (issue #65): the snapshot a later esc-back restores.
+  defp remember(%__MODULE__{step: step, draft: draft, choice: choice} = state),
+    do: %{state | memory: Map.put(state.memory, step, %{draft: draft, choice: choice})}
 
   defp edit(state, code) do
     cond do
       code == "backspace" ->
-        %{state | draft: String.slice(state.draft, 0..-2//1)}
+        remember(%{state | draft: String.slice(state.draft, 0..-2//1)})
 
       single_char?(code) and String.valid?(code) ->
-        %{state | draft: state.draft <> code}
+        remember(%{state | draft: state.draft <> code})
 
       true ->
         state
@@ -499,7 +610,12 @@ defmodule DashFloat.Config.Onboarding do
     end
   end
 
-  defp manual_with_note(state, note), do: %{step(state, :model_manual, "") | note: note}
+  # Entering :model_manual — from any arm — always clears `fetched`
+  # (issue #65's uniform rule): a stale picker list must never survive into
+  # manual entry.
+  defp to_manual(state), do: %{step(state, :model_manual, "") | fetched: []}
+
+  defp manual_with_note(state, note), do: %{to_manual(state) | note: note}
 
   defp add_model(state, id), do: %{state | pending: add_model_to(state.pending, id)}
 
@@ -507,7 +623,12 @@ defmodule DashFloat.Config.Onboarding do
     do: %{pending | models: pending.models ++ [%{nickname: id, model: id}]}
 
   defp finish_provider(state) do
-    %{step(%{state | providers: state.providers ++ [state.pending]}, :loop, "") | pending: nil}
+    # The finish snapshots the fetch state onto the provider (issue #65):
+    # the loop's esc-pop restores it and reads it as "finished from the
+    # picker" (non-empty) vs manual/keyless (empty).
+    pending = %{state.pending | fetched: state.fetched}
+
+    %{step(%{state | providers: state.providers ++ [pending]}, :loop, "") | pending: nil}
   end
 
   defp abandon_mcp(state), do: step(state, :loop, "")

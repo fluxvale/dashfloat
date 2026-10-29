@@ -555,6 +555,60 @@ fetch (including an empty list) lands on manual entry with a short reason on
 screen. Reasons are classes or statuses from the fetch layer ("HTTP 500",
 "timed out"), never response-body content.
 
+### Wizard back navigation: Esc returns to the previous step (issue #65 amendment)
+
+A wrong entry at step N>1 had no way back — esc either skipped forward or did
+nothing, and the only exit was ctrl+q's whole-run abort. Esc now walks BACK one
+step through the wizard's spine, side-effect-free, with the entry preserved.
+
+- **The back-edge map:** `:profile_name → :welcome`, `:provider →
+  :profile_name`, `:custom_url → :provider` (the pre-existing edge), `:label →
+  :provider`, `:key → :label` (replacing the old esc-skips arm — a blank Enter
+  still skips forward to the model step), `:model_pick → :key`,
+  `:model_manual → :key`, `:mcp_name → :loop`, `:mcp_command → :mcp_name`,
+  `:mcp_args → :mcp_command`, `:mcp_token → :mcp_args`. The map is the spine,
+  not a history stack: a step's esc destination is fixed.
+- **First screen:** esc at `:welcome` is a no-op. **Rejected alternative —
+  abort-with-confirm:** a destructive confirm on the most common accidental
+  key, when a quit path already exists (ctrl+q, taught by the welcome hint),
+  is friction with no recovery the confirm buys. Deliberate abort stays
+  ctrl+q's job.
+- **The loop pops the last provider:** finishing a provider snapshots the
+  fetch state onto it (`fetched` — a pending-map key `settings_doc/1` never
+  writes out; its fields are explicit). Esc at `:loop` with providers
+  non-empty undoes the finish: the last provider returns as pending with
+  `models: []` (the pick is what is being undone) and `fetched` restored from
+  the snapshot, landing at `:model_pick` when that snapshot is non-empty —
+  the provider finished from the picker — else `:model_manual`. With no
+  providers, esc returns to `:provider`. Consecutive providers cannot
+  cross-contaminate the list: the key enter resets `fetched` at `:fetching`,
+  and every `:model_manual` entry clears it.
+- **The one exception:** esc at `:fetching` stays the manual fallback, not
+  back navigation — there is no earlier step to return to mid-fetch — and a
+  fetch result landing after that esc stays inert.
+- **The rules:** an esc-back emits no actions; nothing re-validates on
+  return; re-accepting a step re-executes its action (the key write is an
+  idempotent merge into keys.json5). Esc at `:done` is a no-op trap: the
+  config is already written, and backing out would offer a re-write the
+  writer must refuse.
+- **Draft/choice memory:** the wizard keeps a per-step `%{draft, choice}`
+  snapshot — recorded on every edit (typing, backspace, and bracketed
+  paste) and every picker move — and every transition restores the
+  destination's remembered draft/choice when present, the passed-in prefill
+  being the default, not an override; a restore can never point past the
+  destination's list (the picker re-clamps when a refetch arrives smaller).
+  Back-then-forward is therefore lossless. One deliberate exception: the
+  loop's "add another provider" arm still resets the provider menu to its
+  top — a NEW provider's choice starts fresh (pre-#65 behavior), while
+  esc-then-forward within a provider restores. Provider-scoped memory (`:label`, `:key`, the model steps) is
+  dropped wherever a new provider's pending is built (the provider-enter
+  preset arm and the custom_url-enter arm), so a stale edit never leaks
+  into the next provider; `:custom_url`/`:provider`/`:profile_name` memory
+  survives across providers — as does the MCP sub-flow's, a re-entered
+  server entry pre-filling the previous one's drafts — and memory never
+  leaves the process: it is inspect-excluded with the draft and pending
+  (the never-echo rule).
+
 ## Alternatives considered
 
 - **Amending ADR 0008 in place** (the #31 style) — v3 rewrites the schema,
