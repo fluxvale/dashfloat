@@ -169,21 +169,23 @@ covers Linux.
 
 ### Versioning
 
-*Amended 2026-10-29 (the owner's convention, set at the v0.2.0 planning).* A
+*Amended 2026-10-29 (the owner's convention, set at the
+[v0.2.0 planning](https://github.com/fluxvale/dashfloat/issues/84)).* A
 release with new features takes a **minor** bump; a release with bug fixes
 only takes a **patch** bump. The bump is a function of what the release
 contains, so users can read it — a minor brings new capability, a patch only
-repairs — and a release lane derives it from the diff instead of reopening
-the question. v0.2.0 (four features since v0.1.1) is the first release cut
-under the rule.
+repairs — and the prep for a release derives it from the diff instead of
+reopening the question. v0.2.0 (four features since v0.1.1) is the first
+release cut under the rule.
 
 ### Release notes
 
-The workflow composes the Release body: install commands, the macOS
+The workflow composes the Release body: the what's-new section (hand-written
+per release, like the version bump itself), install commands, the macOS
 Gatekeeper/right-click-open instructions for the unsigned binaries, the glibc
-floor and the runtime library requirement, and the security note that checksums
-are attached. Notes are generated from the workflow so they cannot drift from
-the assets.
+floor and the runtime library requirement, and the security note that
+checksums are attached. The asset-shaped parts interpolate the version, so
+the notes cannot drift from the assets.
 
 ## Alternatives considered
 
