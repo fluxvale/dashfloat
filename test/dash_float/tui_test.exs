@@ -2420,7 +2420,7 @@ defmodule DashFloat.TUITest do
     # out), so stopping the application takes exactly that name down.
     test "a dispatch with the task supervisor down fails open, no crash" do
       Application.stop(:dash_float)
-      on_exit(fn -> {:ok, _} = Application.ensure_all_started(:dash_float) end)
+      on_exit(fn -> {:ok, _apps} = Application.ensure_all_started(:dash_float) end)
 
       state =
         State.new(
