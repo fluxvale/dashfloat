@@ -256,10 +256,11 @@ defmodule DashFloat.Session.Title do
   (`String.t() | nil`) on `send_to` (default `self()`). The message must
   always land: a dead task would strand the agent's one-shot latch —
   normalization runs inside the supervised task, never in the agent loop.
-  The START itself is rescued too: a dead or absent supervisor RAISES from
-  `Task.Supervisor.start_child/2` rather than returning `{:error, _}`, and
-  the side-channel must never take the caller down with it (ADR 0023 §8's
-  task-that-cannot-start rule).
+  The START itself is caught too: a dead or absent supervisor name arrives
+  as an `:exit` out of `Task.Supervisor.start_child/2` (a raise there is a
+  programming error and deliberately propagates), and the side-channel must
+  never take the caller down with it (ADR 0023 §8's task-that-cannot-start
+  rule).
   """
   @spec fetch_async(Config.t(), %{user: String.t(), assistant: String.t()}, keyword()) ::
           {:ok, pid()} | {:error, term()}

@@ -1106,8 +1106,8 @@ defmodule DashFloat.Agent do
 
     # The task rides the agent's own supervisor (the :supervisor opt's
     # constituency — embedded starters — must not depend on the global
-    # name), and fetch_async rescues the start: a supervisor that cannot
-    # start the task is a miss, never a crash (ADR 0023 §8).
+    # name), and fetch_async catches the cannot-start exit: a supervisor
+    # that cannot start the task is a miss, never a crash (ADR 0023 §8).
     case Title.fetch_async(config, first_exchange_context(messages),
            ref: ref,
            fetcher: fetcher,
@@ -1155,9 +1155,19 @@ defmodule DashFloat.Agent do
            _other ->
              false
          end) do
-      %{content: content} when is_binary(content) -> content
-      %{"content" => content} when is_binary(content) -> content
-      _other -> ""
+      %{content: content} when is_binary(content) ->
+        content
+
+      %{"content" => content} when is_binary(content) ->
+        content
+
+      # coveralls-ignore-start
+      # Unreachable in a settled exchange (the trigger fires only after the
+      # assistant content was appended, and the user message precedes it);
+      # the belt exists for hand-shaped transcripts.
+      _other ->
+        ""
+        # coveralls-ignore-stop
     end
   end
 

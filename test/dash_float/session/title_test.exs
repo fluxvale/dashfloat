@@ -426,9 +426,10 @@ defmodule DashFloat.Session.TitleTest do
     @spec ok_fetcher(term(), term()) :: {:ok, String.t()}
     def ok_fetcher(_config, _context), do: {:ok, "mfa title"}
 
-    test "a supervisor that cannot start the task is an error tuple, never a raise" do
-      # Task.Supervisor.start_child/2 RAISES on a dead/absent supervisor —
-      # the side-channel must degrade, not take the agent down (review P2).
+    test "a supervisor that cannot start the task is an error tuple, never an exit" do
+      # Task.Supervisor.start_child/2 on a dead/absent name EXITS out of
+      # GenServer.call (OTP 29) — the side-channel must degrade, not take
+      # the agent down (review P2).
       bogus = :"dashfloat-title-no-such-supervisor"
 
       assert {:error, :supervisor_unavailable} =
