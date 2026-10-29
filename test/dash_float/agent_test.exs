@@ -1023,6 +1023,37 @@ defmodule DashFloat.AgentTest do
     bytes = File.read!(session_path)
     refute bytes =~ secret
     refute bytes =~ "api_key"
+
+    ## The unparsable fallback: a base_url URI.parse cannot split into
+    ## scheme+host pins the RAW string — endpoint identity as given, never
+    ## mangled. The turn cannot stream, but the prompt-time save already
+    ## pinned the endpoint.
+    raw_sessions = Path.join(ctx.tmp_dir, "raw-sessions")
+
+    {:ok, raw_sup} = Task.Supervisor.start_link()
+
+    {:ok, raw_agent} =
+      Agent.start_link(
+        provider: {:ok, %Config{base_url: "not-a-url", model: "test-model", api_key: "k"}},
+        cwd: ctx.tmp_dir,
+        session_dir: raw_sessions,
+        supervisor: raw_sup,
+        name: nil
+      )
+
+    on_exit(fn ->
+      DashFloat.TestTeardown.stop(raw_agent)
+      if Process.alive?(raw_sup), do: Process.exit(raw_sup, :kill)
+    end)
+
+    send(raw_agent, {:prompt, self(), "hello"})
+    assert_receive {:entry, :system, failure}, 2_000
+    assert failure =~ "llm:"
+    assert_receive {:phase, :idle}, 2_000
+
+    raw_id = session_id(raw_sessions)
+    assert {:ok, raw_session} = Session.load(raw_sessions, raw_id)
+    assert raw_session.pin.base_url == "not-a-url"
   end
 
   @tag :tmp_dir
@@ -1127,6 +1158,49 @@ defmodule DashFloat.AgentTest do
              "call_1-2",
              "call_1-3"
            ]
+  end
+
+  @tag :tmp_dir
+  test "a colliding id that is itself a rename form with an unused base continues its own name",
+       ctx do
+    # ["dup-2", "dup-2"]: the second dup-2 collides, but its base "dup" was
+    # never announced — the sequence continues on the id itself (dup-2-2),
+    # not on the never-used base.
+    write_sandbox(ctx, "notes.md", "seed\n")
+
+    frames =
+      tool_frames("dup-2", "read_file", [~s({"path":"notes.md"})]) ++
+        tool_frames_1("dup-2", "list_directory", [~s({"path":"."})])
+
+    server =
+      start_server([
+        [{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close],
+        final_episode("pair done")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "run the pair"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:tool_result, %{id: "dup-2", ok: true}}, 2_000
+    assert_receive {:tool_result, %{id: "dup-2-2", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    id = session_id(sessions)
+    assert {:ok, session} = Session.load(sessions, id)
+
+    assert [
+             %{"role" => "user"},
+             %{"role" => "assistant", "content" => nil, "tool_calls" => calls},
+             tool_a,
+             tool_b,
+             %{"role" => "assistant", "content" => "pair done"}
+           ] = session.messages
+
+    assert Enum.map(calls, & &1["id"]) == ["dup-2", "dup-2-2"]
+    assert Enum.map([tool_a, tool_b], & &1["tool_call_id"]) == ["dup-2", "dup-2-2"]
   end
 
   @tag :tmp_dir
