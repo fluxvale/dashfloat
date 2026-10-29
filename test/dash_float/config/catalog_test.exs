@@ -73,55 +73,65 @@ defmodule DashFloat.Config.CatalogTest do
       auth_header!(:absent)
     end
 
-    test "non-2xx fails open" do
+    test "non-2xx reports the HTTP status" do
       server =
         start_server!([
           {:send, "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n"}
         ])
 
       base = SSEServer.base_url(server)
-      assert :error = Catalog.fetch(base, "PLACEHOLDER-key")
+      assert {:error, "HTTP 401"} = Catalog.fetch(base, "PLACEHOLDER-key")
       assert_receive {:sse_request, "GET", _path, _headers, _body}, 1_000
     end
 
-    test "a garbage body fails open" do
+    test "a garbage body reports the format mismatch" do
       server = start_server!([http_ok("not json at all")])
       base = SSEServer.base_url(server)
-      assert :error = Catalog.fetch(base, "PLACEHOLDER-key")
+      assert {:error, "unexpected response format"} = Catalog.fetch(base, "PLACEHOLDER-key")
       assert_receive {:sse_request, _, _, _, _}, 1_000
     end
 
-    test "a timeout fails open" do
+    test "a timeout reports the timeout" do
       # The server sleeps past the (test-scaled) receive timeout.
       server = start_server!([{:sleep, 5_000}])
       base = SSEServer.base_url(server)
 
-      assert :error =
+      assert {:error, "timed out"} =
                Catalog.fetch(base, "PLACEHOLDER-key", timeout: 100)
 
       assert_receive {:sse_request, _, _, _, _}, 1_000
     end
 
-    test "an unreachable host fails open without raising" do
-      assert :error = Catalog.fetch("http://127.0.0.1:1/v1", "PLACEHOLDER-key", timeout: 100)
+    test "an unreachable host reports the connection failure without raising" do
+      assert {:error, "connection failed"} =
+               Catalog.fetch("http://127.0.0.1:1/v1", "PLACEHOLDER-key", timeout: 100)
+    end
+
+    test "any other error class reports the generic request failure" do
+      # A response Mint cannot even parse is neither a transport failure nor
+      # a format mismatch — the catch-all keeps the reason a safe phrase.
+      server = start_server!([{:send, "NOT-HTTP AT ALL\r\n\r\n"}])
+      base = SSEServer.base_url(server)
+      assert {:error, "request failed"} = Catalog.fetch(base, "PLACEHOLDER-key")
     end
   end
 
   defmodule FetchStub do
     @spec two_arity(String.t(), String.t() | nil) ::
-            {:ok, [Catalog.entry()]} | :error
+            {:ok, [Catalog.entry()]} | {:error, String.t()}
     def two_arity(_url, _key), do: {:ok, [%{model: "mfa-model", context: nil}]}
   end
 
   describe "fetch/3 failure arms" do
-    test "an unparsable URL fails open without raising" do
-      assert :error = Catalog.fetch("not a url at all", "PLACEHOLDER-key", timeout: 100)
+    test "an unparsable URL fails soft without raising" do
+      assert {:error, _reason} =
+               Catalog.fetch("not a url at all", "PLACEHOLDER-key", timeout: 100)
     end
 
-    test "a 200 body that is not an object fails open" do
+    test "a 200 body that is not an object reports the format mismatch" do
       server = start_server!([http_ok("[1,2,3]")])
       base = SSEServer.base_url(server)
-      assert :error = Catalog.fetch(base, nil)
+      assert {:error, "unexpected response format"} = Catalog.fetch(base, nil)
       assert_receive {:sse_request, _, _, _, _}, 1_000
     end
 
@@ -144,13 +154,13 @@ defmodule DashFloat.Config.CatalogTest do
       assert_receive {:catalog, %{"https://mfa.example/v1" => [%{model: "mfa-model"}]}}, 1_000
     end
 
-    test "a fetcher answering :error degrades to empty entries" do
+    test "a fetcher answering {:error, reason} still degrades to empty entries" do
       providers = [%{label: "a", base_url: "https://nope.example/v1", api_key: nil}]
 
       assert {:ok, _pid} =
                Catalog.refresh_async(providers,
                  send_to: self(),
-                 fetch: fn _url, _key -> :error end
+                 fetch: fn _url, _key -> {:error, "HTTP 500"} end
                )
 
       assert_receive {:catalog, %{"https://nope.example/v1" => []}}, 1_000

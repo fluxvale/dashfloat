@@ -685,10 +685,14 @@ defmodule DashFloat.TUI.ViewTest do
         {%Onboarding{step: :custom_url, draft: "https://x"}, "OpenAI-compatible"},
         {%Onboarding{step: :label, draft: "zai"}, "Label this provider"},
         {%Onboarding{step: :key, draft: "k"}, "API key"},
-        {%Onboarding{step: :model_choice}, "Pick a model."},
         {%Onboarding{step: :fetching}, "Fetching"},
         {%Onboarding{step: :model_pick, fetched: ["m-a", "m-b"], choice: 1}, "m-b"},
         {%Onboarding{step: :model_manual, draft: "glm"}, "model id"},
+        {%Onboarding{
+           step: :model_manual,
+           draft: "glm",
+           note: "Couldn't fetch the model list — HTTP 500."
+         }, "Couldn't fetch"},
         {%Onboarding{step: :loop}, "Anything else?"},
         {%Onboarding{step: :mcp_name, draft: "fetch"}, "MCP server name"},
         {%Onboarding{step: :mcp_command, draft: "uvx"}, "MCP command"},
@@ -746,6 +750,46 @@ defmodule DashFloat.TUI.ViewTest do
       assert loop_buffer =~ "retries the write"
       assert loop_buffer =~ "write the config and start"
       refute loop_buffer =~ "All set"
+    end
+
+    test "the manual-fallback note renders dim between title and input, never as an error (issue #64)" do
+      state =
+        new_state(
+          setup: %Onboarding{
+            step: :model_manual,
+            draft: "glm",
+            note: "Couldn't fetch the model list — HTTP 500."
+          }
+        )
+
+      buffer = drawn_text(state)
+
+      assert buffer =~ "The model id."
+      assert buffer =~ "Couldn't fetch the model list — HTTP 500."
+      assert buffer =~ "empty skips"
+      assert buffer =~ "❯ glm█"
+
+      # Dim, not error: the note is informational (the error style would
+      # make it a refusal).
+      [{%ExRatatui.Widgets.Paragraph{text: lines}, _rect}] =
+        View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+
+      error = Theme.style(:error)
+      dim = Theme.style(:dim)
+
+      note_rows =
+        for %ExRatatui.Text.Line{spans: [%ExRatatui.Text.Span{content: content, style: style}]} <-
+              lines,
+            style == dim and content =~ "Couldn't fetch",
+            do: content
+
+      assert note_rows != []
+
+      refute Enum.any?(lines, fn %ExRatatui.Text.Line{spans: spans} ->
+               Enum.any?(spans, fn %ExRatatui.Text.Span{content: content, style: style} ->
+                 style == error and content =~ "Couldn't fetch"
+               end)
+             end)
     end
 
     test "a remedy longer than the row wraps at glyph boundaries — never silently clipped (issue #42)" do

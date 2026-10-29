@@ -38,7 +38,10 @@ defmodule DashFloat.TUI.State do
   cycle's `{:set_mode, _}` is ADR 0016; the setup actions (ADR 0009) carry
   the wizard's side-effecting steps to the TUI runner: a profile picked in
   the forced-selection modal, the wizard's finish handoff, an immediate
-  keys.json5 write, the `/models` fetch, and the final settings.json5 write.
+  keys.json5 write, the `/models` fetch, and the final settings.json5
+  write. The wizard may return an ordered LIST of actions (issue #64: the
+  accepted key writes, then its fetch fires), executed in order by the
+  runner.
   """
   @type action ::
           :quit
@@ -52,6 +55,7 @@ defmodule DashFloat.TUI.State do
           | {:write_key, {String.t(), String.t(), String.t()}}
           | {:fetch_models, {String.t(), String.t()}}
           | {:write_settings, map()}
+          | [action()]
 
   @type stats :: %{
           tokens: non_neg_integer(),
@@ -399,6 +403,12 @@ defmodule DashFloat.TUI.State do
   # writes through the config layer, the async fetch, the finish handoff);
   # quitting is the TUI router's global Ctrl+C/Ctrl+Q, not a wizard action.
   defp translate(nil), do: nil
+
+  # One keypress can carry an ordered LIST of actions (issue #64: an
+  # accepted key writes, then its fetch fires); the wizard's lists never
+  # hold nil.
+  defp translate(actions) when is_list(actions), do: Enum.map(actions, &translate/1)
+
   defp translate({:write_key, _spec} = action), do: action
   defp translate({:fetch_models, _spec} = action), do: action
   defp translate({:write_settings, _doc} = action), do: action

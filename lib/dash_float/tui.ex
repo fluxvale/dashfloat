@@ -21,6 +21,7 @@ defmodule DashFloat.TUI do
 
   alias DashFloat.Config
   alias DashFloat.Config.Catalog
+  alias DashFloat.Config.Onboarding
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Suggest
@@ -174,23 +175,40 @@ defmodule DashFloat.TUI do
   def handle_event(_event, state), do: schedule(state)
 
   # The startup phase's actions (ADR 0009) — the chat actions stay above.
-  defp setup_action({:submit, prompt}, state), do: schedule(prompt_agent(prompt, state))
-  defp setup_action({:confirm, decision}, state), do: schedule(confirm_decision(decision, state))
-  defp setup_action(:cancel, state), do: schedule(cancel_agent(state))
+  # One wizard keypress can carry several ordered actions (issue #64: an
+  # accepted key writes, then its fetch fires); each runs on the state the
+  # previous left. A refused write bounces the wizard with its error set
+  # (issue #39): the actions behind it belong to the step the wizard just
+  # left, so the list stops there.
+  defp setup_action([], state), do: schedule(state)
 
-  defp setup_action({:select_profile, name}, state),
-    do: schedule(resolve_setup(state, name))
+  defp setup_action([action | rest], state) do
+    state = run_action(action, state)
 
-  defp setup_action(:setup_finish, state), do: schedule(resolve_setup(state, nil))
+    if write_refused?(state), do: schedule(state), else: setup_action(rest, state)
+  end
 
-  defp setup_action({:write_key, {profile, base_url, value}}, state),
-    do: schedule(write_wizard_key(state, profile, base_url, value))
+  defp setup_action(action, state), do: schedule(run_action(action, state))
 
-  defp setup_action({:fetch_models, {base_url, raw_key}}, state),
-    do: schedule(fetch_wizard_models(state, base_url, raw_key))
+  defp run_action({:submit, prompt}, state), do: prompt_agent(prompt, state)
+  defp run_action({:confirm, decision}, state), do: confirm_decision(decision, state)
+  defp run_action(:cancel, state), do: cancel_agent(state)
+  defp run_action({:select_profile, name}, state), do: resolve_setup(state, name)
+  defp run_action(:setup_finish, state), do: resolve_setup(state, nil)
 
-  defp setup_action({:write_settings, doc}, state),
-    do: schedule(write_wizard_settings(state, doc))
+  defp run_action({:write_key, {profile, base_url, value}}, state),
+    do: write_wizard_key(state, profile, base_url, value)
+
+  defp run_action({:fetch_models, {base_url, raw_key}}, state),
+    do: fetch_wizard_models(state, base_url, raw_key)
+
+  defp run_action({:write_settings, doc}, state),
+    do: write_wizard_settings(state, doc)
+
+  # The refusal detection the list-stop keys on: the bounce leaves the
+  # wizard's error set (issue #39).
+  defp write_refused?(%State{setup: %Onboarding{error: error}}) when error != nil, do: true
+  defp write_refused?(%State{}), do: false
 
   @impl ExRatatui.App
   def handle_info(@tick, state) do

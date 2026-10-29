@@ -188,6 +188,7 @@ defmodule DashFloat.TUITest do
     press(pid, "enter")
     for ch <- String.codepoints("PLACEHOLDER-wizard-key"), do: press(pid, ch)
 
+    # The key Enter writes AND fires the /models fetch (issue #64).
     press(pid, "enter")
 
     # The key landed IMMEDIATELY (ADR 0009: per-step writes, 0600).
@@ -195,9 +196,7 @@ defmodule DashFloat.TUITest do
     eventually(pid, fn _s -> File.exists?(keys_path) end)
     assert match?({:ok, %File.Stat{}}, File.stat(keys_path))
 
-    # Model: fetch from the provider (the loopback above), pick the second id.
-    press(pid, "enter")
-
+    # The fetch lands on the picker; pick the second id.
     picker =
       eventually(pid, fn s ->
         s.setup != nil and s.setup.step == :model_pick
@@ -233,6 +232,461 @@ defmodule DashFloat.TUITest do
 
     assert {:ok, %File.Stat{mode: settings_mode}} = File.stat(settings_path)
     assert Bitwise.band(settings_mode, 0o777) == 0o600
+  end
+
+  test "a failed /models fetch falls back to manual entry with the reason on screen (issue #64)" do
+    # The loopback answers HTTP 500: the key Enter's automatic fetch must
+    # land the wizard on manual entry — the fetch layer's short reason on
+    # screen, never an error screen — and manual entry completes the wizard.
+    script = [{:send, "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n"}, :close]
+
+    {:ok, server} = SSEServer.start_link(script)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    base = SSEServer.base_url(server)
+
+    dir = wizard_dir("dashfloat-tui-fetch-fail")
+    resolver = fn _nil_or_name -> DashFloat.Config.load(dir, %{}, []) end
+
+    {:ok, pid} =
+      start_tui(
+        provider: {:error, "no profile configured"},
+        setup: Onboarding.new(),
+        config_dir: dir,
+        resolve: resolver
+      )
+
+    # welcome → profile name (accept the prefill) → provider: custom → its
+    # URL (the loopback) → label (accept) → key — this Enter writes AND
+    # fetches (issue #64).
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+
+    for ch <- String.codepoints(base), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("PLACEHOLDER-fallback-key"), do: press(pid, ch)
+    press(pid, "enter")
+
+    manual =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :model_manual and s.setup.note != nil
+      end)
+
+    assert manual.setup.note == "Couldn't fetch the model list — HTTP 500."
+
+    screen = screen_text(manual)
+    assert screen =~ "Couldn't fetch the model list"
+    assert screen =~ "HTTP 500"
+
+    # Manual entry completes the provider; done writes the config.
+    for ch <- String.codepoints("manual-model"), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+
+    # The done screen hands off (ADR 0009: any Enter finishes).
+    press(pid, "enter")
+
+    assert_receive {:set_provider, {:ok, config}}, 2_000
+    assert config.base_url == base
+    assert config.api_key == "PLACEHOLDER-fallback-key"
+    assert config.model == "manual-model"
+
+    state = eventually(pid, fn s -> s.setup == nil end)
+    assert state.provider == {:ok, config}
+
+    dir
+    |> Path.join("settings.json5")
+    |> File.exists?()
+    |> assert()
+  end
+
+  ## ESC back navigation through the live wizard (issue #65, ADR 0009)
+
+  defp esc_tui(dir) do
+    resolver = fn _nil_or_name -> DashFloat.Config.load(dir, %{}, []) end
+
+    start_tui(
+      provider: {:error, "no profile configured"},
+      setup: Onboarding.new(),
+      config_dir: dir,
+      resolve: resolver
+    )
+  end
+
+  test "esc at welcome is a no-op (issue #65)" do
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-welcome"))
+
+    press(pid, "esc")
+    state = eventually(pid, fn s -> s.setup == Onboarding.new() end)
+    assert state.setup.step == :welcome
+  end
+
+  test "esc at profile_name returns to welcome; the typed name round-trips (issue #65)" do
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-name"))
+
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :profile_name end)
+
+    for ch <- List.duplicate("backspace", 8) ++ String.codepoints("work"), do: press(pid, ch)
+    press(pid, "esc")
+
+    eventually(pid, fn s -> s.setup.step == :welcome end)
+
+    press(pid, "enter")
+
+    round_trip =
+      eventually(pid, fn s ->
+        s.setup.step == :profile_name and s.setup.draft == "work"
+      end)
+
+    assert round_trip.setup.draft == "work"
+  end
+
+  test "esc at provider returns to profile_name (issue #65)" do
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-provider"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :provider end)
+
+    press(pid, "esc")
+
+    back = eventually(pid, fn s -> s.setup.step == :profile_name end)
+    assert back.setup.step == :profile_name
+  end
+
+  test "esc at custom_url returns to provider and the draft round-trips (issue #65)" do
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-custom"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :custom_url end)
+
+    for ch <- String.codepoints("https://esc.example/v1"), do: press(pid, ch)
+    press(pid, "esc")
+
+    back = eventually(pid, fn s -> s.setup.step == :provider end)
+    assert back.setup.choice == 2
+
+    # Forward again on the restored highlight: the draft comes back.
+    press(pid, "enter")
+
+    round_trip =
+      eventually(pid, fn s ->
+        s.setup.step == :custom_url and s.setup.draft == "https://esc.example/v1"
+      end)
+
+    assert round_trip.setup.draft == "https://esc.example/v1"
+  end
+
+  test "esc at label returns to provider (issue #65)" do
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-label"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :label end)
+
+    press(pid, "esc")
+
+    back = eventually(pid, fn s -> s.setup.step == :provider end)
+    assert back.setup.step == :provider
+  end
+
+  test "esc at key returns to label with the pending label on screen (issue #65)" do
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-key"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :key end)
+
+    for ch <- String.codepoints("k"), do: press(pid, ch)
+    press(pid, "esc")
+
+    back =
+      eventually(pid, fn s ->
+        s.setup.step == :label and s.setup.draft == "zai"
+      end)
+
+    assert back.setup.step == :label
+    assert screen_text(back) =~ "esc back"
+  end
+
+  test "esc while fetching falls back to manual entry — the exception (issue #65)" do
+    # The server accepts the request and never answers: the wizard sits at
+    # :fetching until esc takes the manual fallback.
+    script = [{:wait_close, 5_000}]
+    {:ok, server} = SSEServer.start_link(script)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    base = SSEServer.base_url(server)
+
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-fetching"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    for ch <- String.codepoints(base), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("PLACEHOLDER-esc-fetch"), do: press(pid, ch)
+    press(pid, "enter")
+
+    eventually(pid, fn s -> s.setup.step == :fetching end)
+    press(pid, "esc")
+
+    manual = eventually(pid, fn s -> s.setup.step == :model_manual end)
+    assert manual.setup.step == :model_manual
+  end
+
+  test "esc at the picker returns to key with the key draft intact (issue #65)" do
+    script = [http_ok(models_body(["glm-loopback"])), :close]
+    {:ok, server} = SSEServer.start_link(script)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    base = SSEServer.base_url(server)
+
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-pick"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    for ch <- String.codepoints(base), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("PLACEHOLDER-esc-pick"), do: press(pid, ch)
+    press(pid, "enter")
+
+    eventually(pid, fn s -> s.setup.step == :model_pick end)
+    press(pid, "esc")
+
+    back =
+      eventually(pid, fn s ->
+        s.setup.step == :key and s.setup.draft == "PLACEHOLDER-esc-pick"
+      end)
+
+    assert back.setup.step == :key
+  end
+
+  test "esc at manual entry returns to key with the key draft intact (issue #65)" do
+    script = [{:send, "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n"}, :close]
+    {:ok, server} = SSEServer.start_link(script)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    base = SSEServer.base_url(server)
+
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-manual"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    for ch <- String.codepoints(base), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("PLACEHOLDER-esc-manual"), do: press(pid, ch)
+    press(pid, "enter")
+
+    eventually(pid, fn s -> s.setup.step == :model_manual end)
+    for ch <- String.codepoints("m"), do: press(pid, ch)
+    press(pid, "esc")
+
+    back =
+      eventually(pid, fn s ->
+        s.setup.step == :key and s.setup.draft == "PLACEHOLDER-esc-manual"
+      end)
+
+    assert back.setup.step == :key
+  end
+
+  test "esc at the loop pops the provider finished from the picker (issue #65)" do
+    script = [http_ok(models_body(["glm-loopback", "other-one"])), :close]
+    {:ok, server} = SSEServer.start_link(script)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    base = SSEServer.base_url(server)
+
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-loop-pick"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    for ch <- String.codepoints(base), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("PLACEHOLDER-esc-loop"), do: press(pid, ch)
+    press(pid, "enter")
+
+    eventually(pid, fn s -> s.setup.step == :model_pick end)
+    press(pid, "down")
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :loop end)
+
+    press(pid, "esc")
+
+    popped =
+      eventually(pid, fn s ->
+        s.setup.step == :model_pick and s.setup.providers == [] and
+          s.setup.fetched == ["glm-loopback", "other-one"]
+      end)
+
+    assert popped.setup.pending.models == []
+    # The highlight is restored memory: back on the model that was picked.
+    assert popped.setup.choice == 1
+
+    # Re-picking re-finishes the provider exactly once.
+    press(pid, "enter")
+
+    refinished =
+      eventually(pid, fn s ->
+        s.setup.step == :loop and length(s.setup.providers) == 1
+      end)
+
+    assert [%{models: [%{nickname: "other-one", model: "other-one"}]}] =
+             refinished.setup.providers
+  end
+
+  test "esc at the loop pops a manual-finish provider back to manual (issue #65)" do
+    script = [{:send, "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n"}, :close]
+    {:ok, server} = SSEServer.start_link(script)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    base = SSEServer.base_url(server)
+
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-loop-manual"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    for ch <- String.codepoints(base), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("PLACEHOLDER-esc-loop2"), do: press(pid, ch)
+    press(pid, "enter")
+
+    eventually(pid, fn s -> s.setup.step == :model_manual end)
+    for ch <- String.codepoints("manual-model"), do: press(pid, ch)
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :loop end)
+
+    press(pid, "esc")
+
+    popped =
+      eventually(pid, fn s ->
+        s.setup.step == :model_manual and s.setup.draft == "manual-model" and
+          s.setup.providers == []
+      end)
+
+    assert popped.setup.pending.models == []
+    assert popped.setup.fetched == []
+
+    press(pid, "enter")
+
+    refinished =
+      eventually(pid, fn s ->
+        s.setup.step == :loop and length(s.setup.providers) == 1
+      end)
+
+    assert [%{models: [%{nickname: "manual-model", model: "manual-model"}]}] =
+             refinished.setup.providers
+  end
+
+  test "esc at a provider-less loop returns to provider (issue #65)" do
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-loop-empty"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :loop end)
+
+    press(pid, "esc")
+
+    back = eventually(pid, fn s -> s.setup.step == :provider end)
+    assert back.setup.step == :provider
+  end
+
+  test "esc walks back through the mcp steps with drafts (issue #65)" do
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-esc-mcp"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :mcp_name end)
+
+    for ch <- String.codepoints("fetch"), do: press(pid, ch)
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :mcp_command end)
+
+    for ch <- String.codepoints("uvx"), do: press(pid, ch)
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :mcp_args end)
+
+    for ch <- String.codepoints("-y"), do: press(pid, ch)
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :mcp_token end)
+
+    press(pid, "esc")
+
+    eventually(pid, fn s ->
+      s.setup.step == :mcp_args and s.setup.draft == "-y"
+    end)
+
+    press(pid, "esc")
+    eventually(pid, fn s -> s.setup.step == :mcp_command and s.setup.draft == "uvx" end)
+
+    press(pid, "esc")
+    eventually(pid, fn s -> s.setup.step == :mcp_name and s.setup.draft == "fetch" end)
+
+    press(pid, "esc")
+    back_loop = eventually(pid, fn s -> s.setup.step == :loop end)
+    assert back_loop.setup.step == :loop
+  end
+
+  test "esc at done is a no-op — the written config stands (issue #65)" do
+    dir = wizard_dir("dashfloat-tui-esc-done")
+    {:ok, pid} = esc_tui(dir)
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    eventually(pid, fn s -> s.setup.step == :done end)
+
+    settings_path = Path.join(dir, "settings.json5")
+    assert File.exists?(settings_path)
+
+    press(pid, "esc")
+
+    trapped = eventually(pid, fn s -> s.setup.step == :done end)
+    assert trapped.setup.step == :done
+    assert File.exists?(settings_path)
   end
 
   test "a failing settings write at wizard-done surfaces the refusal and gates :done (issue #39)" do
@@ -526,12 +980,11 @@ defmodule DashFloat.TUITest do
     press(pid, "enter")
     press(pid, "enter")
     for ch <- String.codepoints("$" <> var), do: press(pid, ch)
+
+    # The key Enter writes the reference AND fires the fetch; the reference
+    # is resolved from the environment for the fetch only.
     press(pid, "enter")
 
-    # Model: fetch from the provider (the loopback above).
-    press(pid, "enter")
-
-    # The reference is stored verbatim; the fetch resolves the env var.
     picker =
       eventually(pid, fn s ->
         s.setup != nil and s.setup.step == :model_pick
@@ -620,13 +1073,19 @@ defmodule DashFloat.TUITest do
     refute screen =~ "immediately"
     refute screen =~ "k-1"
 
-    # Fix in place: backspace out the backslash, re-accept — the retry writes.
+    # Fix in place: backspace out the backslash, re-accept — the retry writes
+    # and its fetch fires (issue #64). No loopback stands in here, so the
+    # wizard leaves :fetching for whichever arm the live endpoint yields.
     press(pid, "backspace")
     press(pid, "backspace")
     press(pid, "9")
     press(pid, "enter")
 
-    eventually(pid, fn s -> s.setup != nil and s.setup.step == :model_choice end)
+    eventually(
+      pid,
+      fn s -> s.setup != nil and s.setup.step != :fetching end,
+      600
+    )
 
     zai = "https://api.z.ai/api/coding/paas/v4"
     assert {:ok, %{"personal" => %{^zai => "k-19"}}} = JSON5.read_map(keys_file)
@@ -672,11 +1131,17 @@ defmodule DashFloat.TUITest do
     refute screen =~ "clean-key"
     assert File.read!(keys_file) == "{personal: {'https://other/v1': 'a\\b'}}"
 
-    # Apply the remedy by hand, retry the same key — the write lands.
+    # Apply the remedy by hand, retry the same key — the write lands and its
+    # fetch fires (issue #64). The wizard leaves :fetching for whichever arm
+    # the live endpoint yields; the assertions below are about the file.
     File.write!(keys_file, "{personal: {'https://other/v1': 'ab'}}")
     press(pid, "enter")
 
-    eventually(pid, fn s -> s.setup != nil and s.setup.step == :model_choice end)
+    eventually(
+      pid,
+      fn s -> s.setup != nil and s.setup.step != :fetching end,
+      600
+    )
 
     zai = "https://api.z.ai/api/coding/paas/v4"
 

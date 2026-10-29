@@ -28,10 +28,13 @@ defmodule DashFloat.Config.Catalog do
   `Authorization: Bearer` when `api_key` resolves (the header is omitted for
   key-less providers — a catalog that needs no auth still refreshes).
   `{:ok, entries}` (each `%{model: id, context: positive integer | nil}`) or
-  `:error` — never a raise, never a leak: failures log nothing about bodies.
-  `timeout:` bounds the wait (default 5 s; tests use milliseconds).
+  `{:error, reason}` — the reason a SHORT, safe class phrase (an HTTP status
+  or an error class; the wizard shows it on screen), never response-body
+  content. Never a raise, never a leak. `timeout:` bounds the wait (default
+  5 s; tests use milliseconds).
   """
-  @spec fetch(String.t(), String.t() | nil, keyword()) :: {:ok, [entry()]} | :error
+  @spec fetch(String.t(), String.t() | nil, keyword()) ::
+          {:ok, [entry()]} | {:error, String.t()}
   def fetch(base_url, api_key, opts \\ []) when is_binary(base_url) do
     url = String.trim_trailing(base_url, "/") <> "/models"
 
@@ -42,13 +45,28 @@ defmodule DashFloat.Config.Catalog do
       {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
         parse(body)
 
-      _other ->
-        :error
+      {:ok, %Req.Response{status: status}} ->
+        {:error, "HTTP " <> Integer.to_string(status)}
+
+      # Classes, not bodies: the reason lands on the wizard's screen.
+      {:error, %Req.TransportError{reason: :timeout}} ->
+        {:error, "timed out"}
+
+      {:error, %Req.TransportError{}} ->
+        {:error, "connection failed"}
+
+      # Req hands back the JSON decoder's failure for a body its
+      # content-type promised was JSON — the same format-mismatch class.
+      {:error, %Jason.DecodeError{}} ->
+        {:error, "unexpected response format"}
+
+      {:error, _other} ->
+        {:error, "request failed"}
     end
   rescue
     # Fail-open, absolutely: a raise in Req/Mint/Jason is the same as any
     # other failure — configured menus stay, the app never notices.
-    _reason -> :error
+    _reason -> {:error, "request failed"}
   end
 
   # The OpenAI listing shape: {"data": [{"id": "…"}, …]}. Anything else is a
@@ -66,7 +84,7 @@ defmodule DashFloat.Config.Catalog do
     {:ok, parsed}
   end
 
-  defp parse(_other), do: :error
+  defp parse(_other), do: {:error, "unexpected response format"}
 
   defp usable(value) when is_binary(value) do
     case String.trim_trailing(value) do
