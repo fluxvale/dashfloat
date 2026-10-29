@@ -782,6 +782,21 @@ defmodule DashFloat.TUI.StateTest do
       assert {^unchained, {:set_mode, :plan}} = State.handle_key(unchained, "tab", ["shift"])
     end
 
+    test "back_tab cycles in the shapes real terminals emit; bare tab never does" do
+      # Native BackTab (and the remote parser's CSI Z) arrives as "back_tab",
+      # with or without shift reported — the synthetic "tab"+shift shape is
+      # covered above.
+      for mods <- [[], ["shift"]] do
+        state = new_state()
+        assert {^state, {:set_mode, :auto}} = State.handle_key(state, "back_tab", mods)
+      end
+
+      # Bare tab is an editing key: it forwards to the textarea, never cycles.
+      idle = new_state()
+      assert {^idle, nil} = State.handle_key(idle, "tab", [])
+      assert idle.mode == :build
+    end
+
     test "shift+tab is swallowed while a confirmation is pending" do
       {state, _ref} = confirming()
 
@@ -2405,6 +2420,34 @@ defmodule DashFloat.TUI.StateTest do
       assert pairs(new_state(transcript: transcript)) == [
                {:user, "go"},
                {:tool, "⚙ tool → ok"}
+             ]
+    end
+
+    test "a blocked plan result renders proposed (plan), not error" do
+      # The plan-mode proposal's stored result shape (ADR 0016 §4); replay
+      # must carry "blocked" through or resume shows a bogus error row.
+      transcript = [
+        %{
+          "role" => "assistant",
+          "content" => nil,
+          "tool_calls" => [
+            %{
+              "id" => "t1",
+              "type" => "function",
+              "function" => %{"name" => "write_file", "arguments" => ~s({"path": "lib/x.ex"})}
+            }
+          ]
+        },
+        %{
+          "role" => "tool",
+          "tool_call_id" => "t1",
+          "content" => ~s({"ok":false,"blocked":"plan"})
+        }
+      ]
+
+      assert pairs(new_state(transcript: transcript)) == [
+               {:tool, "⚙ write_file lib/x.ex"},
+               {:tool, "⚙ write_file → proposed (plan)"}
              ]
     end
 

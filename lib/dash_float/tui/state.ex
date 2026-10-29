@@ -348,6 +348,7 @@ defmodule DashFloat.TUI.State do
           ok: result["ok"],
           rejected: result["rejected"],
           cancelled: result["cancelled"],
+          blocked: result["blocked"],
           error: result["error"],
           output: result["output"],
           content: result["content"]
@@ -650,8 +651,14 @@ defmodule DashFloat.TUI.State do
     do: {state, nil}
 
   # Shift+Tab cycles the interaction mode (ADR 0016 §7): the action carries
-  # it to the agent, whose echo applies it — no local change.
+  # it to the agent, whose echo applies it — no local change. Real terminals
+  # emit BackTab (CSI Z), which the native layer maps to "back_tab" with an
+  # arbitrary modifier list — never "tab"+shift — so back_tab cycles in any
+  # shape; the tab+shift clause stays for the synthetic shape it tests.
   defp route_key(state, "tab", ["shift"], _now),
+    do: {state, {:set_mode, Mode.cycle(state.mode)}}
+
+  defp route_key(state, "back_tab", _modifiers, _now),
     do: {state, {:set_mode, Mode.cycle(state.mode)}}
 
   # Enter / Ctrl+Enter submit; Shift+Enter / Alt+Enter insert a newline.
