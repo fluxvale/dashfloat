@@ -4,8 +4,10 @@ defmodule DashFloat.Session.TitleTest do
   # the real XDG data dir is off-limits. See #80.
   use ExUnit.Case, async: true
 
+  alias DashFloat.Config
   alias DashFloat.Session
   alias DashFloat.Session.Title
+  alias DashFloat.SSEServer
 
   describe "normalize/1" do
     test "trims, collapses inner whitespace runs, and preserves case" do
@@ -126,5 +128,270 @@ defmodule DashFloat.Session.TitleTest do
         messages: [],
         title: title
       })
+  end
+
+  ## The model side-request (#80)
+
+  @zai "https://api.z.ai/api/coding/paas/v4"
+
+  defp config(overrides \\ []) do
+    struct!(
+      Config,
+      Keyword.merge(
+        [base_url: "https://custom.example/v1", model: "active-m", api_key: "k"],
+        overrides
+      )
+    )
+  end
+
+  defp context(user \\ "fix the login bug", assistant \\ "Here is the fix."),
+    do: %{user: user, assistant: assistant}
+
+  describe "model/1" do
+    test "auto_title: false reads nil — the agent never requests then" do
+      off = config(auto_title: false)
+      assert Title.model(off) == nil
+    end
+
+    test "an explicit id wins over the preset table" do
+      pinned = config(auto_title: "cheap-override-m", base_url: @zai)
+      assert Title.model(pinned) == "cheap-override-m"
+    end
+
+    test "unset reads the preset cheap model; a custom provider falls back to the active model" do
+      zai = config(base_url: @zai)
+      custom = config()
+
+      assert Title.model(zai) == "glm-5.3-flash"
+      assert Title.model(custom) == "active-m"
+    end
+  end
+
+  describe "body/2" do
+    test "the instruction plus the first exchange's two messages, on the resolved model" do
+      zai = config(base_url: @zai)
+      body = Title.body(zai, context("the question", "the answer"))
+
+      assert body["model"] == "glm-5.3-flash"
+      assert body["max_tokens"] == 32
+
+      assert [
+               %{"role" => "system", "content" => instruction},
+               %{"role" => "user", "content" => "the question"},
+               %{"role" => "assistant", "content" => "the answer"}
+             ] = body["messages"]
+
+      assert instruction =~ "Propose a concise title"
+    end
+
+    # The bound is a BYTE prefix taken before any other work — a grapheme cap
+    # would pass a single giant cluster whole (the Suggest @raw_cap pattern).
+    test "each context string is byte-prefixed to 1 KiB" do
+      huge = String.duplicate("a", 5_000)
+      body = Title.body(config(), context(huge, huge <> "END"))
+
+      [_system, %{"content" => user}, %{"content" => assistant}] = body["messages"]
+
+      assert byte_size(user) == 1024
+      assert byte_size(assistant) == 1024
+      assert String.valid?(user) and String.valid?(assistant)
+    end
+
+    # A byte prefix can split a codepoint; the repair keeps the body
+    # encodable (Jason refuses invalid UTF-8 strings).
+    test "a split codepoint at the cap is repaired, never raises" do
+      split = String.pad_trailing("é", 1022) <> "é" <> String.duplicate("a", 2000)
+      body = Title.body(config(), context(split, "ok"))
+      assert [%{"content" => user}, %{"content" => _assistant}] = tl(body["messages"])
+      assert byte_size(user) <= 1024
+      assert String.valid?(user)
+    end
+  end
+
+  describe "request/2 against the loopback" do
+    test "2xx with the OpenAI reply shape yields {:ok, content}" do
+      steps = ok_step("Fix the Login Bug")
+      {:ok, server} = SSEServer.start_link(steps)
+      on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+
+      config = config(base_url: SSEServer.base_url(server))
+
+      assert Title.request(config, context()) == {:ok, "Fix the Login Bug"}
+
+      assert_receive {:sse_request, "POST", "/chat/completions", headers, body}, 1_000
+      assert headers["authorization"] == "Bearer k"
+      decoded = Jason.decode!(body)
+      assert decoded["max_tokens"] == 32
+      assert [_system, _user, _assistant] = decoded["messages"]
+    end
+
+    test "no api key sends no authorization header" do
+      steps = ok_step("t")
+      {:ok, server} = SSEServer.start_link(steps)
+      on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+
+      config = config(base_url: SSEServer.base_url(server), api_key: nil)
+
+      assert Title.request(config, context()) == {:ok, "t"}
+
+      assert_receive {:sse_request, "POST", "/chat/completions", headers, _body}, 1_000
+      refute Map.has_key?(headers, "authorization")
+    end
+
+    # A followed redirect would relay the first exchange to a third host: a
+    # 3xx is just another failure (the ChatStream/Suggest precedent).
+    test "a 307 is never followed: :error and no second connection" do
+      {:ok, server} = SSEServer.start_link([redirect_step(), :close])
+      on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+
+      config = config(base_url: SSEServer.base_url(server))
+
+      assert Title.request(config, context()) == :error
+
+      assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 1_000
+      Process.sleep(300)
+      refute_received {:sse_request, _, _, _, _}
+    end
+
+    test "a raise inside the HTTP path is rescued to :error (fail-open)" do
+      config = config(base_url: "not-a-url")
+      assert Title.request(config, context()) == :error
+    end
+
+    test "a shape violation (non-binary content) is :error" do
+      steps = ok_step(42)
+      {:ok, server} = SSEServer.start_link(steps)
+      on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+
+      config = config(base_url: SSEServer.base_url(server))
+      assert Title.request(config, context()) == :error
+    end
+
+    defp ok_step(content) do
+      body = Jason.encode!(%{choices: [%{message: %{content: content}}]})
+
+      [
+        {:send,
+         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n" <>
+           body},
+        :close
+      ]
+    end
+
+    defp redirect_step do
+      {:send, "HTTP/1.1 307 Temporary Redirect\r\nlocation: /x\r\ncontent-length: 0\r\n\r\n"}
+    end
+  end
+
+  describe "proposal/1" do
+    test ":error is nil; non-binary content is nil" do
+      assert Title.proposal(:error) == nil
+      assert Title.proposal({:ok, 42}) == nil
+    end
+
+    test "the first non-blank line, trimmed" do
+      assert Title.proposal({:ok, "\n \n  Fix the Login Bug  \nsecond line"}) ==
+               "Fix the Login Bug"
+    end
+
+    test "ONE pair of surrounding quotes is stripped; inner quotes survive" do
+      assert Title.proposal({:ok, ~s("Fix the Login Bug")}) == "Fix the Login Bug"
+      assert Title.proposal({:ok, "'Fix the Login Bug'"}) == "Fix the Login Bug"
+      assert Title.proposal({:ok, ~s("say "hi" now")}) == ~s(say "hi" now)
+    end
+
+    test "control, C1, and bidi characters are scrubbed" do
+      assert Title.proposal({:ok, "fix\a the login\x7f bug"}) == "fix the login bug"
+      assert Title.proposal({:ok, "\u{202E}evil\u{200B} title"}) == "evil title"
+    end
+
+    test "hard-capped to 80 graphemes" do
+      raw = String.duplicate("x", 200)
+      title = Title.proposal({:ok, raw})
+
+      assert String.length(title) == 80
+      assert String.starts_with?(raw, title)
+    end
+
+    test "blank, quote-only, and scrub-to-blank bodies are nil" do
+      assert Title.proposal({:ok, "\n \n"}) == nil
+      assert Title.proposal({:ok, "\"\""}) == nil
+      assert Title.proposal({:ok, "\e\a\b\x7f"}) == nil
+    end
+
+    test "a UUID-shaped proposal is nil — the silent give-up" do
+      assert Title.proposal({:ok, "0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c"}) == nil
+    end
+
+    test "invalid UTF-8 is repaired; a pure-invalid body is nil" do
+      title = Title.proposal({:ok, <<0xFF, ?a>>})
+      assert String.valid?(title)
+      assert title == "a"
+
+      assert Title.proposal({:ok, <<0xFF, 0xFE>>}) == nil
+    end
+
+    # The deterministic bound: a single multi-megabyte grapheme cluster is
+    # byte-capped before any grapheme work.
+    test "a single multi-megabyte grapheme cluster is byte-capped" do
+      title = Title.proposal({:ok, "a" <> String.duplicate("\u0301", 8_000_000)})
+
+      assert byte_size(title) <= 16_384
+      assert String.length(title) == 1
+    end
+  end
+
+  describe "fetch_async/3" do
+    test "the normalized proposal lands as {:title_proposal, ref, text} on send_to" do
+      ref = make_ref()
+
+      assert {:ok, _pid} =
+               Title.fetch_async(config(), context("q", "a"),
+                 send_to: self(),
+                 ref: ref,
+                 fetcher: fn _config, _ctx -> {:ok, "for the exchange"} end
+               )
+
+      assert_receive {:title_proposal, ^ref, "for the exchange"}, 1_000
+    end
+
+    test "the default fetcher is the real request — an {m, f} or fun/2 fetcher both run" do
+      ref = make_ref()
+
+      assert {:ok, _pid} =
+               Title.fetch_async(config(), context(),
+                 send_to: self(),
+                 ref: ref,
+                 fetcher: {__MODULE__, :ok_fetcher}
+               )
+
+      assert_receive {:title_proposal, ^ref, "mfa title"}, 1_000
+    end
+
+    test ":error, a raise, a throw, an exit, and off-contract results all deliver nil" do
+      fetchers = [
+        fn _config, _ctx -> :error end,
+        fn _config, _ctx -> raise "boom" end,
+        fn _config, _ctx -> throw(:ball) end,
+        fn _config, _ctx -> exit(:die) end,
+        fn _config, _ctx -> :weird end
+      ]
+
+      for fetcher <- fetchers do
+        ref = make_ref()
+
+        assert {:ok, _pid} =
+                 Title.fetch_async(config(), context(),
+                   send_to: self(),
+                   ref: ref,
+                   fetcher: fetcher
+                 )
+
+        assert_receive {:title_proposal, ^ref, nil}, 1_000
+      end
+    end
+
+    @spec ok_fetcher(term(), term()) :: {:ok, String.t()}
+    def ok_fetcher(_config, _context), do: {:ok, "mfa title"}
   end
 end
