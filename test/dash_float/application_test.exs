@@ -1013,7 +1013,9 @@ defmodule DashFloat.ApplicationTest do
         end)
 
       assert logs =~ "legacy session id sweep skipped"
-      assert File.exists?(Path.join(sessions, legacy <> ".json"))
+
+      legacy_path = Path.join(sessions, legacy <> ".json")
+      assert File.exists?(legacy_path)
     end
   end
 
