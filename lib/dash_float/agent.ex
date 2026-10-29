@@ -109,7 +109,8 @@ defmodule DashFloat.Agent do
       case resume do
         %{id: id, pin: pin, messages: messages} ->
           {id, pin, Map.get(resume, :created_at), messages,
-           anchor_from_context(Map.get(resume, :context)), Map.get(resume, :compactions, [])}
+           anchor_from_context(Map.get(resume, :context), messages),
+           list_or_empty(Map.get(resume, :compactions))}
 
         nil ->
           {nil, nil, nil, [], nil, []}
@@ -145,11 +146,12 @@ defmodule DashFloat.Agent do
       {:ok, _config} ->
         state = %{state | ui: ui, messages: state.messages ++ [%{role: "user", content: text}]}
 
-        # Persist before the episode starts: a kill mid-stream must lose at
-        # most the reply, never the question (ADR 0014 §5). Compaction rides
-        # the same seam — after the append+persist, before the episode, the
-        # one point every request passes through (ADR 0022 §5).
-        state = maybe_compact(persist(state))
+        # Compact and persist before the episode starts: a kill mid-stream
+        # must lose at most the reply, never the question (ADR 0014 §5), and
+        # compaction rides the same seam — after the append, before the
+        # episode, the one point every request passes through (ADR 0022 §5).
+        # One persist per prompt, so a failed save shows one notice (m4).
+        state = maybe_compact(state)
         start_episode(state)
     end
   end
@@ -690,16 +692,17 @@ defmodule DashFloat.Agent do
   ## Context accounting (ADR 0022)
 
   # The compaction hook (ADR 0022 §5): prompt time, after the user message is
-  # appended and persisted, before the episode starts. Only a configured
-  # window compacts — nil (or non-positive) returns the state unchanged,
-  # nothing is guessed (§2). The no-op path returns the state unchanged; the
-  # compacting path mutates, persists once, and announces what happened (§6).
+  # appended, before the episode starts. Only a configured window compacts —
+  # nil (or non-positive) persists the question and returns (§2, nothing is
+  # guessed). The compacting path mutates, persists once, and announces what
+  # happened (§6); one persist per prompt either way, so a failed save warns
+  # once (hostile review m4).
   defp maybe_compact(%__MODULE__{provider: {:ok, %Config{context_tokens: window}}} = state)
        when is_integer(window) and window > 0 do
     plan = Accounting.compact(state.messages, state.anchor, window)
 
     if plan.dropped == 0 and not plan.oversize do
-      state
+      persist(state)
     else
       before = Accounting.estimate(state.messages, state.anchor)
       after_estimate = Accounting.estimate(plan.kept, plan.anchor)
@@ -729,7 +732,7 @@ defmodule DashFloat.Agent do
     end
   end
 
-  defp maybe_compact(state), do: state
+  defp maybe_compact(state), do: persist(state)
 
   # One chronological record per dropping compact (ADR 0022 §6); an
   # oversize-only pass appends nothing.
@@ -749,11 +752,21 @@ defmodule DashFloat.Agent do
 
   # The persisted anchor shape (%{prompt_tokens:, messages:}, ADR 0022 §6)
   # converts to the accounting anchor (%{tokens:, index:}) at the resume
-  # boundary; anything else is no anchor.
-  defp anchor_from_context(%{prompt_tokens: prompt_tokens, messages: messages}),
-    do: %{tokens: prompt_tokens, index: messages}
+  # boundary. Anything that is not two non-negative integers is no anchor —
+  # a hand-built resume map may carry anything (hostile review B1) — and so
+  # is an index past the message list: a legitimate anchor can never claim
+  # more messages than exist, so that shape is hand damage and must not
+  # silently defeat the trigger by estimating over an empty tail (M1).
+  defp anchor_from_context(%{prompt_tokens: prompt_tokens, messages: messages}, list)
+       when is_integer(prompt_tokens) and prompt_tokens >= 0 and is_integer(messages) and
+              messages >= 0 and messages <= length(list) do
+    %{tokens: prompt_tokens, index: messages}
+  end
 
-  defp anchor_from_context(_other), do: nil
+  defp anchor_from_context(_other, _list), do: nil
+
+  defp list_or_empty(list) when is_list(list), do: list
+  defp list_or_empty(_other), do: []
 
   ## Session persistence
 

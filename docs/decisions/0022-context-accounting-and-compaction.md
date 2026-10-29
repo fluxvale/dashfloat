@@ -69,6 +69,11 @@ estimate(messages, %{tokens:, index:}) = tokens + Σ weight(m) for m after index
   written without one — means a pure heuristic estimate over the whole list.
   Chars/4 over-counts some text and under-counts other (CJK badly); the
   headroom under the window is the margin.
+- **The estimate is total** (hostile review B1): a malformed anchor — not two
+  non-negative integers, or an index past the message list — degrades to the
+  heuristic, never raises. The session loader tolerates hand-edited
+  diagnostics, and #67 binds to this public function, so no caller's shape
+  can crash a prompt.
 - The anchor is **minted per episode**: the agent records the request's
   message count when it starts an episode, and the episode's usage frame
   completes the anchor (`tokens` from the frame, `index` from that count).
@@ -98,10 +103,11 @@ integers (a 2000-token fixture window triggers above 1600).
 ### 4. Eviction: oldest COMPLETE turns, prefix-only
 
 Messages group into turns (`chunk` before each `user` message; any leading
-non-user prelude belongs to the first group). Eviction drops **whole groups
-from the front only**, recomputing the estimate after each drop, and stops
-when the estimate is ≤ threshold or **one group remains** — the user's most
-recent question is never dropped:
+non-user messages form their own leading group, dropped first — they can
+never be split from what follows). Eviction drops **whole groups from the
+front only**, recomputing the estimate after each drop, and stops when the
+estimate is ≤ threshold or **one group remains** — the user's most recent
+question is never dropped:
 
 - The retained list is always a suffix of the input, so it can never begin
   with a `role: "tool"` message, orphan a tool answer, or split a batch from

@@ -19,9 +19,16 @@ defmodule DashFloat.Accounting do
   @spec estimate([map()], anchor()) :: non_neg_integer()
   def estimate(messages, nil), do: sum_weights(messages)
 
-  def estimate(messages, %{tokens: tokens, index: index}) do
+  def estimate(messages, %{tokens: tokens, index: index})
+      when is_integer(tokens) and tokens >= 0 and is_integer(index) and index >= 0 do
     tokens + sum_weights(Enum.drop(messages, index))
   end
+
+  # Total on purpose (hostile review B1): a hand-built or hand-edited anchor
+  # must degrade to the pure heuristic, never raise out of a prompt. The
+  # session loader refuses nothing here (ADR 0022 §6), so this public API —
+  # which #67 will bind to — cannot assume its callers validated.
+  def estimate(messages, _malformed_anchor), do: sum_weights(messages)
 
   @doc """
   The stage-2 read the stats footer binds to (ADR 0022 §7): the estimate of
@@ -39,9 +46,10 @@ defmodule DashFloat.Accounting do
   Drops whole oldest turns — each `user` message opens one — from the front
   while the estimate sits above `div(window * 4, 5)` and more than one turn
   remains, so `kept` is always a suffix of `messages` and no `tool_calls`
-  batch can be split from its results (ADR 0022 §4). The anchor sheds the
-  weights of the messages a drop takes, and `oversize` flags a surviving turn
-  that is itself above the budget.
+  batch can be split from its results (ADR 0022 §4). A leading non-user
+  prelude is its own first group. The anchor sheds the weights of the
+  messages a drop takes, and `oversize` flags a surviving turn that is itself
+  above the budget.
   """
   @spec compact([map()], anchor(), pos_integer()) ::
           %{kept: [map()], anchor: anchor(), dropped: non_neg_integer(), oversize: boolean()}
@@ -99,9 +107,10 @@ defmodule DashFloat.Accounting do
     end
   end
 
-  # Turns are structural: each `user` message opens one; leading non-user
-  # messages belong to the first turn, and a transcript with no user message
-  # is a single turn (ADR 0022 §4).
+  # Turns are structural: each `user` message opens one. Leading non-user
+  # messages form their own leading group (dropped first, so they can never
+  # split from what follows), and a transcript with no user message is a
+  # single turn (ADR 0022 §4).
   defp turns(messages) do
     {reversed, current} =
       Enum.reduce(messages, {[], []}, fn message, {turns, current} ->

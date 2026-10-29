@@ -1982,6 +1982,105 @@ defmodule DashFloat.AgentTest do
   end
 
   @tag :tmp_dir
+  test "a malformed resume anchor or compactions never crashes a prompt (B1)", ctx do
+    window = 2000
+    spec = read_turn(1, 40)
+    u1 = user_message("turn 1")
+    u2 = user_message("turn 2")
+    full = spec.expected
+
+    # Both arms of the hostile-review B1 finding: a hand-built resume map can
+    # carry a context of any shape (the loader tolerates one, ADR 0022 §6)
+    # and a compactions value that is not a list. Neither may raise.
+    resume = %{
+      id: "20261029-000000-abcdef",
+      pin: %{profile: nil, model: nil, base_url: nil},
+      messages: full ++ [u1],
+      context: %{prompt_tokens: "412", messages: 6},
+      compactions: nil
+    }
+
+    server = start_server([final_episode("ack", usage: {10, 5, 15})])
+    write_sandbox(ctx, spec.args["path"], spec.content)
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: Path.join(ctx.tmp_dir, "sessions"),
+        provider: provider(server, window),
+        resume: resume
+      )
+
+    send(agent, {:prompt, self(), "turn 2"})
+    assert_receive {:sse_request, "POST", _, _, _body}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+    assert Process.alive?(agent)
+
+    # A well-shaped anchor whose index claims more messages than exist (M1)
+    # is no anchor at all: the trigger keeps working on the heuristic.
+    resume2 = %{resume | context: %{prompt_tokens: 10, messages: 999_999}}
+
+    {agent2, _sup2} =
+      start_agent(server, ctx.tmp_dir, provider: provider(server, window), resume: resume2)
+
+    send(agent2, {:prompt, self(), "turn 2"})
+    assert_receive {:sse_request, "POST", _, _, _body}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+    assert Process.alive?(agent2)
+
+    # And an integer anchor past the end must not disable the trigger: this
+    # transcript alone is far over a tiny window, so the prompt-time hook
+    # still evicts (asserted through the request body).
+    big =
+      Enum.map(1..8, fn i -> %{role: "user", content: String.duplicate("x", 400) <> "#{i}"} end)
+
+    resume3 = %{resume2 | messages: big, context: %{prompt_tokens: 10, messages: 999_999}}
+
+    {agent3, _sup3} =
+      start_agent(server, ctx.tmp_dir, provider: provider(server, 100), resume: resume3)
+
+    send(agent3, {:prompt, self(), "last"})
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+    messages = request_messages(body)
+    refute hd(messages)["content"] == "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1"
+    assert Process.alive?(agent3)
+  end
+
+  @tag :tmp_dir
+  test "a resumed-agent save keeps the pre-compaction file shape (m3)", ctx do
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    # A session file that predates compaction: valid messages, no diagnostics.
+    id = "20261029-000000-abcdef"
+
+    body = %{
+      "version" => 1,
+      "id" => id,
+      "created_at" => "2026-10-29T00:00:00Z",
+      "pin" => %{"profile" => nil, "model" => nil, "base_url" => nil},
+      "messages" => [%{"role" => "user", "content" => "hello"}]
+    }
+
+    File.mkdir_p!(sessions)
+    file = Path.join(sessions, id <> ".json")
+    File.write!(file, Jason.encode!(body))
+    {:ok, loaded} = Session.load(sessions, id)
+
+    # The loader fills context: nil / compactions: [] in — but a save of that
+    # same map must not write the keys back (ADR 0022 §6: written only once
+    # they exist), so the file keeps its pre-compaction shape.
+    assert :ok = Session.save(sessions, loaded)
+
+    decoded =
+      sessions
+      |> Path.join(id <> ".json")
+      |> File.read!()
+      |> Jason.decode!()
+
+    refute Map.has_key?(decoded, "context")
+    refute Map.has_key?(decoded, "compactions")
+  end
+
+  @tag :tmp_dir
   test "the estimate tracks the fixture provider within the stated band", ctx do
     # Turn 1 is a read_file batch, turns 2 and 3 plain replies. Every usage
     # frame reports the fixture tokenizer's F of the request list the agent is

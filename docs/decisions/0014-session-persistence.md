@@ -145,8 +145,11 @@ receives display-contract messages.
   (`pin` is rebuilt from its three fields at load — extras inside it do
   not survive). Anything that changes how existing fields are *read* bumps
   the version (which old binaries then refuse). This is the #43 seam —
-  accounting/compaction reads the same `messages` and nests its additions
-  there.
+  accounting/compaction reads the same `messages`. *(Amended 2026-10-29,
+  [ADR 0022](0022-context-accounting-and-compaction.md): #43 chose
+  **top-level** additive fields, not nesting inside `messages`, so the
+  additions never ride a request body to the provider; the old-binary
+  drop-on-re-save consequence accepted here applies to them. See 0022 §6.)*
 
 ### 4. Load: tolerance, refusals, repair
 

@@ -61,15 +61,21 @@ defmodule DashFloat.AccountingTest do
 
   # The invariants of a compact that dropped something (ADR 0022 §4): the
   # kept list is a user-first suffix and no kept call lost its answer.
-  defp assert_suffix_invariants(messages, kept) do
+  # The suffix rule always holds; the user-first head is a property of a
+  # DROP (a retained prelude, including a no-user transcript, keeps whatever
+  # head the input had — ADR 0022 §4). Hostile review m2: the randomized run
+  # must exercise those arms, not assume them away.
+  defp assert_suffix_invariants(messages, kept, dropped \\ 1) do
     prefix_length = length(messages) - length(kept)
     assert kept == Enum.drop(messages, prefix_length)
-    assert role(hd(kept)) == "user"
+    if dropped > 0 and has_user?(messages), do: assert(role(hd(kept)) == "user")
 
     calls = call_ids(kept)
     answers = tool_ids(kept)
     assert MapSet.equal?(calls, answers)
   end
+
+  defp has_user?(messages), do: Enum.any?(messages, &(role(&1) == "user"))
 
   defp turn_count(messages) do
     Enum.count(messages, fn message -> role(message) == "user" end)
@@ -258,14 +264,48 @@ defmodule DashFloat.AccountingTest do
         result = Accounting.compact(messages, anchor, window)
 
         assert result.dropped >= 0
-        assert_suffix_invariants(messages, result.kept)
+        assert_suffix_invariants(messages, result.kept, result.dropped)
 
         estimate = Accounting.estimate(result.kept, result.anchor)
-        single_turn = turn_count(result.kept) == 1
 
-        assert estimate <= threshold or single_turn
+        assert estimate <= threshold or turn_count(result.kept) <= 1
         assert result.oversize == estimate > threshold
       end
+    end
+
+    # The prelude and no-user arms of the grouping rule (ADR 0022 §4), which
+    # the generator above cannot produce (hostile review m2).
+    test "a leading assistant prelude is its own leading group and drops first" do
+      messages = [
+        assistant(1200),
+        user(400),
+        assistant(1200),
+        user(400),
+        assistant(1200)
+      ]
+
+      assert %{kept: kept, dropped: 1} = Accounting.compact(messages, nil, 1000)
+      assert hd(kept) == Enum.at(messages, 1)
+    end
+
+    test "a drop that includes a whole tool batch leaves no unpaired call" do
+      messages = [
+        user(400),
+        tool_assistant([call("c1", 8, 20)], 0),
+        tool_result("c1", 3000),
+        user(400),
+        assistant(200)
+      ]
+
+      assert %{kept: kept, dropped: 1} = Accounting.compact(messages, nil, 1000)
+      assert kept == Enum.drop(messages, 3)
+    end
+
+    test "a transcript with no user message is one never-dropped turn" do
+      messages = [assistant(2000)]
+
+      assert %{kept: ^messages, dropped: 0, oversize: true} =
+               Accounting.compact(messages, nil, 100)
     end
   end
 
@@ -273,14 +313,29 @@ defmodule DashFloat.AccountingTest do
   # identified tool calls, and one tool answer per call in order; the key
   # style is chosen per transcript, and both must behave identically.
   defp generate_transcript do
-    {turns, _next_id} = build_turns(rand_int(1, 8), 1, [])
-
     messages =
-      turns
-      |> Enum.reverse()
-      |> Enum.concat()
+      case :rand.uniform(10) do
+        # a leading assistant prelude (ADR 0022 §4)
+        n when n <= 2 ->
+          [assistant(rand_int(1, 300)) | generate_turns()]
+
+        # a transcript with no user message at all
+        3 ->
+          [assistant(rand_int(1, 4000))]
+
+        _other ->
+          generate_turns()
+      end
 
     if :rand.uniform(2) == 1, do: stringify(messages), else: messages
+  end
+
+  defp generate_turns do
+    {turns, _next_id} = build_turns(rand_int(1, 8), 1, [])
+
+    turns
+    |> Enum.reverse()
+    |> Enum.concat()
   end
 
   defp build_turns(0, next_id, turns), do: {turns, next_id}

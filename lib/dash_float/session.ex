@@ -67,7 +67,26 @@ defmodule DashFloat.Session do
     # The id names the file (ADR 0014 §2): only the minted shape ever
     # reaches the filesystem, so no hand-supplied id can carry a path.
     with :ok <- check_save_id(session.id) do
-      do_save(dir, session)
+      do_save(dir, normalize(session))
+    end
+  end
+
+  # The additive diagnostics are written only once they exist (ADR 0022 §6),
+  # so a loaded map — which always carries `context: nil, compactions: []` —
+  # re-saves byte-identically to a pre-compaction file (hostile review m3).
+  defp normalize(session) do
+    session
+    |> drop_empty(:context, &is_nil/1)
+    |> drop_empty(:compactions, &(&1 == []))
+  end
+
+  defp drop_empty(session, key, empty?) do
+    value = Map.get(session, key)
+
+    if Map.has_key?(session, key) and empty?.(value) do
+      Map.delete(session, key)
+    else
+      session
     end
   end
 
