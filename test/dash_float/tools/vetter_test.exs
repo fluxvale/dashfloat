@@ -90,6 +90,31 @@ defmodule DashFloat.Tools.VetterTest do
     assert_receive {:sse_closed}, 3_000
   end
 
+  test "a stream child killed without reporting is a failed check" do
+    server =
+      start_server([
+        {:send, [@headers, frame("working")]},
+        {:sleep, 1_000},
+        {:wait_close, 2_000}
+      ])
+
+    task =
+      Task.async(fn ->
+        Vetter.verdict(provider(SSEServer.base_url(server)), call(), ["$ mix test"],
+          vet_timeout: 10_000
+        )
+      end)
+
+    # The vetter holds its stream child as a bare spawn_monitor pid with no
+    # seam to reach it; the child's :monitored_by is the only view of it (the
+    # task spawn_monitors nothing else). Kill without a report so only the
+    # monitor can resolve the wait — ChatStream's own reports never fire.
+    child = wait_for_child(task.pid)
+    Process.exit(child, :kill)
+
+    assert {:error, "safety check stream crashed: :killed"} = Task.await(task, 1_000)
+  end
+
   test "a refused connection is a failed check" do
     no_listener =
       {:ok, %Config{base_url: "http://127.0.0.1:#{free_port()}", model: "m", api_key: "k"}}
@@ -163,11 +188,43 @@ defmodule DashFloat.Tools.VetterTest do
     prompt = Vetter.build_prompt(subject, preview_lines)
 
     assert prompt =~ "… (truncated)"
-    # Instruction prose + 8 KiB args + 8 KiB preview, plus marker lines.
+    # The 8 KiB caps are on raw content, not wire size (ADR 0016 §6): the
+    # budget is content-side, so this escape-free payload is the cheap case —
+    # prose + 8 KiB args + 8 KiB preview, plus marker lines.
     assert byte_size(prompt) < 17_500
 
     # A byte cut landing mid-codepoint backs off instead of raising.
     assert String.valid?(prompt)
+  end
+
+  test "escaping-heavy content stays under the documented inflated ceiling" do
+    # 8 KiB of raw backslashes: every one doubles on the wire — the args
+    # escape twice (encoded, capped, encoded again), the preview once — and
+    # the encoded prompt measures ~34 KB, inside the ~40 KB escaping budget
+    # under ADR 0016 §6's ~60 KB worst case.
+    content = String.duplicate("\\", 8_192)
+    args = %{"path" => "big.txt", "content" => content}
+    subject = call("write_file", args)
+
+    prompt = Vetter.build_prompt(subject, [content])
+
+    assert byte_size(prompt) < 40_000
+    assert String.valid?(prompt)
+  end
+
+  test "a preview spending the byte budget exactly keeps whole lines and drops the next" do
+    # 9 + 8183 = 8192: the budget is spent to the byte after the second
+    # line, so the third line hits the cap's spent-budget clause — dropped
+    # whole and disclosed by the marker — never the truncation clause.
+    head = String.duplicate("a", 9)
+    tail = String.duplicate("b", 8_183)
+
+    prompt = Vetter.build_prompt(call(), [head, tail, "past the spent budget"])
+
+    assert prompt =~ "… (truncated)"
+    # `tail` rides escape-free: its full presence proves it was kept whole.
+    assert prompt =~ tail
+    refute prompt =~ "past the spent budget"
   end
 
   test "parse accepts only strict decision JSON" do
@@ -186,5 +243,31 @@ defmodule DashFloat.Tools.VetterTest do
     {:ok, port} = :inet.port(listen)
     :gen_tcp.close(listen)
     port
+  end
+
+  # Spawned stream children are anonymous, but a parent's monitor shows up in
+  # the child's :monitored_by — the vetting task's only monitor is the child.
+  defp wait_for_child(parent, tries \\ 100)
+
+  defp wait_for_child(parent, 0), do: flunk("stream child of #{inspect(parent)} not found")
+
+  defp wait_for_child(parent, tries) do
+    case find_child(parent) do
+      nil ->
+        Process.sleep(10)
+        wait_for_child(parent, tries - 1)
+
+      child ->
+        child
+    end
+  end
+
+  defp find_child(parent) do
+    Enum.find(:erlang.processes(), fn pid ->
+      case Process.info(pid, :monitored_by) do
+        {:monitored_by, watchers} -> parent in watchers
+        nil -> false
+      end
+    end)
   end
 end
