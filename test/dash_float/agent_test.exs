@@ -147,7 +147,15 @@ defmodule DashFloat.AgentTest do
 
   defp provider(server) do
     {:ok,
-     %Config{base_url: SSEServer.base_url(server), model: "test-model", api_key: "test-key-123"}}
+     %Config{
+       base_url: SSEServer.base_url(server),
+       model: "test-model",
+       api_key: "test-key-123",
+       # The auto-title side-request is opted out suite-wide (#80): only the
+       # title tests below opt in, so no other test's server script count or
+       # request order gains a side-request connection.
+       auto_title: false
+     }}
   end
 
   # A provider carrying an explicit context window (ADR 0022 §2); the arity-1
@@ -158,7 +166,8 @@ defmodule DashFloat.AgentTest do
        base_url: SSEServer.base_url(server),
        model: "test-model",
        api_key: "test-key-123",
-       context_tokens: context_tokens
+       context_tokens: context_tokens,
+       auto_title: false
      }}
   end
 
@@ -174,6 +183,8 @@ defmodule DashFloat.AgentTest do
       supervisor: sup,
       session_dir: Keyword.get(opts, :session_dir),
       resume: Keyword.get(opts, :resume),
+      title: Keyword.get(opts, :title),
+      title_fetcher: Keyword.get(opts, :title_fetcher),
       name: nil
     ]
 
@@ -194,6 +205,15 @@ defmodule DashFloat.AgentTest do
   defp session_id(dir) do
     [file] = File.ls!(dir)
     Path.rootname(file)
+  end
+
+  # The AGENT's own id/file, for dirs that also hold pre-written holder
+  # files (the collision and rename tests).
+  defp own_id(agent), do: :sys.get_state(agent).session_id
+
+  defp load_own_session(dir, agent) do
+    {:ok, session} = Session.load(dir, own_id(agent))
+    session
   end
 
   defp read_session(dir) do
@@ -1559,7 +1579,14 @@ defmodule DashFloat.AgentTest do
 
     {:ok, agent} =
       Agent.start_link(
-        provider: {:ok, %Config{base_url: leaked_url, model: "test-model", api_key: "k"}},
+        provider:
+          {:ok,
+           %Config{
+             base_url: leaked_url,
+             model: "test-model",
+             api_key: "k",
+             auto_title: false
+           }},
         cwd: ctx.tmp_dir,
         session_dir: sessions,
         supervisor: sup,
@@ -1860,7 +1887,12 @@ defmodule DashFloat.AgentTest do
       Agent.start_link(
         provider:
           {:ok,
-           %Config{base_url: SSEServer.base_url(server), model: "test-model", api_key: sentinel}},
+           %Config{
+             base_url: SSEServer.base_url(server),
+             model: "test-model",
+             api_key: sentinel,
+             auto_title: false
+           }},
         cwd: ctx.tmp_dir,
         session_dir: sessions,
         supervisor: sup,
@@ -2722,6 +2754,563 @@ defmodule DashFloat.AgentTest do
         u4
       ]
     )
+  end
+
+  ## Session title (#80): the auto-title side-request, the rename seam,
+  ## resume adoption. The suite's default provider opts the trigger out;
+  ## these tests opt in through `title_provider/2`.
+
+  # The auto-title tests' provider: the suite's shape with the tri-state the
+  # trigger reads left unset (nil = enabled, the resolution default).
+  defp title_provider(server, overrides \\ []) do
+    {:ok,
+     struct!(
+       Config,
+       Keyword.merge(
+         [base_url: SSEServer.base_url(server), model: "test-model", api_key: "test-key-123"],
+         overrides
+       )
+     )}
+  end
+
+  # A plain-JSON chat-completions response — the title side-request's reply
+  # shape (no SSE).
+  defp title_step(content) do
+    body = Jason.encode!(%{choices: [%{message: %{content: content}}]})
+
+    [
+      {:send,
+       "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n" <>
+         body},
+      :close
+    ]
+  end
+
+  # A fetcher that notifies the test each time the agent calls it, then
+  # proposes `title`.
+  defp notify_fetcher(test_pid, title \\ "Proposed Title") do
+    fn _config, _context ->
+      send(test_pid, :title_fetcher_called)
+      {:ok, title}
+    end
+  end
+
+  defp save_titled(dir, id, title) do
+    :ok =
+      Session.save(dir, %{
+        version: 1,
+        id: id,
+        created_at: "2026-10-29T00:00:00Z",
+        pin: %{profile: nil, model: nil, base_url: nil},
+        messages: [],
+        title: title
+      })
+  end
+
+  @other_id "0192aa10-b001-7c00-8000-00000000000b"
+  @other_id_2 "0192aa10-b002-7c00-8000-00000000000c"
+
+  @tag :tmp_dir
+  test "the first settled turn fires one title side-request, e2e at the loopback", ctx do
+    server =
+      start_server([final_episode("Fix the login bug"), title_step("Fix the login bug")])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: title_provider(server, model: "glm-5.3-flash")
+      )
+
+    send(agent, {:prompt, self(), "title this session"})
+    assert_receive {:sse_request, "POST", "/chat/completions", _, _main}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # The side-request: the resolved model (the loopback is a custom
+    # provider, so unset autoTitle rides the active-model fallback — here
+    # the Z.AI cheap id; the preset-table arm is Title's unit tests), the
+    # instruction, the first exchange, and the 32-token cap.
+    assert_receive {:sse_request, "POST", "/chat/completions", _, title_body}, 2_000
+
+    assert %{
+             "model" => "glm-5.3-flash",
+             "max_tokens" => 32,
+             "messages" => [
+               %{"role" => "system", "content" => instruction},
+               %{"role" => "user", "content" => "title this session"},
+               %{"role" => "assistant", "content" => "Fix the login bug"}
+             ]
+           } = Jason.decode!(title_body)
+
+    assert instruction =~ "Propose a concise title"
+
+    # The scripted reply titles the session: entry and file.
+    assert_receive {:entry, :system, "[session titled: Fix the login bug]"}, 2_000
+
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+    assert session.title == "Fix the login bug"
+  end
+
+  @tag :tmp_dir
+  test "the turn reaches idle before the side-request is answered", ctx do
+    server = start_server([final_episode("done"), [{:sleep, 400} | title_step("Slow Title")]])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: title_provider(server)
+      )
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:sse_request, "POST", _, _, _main}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # The side-request is still sleeping on the server; the agent is idle.
+    refute_received {:entry, :system, "[session titled: Slow Title]"}
+
+    assert_receive {:entry, :system, "[session titled: Slow Title]"}, 2_000
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+    assert session.title == "Slow Title"
+  end
+
+  @tag :tmp_dir
+  test "no fire when the session boots titled", ctx do
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: title_provider(server),
+        title: "Booted Title",
+        title_fetcher: notify_fetcher(self())
+      )
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+    Process.sleep(300)
+    refute_received :title_fetcher_called
+
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+    assert session.title == "Booted Title"
+  end
+
+  test "no fire when auto_title is false or persistence is off" do
+    server = start_server([final_episode("a"), final_episode("b")])
+
+    for provider <- [title_provider(server, auto_title: false), title_provider(server)] do
+      {agent, _sup} = start_agent(server, System.tmp_dir!(), provider: provider)
+      send(agent, {:prompt, self(), "hello"})
+      assert_receive {:phase, :idle}, 2_000
+    end
+
+    Process.sleep(300)
+    refute_received :title_fetcher_called
+  end
+
+  @tag :tmp_dir
+  test "a cancelled first turn never fires; the next settled turn does, once", ctx do
+    # The first connection parks in wait_close — the cancel kills the client
+    # side, which releases the single-threaded acceptor for the second turn
+    # (no EOF can race the Esc into a normal end-of-turn).
+    server =
+      start_server([
+        [{:send, [@headers, frame("partial")]}, {:wait_close, 30_000}],
+        final_episode("settled now")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: title_provider(server),
+        title_fetcher: notify_fetcher(self())
+      )
+
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:token, "partial"}, 2_000
+    send(agent, {:cancel})
+    assert_receive {:entry, :system, "[cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # The cancelled turn is not a settled one: no fire.
+    refute_received :title_fetcher_called
+
+    send(agent, {:prompt, self(), "again"})
+    assert_receive {:phase, :idle}, 2_000
+    assert_receive :title_fetcher_called, 2_000
+    Process.sleep(300)
+    refute_received :title_fetcher_called
+  end
+
+  @tag :tmp_dir
+  test "a failed proposal never re-fires: the latch is one-shot per run", ctx do
+    server = start_server([final_episode("one"), final_episode("two")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    test_pid = self()
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: title_provider(server),
+        title_fetcher: fn _config, _context ->
+          send(test_pid, :title_fetcher_called)
+          :error
+        end
+      )
+
+    send(agent, {:prompt, self(), "one"})
+    assert_receive {:phase, :idle}, 2_000
+    assert_receive :title_fetcher_called, 2_000
+
+    # The failure cleared the guard, kept the latch: no entry, no ref.
+    assert %{title_fired?: true, title_ref: nil, session_title: nil} = :sys.get_state(agent)
+
+    send(agent, {:prompt, self(), "two"})
+    assert_receive {:phase, :idle}, 2_000
+    Process.sleep(300)
+    refute_received :title_fetcher_called
+  end
+
+  @tag :tmp_dir
+  test "a user title set while a proposal is in flight wins", ctx do
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: title_provider(server),
+        title_fetcher: fn _config, _context ->
+          Process.sleep(400)
+          {:ok, "Late Proposal"}
+        end
+      )
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+    send(agent, {:set_title, self(), "User Title"})
+    assert_receive {:entry, :system, "[session titled: User Title]"}, 2_000
+
+    # The late proposal lands and loses — the in-flight guard drops it.
+    Process.sleep(700)
+    refute_received {:entry, :system, "[session titled: Late Proposal]"}
+    assert %{session_title: "User Title", title_ref: nil} = :sys.get_state(agent)
+
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+    assert session.title == "User Title"
+  end
+
+  @tag :tmp_dir
+  test "a proposal another session holds lands in its (2) form", ctx do
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    save_titled(sessions, @other_id, "Fix the bug")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: title_provider(server),
+        title_fetcher: fn _config, _context -> {:ok, "Fix the bug"} end
+      )
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:entry, :system, "[session titled: Fix the bug (2)]"}, 2_000
+
+    session = load_own_session(sessions, agent)
+    assert session.title == "Fix the bug (2)"
+  end
+
+  @tag :tmp_dir
+  test "a colliding long proposal truncates under the cap with the suffix", ctx do
+    long = String.duplicate("x", 90)
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    save_titled(sessions, @other_id, String.slice(long, 0, 80))
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: title_provider(server),
+        title_fetcher: fn _config, _context -> {:ok, long} end
+      )
+
+    send(agent, {:prompt, self(), "hello"})
+    expected = String.slice(long, 0, 76) <> " (2)"
+    assert_receive {:entry, :system, "[session titled: " <> _}, 2_000
+    assert %{session_title: landed} = :sys.get_state(agent)
+    assert landed == expected
+    assert String.length(landed) == 80
+  end
+
+  @tag :tmp_dir
+  test "eight held candidates give up silently: no title, no entry", ctx do
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    save_titled(sessions, @other_id, "T")
+
+    for n <- 2..8 do
+      save_titled(sessions, "0192aa10-b00#{n}-7c00-8000-00000000000b", "T (#{n})")
+    end
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: title_provider(server),
+        title_fetcher: fn _config, _context -> {:ok, "T"} end
+      )
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+    Process.sleep(300)
+    refute_received {:entry, :system, "[session titled" <> _}
+    assert %{session_title: nil, title_ref: nil} = :sys.get_state(agent)
+
+    session = load_own_session(sessions, agent)
+    assert session.title == nil
+  end
+
+  @tag :tmp_dir
+  test "the side-request carries the FIRST exchange's contents (string-keyed resumes too)",
+       ctx do
+    server = start_server([final_episode("second answer")])
+
+    resumed_messages = [
+      %{"role" => "user", "content" => "first question"},
+      %{"role" => "assistant", "content" => "first answer"}
+    ]
+
+    test_pid = self()
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: Path.join(ctx.tmp_dir, "sessions"),
+        provider: title_provider(server),
+        resume: %{
+          id: "0192aa10-b009-7c00-8000-00000000000b",
+          pin: %{profile: nil, model: nil, base_url: nil},
+          messages: resumed_messages
+        },
+        title_fetcher: fn _config, context ->
+          send(test_pid, {:title_context, context})
+          {:ok, "T"}
+        end
+      )
+
+    send(agent, {:prompt, self(), "second question"})
+    assert_receive {:phase, :idle}, 2_000
+    assert_receive {:title_context, context}, 2_000
+    assert context == %{user: "first question", assistant: "first answer"}
+  end
+
+  @tag :tmp_dir
+  test "a nil-content first assistant message reads an empty side of the context", ctx do
+    write_sandbox(ctx, "notes.md", "seed\n")
+
+    server =
+      start_server([
+        call_tool_episode("call_1", "read_file", %{"path" => "notes.md"}),
+        final_episode("done")
+      ])
+
+    test_pid = self()
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: Path.join(ctx.tmp_dir, "sessions"),
+        provider: title_provider(server),
+        title_fetcher: fn _config, context ->
+          send(test_pid, {:title_context, context})
+          {:ok, "T"}
+        end
+      )
+
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:phase, :idle}, 2_000
+    assert_receive {:title_context, context}, 2_000
+
+    # The first assistant message is the nil-content tool batch.
+    assert context == %{user: "go", assistant: ""}
+  end
+
+  @tag :tmp_dir
+  test "a stale title proposal is ignored, never a crash", ctx do
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+
+    send(agent, {:title_proposal, make_ref(), "Stale"})
+    send(agent, {:title_proposal, make_ref(), nil})
+    Process.sleep(100)
+
+    assert Process.alive?(agent)
+    assert %{session_title: nil, title_ref: nil} = :sys.get_state(agent)
+    refute_received {:entry, :system, "[session titled" <> _}
+  end
+
+  ## The rename seam (#80)
+
+  @tag :tmp_dir
+  test "set_title: a free title normalizes, sets, persists, and confirms", ctx do
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+
+    send(agent, {:set_title, self(), "  Rename   Me  "})
+    assert_receive {:entry, :system, "[session titled: Rename Me]"}, 2_000
+    assert %{session_title: "Rename Me"} = :sys.get_state(agent)
+
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+    assert session.title == "Rename Me"
+  end
+
+  @tag :tmp_dir
+  test "set_title refuses empty, oversized, and uuid-shaped titles", ctx do
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+
+    for {raw, refusal} <- [
+          {"", "[title not set: may not be empty]"},
+          {"   ", "[title not set: may not be empty]"},
+          {String.duplicate("a", 81), "[title not set: may not exceed 80 characters]"},
+          {"0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c",
+           "[title not set: may not look like a session id]"}
+        ] do
+      send(agent, {:set_title, self(), raw})
+      assert_receive {:entry, :system, ^refusal}, 2_000
+    end
+
+    assert %{session_title: nil} = :sys.get_state(agent)
+
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+    assert session.title == nil
+  end
+
+  @tag :tmp_dir
+  test "set_title names the holder when the title is taken", ctx do
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    save_titled(sessions, @other_id_2, "Taken Name")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+
+    send(agent, {:set_title, self(), "taken name"})
+    assert_receive {:entry, :system, taken}, 2_000
+    assert taken == "[title not set: \"taken name\" is already taken by session #{@other_id_2}]"
+    assert %{session_title: nil} = :sys.get_state(agent)
+
+    session = load_own_session(sessions, agent)
+    assert session.title == nil
+  end
+
+  @tag :tmp_dir
+  test "set_title allows retitling to a key the session itself holds", ctx do
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+
+    send(agent, {:set_title, self(), "Alpha"})
+    assert_receive {:entry, :system, "[session titled: Alpha]"}, 2_000
+
+    # The same key, different case: the holder scan skips this session's id.
+    send(agent, {:set_title, self(), "ALPHA"})
+    assert_receive {:entry, :system, "[session titled: ALPHA]"}, 2_000
+    assert %{session_title: "ALPHA"} = :sys.get_state(agent)
+  end
+
+  @tag :tmp_dir
+  test "set_title with persistence off still normalizes and confirms", ctx do
+    server = start_server([final_episode("done")])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+
+    send(agent, {:set_title, self(), "  Off   Grid  "})
+    assert_receive {:entry, :system, "[session titled: Off Grid]"}, 2_000
+    assert %{session_title: "Off Grid"} = :sys.get_state(agent)
+  end
+
+  @tag :tmp_dir
+  test "a title set before the first prompt writes no session file", ctx do
+    server = start_server([final_episode("unused")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:set_title, self(), "Early"})
+    assert_receive {:entry, :system, "[session titled: Early]"}, 2_000
+    assert %{session_title: "Early"} = :sys.get_state(agent)
+
+    # The ADR 0014 §5 invariant: a launch that never prompts leaves nothing.
+    refute File.exists?(sessions)
+  end
+
+  test "a malformed set_title message is ignored, never a crash" do
+    server = start_server([final_episode("done")])
+    {agent, _sup} = start_agent(server, System.tmp_dir!())
+
+    send(agent, {:set_title, self(), 42})
+    send(agent, {:set_title, "not-a-pid", "x"})
+    Process.sleep(100)
+
+    assert Process.alive?(agent)
+    assert %{session_title: nil} = :sys.get_state(agent)
+    refute_received {:entry, :system, "[title not set" <> _}
+    refute_received {:entry, :system, "[session titled" <> _}
+  end
+
+  @tag :tmp_dir
+  test "a resumed session keeps its title on the next save and never fires the nudge", ctx do
+    id = "0192aa10-b010-7c00-8000-00000000000b"
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    save_titled(sessions, id, "Resumed Title")
+    {:ok, loaded} = Session.load(sessions, id)
+
+    server = start_server([final_episode("resumed fine")])
+
+    {resumed, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: title_provider(server),
+        resume: %{
+          id: loaded.id,
+          pin: loaded.pin,
+          messages: loaded.messages,
+          created_at: loaded.created_at,
+          title: loaded.title
+        },
+        title_fetcher: notify_fetcher(self())
+      )
+
+    assert %{session_title: "Resumed Title"} = :sys.get_state(resumed)
+
+    send(resumed, {:prompt, self(), "continue"})
+    assert_receive {:phase, :idle}, 2_000
+    Process.sleep(300)
+    refute_received :title_fetcher_called
+
+    # The round trip: the re-saved file carries the adopted title verbatim.
+    {:ok, session} = Session.load(sessions, id)
+    assert session.title == "Resumed Title"
+    assert List.last(session.messages)["content"] == "resumed fine"
   end
 
   defp free_port do
