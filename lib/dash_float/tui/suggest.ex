@@ -209,8 +209,22 @@ defmodule DashFloat.TUI.Suggest do
           |> strip_quotes()
           |> String.slice(0, @display_cap)
 
-        if String.trim(ghost) == "", do: nil, else: ghost
+        if visible?(ghost), do: ghost, else: nil
     end
+  end
+
+  # The visibility gate: format characters (Cf — soft hyphen, word joiner)
+  # and combining marks (Mn/Me) carry no width, so a ghost made ONLY of
+  # them would blank the placeholder and Tab could materialize an unseen
+  # submit. They may still appear WITHIN a ghost that has visible text —
+  # only a remainder with nothing visible is refused.
+  @invisible ~r/[\p{Cf}\p{Mn}\p{Me}]/u
+
+  defp visible?(ghost) do
+    ghost
+    |> String.replace(@invisible, "")
+    |> String.trim()
+    |> Kernel.!=("")
   end
 
   def normalize({:ok, _other}), do: nil
