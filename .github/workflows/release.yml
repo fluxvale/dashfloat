@@ -265,6 +265,46 @@ jobs:
           cat > notes.md <<EOF
           DashFloat $VERSION.
 
+          ## What's new in $VERSION
+
+          Four features since 0.1.1:
+
+          - **Sessions persist and resume.** Every turn is saved as you go.
+            Close the terminal and pick the conversation back up later:
+            \`dashfloat --resume <id>\` replays the transcript and your next
+            message continues it. List the ids with
+            \`ls ~/.local/share/dashfloat/sessions/\` on Linux
+            (\`~/Library/Application Support/dashfloat/sessions/\` on macOS).
+            A crash mid-task leaves a repairable session, not a lost one.
+          - **A sharper composer.** The input shows a cursor that blinks
+            while the agent works and disappears when its pane loses focus,
+            a dim footer under the input carries the working directory, the
+            active model, and live tok/s while streaming, and after a
+            completed turn a greyed next-input suggestion can appear — Tab
+            accepts it, typing ignores it. The suggestion targets a cheap
+            model by default; set \`suggest\` under a profile's \`settings\`
+            in settings.json5 to a model id to change it, or \`false\` to
+            turn it off.
+          - **Context accounting and compaction.** DashFloat tracks how full
+            the model's context window is and, once a session passes roughly
+            80%, drops the oldest complete turns to stay inside it — a
+            visible notice names the count. Long sessions keep working
+            instead of failing on their own length. (Needs the model's
+            context window configured — \`context\` on the model in
+            settings, or \`DASHFLOAT_CONTEXT_TOKENS\`.)
+          - **Interaction modes.** Shift+Tab cycles Plan → Build → Auto →
+            Unchained. Plan is read-only research: changes are proposed in
+            the log, never executed. Build — the default — confirms before
+            anything writes files or runs a command. Auto lets a model-based
+            safety check decide per call whether a tool runs without asking.
+            Unchained runs everything. Modes bind what the agent may do
+            unattended; your explicit answers always outrank them.
+
+          Upgrading: re-run the install command below — it replaces the
+          previous version and keeps your sessions. On macOS,
+          \`brew upgrade dashfloat\` does the same once the tap catches up
+          with the release.
+
           ## Install
 
           \`\`\`sh
