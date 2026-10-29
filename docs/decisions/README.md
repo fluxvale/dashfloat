@@ -38,3 +38,4 @@ their replacement.
 | [0013](0013-exec-pgid-tracked-at-spawn.md) | Exec's process group is tracked at spawn, not queried from the port at reap | Accepted |
 | [0014](0014-session-persistence.md) | Session persistence: transcript store, resume, dangling repair, pinning | Accepted |
 | [0015](0015-input-surface-cursor-stats-ghost.md) | Input surface: blinking cursor, stats footer, model-driven ghost text | Accepted |
+| [0022](0022-context-accounting-and-compaction.md) | Context accounting and compaction: usage-frame anchor, chars/4 growth, 80% whole-turn eviction | Accepted |

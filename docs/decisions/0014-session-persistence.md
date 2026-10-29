@@ -120,7 +120,12 @@ receives display-contract messages.
   accounting/compaction reads the same `messages` and may add fields, not
   reinterpret them.
 - **Never a credential by the writer's own hand.** The file holds `version`,
-  `id`, `created_at`, `pin`, `messages` — nothing else. The writer receives
+  `id`, `created_at`, `pin`, `messages` — nothing else. *(Amended 2026-10-29,
+  [ADR 0022](0022-context-accounting-and-compaction.md): the additive-evolution
+  seam below is now in use — the file may additionally carry `context` and
+  `compactions`, written only once they exist and tolerated the `pin` way at
+  load. Still never a credential, and nothing display-shaped.)* The writer
+  receives
   the message list and three pin strings, never the key: `api_key` values,
   keys.json5 contents, and environment values have no path into what the
   writer serializes. **What the transcript itself carries is different and
