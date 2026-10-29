@@ -49,7 +49,9 @@ defmodule DashFloat.TUI.Commands do
   end
 
   defp registry_lookup(trimmed, prefix) do
-    case Enum.find(all(), &(&1.name == prefix)) do
+    # Case-insensitive like the widget's matcher (ADR 0020): "/MODE plan"
+    # runs mode — the popup and the submit path can never disagree.
+    case Enum.find(all(), &(&1.name == String.downcase(prefix))) do
       %Command{name: name} -> {name, rest_after(trimmed, name)}
       nil -> nil
     end

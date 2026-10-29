@@ -44,11 +44,13 @@ pure-state contract holds: no processes, terminal, or timers).
 :commands | :models | :profiles, items:, selected:}`:
 
 - **`:filter`** is the composer slash autocomplete. It is derived state:
-  recomputed after every keystroke from the draft (`SlashCommands.parse` →
-  prefix match), visible only while idle, the draft is command-shaped, and at
-  least one command matches. Up/Down move the selection (selection resets to 0
-  whenever the filter changes); Enter executes the selected match; Esc
-  dismisses until the next edit.
+  recomputed after every draft-changing keystroke from the draft
+  (`SlashCommands.parse` → prefix match), visible only while idle, the draft
+  is command-shaped, and at least one command matches. Up/Down move the
+  selection (the selection resets to 0 whenever the match set changes;
+  typing that narrows within the same set keeps it); Enter executes the
+  selected match; Esc dismisses until the next draft change (cursor-only
+  keys neither reopen nor keep it alive past the dismissal).
 - **`:modal`** is Ctrl+P (the command palette), the `/model` picker, and the
   `/profile` picker. It swallows every key except Up/Down/Enter/Esc/Ctrl+P
   (toggle) and the global quits (Ctrl+Q/Ctrl+C clauses sit above it, so quit
@@ -58,8 +60,10 @@ Enter executes the highlighted entry in both modes — palette parity, one rule.
 
 **Command-shaped:** trimmed text whose first whitespace-free token is a
 registry name — `/clear`, but also `/mode plan` or `/title fix the login`
-(arg-taking commands). The autocomplete popup shows only while the draft
-starts with `/` and has no whitespace yet (the name is still being typed).
+(arg-taking commands); the name matches case-insensitively (`/MODE plan`
+runs `mode`), matching the widget's case-insensitive autocomplete. The
+autocomplete popup shows only while the draft starts with `/` and has no
+whitespace yet (the name is still being typed).
 Anything else starting with `/` (e.g. `/etc/hosts is weird`) is an ordinary
 message — the escape hatch for literal slash text. Argless commands ignore
 trailing text after their name.

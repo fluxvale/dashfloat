@@ -445,8 +445,15 @@ defmodule DashFloat.TUI.State do
     # The class guard (P1-2, hostile review): leaving setup CLEARS the
     # composer — whatever a routing bug of the day may have dropped there
     # mid-setup, a credential pasted at the wrong moment can never become
-    # chat prompt text.
-    ExRatatui.textarea_set_value(state.input, "")
+    # chat prompt text. A runtime /profile switch (ADR 0020) arrives with
+    # setup already nil and keeps the in-progress draft.
+    state =
+      if state.setup != nil do
+        ExRatatui.textarea_set_value(state.input, "")
+        state
+      else
+        state
+      end
 
     {%{state | setup: nil, provider: classification}, {:agent_provider, classification}}
   end
@@ -584,12 +591,12 @@ defmodule DashFloat.TUI.State do
     end
   end
 
-  # 999_999 reads "1.0m", not "1000k": a value that rounds up to the next
-  # unit's thousand boundary uses that unit.
-  defp humanize(n) when n < 1_000, do: Integer.to_string(n)
-  defp humanize(n) when n < 999_950, do: trim_zero(n / 1_000) <> "k"
-  defp humanize(n) when n < 999_950_000, do: trim_zero(n / 1_000_000) <> "m"
-  defp humanize(n), do: trim_zero(n / 1_000_000_000) <> "b"
+  @doc "Token counts for humans: 999 reads 999, 1_500 1.5k, 1_048_576 1m."
+  @spec humanize(integer()) :: String.t()
+  def humanize(n) when n < 1_000, do: Integer.to_string(n)
+  def humanize(n) when n < 999_950, do: trim_zero(n / 1_000) <> "k"
+  def humanize(n) when n < 999_950_000, do: trim_zero(n / 1_000_000) <> "m"
+  def humanize(n), do: trim_zero(n / 1_000_000_000) <> "b"
 
   defp trim_zero(x) do
     x
@@ -717,6 +724,12 @@ defmodule DashFloat.TUI.State do
   defp route_key(%{palette: palette} = state, "esc", _modifiers, _now) when palette != nil,
     do: {%{state | palette: nil}, nil}
 
+  defp route_key(%{palette: %Palette{mode: :filter}} = state, "tab", ["shift"], _now),
+    do: {state, nil}
+
+  defp route_key(%{palette: %Palette{mode: :filter}} = state, "back_tab", _modifiers, _now),
+    do: {state, nil}
+
   defp route_key(%{palette: %Palette{mode: :modal}} = state, _code, _modifiers, _now),
     do: {state, nil}
 
@@ -766,6 +779,7 @@ defmodule DashFloat.TUI.State do
     if input_text(state) == "" do
       state
       |> set_draft(suggestion)
+      |> refresh_palette()
       |> dismiss_suggestion()
       |> then(&{&1, nil})
     else
@@ -778,11 +792,18 @@ defmodule DashFloat.TUI.State do
     do: forward(state, code, modifiers)
 
   defp forward(state, code, modifiers) do
+    before = input_text(state)
     ExRatatui.textarea_handle_key(state.input, code, modifiers)
     # Editing while browsing history keeps the edited text: it becomes the
-    # live draft (no longer restorable by navigating down). The edit also
-    # re-derives the filter palette from the new draft (ADR 0020).
-    {refresh_palette(dismiss_suggestion(leave_history(state))), nil}
+    # live draft (no longer restorable by navigating down). The filter
+    # palette re-derives only when the draft actually changed — Esc's
+    # dismissal survives cursor-only keys (ADR 0020).
+    edited = dismiss_suggestion(leave_history(state))
+
+    state =
+      if input_text(edited) == before, do: edited, else: refresh_palette(edited)
+
+    {state, nil}
   end
 
   ## Filter palette (ADR 0020)
@@ -885,7 +906,7 @@ defmodule DashFloat.TUI.State do
   nil}` when the draft is blank or a request is already in flight (one at a
   time; queueing is Phase 2).
   """
-  @spec submit(t()) :: {t(), {:submit, String.t()} | nil}
+  @spec submit(t()) :: {t(), action()}
   def submit(%__MODULE__{} = state) do
     text = input_text(state)
 
@@ -968,6 +989,7 @@ defmodule DashFloat.TUI.State do
     state
     |> push_history(text)
     |> clear_input()
+    |> dismiss_suggestion()
     |> Map.put(:palette, nil)
     |> then(&run_command(&1, name, rest))
   end
@@ -975,7 +997,10 @@ defmodule DashFloat.TUI.State do
   # Palette Enter — the same rule in both modes (ADR 0020). The modal command
   # palette runs with empty args and pushes NO history: nothing was typed.
   defp execute_palette(state, %Palette{kind: :commands, items: items, selected: selected}) do
-    run_command(%{state | palette: nil}, Enum.at(items, selected).name, "")
+    state
+    |> dismiss_suggestion()
+    |> Map.put(:palette, nil)
+    |> then(&run_command(&1, Enum.at(items, selected).name, ""))
   end
 
   defp execute_palette(state, %Palette{kind: :models} = palette), do: pick_model(state, palette)
@@ -1045,7 +1070,9 @@ defmodule DashFloat.TUI.State do
   end
 
   defp run_command(state, "model", _rest),
-    do: {append_entry(state, :system, "[model catalog is empty — nothing to pick]"), nil}
+    do:
+      {append_entry(state, :system, "[no provider resolved — /model needs a working profile]"),
+       nil}
 
   defp run_command(state, "profile", _rest), do: {state, :list_profiles}
 

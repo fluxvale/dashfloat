@@ -40,6 +40,11 @@ defmodule DashFloat.TUI.CommandsTest do
       assert Commands.split_command("/title  fix the login ") == {"title", "fix the login"}
     end
 
+    test "the name matches case-insensitively, like the autocomplete matcher" do
+      assert Commands.split_command("/MODE plan") == {"mode", "plan"}
+      assert Commands.split_command("/Title") == {"title", ""}
+    end
+
     test "argless commands still split their ignored rest" do
       assert Commands.split_command("/clear oops") == {"clear", "oops"}
     end

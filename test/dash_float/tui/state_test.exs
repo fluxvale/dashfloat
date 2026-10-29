@@ -2555,6 +2555,28 @@ defmodule DashFloat.TUI.StateTest do
       assert %{mode: :filter} = redone.palette
     end
 
+    test "esc's dismissal survives cursor-only keys; a cursor move keeps an open popup" do
+      typed = type(new_state(), "/he")
+      dismissed = press(typed, "esc", [])
+      moved = press(dismissed, "left", [])
+
+      assert moved.palette == nil
+      assert State.input_text(moved) == "/he"
+
+      cursor = press(typed, "left", [])
+      assert %{mode: :filter} = cursor.palette
+    end
+
+    test "shift+tab and back_tab are swallowed while the filter popup is open" do
+      typed = type(new_state(), "/he")
+
+      assert {swallowed, nil} = State.handle_key(typed, "tab", ["shift"])
+      assert swallowed == typed
+
+      assert {back, nil} = State.handle_key(typed, "back_tab", [])
+      assert back == typed
+    end
+
     test "up/down move the popup selection and never touch history" do
       moved =
         new_state()
@@ -2600,6 +2622,13 @@ defmodule DashFloat.TUI.StateTest do
 
       assert %{mode: :filter, kind: :commands} = state.palette
       assert State.input_text(state) == "/help"
+    end
+
+    test "a tab-materialized slash-shaped ghost derives the popup like typed text" do
+      state = press(%{new_state() | suggestion: "/clear"}, "tab", [])
+
+      assert State.input_text(state) == "/clear"
+      assert %{mode: :filter} = state.palette
     end
   end
 
@@ -2752,15 +2781,27 @@ defmodule DashFloat.TUI.StateTest do
       assert state.palette == nil
     end
 
-    test "/model with no provider warns" do
+    test "/model with no provider names the missing provider, not the catalog" do
       {state, nil} = enter_typed(new_state(), "/model")
 
-      assert pairs(state) == [{:system, "[model catalog is empty — nothing to pick]"}]
+      assert pairs(state) == [
+               {:system, "[no provider resolved — /model needs a working profile]"}
+             ]
     end
 
     test "/profile returns :list_profiles" do
-      assert {state, :list_profiles} = enter_typed(new_state(), "/profile")
-      assert state.palette == nil
+      assert {_state, :list_profiles} = enter_typed(new_state(), "/profile")
+      assert _state.palette == nil
+    end
+
+    test "a runtime profile switch keeps the composer draft (ADR 0020)" do
+      typed = type(new_state(), "hello draft")
+
+      {switched, {:agent_provider, _classification}} =
+        State.provider_resolved(typed, {:ok, %DashFloat.Config{}})
+
+      assert State.input_text(switched) == "hello draft"
+      assert switched.setup == nil
     end
 
     test "profiles_arrived opens the picker" do
@@ -2880,6 +2921,28 @@ defmodule DashFloat.TUI.StateTest do
     test "ctrl+q still quits while a modal is open" do
       state = press(new_state(), "p", ["ctrl"])
       assert {^state, :quit} = State.handle_key(state, "q", ["ctrl"])
+    end
+
+    test "the double Ctrl+C quit works while a modal is open" do
+      opened = press(new_state(), "p", ["ctrl"])
+
+      {armed, nil} = State.handle_key(opened, "c", ["ctrl"], 1_000)
+      assert armed.exit_guard_at == 1_000
+
+      {quitting, :quit} = State.handle_key(armed, "c", ["ctrl"], 1_500)
+      assert quitting.exit_guard_at == nil
+    end
+
+    test "a palette-executed /clear dismisses the ghost too" do
+      opened =
+        new_state()
+        |> Map.put(:suggestion, "next thing")
+        |> press("p", ["ctrl"])
+
+      {cleared, nil} = State.handle_key(opened, "enter", [])
+
+      assert cleared.entries == []
+      assert cleared.suggestion == nil
     end
 
     test "a pending confirm outranks the palette (ADR 0016 §3)" do

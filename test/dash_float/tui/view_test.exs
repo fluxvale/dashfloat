@@ -1120,6 +1120,18 @@ defmodule DashFloat.TUI.ViewTest do
       assert buffer =~ "m2 · current"
     end
 
+    test "the context detail rides the status bar's humanize ladder" do
+      entries = [%{model: "tiny", context: 999}, %{model: "big", context: 1_048_576}]
+      palette = %Palette{mode: :modal, kind: :models, items: entries, selected: 0}
+      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "tiny", api_key: "k"}}
+      state = %{new_state(provider: provider) | palette: palette}
+
+      buffer = drawn_text(state)
+
+      assert buffer =~ "tiny (999)"
+      assert buffer =~ "big (1m)"
+    end
+
     test "a profiles picker draws the names" do
       palette = %Palette{mode: :modal, kind: :profiles, items: ["personal", "work"], selected: 0}
       state = %{new_state() | palette: palette}

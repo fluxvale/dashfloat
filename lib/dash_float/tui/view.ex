@@ -724,8 +724,10 @@ defmodule DashFloat.TUI.View do
     [picker("Profiles", names, selected, area)]
   end
 
+  # The detail rides the status bar's own humanize ladder (999 reads "999",
+  # not "0k"); the marker only on the provider's current model.
   defp model_item(id, context, current) do
-    detail = if is_integer(context), do: " (#{div(context, 1000)}k)", else: ""
+    detail = if is_integer(context), do: " (#{State.humanize(context)})", else: ""
     marker = if id == current, do: " · current", else: ""
 
     id <> detail <> marker
