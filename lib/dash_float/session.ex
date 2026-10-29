@@ -104,6 +104,65 @@ defmodule DashFloat.Session do
     end
   end
 
+  @doc """
+  One-shot legacy-id sweep (#80): rewrites timestamp-named session files
+  under fresh UUIDv7 ids, preserving every other field verbatim, then
+  removes the old file — write-before-delete, so a kill in the microsecond
+  window can orphan a duplicate that a later sweep rewrites again
+  (accepted). Only a fully-loading file is rewritten; one that refuses is
+  hand damage the load path will report — skipped silently. A UUID-named
+  file is exempt by name shape alone and never decoded. `{:ok, 0}` — zero
+  writes — for a missing directory (creation belongs to save) and an
+  all-UUID directory, so a steady-state boot touches no session files.
+  """
+  @spec migrate_legacy_ids(Path.t()) :: {:ok, non_neg_integer()} | {:error, String.t()}
+  def migrate_legacy_ids(dir) do
+    case File.ls(dir) do
+      {:error, _reason} -> {:ok, 0}
+      {:ok, names} -> migrate_names(dir, names)
+    end
+  end
+
+  defp migrate_names(dir, names) do
+    legacy =
+      names
+      |> Enum.filter(&json_name?/1)
+      |> Enum.reject(&uuid_name?/1)
+      |> Enum.sort()
+
+    Enum.reduce_while(legacy, {:ok, 0}, fn name, {:ok, count} ->
+      case rewrite_legacy(dir, name) do
+        :ok -> {:cont, {:ok, count + 1}}
+        :skipped -> {:cont, {:ok, count}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp json_name?(name), do: String.ends_with?(name, ".json")
+
+  defp uuid_name?(name), do: Regex.match?(@id_shape, String.replace_suffix(name, ".json", ""))
+
+  defp rewrite_legacy(dir, name) do
+    case load_by_path(dir, String.replace_suffix(name, ".json", "")) do
+      {:ok, session} -> rewrite(dir, session)
+      {:error, _reason} -> :skipped
+    end
+  end
+
+  defp rewrite(dir, session) do
+    case save(dir, %{session | id: new_id()}) do
+      :ok -> remove_legacy(dir, session.id)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp remove_legacy(dir, old_id) do
+    path = path_for(dir, old_id)
+
+    if File.rm(path) == :ok, do: :ok, else: {:error, "cannot remove #{path}"}
+  end
+
   defp do_save(dir, session) do
     case ensure_dir(dir) do
       :ok ->
@@ -140,11 +199,14 @@ defmodule DashFloat.Session do
   @spec load(Path.t(), String.t()) :: {:ok, t()} | {:error, String.t()}
   def load(dir, requested) do
     with :ok <- check_load_id(dir, requested) do
-      do_load(dir, String.replace_suffix(requested, ".json", ""))
+      load_by_path(dir, String.replace_suffix(requested, ".json", ""))
     end
   end
 
-  defp do_load(dir, id) do
+  # The UUID gate lives in load/2; the legacy-id sweep (#80) reuses the
+  # validation below — version, id-field-equals-filename, created_at,
+  # messages shape — with the gate bypassed.
+  defp load_by_path(dir, id) do
     path = path_for(dir, id)
 
     with {:ok, body} <- read_file(path, dir, id),

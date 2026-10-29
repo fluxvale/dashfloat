@@ -731,6 +731,134 @@ defmodule DashFloat.SessionTest do
     end
   end
 
+  describe "migrate_legacy_ids/1" do
+    # The suite's one deliberate legacy-shaped id: the sweep's input.
+    @legacy_id "20261027-090000-abc123"
+    @bad_legacy_id "20261027-090500-bad000"
+
+    defp legacy_body(overrides \\ []) do
+      Map.merge(
+        %{
+          "version" => 1,
+          "id" => @legacy_id,
+          "created_at" => "2026-10-27T09:00:00Z",
+          "pin" => %{"profile" => "personal", "model" => "glm-5.3", "base_url" => nil},
+          "messages" => [%{"role" => "user", "content" => "legacy"}]
+        },
+        Map.new(overrides)
+      )
+    end
+
+    defp write_legacy(ctx, id \\ @legacy_id, body \\ nil) do
+      body = body || legacy_body()
+      File.write!(Path.join(ctx.tmp_dir, id <> ".json"), Jason.encode!(body))
+    end
+
+    @tag :tmp_dir
+    test "a fully-loading legacy file is rewritten under a fresh id, fields verbatim", ctx do
+      body =
+        Map.merge(legacy_body(), %{
+          "title" => "Kept Title",
+          "context" => %{"prompt_tokens" => 3, "messages" => 1}
+        })
+
+      write_legacy(ctx, @legacy_id, body)
+
+      assert {:ok, 1} = Session.migrate_legacy_ids(ctx.tmp_dir)
+      refute File.exists?(Path.join(ctx.tmp_dir, @legacy_id <> ".json"))
+
+      assert [new_name] = File.ls!(ctx.tmp_dir)
+      new_id = Path.rootname(new_name)
+      assert {:ok, loaded} = Session.load(ctx.tmp_dir, new_id)
+
+      assert loaded.id == new_id
+      assert loaded.created_at == "2026-10-27T09:00:00Z"
+      assert loaded.pin == %{profile: "personal", model: "glm-5.3", base_url: nil}
+      assert loaded.messages == [%{"role" => "user", "content" => "legacy"}]
+      assert loaded.title == "Kept Title"
+      assert loaded.context == %{prompt_tokens: 3, messages: 1}
+      assert mode(Path.join(ctx.tmp_dir, new_name)) == 0o600
+    end
+
+    @tag :tmp_dir
+    test "a legacy file that does not fully load is left untouched", ctx do
+      file = Path.join(ctx.tmp_dir, @legacy_id <> ".json")
+      File.write!(file, "definitely {{{ not json")
+
+      assert {:ok, 0} = Session.migrate_legacy_ids(ctx.tmp_dir)
+      assert File.read!(file) == "definitely {{{ not json"
+    end
+
+    @tag :tmp_dir
+    test "an all-uuid directory is steady state: zero writes", ctx do
+      save_ok(ctx, [%{role: "user", content: "hi"}])
+      file = path(ctx)
+      {:ok, stat_before} = File.stat(file)
+
+      assert {:ok, 0} = Session.migrate_legacy_ids(ctx.tmp_dir)
+
+      {:ok, stat_after} = File.stat(file)
+      assert stat_after.mtime == stat_before.mtime
+      assert stat_after.size == stat_before.size
+    end
+
+    @tag :tmp_dir
+    test "a missing directory is {:ok, 0} and stays missing", ctx do
+      dir = Path.join(ctx.tmp_dir, "does-not-exist")
+      assert {:ok, 0} = Session.migrate_legacy_ids(dir)
+      refute File.exists?(dir)
+    end
+
+    @tag :tmp_dir
+    test "a mixed directory migrates only the legacy names", ctx do
+      save_ok(ctx, [%{role: "user", content: "already uuid"}])
+      write_legacy(ctx)
+      bad = Path.join(ctx.tmp_dir, @bad_legacy_id <> ".json")
+      File.write!(bad, "garbage {{{")
+      File.write!(Path.join(ctx.tmp_dir, "notes.txt"), "not a session file")
+
+      assert {:ok, 1} = Session.migrate_legacy_ids(ctx.tmp_dir)
+
+      assert File.read!(bad) == "garbage {{{"
+      assert File.read!(Path.join(ctx.tmp_dir, "notes.txt")) == "not a session file"
+      assert {:ok, _loaded} = Session.load(ctx.tmp_dir, @id)
+      refute File.exists?(Path.join(ctx.tmp_dir, @legacy_id <> ".json"))
+
+      rest = File.ls!(ctx.tmp_dir) -- [@id <> ".json", @bad_legacy_id <> ".json", "notes.txt"]
+      assert [new_name] = rest
+
+      assert {:ok, %{messages: [%{"role" => "user", "content" => "legacy"}]}} =
+               Session.load(ctx.tmp_dir, Path.rootname(new_name))
+    end
+
+    @tag :tmp_dir
+    test "a uuid-named file is exempt by name shape alone, even when its body is damaged",
+         ctx do
+      file = path(ctx)
+      body = %{"version" => 1, "id" => "another-session", "created_at" => @created_at}
+      File.write!(file, Jason.encode!(body))
+
+      assert {:ok, 0} = Session.migrate_legacy_ids(ctx.tmp_dir)
+      assert File.read!(file) == Jason.encode!(body)
+    end
+
+    # The one deterministic save-failure trigger: a read-only directory (the
+    # suite runs unprivileged — local user and the CI runner — so chmod bites;
+    # the directory trick cannot work here, the file must exist to load).
+    @tag :tmp_dir
+    test "a save failure during the sweep errors naming the path", ctx do
+      write_legacy(ctx)
+      dir = ctx.tmp_dir
+      on_exit(fn -> File.chmod(dir, 0o755) end)
+
+      File.chmod!(dir, 0o555)
+      assert {:error, error} = Session.migrate_legacy_ids(dir)
+      assert error =~ dir
+      # The legacy file survived the failed rewrite.
+      assert File.exists?(Path.join(dir, @legacy_id <> ".json"))
+    end
+  end
+
   describe "orphan tool results" do
     @tag :tmp_dir
     test "a tool message with no assistant batch before it refuses naming the index", ctx do
