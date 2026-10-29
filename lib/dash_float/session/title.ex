@@ -269,8 +269,10 @@ defmodule DashFloat.Session.Title do
     fetcher = Keyword.get(opts, :fetcher) || {__MODULE__, :request}
     supervisor = Keyword.get(opts, :supervisor, DashFloat.TaskSupervisor)
 
-    # The rescue is the load-bearing half (ADR 0023 §8): the reachable
-    # cannot-start failure is this raise, not an error tuple.
+    # The catch is the load-bearing half (ADR 0023 §8): on this OTP the
+    # cannot-start failure arrives as an :exit out of GenServer.call (a dead
+    # or absent supervisor name); a genuine raise (bad arguments) SHOULD
+    # raise — it is a programming error, not a miss.
     try do
       Task.Supervisor.start_child(supervisor, fn ->
         # Normalize HERE, inside the supervised task — never in the agent loop.
@@ -287,11 +289,7 @@ defmodule DashFloat.Session.Title do
 
         send(send_to, {:title_proposal, ref, text})
       end)
-    rescue
-      _reason -> {:error, :supervisor_unavailable}
     catch
-      # GenServer.call on a dead name arrives as an :exit, not a raise —
-      # both shapes are the same miss.
       :exit, _reason -> {:error, :supervisor_unavailable}
     end
   end

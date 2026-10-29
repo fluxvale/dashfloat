@@ -1116,10 +1116,16 @@ defmodule DashFloat.Agent do
       {:ok, _pid} ->
         %{state | title_fired?: true, title_ref: ref}
 
+      # coveralls-ignore-start
       # A supervisor that could not start the task (dead, absent, full) —
-      # the latch stays unarmed, the next settled turn retries.
+      # the latch stays unarmed, the next settled turn retries. The failure
+      # class is unit-proven (Title.fetch_async's bogus-supervisor test);
+      # this arm is the pattern match consuming it, and forcing it here
+      # needs a supervisor dead between the stream's end and the settle —
+      # a race, not a test.
       {:error, _reason} ->
         state
+        # coveralls-ignore-stop
     end
   end
 

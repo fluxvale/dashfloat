@@ -2902,14 +2902,19 @@ defmodule DashFloat.AgentTest do
     server = start_server([final_episode("a"), final_episode("b")])
 
     # The two opt-outs are exercised APART (review: a shared iteration never
-    # proves the auto_title guard with persistence on): a directory-holding
-    # agent under auto_title: false, and a dir-less agent under the default.
+    # proves the auto_title guard with persistence on), each with a
+    # notifying fetcher installed — the refute is only meaningful if a fire
+    # would have been observable.
     for {provider, session_dir} <- [
           {title_provider(server, auto_title: false), Path.join(ctx.tmp_dir, "sessions-off")},
           {title_provider(server), nil}
         ] do
       {agent, _sup} =
-        start_agent(server, ctx.tmp_dir, provider: provider, session_dir: session_dir)
+        start_agent(server, ctx.tmp_dir,
+          provider: provider,
+          session_dir: session_dir,
+          title_fetcher: notify_fetcher(self())
+        )
 
       send(agent, {:prompt, self(), "hello"})
       assert_receive {:phase, :idle}, 2_000

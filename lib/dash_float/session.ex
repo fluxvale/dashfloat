@@ -171,21 +171,25 @@ defmodule DashFloat.Session do
   # persistently un-removable legacy file must not mint one orphan UUID
   # duplicate per boot (ADR 0023 §2 accepts a ONE-TIME kill-window
   # duplicate, not a multiplier) — the next boot retries the rewrite whole.
+  # Only the failure arm is ignore-marked: the success arm is exercised by
+  # every sweep-migration test and must keep its coverage honest.
   defp remove_legacy(dir, old_id, new_path) do
     old_path = path_for(dir, old_id)
 
-    # coveralls-ignore-start
-    # Deterministic rm-failure with a successful save needs a filesystem
-    # condition the suite cannot produce unprivileged (immutable file);
-    # probe-verified in review, not suite-reachable.
-    if File.rm(old_path) == :ok do
-      :ok
-    else
-      _removed = File.rm(new_path)
-      {:error, "cannot remove #{old_path}"}
-    end
+    case File.rm(old_path) do
+      :ok ->
+        :ok
 
-    # coveralls-ignore-stop
+      # coveralls-ignore-start
+      # Deterministic rm-failure with a successful save needs a filesystem
+      # condition the suite cannot produce unprivileged (immutable file —
+      # a read-only directory fails the save first); probe-verified in
+      # review, not suite-reachable.
+      {:error, _reason} ->
+        _removed = File.rm(new_path)
+        {:error, "cannot remove #{old_path}"}
+        # coveralls-ignore-stop
+    end
   end
 
   defp do_save(dir, session) do
