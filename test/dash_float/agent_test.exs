@@ -1600,7 +1600,11 @@ defmodule DashFloat.AgentTest do
     content_weight + calls_weight
   end
 
-  defp weight_sum(messages), do: Enum.sum(Enum.map(messages, &weight_of/1))
+  defp weight_sum(messages) do
+    messages
+    |> Enum.map(&weight_of/1)
+    |> Enum.sum()
+  end
 
   # The fixture tokenizer (ADR 0022 test plan 7): Accounting's weights plus 8
   # tokens of per-message scaffolding the heuristic cannot see.
@@ -1750,7 +1754,8 @@ defmodule DashFloat.AgentTest do
     {agent, _sup} =
       start_agent(server, ctx.tmp_dir, session_dir: sessions, provider: provider(server, window))
 
-    [_, _, {third_first, _}] = drive_read_turns(agent, Enum.map(specs, & &1.prompt))
+    [_first, _second, {third_first, _request}] =
+      drive_read_turns(agent, Enum.map(specs, & &1.prompt))
 
     # The eviction is announced with the estimate bracket.
     before = Accounting.estimate(messages_at_3, anchor_after.(2))
@@ -1765,7 +1770,7 @@ defmodule DashFloat.AgentTest do
     # user text and its tool batch are absent, the newest turn is present.
     messages = request_messages(third_first)
     assert messages == plan.kept
-    assert [%{"role" => "user", "content" => "turn 2"} | _] = messages
+    assert [%{"role" => "user", "content" => "turn 2"} | _rest] = messages
     refute Enum.any?(messages, &(&1["content"] == "turn 1"))
     refute Enum.any?(messages, &match?(%{"tool_call_id" => "call_1"}, &1))
 
@@ -1814,7 +1819,8 @@ defmodule DashFloat.AgentTest do
     {agent, _sup} =
       start_agent(server, ctx.tmp_dir, session_dir: sessions, provider: provider(server, window))
 
-    [_, _, {third_first, _}] = drive_read_turns(agent, Enum.map(specs, & &1.prompt))
+    [_first, _second, {third_first, _request}] =
+      drive_read_turns(agent, Enum.map(specs, & &1.prompt))
 
     # No context entry, no eviction: the third request carries the full history.
     assert request_messages(third_first) == messages_at_3
@@ -1840,7 +1846,8 @@ defmodule DashFloat.AgentTest do
     sessions = Path.join(ctx.tmp_dir, "sessions")
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
-    [_, _, {third_first, _}] = drive_read_turns(agent, Enum.map(specs, & &1.prompt))
+    [_first, _second, {third_first, _request}] =
+      drive_read_turns(agent, Enum.map(specs, & &1.prompt))
 
     assert request_messages(third_first) == messages_at_3
     refute_received {:entry, :system, "[context: " <> _}
@@ -1923,15 +1930,19 @@ defmodule DashFloat.AgentTest do
     {agent, _sup} =
       start_agent(server, ctx.tmp_dir, session_dir: sessions, provider: provider(server, window))
 
-    [_, _] = drive_read_turns(agent, Enum.map(specs, & &1.prompt))
+    [_first, _second] = drive_read_turns(agent, Enum.map(specs, & &1.prompt))
     id = session_id(sessions)
 
     # The file persists the anchor: the last scripted frame's prompt_tokens
     # over that episode's request message count. No evictions yet.
     prompt_tokens = anchor.tokens
 
-    assert %{"context" => %{"prompt_tokens" => ^prompt_tokens, "messages" => 7}} =
-             Jason.decode!(read_session(sessions))
+    decoded =
+      sessions
+      |> read_session()
+      |> Jason.decode!()
+
+    assert %{"context" => %{"prompt_tokens" => ^prompt_tokens, "messages" => 7}} = decoded
 
     {:ok, saved} = Session.load(sessions, id)
     assert saved.context == %{prompt_tokens: anchor.tokens, messages: 7}
