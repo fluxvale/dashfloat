@@ -1970,7 +1970,7 @@ defmodule DashFloat.AgentTest do
       start_agent(server, ctx.tmp_dir,
         session_dir: sessions,
         resume: %{
-          id: "20261001-000000-aabbcc",
+          id: "0192aa0c-8e9f-7a2b-8f8e-2f3a4b5c6d7e",
           pin: original_pin,
           messages: [%{"role" => "user", "content" => "earlier"}]
         }
@@ -1979,7 +1979,7 @@ defmodule DashFloat.AgentTest do
     send(resumed, {:prompt, self(), "continue"})
     assert_receive {:phase, :idle}, 2_000
 
-    {:ok, saved} = Session.load(sessions, "20261001-000000-aabbcc")
+    {:ok, saved} = Session.load(sessions, "0192aa0c-8e9f-7a2b-8f8e-2f3a4b5c6d7e")
     assert saved.pin == original_pin
   end
 
@@ -1992,7 +1992,7 @@ defmodule DashFloat.AgentTest do
       start_agent(server, ctx.tmp_dir,
         session_dir: sessions,
         resume: %{
-          id: "20261001-000000-aabbcc",
+          id: "0192aa0c-8e9f-7a2b-8f8e-2f3a4b5c6d7e",
           created_at: "2026-10-01T00:00:00Z",
           pin: %{profile: nil, model: "test-model", base_url: SSEServer.base_url(server)},
           messages: [%{"role" => "user", "content" => "earlier"}]
@@ -2003,9 +2003,9 @@ defmodule DashFloat.AgentTest do
     assert_receive {:phase, :idle}, 2_000
 
     # The same file, under the adopted id, with the adopted created_at.
-    assert session_id(sessions) == "20261001-000000-aabbcc"
+    assert session_id(sessions) == "0192aa0c-8e9f-7a2b-8f8e-2f3a4b5c6d7e"
 
-    {:ok, session} = Session.load(sessions, "20261001-000000-aabbcc")
+    {:ok, session} = Session.load(sessions, "0192aa0c-8e9f-7a2b-8f8e-2f3a4b5c6d7e")
     assert session.created_at == "2026-10-01T00:00:00Z"
 
     assert session.messages == [
@@ -2563,7 +2563,7 @@ defmodule DashFloat.AgentTest do
     # carry a context of any shape (the loader tolerates one, ADR 0022 §6)
     # and a compactions value that is not a list. Neither may raise.
     resume = %{
-      id: "20261029-000000-abcdef",
+      id: "0192aa0d-90a1-7b3c-9a9b-3b4c5d6e7f8a",
       pin: %{profile: nil, model: nil, base_url: nil},
       messages: full ++ [u1],
       context: %{prompt_tokens: "412", messages: 6},
@@ -2620,7 +2620,7 @@ defmodule DashFloat.AgentTest do
     sessions = Path.join(ctx.tmp_dir, "sessions")
 
     # A session file that predates compaction: valid messages, no diagnostics.
-    id = "20261029-000000-abcdef"
+    id = "0192aa0d-90a1-7b3c-9a9b-3b4c5d6e7f8a"
 
     body = %{
       "version" => 1,

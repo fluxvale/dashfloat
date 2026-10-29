@@ -6,7 +6,7 @@ defmodule DashFloat.CLI do
   §6).
 
   `parse/1` turns argv into a keyword list the config loader and the boot
-  consume: `[profile: "work", model: "Sol", resume: "20261027-143052-a1b2c3"]`.
+  consume: `[profile: "work", model: "Sol", resume: "0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c"]`.
   Accepted forms: `--profile work`, `--profile=work`, `--model Sol`,
   `--model=Sol`, `--resume <id>`, `--resume=<id>`. A switch without a value,
   an unrecognized argument, or a repeated switch warns and is ignored —

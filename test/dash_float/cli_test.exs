@@ -90,12 +90,12 @@ defmodule DashFloat.CLITest do
   # ADR 0014 §6: --resume rides the same parse discipline as the selection
   # flags; the boot consumes the id after config classification.
   test "--resume parses in space and equals forms" do
-    assert CLI.parse(["--resume", "20261027-143052-a1b2c3"]) == [
-             resume: "20261027-143052-a1b2c3"
+    assert CLI.parse(["--resume", "0192aa0b-6c7d-7c91-9d9e-1e2f3a4b5c6d"]) == [
+             resume: "0192aa0b-6c7d-7c91-9d9e-1e2f3a4b5c6d"
            ]
 
-    assert CLI.parse(["--resume=20261027-143052-a1b2c3"]) == [
-             resume: "20261027-143052-a1b2c3"
+    assert CLI.parse(["--resume=0192aa0b-6c7d-7c91-9d9e-1e2f3a4b5c6d"]) == [
+             resume: "0192aa0b-6c7d-7c91-9d9e-1e2f3a4b5c6d"
            ]
   end
 

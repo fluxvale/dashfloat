@@ -13,8 +13,10 @@ defmodule DashFloat.Session do
 
   @version 1
 
-  @id_shape ~r/\A[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\z/
-  @id_example "20261027-143052-a1b2c3"
+  # Strict lowercase — we mint lowercase; a typed uppercase value fails this
+  # check (and is handled as a title by the boot, a later slice). See #80.
+  @id_shape ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/
+  @id_example "0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c"
   @id_shape_error "session ids look like #{@id_example}"
 
   @type pin :: %{
@@ -46,15 +48,25 @@ defmodule DashFloat.Session do
   end
 
   @doc """
-  A fresh session id: UTC `YYYYMMDD-HHMMSS` plus six random hex chars —
-  name-sortable ≈ time-sortable, collision-safe in practice.
+  A fresh session id: UUIDv7 — a 48-bit unix-ms prefix plus 74 random bits,
+  canonical lowercase. Name-sortable ≈ time-sortable (ADR 0014 §2) survives:
+  the lexical order of ids is their recency order. Elixir 1.20 / OTP 29 ship
+  no UUID module (#80), so v7 is minted here in a few lines — no dependency.
   """
   @spec new_id() :: String.t()
   def new_id do
-    stamp = Calendar.strftime(DateTime.utc_now(), "%Y%m%d-%H%M%S")
-    bytes = :crypto.strong_rand_bytes(3)
-    rand = Base.encode16(bytes, case: :lower)
-    stamp <> "-" <> rand
+    ts = System.system_time(:millisecond)
+    <<rand_a::12, rand_b::62, _::22>> = :crypto.strong_rand_bytes(12)
+    uuid_hex(<<ts::48, 7::4, rand_a::12, 2::2, rand_b::62>>)
+  end
+
+  # RFC 9562: 48-bit unix ms, version 7, variant `10`, 62 random bits —
+  # collision safety is those 62 bits per millisecond.
+  defp uuid_hex(<<payload::binary-size(16)>>) do
+    <<a::binary-size(8), b::binary-size(4), c::binary-size(4), d::binary-size(4),
+      e::binary-size(12)>> = Base.encode16(payload, case: :lower)
+
+    <<a::binary, ?-, b::binary, ?-, c::binary, ?-, d::binary, ?-, e::binary>>
   end
 
   @doc """

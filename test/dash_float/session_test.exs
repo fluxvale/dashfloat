@@ -6,7 +6,7 @@ defmodule DashFloat.SessionTest do
 
   alias DashFloat.Session
 
-  @id "20261027-143052-a1b2c3"
+  @id "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5c"
   @created_at "2026-10-27T14:30:52Z"
 
   defp session(messages, overrides \\ []) do
@@ -75,13 +75,31 @@ defmodule DashFloat.SessionTest do
       assert String.ends_with?(dir, "dashfloat/sessions")
     end
 
-    test "new_id/0 is UTC YYYYMMDD-HHMMSS plus six lowercase hex chars" do
-      assert Regex.match?(~r/^\d{8}-\d{6}-[0-9a-f]{6}$/, Session.new_id())
+    test "new_id/0 is a canonical lowercase UUIDv7: 36 chars, 8-4-4-4-12, version 7" do
+      id = Session.new_id()
+      assert String.length(id) == 36
+
+      assert Regex.match?(
+               ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/,
+               id
+             )
+
+      # The version nibble sits at offset 14, after group one plus its dash.
+      assert binary_part(id, 14, 1) == "7"
     end
 
-    test "two ids minted in the same second differ" do
+    test "25 mints are unique and their unix-ms prefixes never sort backwards" do
       ids = for _i <- 1..25, do: Session.new_id()
       assert Enum.uniq(ids) == ids
+
+      # The 48-bit unix-ms prefix ascends, so lexical order is recency order
+      # (ADR 0014 §2). Same-millisecond mints tie on the prefix and are broken
+      # by their random tail — no order claim within a millisecond.
+      prefixes = Enum.map(ids, &binary_part(&1, 0, 13))
+
+      assert prefixes
+             |> Enum.chunk_every(2, 1, :discard)
+             |> Enum.all?(fn [a, b] -> a <= b end)
     end
   end
 
@@ -647,7 +665,7 @@ defmodule DashFloat.SessionTest do
       dir = Path.join(ctx.tmp_dir, "never-created")
 
       assert {:error, msg} = Session.save(dir, session([], id: "../escape"))
-      assert msg == "session ids look like 20261027-143052-a1b2c3"
+      assert msg == "session ids look like 0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c"
       refute File.exists?(dir)
     end
 
@@ -656,7 +674,7 @@ defmodule DashFloat.SessionTest do
       assert {:error, msg} = Session.load(ctx.tmp_dir, "../escape")
 
       assert msg ==
-               "no session ../escape under #{ctx.tmp_dir} — session ids look like 20261027-143052-a1b2c3; list sessions with: ls #{ctx.tmp_dir}"
+               "no session ../escape under #{ctx.tmp_dir} — session ids look like 0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c; list sessions with: ls #{ctx.tmp_dir}"
 
       assert File.ls!(ctx.tmp_dir) == []
     end
@@ -664,12 +682,12 @@ defmodule DashFloat.SessionTest do
     @tag :tmp_dir
     test "a non-string id returns the shape error on both paths, never a raise", ctx do
       assert {:error, msg} = Session.save(ctx.tmp_dir, session([], id: 123))
-      assert msg == "session ids look like 20261027-143052-a1b2c3"
+      assert msg == "session ids look like 0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c"
 
       assert {:error, msg} = Session.load(ctx.tmp_dir, 123)
 
       assert msg ==
-               "no session 123 under #{ctx.tmp_dir} — session ids look like 20261027-143052-a1b2c3; list sessions with: ls #{ctx.tmp_dir}"
+               "no session 123 under #{ctx.tmp_dir} — session ids look like 0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c; list sessions with: ls #{ctx.tmp_dir}"
 
       # No String.Chars implementation: interpolation would raise here.
       assert {:error, _msg} = Session.load(ctx.tmp_dir, self())

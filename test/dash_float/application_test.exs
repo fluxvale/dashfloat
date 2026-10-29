@@ -401,12 +401,12 @@ defmodule DashFloat.ApplicationTest do
     test "an unknown id refuses on stderr naming the sessions dir, with no children" do
       sessions = tmp_dir()
 
-      {result, stderr} = resume_boot(sessions, "20990101-000000-000000")
+      {result, stderr} = resume_boot(sessions, "0192aa01-2f3b-7c4d-9e5f-1a2b3c4d5e6f")
 
       assert {:error, :session_resume_failed} = result
       assert_received {:halted, 1}
       assert stderr =~ sessions
-      assert stderr =~ "20990101-000000-000000"
+      assert stderr =~ "0192aa01-2f3b-7c4d-9e5f-1a2b3c4d5e6f"
       # The refusal returned before any child could start.
       refute Process.whereis(DashFloat.Agent)
       # A load never writes: the directory is still empty.
@@ -416,7 +416,7 @@ defmodule DashFloat.ApplicationTest do
     test "a missing sessions directory refuses the same way" do
       sessions = Path.join(tmp_dir(), "does-not-exist")
 
-      {result, stderr} = resume_boot(sessions, "20990101-000000-000000")
+      {result, stderr} = resume_boot(sessions, "0192aa01-2f3b-7c4d-9e5f-1a2b3c4d5e6f")
 
       assert {:error, :session_resume_failed} = result
       assert_received {:halted, 1}
@@ -426,7 +426,7 @@ defmodule DashFloat.ApplicationTest do
 
     test "a garbage file refuses loudly and stays byte-identical" do
       sessions = tmp_dir()
-      id = "20261027-090000-abc123"
+      id = "0192aa02-4a5b-7c6d-8e7f-2b3c4d5e6f7a"
       path = write_session_file(sessions, id, "definitely {{{ not json")
       before = File.read!(path)
 
@@ -440,13 +440,13 @@ defmodule DashFloat.ApplicationTest do
 
     test "a truncated file refuses loudly and stays byte-identical" do
       sessions = tmp_dir()
-      id = "20261027-091500-bcd234"
+      id = "0192aa03-6c7d-7c8e-9a9b-3c4d5e6f7a8b"
 
       path =
         write_session_file(
           sessions,
           id,
-          ~s({"version": 1, "id": "20261027-091500-bcd234", "created_at": "2026-10-27T09:15:00Z", "mess)
+          ~s({"version": 1, "id": "0192aa03-6c7d-7c8e-9a9b-3c4d5e6f7a8b", "created_at": "2026-10-27T09:15:00Z", "mess)
         )
 
       before = File.read!(path)
@@ -464,7 +464,7 @@ defmodule DashFloat.ApplicationTest do
     # (the session_test pattern).
     test "a session path that is a directory refuses loudly and stays put" do
       sessions = tmp_dir()
-      id = "20261027-093000-cde345"
+      id = "0192aa04-8e9f-7c0a-8b8c-4d5e6f7a8b9c"
       path = Path.join(sessions, id <> ".json")
       File.mkdir!(path)
 
@@ -478,7 +478,7 @@ defmodule DashFloat.ApplicationTest do
 
     test "a version 2 file refuses naming the field and stays byte-identical" do
       sessions = tmp_dir()
-      id = "20261027-094500-def456"
+      id = "0192aa05-a0b1-7c2b-9c9d-5e6f7a8b9c0d"
 
       contents =
         Jason.encode!(%{
@@ -504,7 +504,7 @@ defmodule DashFloat.ApplicationTest do
     test "a valid session boots to the children instead of refusing" do
       config_dir = v3_dir()
       sessions = tmp_dir()
-      id = "20261027-140000-ef1234"
+      id = "0192aa06-c2d3-7c4c-8d8e-6f7a8b9c0d1e"
 
       write_session_file(
         sessions,
@@ -524,7 +524,7 @@ defmodule DashFloat.ApplicationTest do
     test "a pin mismatch warns naming both sides and rides to the TUI as the note" do
       config_dir = v3_dir()
       sessions = tmp_dir()
-      id = "20261027-143000-cd9911"
+      id = "0192aa07-e4f5-7c5d-9e9f-7a8b9c0d1e2f"
 
       pin = %{profile: "personal", model: "glm-5.3", base_url: "https://elsewhere.example/v1"}
 
@@ -569,7 +569,7 @@ defmodule DashFloat.ApplicationTest do
     test "a matching pin hands off with no note, and the TUI mounts the transcript" do
       config_dir = v3_dir()
       sessions = tmp_dir()
-      id = "20261027-141500-ab7712"
+      id = "0192aa08-0617-7c6e-8a8b-8b9c0d1e2f3a"
       messages = [%{"role" => "user", "content" => "picked up"}]
 
       write_session_file(
@@ -619,7 +619,7 @@ defmodule DashFloat.ApplicationTest do
 
     test "a setup classification skips the pin compare but still hands the session off" do
       sessions = tmp_dir()
-      id = "20261027-144500-ab5678"
+      id = "0192aa09-2839-7c7f-9b9c-9c0d1e2f3a4b"
       pin = %{profile: "personal", model: "glm-5.3", base_url: nil}
 
       write_session_file(
@@ -639,7 +639,7 @@ defmodule DashFloat.ApplicationTest do
     test "a hand-written dangling session hands off synthesized cancelled results" do
       config_dir = v3_dir()
       sessions = tmp_dir()
-      id = "20261027-150000-be6789"
+      id = "0192aa0a-4a5b-7c80-8c8d-0d1e2f3a4b5c"
 
       dangling =
         Jason.encode!(%{
