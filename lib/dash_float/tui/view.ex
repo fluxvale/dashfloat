@@ -12,6 +12,7 @@ defmodule DashFloat.TUI.View do
   alias DashFloat.TUI.Theme
   alias DashFloat.TUI.Wrap
   alias ExRatatui.Layout.Rect
+  alias ExRatatui.Style
   alias ExRatatui.Text.Line
   alias ExRatatui.Text.Span
   alias ExRatatui.Widgets.Block
@@ -30,32 +31,38 @@ defmodule DashFloat.TUI.View do
   # which IS the wrap width — shrinks with it.
   @margin 1
 
+  # The composer's static key hint (the placeholder when no ghost shows).
+  @input_hint "ask anything — Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit"
+
   @doc """
   Splits `width` x `height` into status (1 row), log (rest), activity
   (1 row while an overlay exists — an active phase or the exit prompt —
-  else 0), and input (`2 + input_lines` rows, clamped to a third of the
-  frame) — the whole chrome inset by one cell per side.
+  else 0), input (`2 + input_lines` rows, clamped to a third of the
+  frame), and the permanent stats footer (1 row, ADR 0015) — the whole
+  chrome inset by one cell per side.
   """
   @spec regions({integer(), integer()}, integer(), boolean()) :: %{
           status: Rect.t(),
           log: Rect.t(),
           activity: Rect.t(),
-          input: Rect.t()
+          input: Rect.t(),
+          footer: Rect.t()
         }
   def regions({width, height}, input_lines, active?)
       when is_integer(width) and is_integer(height) and is_integer(input_lines) and
              is_boolean(active?) do
     area = inset_area(width, height)
 
-    [status, log, activity, input] =
+    [status, log, activity, input, footer] =
       ExRatatui.Layout.split(area, :vertical, [
         {:length, 1},
         {:min, 0},
         {:length, if(active?, do: 1, else: 0)},
-        {:length, input_height(input_lines, area.height)}
+        {:length, input_height(input_lines, area.height)},
+        {:length, 1}
       ])
 
-    %{status: status, log: log, activity: activity, input: input}
+    %{status: status, log: log, activity: activity, input: input, footer: footer}
   end
 
   @doc """
@@ -89,8 +96,9 @@ defmodule DashFloat.TUI.View do
   end
 
   @doc """
-  Renders the four regions — or, while the startup phase owns the screen,
-  the one setup box instead (ADR 0009). Pure; never raises on odd sizes.
+  Renders the five regions — status, log, activity, input, and the stats
+  footer — or, while the startup phase owns the screen, the one setup box
+  instead (ADR 0009). Pure; never raises on odd sizes.
   """
   @spec render(State.t(), ExRatatui.Frame.t()) :: [{ExRatatui.widget(), Rect.t()}]
   def render(%State{setup: setup} = _state, %ExRatatui.Frame{width: width, height: height})
@@ -109,7 +117,8 @@ defmodule DashFloat.TUI.View do
       {status_widget(state, regions.log.height), regions.status},
       {log_widget(state, regions.log.height), regions.log},
       {activity_widget(state), regions.activity},
-      {input_widget(state), regions.input}
+      {input_widget(state), regions.input},
+      {footer_widget(state), regions.footer}
     ]
   end
 
@@ -392,44 +401,58 @@ defmodule DashFloat.TUI.View do
 
   ## Status bar
 
-  # One left-flowing line, ADR order: cwd, model, context, rate, phase, log
-  # position. Token fields are omitted entirely until something streamed.
+  # One left-flowing line: context, phase, log position — non-empty groups
+  # joined with a separator BETWEEN them, so a fresh session opens with the
+  # phase dot, never a dangling leading separator. cwd, model, and rate
+  # moved to the stats footer (ADR 0015 §2) — moved, not duplicated.
   defp status_widget(state, log_height) do
     {label, role} = Map.fetch!(@phases, state.phase)
+
+    spans =
+      [
+        context_spans(state),
+        phase_spans(label, role),
+        position_spans(state, log_height)
+      ]
+      |> Enum.reject(&(&1 == []))
+      |> Enum.intersperse([separator()])
+      |> List.flatten()
+
+    %Paragraph{text: [Line.new(spans)]}
+  end
+
+  # The stats footer under the composer (ADR 0015 §2): cwd, model, live
+  # tok/s in the old status-bar span vocabulary. Static data read at render
+  # time — live while streaming because the tick recomputes the rate; the
+  # rate span is omitted entirely until a rate exists.
+  defp footer_widget(state) do
+    rate_spans =
+      case State.rate_label(state) do
+        nil -> []
+        rate -> [separator(), Span.new("#{rate} tok/s", style: Theme.style(:dim))]
+      end
 
     %Paragraph{
       text: [
         Line.new(
           [Span.new("❯ " <> State.cwd_label(state), style: Theme.style(:dim))] ++
-            model_spans(state) ++
-            context_spans(state) ++
-            rate_spans(state) ++
-            phase_spans(label, role) ++ position_spans(state, log_height)
+            [
+              separator(),
+              Span.new(State.provider_label(state) || "—", style: Theme.style(:assistant))
+            ] ++ rate_spans
         )
       ]
     }
   end
 
-  defp model_spans(state) do
-    [separator(), Span.new(State.provider_label(state) || "—", style: Theme.style(:assistant))]
-  end
-
   defp context_spans(%{stats: %{context_total: 0}}), do: []
 
   defp context_spans(state) do
-    [separator(), Span.new("ctx " <> State.context_label(state), style: Theme.style(:dim))]
-  end
-
-  defp rate_spans(state) do
-    case State.rate_label(state) do
-      nil -> []
-      rate -> [separator(), Span.new("#{rate} tok/s", style: Theme.style(:dim))]
-    end
+    [Span.new("ctx " <> State.context_label(state), style: Theme.style(:dim))]
   end
 
   defp phase_spans(label, role) do
     [
-      separator(),
       Span.new("● ", style: Theme.style(role)),
       Span.new(label, style: Theme.style(role))
     ]
@@ -437,7 +460,7 @@ defmodule DashFloat.TUI.View do
 
   defp position_spans(state, log_height) do
     position = position(state, log_height)
-    [separator(), Span.new(position, style: Theme.style(:dim))]
+    [Span.new(position, style: Theme.style(:dim))]
   end
 
   defp separator, do: Span.new(" · ", style: Theme.style(:hint))
@@ -598,10 +621,24 @@ defmodule DashFloat.TUI.View do
         border_type: :rounded,
         border_style: Theme.style(:dim)
       },
-      placeholder:
-        "ask anything — Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit",
+      # The ghost (ADR 0015 §3) rides the placeholder slot in the existing
+      # placeholder styling; the textarea only shows a placeholder while the
+      # draft is empty, which is the display gate.
+      placeholder: state.suggestion || @input_hint,
       placeholder_style: Theme.style(:dim),
-      wrap_mode: :word_or_glyph
+      wrap_mode: :word_or_glyph,
+      cursor_style: cursor_style(state)
     }
+  end
+
+  # The composer's cursor artifact (ADR 0015 §1): absent while the pane is
+  # unfocused, static reversed while idle (zero timers — ADR 0006's idle
+  # discipline stands), and a 500 ms on/off blink in active phases riding
+  # the existing 125 ms tick — 4 anim_steps on, 4 off at the 8 Hz budget.
+  defp cursor_style(%State{focused?: false}), do: %Style{}
+  defp cursor_style(%State{phase: :idle}), do: Theme.style(:cursor)
+
+  defp cursor_style(%State{anim_step: step}) do
+    if rem(div(step, 4), 2) == 0, do: Theme.style(:cursor), else: %Style{}
   end
 end

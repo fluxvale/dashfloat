@@ -10,6 +10,7 @@ defmodule DashFloat.ConfigTest do
 
   alias DashFloat.Config
   alias DashFloat.Config.JSON5
+  alias DashFloat.Config.Presets
 
   @tmp_root "/tmp/opencode"
 
@@ -654,6 +655,137 @@ defmodule DashFloat.ConfigTest do
 
       assert {:ok, %Config{context_tokens: 196_608}} =
                Config.load(fleet_dir(), %{"DASHFLOAT_CONTEXT_TOKENS" => " "}, [])
+    end
+  end
+
+  # A minimal one-profile layout whose settings map the test varies.
+  defp suggest_dir(settings) do
+    dir = tmp_dir()
+
+    write!(dir, """
+    {
+      configVersion: 3,
+      defaultProfile: 'work',
+      profiles: [
+        {
+          name: 'work',
+          providers: [
+            {
+              baseUrl: '#{@base_url}',
+              models: [{ nickname: 'Sol', model: 'glm-5.3', context: 524288 }],
+            },
+          ],
+          settings: { #{settings} },
+        },
+      ],
+    }
+    """)
+
+    write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+    dir
+  end
+
+  describe "suggest: tri-state, file < env (ADR 0015)" do
+    test "nothing set is nil — the provider's default cheap model" do
+      assert {:ok, %Config{suggest: nil}} = Config.load(fleet_dir(), %{}, [])
+    end
+
+    test "the file tri-state: false opts out, a string pins the id, true is the default" do
+      off = suggest_dir("suggest: false")
+      assert {:ok, %Config{suggest: false}} = Config.load(off, %{}, [])
+
+      pinned = suggest_dir("suggest: 'cheap-m'")
+      assert {:ok, %Config{suggest: "cheap-m"}} = Config.load(pinned, %{}, [])
+
+      enabled = suggest_dir("suggest: true")
+      assert {:ok, %Config{suggest: nil}} = Config.load(enabled, %{}, [])
+
+      blank = suggest_dir("suggest: ''")
+      assert {:ok, %Config{suggest: nil}} = Config.load(blank, %{}, [])
+    end
+
+    test "garbage in the file warns naming the field and degrades to the default" do
+      dir = suggest_dir("suggest: 42")
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{suggest: nil}} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ "suggest is not a usable value"
+    end
+
+    test "env wins both ways: a string over a file opt-out, an opt-out over a file id" do
+      opted_out = suggest_dir("suggest: false")
+      env = %{"DASHFLOAT_SUGGEST" => "env-cheap-m"}
+
+      assert {:ok, %Config{suggest: "env-cheap-m"}} = Config.load(opted_out, env, [])
+
+      pinned = suggest_dir("suggest: 'file-m'")
+
+      assert {:ok, %Config{suggest: false}} =
+               Config.load(pinned, %{"DASHFLOAT_SUGGEST" => "false"}, [])
+    end
+
+    test "the env spellings: 0 opts out, true and 1 are the default" do
+      pinned = suggest_dir("suggest: 'file-m'")
+
+      assert {:ok, %Config{suggest: false}} =
+               Config.load(pinned, %{"DASHFLOAT_SUGGEST" => "0"}, [])
+
+      opted_out = suggest_dir("suggest: false")
+
+      assert {:ok, %Config{suggest: nil}} =
+               Config.load(opted_out, %{"DASHFLOAT_SUGGEST" => "true"}, [])
+
+      assert {:ok, %Config{suggest: nil}} =
+               Config.load(opted_out, %{"DASHFLOAT_SUGGEST" => "1"}, [])
+    end
+
+    # Leading whitespace trims too: an env `" false"` is the opt-out, never
+    # a model id " false" (which would silently become a side-request).
+    test "the env spellings trim BOTH ends: ' false' and ' 0' opt out" do
+      pinned = suggest_dir("suggest: 'file-m'")
+
+      assert {:ok, %Config{suggest: false}} =
+               Config.load(pinned, %{"DASHFLOAT_SUGGEST" => " false"}, [])
+
+      assert {:ok, %Config{suggest: false}} =
+               Config.load(pinned, %{"DASHFLOAT_SUGGEST" => " 0"}, [])
+    end
+
+    test "a blank env var counts as absent and falls to the file" do
+      dir = suggest_dir("suggest: 'file-m'")
+
+      assert {:ok, %Config{suggest: "file-m"}} =
+               Config.load(dir, %{"DASHFLOAT_SUGGEST" => " "}, [])
+    end
+
+    test "the env id is taken verbatim (never downcased)" do
+      dir = suggest_dir("suggest: false")
+
+      assert {:ok, %Config{suggest: "Cheap-Mixed"}} =
+               Config.load(dir, %{"DASHFLOAT_SUGGEST" => "Cheap-Mixed"}, [])
+    end
+  end
+
+  describe "Presets.suggest_model/1 (ADR 0015)" do
+    test "the preset cheap models keyed by base URL; nil for custom providers" do
+      assert Presets.suggest_model("https://api.z.ai/api/coding/paas/v4") == "glm-5.3-flash"
+      assert Presets.suggest_model("https://api.synthetic.new/openai/v1") == "glm-4.7-flash"
+      assert Presets.suggest_model("https://custom.example/v1") == nil
+    end
+
+    # Catalog.fetch's URL convention: a trailing slash is convention, not
+    # identity — a preset URL stored with one must still map to the cheap
+    # model, never silently fall back to the flagship.
+    test "trailing-slash forms of the preset URLs resolve; custom URLs stay nil" do
+      assert Presets.suggest_model("https://api.z.ai/api/coding/paas/v4/") == "glm-5.3-flash"
+
+      assert Presets.suggest_model("https://api.synthetic.new/openai/v1/") ==
+               "glm-4.7-flash"
+
+      assert Presets.suggest_model("https://custom.example/v1/") == nil
     end
   end
 

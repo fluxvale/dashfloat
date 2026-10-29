@@ -31,4 +31,24 @@ defmodule DashFloat.Config.Presets do
   @doc "The wizard's preset list, in display order."
   @spec all() :: [preset()]
   def all, do: @presets
+
+  # The provider→cheap-suggestion-model table (ADR 0015 §3): the officially
+  # supported presets ship one each — the owner's budget call (cheap tier =
+  # low spend by default). A custom OpenAI-compatible provider has no
+  # official cheap tier and falls back to the active model.
+  @suggest_models %{
+    "https://api.z.ai/api/coding/paas/v4" => "glm-5.3-flash",
+    "https://api.synthetic.new/openai/v1" => "glm-4.7-flash"
+  }
+
+  @doc """
+  The provider's default cheap suggestion model (ADR 0015 §3), keyed by
+  base URL; nil for custom providers (the caller falls back to the active
+  model). The URL is normalized like `Config.Catalog.fetch`'s (a trailing
+  slash is convention, not identity), so a preset URL pasted with one
+  still resolves.
+  """
+  @spec suggest_model(String.t()) :: String.t() | nil
+  def suggest_model(base_url),
+    do: Map.get(@suggest_models, String.trim_trailing(base_url, "/"))
 end

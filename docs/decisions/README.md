@@ -37,3 +37,4 @@ their replacement.
 | [0012](0012-runner-dead-before-monitor-is-cancelled.md) | A runner dead before its monitor goes up is cancelled, not crashed | Accepted |
 | [0013](0013-exec-pgid-tracked-at-spawn.md) | Exec's process group is tracked at spawn, not queried from the port at reap | Accepted |
 | [0014](0014-session-persistence.md) | Session persistence: transcript store, resume, dangling repair, pinning | Accepted |
+| [0015](0015-input-surface-cursor-stats-ghost.md) | Input surface: blinking cursor, stats footer, model-driven ghost text | Accepted |

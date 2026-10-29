@@ -371,7 +371,7 @@ defmodule DashFloat.TUI.StateTest do
 
       scrolled = State.wheel_scroll(state, :up)
       refute scrolled.follow?
-      top = State.effective_scroll(scrolled, 18)
+      top = State.effective_scroll(scrolled, 17)
       assert top > 0
 
       # Click on the status bar (screen row 0): anchors the viewport's
@@ -380,9 +380,10 @@ defmodule DashFloat.TUI.StateTest do
       assert above.selection.anchor == {top, 0}
 
       # Drag into the input pane (screen row 23): the viewport's last
-      # visible row (18-row idle viewport: rows top..top + 17).
+      # visible row (17-row idle viewport, ADR 0015's footer: rows
+      # top..top + 16).
       {below, _nil} = State.select_mouse(scrolled, "down", 1, 23)
-      assert below.selection.anchor == {top + 17, 0}
+      assert below.selection.anchor == {top + 16, 0}
     end
 
     test "click jitter below the drag threshold clears instead of copying" do
@@ -868,6 +869,7 @@ defmodule DashFloat.TUI.StateTest do
     test "tokens accumulate in the in-flight entry and count in stats" do
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "hel"}, 1_000)
         |> State.stream_message({:token, "lo"}, 1_200)
 
@@ -880,9 +882,30 @@ defmodule DashFloat.TUI.StateTest do
       assert state.in_flight_lines == nil
     end
 
+    # A stray token at idle belongs to a turn that is over (the late-usage
+    # rule): letting it set in_flight would let a later {:phase, :idle}
+    # finalize and arm a suggestion for it — a contract-violating producer
+    # would re-open the duplicate-arm window (ADR 0015 §3).
+    test "a token at idle is ignored: in_flight stays nil, no arm" do
+      state = State.stream_message(new_state(), {:token, "x"}, 1_000)
+
+      assert state.in_flight == nil
+      assert state.suggest_arm == false
+    end
+
+    # The guard keeps the module's own contract rule intact: only a WELL-
+    # FORMED late token is ignored; a malformed one still crashes —
+    # contract violations are bugs, silent no-ops hide producer errors.
+    test "a malformed token at idle still crashes (the contract rule)" do
+      assert_raise FunctionClauseError, fn ->
+        State.stream_message(new_state(), {:token, :not_binary}, 1_000)
+      end
+    end
+
     test "re-announcing :streaming never finalizes the in-flight entry" do
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "The answer is "}, 1_000)
         |> State.stream_message({:token, "42."}, 1_010)
         |> State.stream_message({:phase, :streaming}, 1_020)
@@ -897,6 +920,7 @@ defmodule DashFloat.TUI.StateTest do
     test "leaving :streaming for :executing_tool finalizes the in-flight entry" do
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "one\ntwo"}, 1_000)
         |> State.stream_message({:phase, :executing_tool}, 1_010)
 
@@ -1047,8 +1071,12 @@ defmodule DashFloat.TUI.StateTest do
         State.stream_message(new_state(), bad_phase)
       end
 
+      # A malformed token payload crashes only mid-turn — at idle the token
+      # is ignored wholesale (the late-usage rule).
+      streaming = Map.put(new_state(), :phase, :streaming)
+
       assert_raise FunctionClauseError, fn ->
-        State.stream_message(new_state(), bad_token)
+        State.stream_message(streaming, bad_token)
       end
 
       assert_raise FunctionClauseError, fn ->
@@ -1143,6 +1171,7 @@ defmodule DashFloat.TUI.StateTest do
     test "finalize freezes the rate and clears the streaming counters" do
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "abc"}, 1_000)
         |> State.stream_message({:token, "def"}, 1_500)
         |> State.stream_message({:phase, :idle}, 2_000)
@@ -1177,6 +1206,7 @@ defmodule DashFloat.TUI.StateTest do
     test "cancel-style finalize with no usage frame still freezes a rate" do
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "partial"}, 1_000)
         |> State.stream_message({:phase, :idle}, 1_500)
 
@@ -1195,6 +1225,7 @@ defmodule DashFloat.TUI.StateTest do
     test "an empty elapsed window keeps the prior rate" do
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "a"}, 1_000)
         |> State.stream_message({:phase, :idle}, 1_000)
 
@@ -1338,15 +1369,16 @@ defmodule DashFloat.TUI.StateTest do
       assert State.log_line_count(state) == 2
     end
 
-    test "page_up on a viewport-sized log is a no-op (stays pinned)" do
-      # The real idle viewport at 80x24 is 18 rows with the margin (issue #28);
-      # 9 entries = blank + line each = exactly one viewport.
-      base = full_state(9)
-      assert State.log_line_count(base) == 18
+    test "page_up on a viewport-fitting log is a no-op (stays pinned)" do
+      # The real idle viewport at 80x24 is 17 rows with the margin (issue
+      # #28; ADR 0015's footer took one more row); 8 entries = blank + line
+      # each fit inside one viewport.
+      base = full_state(8)
+      assert State.log_line_count(base) == 16
 
       {paged, nil} = State.handle_key(base, "page_up", [])
       assert paged.follow?
-      assert State.effective_scroll(paged, 18) == 0
+      assert State.effective_scroll(paged, 17) == 0
     end
 
     test "submit re-pins the log so the new reply is visible" do
@@ -1368,46 +1400,47 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up unfollows and pages back; page_down re-pins at the bottom" do
-      # 200 lines, 18-row viewport (the padded 80x24 layout) → bottom 182.
+      # 200 lines, 17-row viewport (the padded 80x24 layout with ADR 0015's
+      # footer) → bottom 183.
       base = full_state(100)
       {up_one, nil} = State.handle_key(base, "page_up", [])
       refute up_one.follow?
-      assert State.effective_scroll(up_one, 18) == 164
+      assert State.effective_scroll(up_one, 17) == 166
 
       {up_two, nil} = State.handle_key(up_one, "page_up", [])
-      assert State.effective_scroll(up_two, 18) == 146
+      assert State.effective_scroll(up_two, 17) == 149
 
       {down_one, nil} = State.handle_key(up_two, "page_down", [])
-      assert State.effective_scroll(down_one, 18) == 164
+      assert State.effective_scroll(down_one, 17) == 166
 
       {down_two, nil} = State.handle_key(down_one, "page_down", [])
       assert down_two.follow?
-      assert State.effective_scroll(down_two, 18) == 182
+      assert State.effective_scroll(down_two, 17) == 183
     end
 
     test "wheel_scroll: one notch is three lines; up unfollows, down re-pins at the bottom" do
       base = full_state(100)
-      assert State.effective_scroll(base, 18) == 182
+      assert State.effective_scroll(base, 17) == 183
 
       wheeled = State.wheel_scroll(base, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 18) == 179
+      assert State.effective_scroll(wheeled, 17) == 180
 
       again = State.wheel_scroll(wheeled, :up)
-      assert State.effective_scroll(again, 18) == 176
+      assert State.effective_scroll(again, 17) == 177
 
       down = State.wheel_scroll(again, :down)
       refute down.follow?
-      assert State.effective_scroll(down, 18) == 179
+      assert State.effective_scroll(down, 17) == 180
 
       pinned = State.wheel_scroll(down, :down)
       assert pinned.follow?
-      assert State.effective_scroll(pinned, 18) == 182
+      assert State.effective_scroll(pinned, 17) == 183
     end
 
-    test "wheel up on a viewport-sized log is a no-op (stays pinned)" do
-      base = full_state(9)
-      assert State.log_line_count(base) == 18
+    test "wheel up on a viewport-fitting log is a no-op (stays pinned)" do
+      base = full_state(8)
+      assert State.log_line_count(base) == 16
       assert State.wheel_scroll(base, :up) == base
     end
 
@@ -1422,11 +1455,12 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.phase == :confirming
 
-      # The activity row is up while confirming: the viewport is 17 rows.
-      bottom = State.effective_scroll(state, 17)
+      # The activity row is up while confirming: the viewport is 16 rows
+      # (ADR 0015's footer took one from the log).
+      bottom = State.effective_scroll(state, 16)
       wheeled = State.wheel_scroll(state, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 17) == bottom - 3
+      assert State.effective_scroll(wheeled, 16) == bottom - 3
     end
 
     test "new content does not move an unfollowed view, but clamping still holds" do
@@ -1450,6 +1484,7 @@ defmodule DashFloat.TUI.StateTest do
       state =
         new_state()
         |> State.stream_message({:entry, :system, "a\nb"})
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "c\nd"})
 
       # system entry: blank + a + b; the in-flight text is not rendered until
@@ -1491,6 +1526,7 @@ defmodule DashFloat.TUI.StateTest do
       state =
         new_state()
         |> Map.put(:agent_ref, ref)
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "partial"}, 1_000)
 
       {after_down, handled} = State.agent_down(state, ref, :normal)
@@ -1518,6 +1554,7 @@ defmodule DashFloat.TUI.StateTest do
       state =
         new_state()
         |> Map.put(:agent_ref, ref)
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "partial reply"}, 1_000)
 
       {after_down, handled} = State.agent_down(state, ref, :killed)
@@ -1956,6 +1993,179 @@ defmodule DashFloat.TUI.StateTest do
         })
 
       assert State.provider_context_tokens(contextless) == nil
+    end
+  end
+
+  describe "ghost text (ADR 0015 §3)" do
+    @provider {:ok, %DashFloat.Config{base_url: "http://x", model: "m", api_key: "k"}}
+
+    test "new/1 wires the suggest fetcher and debounce opts; the ghost fields start empty" do
+      fetcher = {DashFloat.TUI.Suggest, :request}
+      state = new_state(suggest_fetcher: fetcher, suggest_debounce_ms: 25)
+
+      assert state.suggest_fetcher == fetcher
+      assert state.suggest_debounce_ms == 25
+
+      fresh = new_state()
+      assert fresh.suggest_fetcher == nil
+      assert fresh.suggest_debounce_ms == 600
+      assert fresh.suggestion == nil
+      assert fresh.suggest_epoch == 0
+      assert fresh.suggest_arm == false
+      assert fresh.suggest_reap == false
+    end
+
+    # One completed assistant turn (no usage frame — the rate is not the
+    # subject here).
+    defp turn_with_reply(state, reply) do
+      state
+      |> Map.put(:phase, :streaming)
+      |> State.stream_message({:token, reply}, 1_000)
+      |> State.stream_message({:phase, :idle}, 2_000)
+    end
+
+    test "a finalized assistant turn with an empty draft arms the one-shot" do
+      base = new_state(provider: @provider)
+      state = turn_with_reply(base, "all done")
+      assert state.suggest_arm == true
+    end
+
+    test "a typed draft never arms" do
+      base = new_state(provider: @provider)
+      typed = type(base, "question")
+      state = turn_with_reply(typed, "answer")
+
+      assert state.suggest_arm == false
+    end
+
+    test "suggest: false never arms" do
+      off =
+        {:ok, %DashFloat.Config{base_url: "http://x", model: "m", api_key: "k", suggest: false}}
+
+      state = turn_with_reply(new_state(provider: off), "answer")
+
+      assert state.suggest_arm == false
+    end
+
+    test "a non-assistant last entry never arms" do
+      base = new_state(provider: @provider)
+      streaming = %{base | phase: :streaming}
+
+      state =
+        streaming
+        |> State.stream_message({:token, "answer"}, 1_000)
+        |> State.stream_message({:phase, :executing_tool}, 1_100)
+        |> State.stream_message({:entry, :system, "note"}, 1_500)
+        |> State.stream_message({:phase, :idle}, 2_000)
+
+      assert state.suggest_arm == false
+    end
+
+    # agent_down(:normal) re-sends {:phase, :idle}: nothing finalizes, so
+    # an already-consumed arm intent must not be re-armed into a SECOND
+    # side-request for one turn (ADR 0015 §3).
+    test "a re-sent idle does not re-arm the consumed intent" do
+      base = new_state(provider: @provider)
+      armed = turn_with_reply(base, "all done")
+      assert armed.suggest_arm == true
+
+      # The runner consumed the one-shot intent (tui.ex suggest_arm/1).
+      consumed = %{armed | suggest_arm: false}
+
+      state = State.stream_message(consumed, {:phase, :idle}, 3_000)
+
+      assert state.suggest_arm == false
+    end
+
+    test "a tool interlude never arms (mid-turn), even after a reply" do
+      base = new_state(provider: @provider)
+
+      state =
+        %{base | phase: :streaming}
+        |> State.stream_message({:token, "answer"}, 1_000)
+        |> State.stream_message({:phase, :executing_tool}, 1_100)
+
+      assert state.suggest_arm == false
+    end
+
+    test "Tab materializes the ghost into the draft and dismisses it" do
+      ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
+
+      {state, nil} = State.handle_key(ghosted, "tab", [])
+
+      assert State.input_text(state) == "tell me more"
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+    end
+
+    test "Tab with a non-empty draft falls through — the draft is not replaced" do
+      typed = type(new_state(provider: @provider), "h")
+      ghosted = %{typed | suggestion: "tell me more"}
+
+      {state, nil} = State.handle_key(ghosted, "tab", [])
+
+      refute State.input_text(state) == "tell me more"
+    end
+
+    test "typing dismisses the ghost" do
+      ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
+      state = type(ghosted, "x")
+
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+    end
+
+    test "a paste dismisses the ghost" do
+      ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
+      state = State.paste(ghosted, "hello")
+
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+    end
+
+    test "a submit dismisses the ghost" do
+      ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
+      typed = type(ghosted, "q")
+
+      {state, {:submit, "q"}} = State.handle_key(typed, "enter", [])
+
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+      assert state.phase == :streaming
+    end
+
+    test "a new streaming phase dismisses the ghost" do
+      ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
+      state = State.stream_message(ghosted, {:phase, :streaming}, 1_000)
+
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+    end
+
+    # Every new phase sets a reap intent (ADR 0015 §3) — a ghost must not
+    # survive a tool interlude.
+    test "an executing_tool phase dismisses the ghost" do
+      ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
+      state = State.stream_message(ghosted, {:phase, :executing_tool}, 1_000)
+
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+    end
+
+    test "history navigation dismisses the ghost" do
+      ghosted = %{
+        new_state(provider: @provider)
+        | suggestion: "tell me more",
+          history: ["older"]
+      }
+
+      after_up = press(ghosted, "up", [])
+      assert after_up.suggestion == nil
+      assert after_up.suggest_reap == true
+
+      # Down at the newest restores the draft — still a dismiss.
+      after_down = press(after_up, "down", [])
+      assert after_down.suggest_reap == true
     end
   end
 

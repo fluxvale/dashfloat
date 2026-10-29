@@ -1,6 +1,9 @@
 # 0004 — Credo ruleset pinned to the FluxVale fleet config
 
-- **Status:** Accepted
+- **Status:** Accepted; **amended 2026-10-29** (`StructFieldAmount`
+  parameterized to `max_fields: 40` for the TUI's whole-state struct; see
+  [Amendment (2026-10-29): StructFieldAmount at 40](#amendment-2026-10-29-structfieldamount-at-40-tuistate)
+  below)
 - **Date:** 2026-10-23
 - **Implements:** [issue #10](https://github.com/fluxvale/dashfloat/issues/10).
 - **Supersedes:** the "no `.credo.exs` at all" alternative recorded in
@@ -60,3 +63,25 @@ future credo stays off until it is enumerated in both.
   readability rules as `lib/`.
 - Sync with the fleet is a manual diff against the reference config (the
   header points at it); local deviations should be none.
+
+## Amendment (2026-10-29): StructFieldAmount at 40 (TUI.State)
+
+**Status:** Accepted. One deviation from the "identical modulo
+single-app adaptations" rule above, recorded so the ruleset and the ADR
+cannot drift.
+
+`StructFieldAmount` is parameterized to `max_fields: 40` globally (credo's
+default is 31 — the fleet config passes no parameter, i.e. 31): after the
+ghost-text plumbing ([ADR
+0015](0015-input-surface-cursor-stats-ghost.md) §3), `TUI.State` carries 38
+fields. That size is deliberate — the TUI state is one flat pure struct
+whose transitions read it whole (ADRs 0002, 0006, 0015; the ADR 0002
+whole-state contract, the ADR 0006 render contract, and ADR 0015's
+arm/reap/epoch intents all ride the same `%State{}`), and slicing it into
+nested sub-structs would fight every whole-state transition for no behavior
+gain.
+
+**Scope:** the parameter is global, not a per-file exclude, because credo
+check parameters cannot be scoped per file — 40 was chosen as the smallest
+whole number above the struct's actual size, so any future field creep past
+40 still fails the gate.

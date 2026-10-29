@@ -16,7 +16,12 @@
   agent transcript, not entry text, is the persistence truth; entries are
   derived; see
   [Amendment (2026-10-27, issue #27): persistence truth moves to the transcript](#amendment-2026-10-27-issue-27-persistence-truth-moves-to-the-transcript)
-  below)
+  below); **amended 2026-10-29**
+  ([issue #66](https://github.com/fluxvale/dashfloat/issues/66) /
+  [issue #67](https://github.com/fluxvale/dashfloat/issues/67) /
+  [issue #70](https://github.com/fluxvale/dashfloat/issues/70) —
+  composer cursor, stats footer under the input, ghost-text suggestion;
+  see [ADR 0015](0015-input-surface-cursor-stats-ghost.md))
 - **Date:** 2026-10-24
 - **Implements:** [issue #16](https://github.com/fluxvale/dashfloat/issues/16) — Phase 2.5 of the
   [ADR 0001](0001-founding-stack-and-architecture.md) roadmap.
@@ -58,21 +63,27 @@ Dependency facts verified from source before deciding (`ex_ratatui` 0.17.1,
 
 ### Visual language
 
-Four regions; the activity row exists only while work is in flight:
+Five regions *(amended 2026-10-29,
+[ADR 0015](0015-input-surface-cursor-stats-ghost.md))*; the activity row
+exists only while work is in flight:
 
 ```
-┌ status ─ 1 row ──────────── ❯ ~/FluxVale/dashfloat · model · 4.1k tok · 30 tok/s ● Streaming
+┌ status ─ 1 row ──────────── ctx 4.1k/128k · ● Streaming · follow L412
 │ log     :min 0             (windowed; markdown-rendered assistant rows)
 ├ activity 1 row (0 idle) ── ⠋ Streaming…  esc interrupt
-└ input   2 + draft lines ── rounded border, ❯ title, placeholder, soft wrap
+│ input   2 + draft lines ── rounded border, ❯ title, placeholder, soft wrap
+└ footer  1 row ──────────── ❯ ~/FluxVale/dashfloat · model · 30 tok/s
 ```
 
 - **Status bar** — one left-flowing `Line` of styled spans, dim separators:
-  `❯ <cwd>` (dim, last two path segments, `~/`-prefixed), `<model>` (default
-  foreground — truth, not decoration), `ctx <n>` (+`/<window>` and a percent
-  when configured), `<rate> tok/s` (only after/while a stream has produced
-  tokens), phase dot + label (accent while busy, dim idle), log position
-  (dim). The bar omits token fields entirely until something has streamed.
+  `ctx <n>` (+`/<window>` and a percent when configured; omitted entirely
+  until something has streamed), phase dot + label (accent while busy, dim
+  idle), log position (dim). `❯ <cwd>` (dim, last two path segments,
+  `~/`-prefixed), `<model>` (default foreground — truth, not decoration),
+  and `<rate> tok/s` (only after/while a stream has produced tokens) live in
+  the input **footer** — a permanent 1-row region under the composer — per
+  [ADR 0015](0015-input-surface-cursor-stats-ghost.md) §2 (moved, not
+  duplicated; cursor per §1; ghost text per §3).
 - **Activity line** — spinner glyph + action label + dim interrupt hint,
   accent-colored, on the 1-row region above the input. Labels: `Thinking…`
   (streaming, no token yet), `Streaming…` (tokens arrived), `Running tool…`

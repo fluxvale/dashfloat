@@ -16,29 +16,37 @@ defmodule DashFloat.TUI.ViewTest do
   end
 
   describe "regions/3" do
-    test "status 1 row, log the rest, no activity row when idle, input borders + draft" do
-      %{status: status, log: log, activity: activity, input: input} =
+    test "status 1 row, log the rest, no activity row when idle, input borders + draft, footer 1 row" do
+      %{status: status, log: log, activity: activity, input: input, footer: footer} =
         View.regions({80, 24}, 1, false)
 
-      assert {status.height, log.height, activity.height, input.height} == {1, 18, 0, 3}
-      assert status.y == 1 and log.y == 2 and activity.y == 20 and input.y == 20
-      assert Enum.map([status, log, activity, input], & &1.width) == [78, 78, 78, 78]
+      assert {status.height, log.height, activity.height, input.height, footer.height} ==
+               {1, 17, 0, 3, 1}
+
+      assert status.y == 1 and log.y == 2 and activity.y == 19 and input.y == 19
+      assert Enum.map([status, log, activity, input, footer], & &1.width) == [78, 78, 78, 78, 78]
       # One cell of padding on every side (issue #28): nothing at the edges.
-      assert status.x == 1 and log.x == 1 and input.x == 1
-      assert input.y + input.height == 23
+      assert status.x == 1 and log.x == 1 and input.x == 1 and footer.x == 1
+      # The footer sits directly under the input (ADR 0015 §2).
+      assert input.y + input.height == 22 and footer.y == 22
+      assert footer.y + footer.height == 23
     end
 
     test "an active phase claims one activity row between log and input" do
-      %{log: log, activity: activity, input: input} = View.regions({80, 24}, 1, true)
+      %{log: log, activity: activity, input: input, footer: footer} =
+        View.regions({80, 24}, 1, true)
+
       assert activity.height == 1
-      assert log.height == 17
-      assert activity.y == 19 and input.y == 20
+      assert log.height == 16
+      assert activity.y == 18 and input.y == 19 and footer.y == 22
     end
 
     test "the input grows with the draft" do
-      %{log: log, activity: activity, input: input} = View.regions({80, 24}, 5, true)
+      %{log: log, activity: activity, input: input, footer: footer} =
+        View.regions({80, 24}, 5, true)
+
       assert input.height == 7
-      assert_region_sum({80, 24}, [log, activity, input])
+      assert_region_sum({80, 24}, [log, activity, input, footer])
     end
 
     test "the input never exceeds a third of the frame" do
@@ -47,11 +55,11 @@ defmodule DashFloat.TUI.ViewTest do
     end
 
     test "degenerate frames collapse regions without raising" do
-      %{status: status, log: log, activity: activity, input: input} =
+      %{status: status, log: log, activity: activity, input: input, footer: footer} =
         View.regions({1, 1}, 1, true)
 
       assert status.height == 0 and log.height == 0
-      assert activity.height + input.height <= 1
+      assert activity.height + input.height + footer.height <= 1
     end
 
     # Issue #28: the wrap width is the log rect's width — one seam, so
@@ -76,25 +84,35 @@ defmodule DashFloat.TUI.ViewTest do
   end
 
   describe "render/2" do
-    test "produces the four widgets" do
+    test "produces the five widgets" do
       widgets = View.render(new_state(), %ExRatatui.Frame{width: 80, height: 24})
 
       assert [
                {%ExRatatui.Widgets.Paragraph{}, _status_rect},
                {%ExRatatui.Widgets.Paragraph{}, _log_rect},
                {%ExRatatui.Widgets.Paragraph{}, _activity_rect},
-               {%ExRatatui.Widgets.Textarea{}, _input_rect}
+               {%ExRatatui.Widgets.Textarea{}, _input_rect},
+               {%ExRatatui.Widgets.Paragraph{}, _footer_rect}
              ] = widgets
     end
 
-    test "status bar carries the cwd, model, and phase truth, omitting token fields" do
+    test "status bar carries the phase and ctx truth; cwd, model, and rate moved to the footer" do
       text = status_text(new_state())
 
-      assert text =~ "❯ ~/"
-      assert text =~ "—"
+      refute text =~ "❯ ~/"
+      refute text =~ "—"
       refute text =~ "ctx"
       refute text =~ "tok/s"
       assert text =~ "● Idle"
+    end
+
+    # Nothing has streamed and the phase cluster is the bar's first group:
+    # a fresh session never opens with a dangling leading separator.
+    test "a fresh session's status opens with the phase dot, no leading separator" do
+      text = status_text(new_state())
+
+      assert String.starts_with?(text, "● ")
+      refute String.starts_with?(text, " · ")
     end
 
     test "token fields appear only once something has streamed, in ADR order" do
@@ -111,42 +129,20 @@ defmodule DashFloat.TUI.ViewTest do
         )
         |> State.stream_message({:phase, :idle}, 2_000)
 
-      text = status_text(state)
-
-      # The usage frame reconciles the count (2 deltas batched 5 tokens), so
-      # the frozen rate uses the authoritative 5 tokens over the 1 s window.
-      assert text =~ ~r/model · ctx 4\.1k\/128k · 5\.0 tok\/s · ● Idle · /
-      assert text =~ "test-model"
+      # ctx keeps its slot on the status bar, before the phase cluster (the
+      # rate assertion lives with the footer describe now).
+      assert status_text(state) =~ ~r/ctx 4\.1k\/128k · ● Idle · /
     end
 
     test "the status bar is one line of styled spans, dim separators between" do
       [line] = status_line(new_state())
-      assert length(line.spans) > 4
+
+      # Exact fresh-session truth — phase cluster, one separator, the log
+      # position: a wrong separator layout must fail here, not pass on count.
+      assert Enum.map(line.spans, & &1.content) == ["● ", "Idle", " · ", "log empty"]
 
       separators = Enum.filter(line.spans, &(&1.content == " · "))
-      assert separators != []
       assert Enum.all?(separators, &(&1.style.fg == :dark_gray))
-    end
-
-    test "the configured model replaces the placeholder" do
-      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "gpt-test", api_key: "k"}}
-      text = status_text(new_state(provider: provider))
-      assert text =~ "gpt-test"
-    end
-
-    test "the label shows nickname and profile when configured (ADR 0008)" do
-      provider =
-        {:ok,
-         %DashFloat.Config{
-           base_url: "http://x",
-           model: "glm-5.3",
-           api_key: "k",
-           nickname: "Sol",
-           profile: "work"
-         }}
-
-      text = status_text(new_state(provider: provider))
-      assert text =~ "Sol (work)"
     end
 
     test "each phase maps to its status label" do
@@ -159,18 +155,6 @@ defmodule DashFloat.TUI.ViewTest do
         state = %{new_state() | phase: phase}
         assert status_text(state) =~ label
       end
-    end
-
-    test "the rate shows only once one exists" do
-      refute status_text(new_state()) =~ "tok/s"
-
-      state =
-        new_state()
-        |> State.stream_message({:token, "a"}, 1_000)
-        |> State.stream_message({:token, "b"}, 1_000)
-        |> State.stream_message({:phase, :idle}, 2_000)
-
-      assert status_text(state) =~ "2.0 tok/s"
     end
 
     test "the context label shows the accumulated usage" do
@@ -194,8 +178,8 @@ defmodule DashFloat.TUI.ViewTest do
     test "the first tokens are never announced as an empty log" do
       state =
         new_state()
-        |> State.stream_message({:token, "hello"}, 1_000)
         |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "hello"}, 1_000)
 
       # Before the first tick the lines are not rendered yet, but the log
       # must not claim to be empty.
@@ -206,9 +190,9 @@ defmodule DashFloat.TUI.ViewTest do
       state =
         new_state()
         |> State.stream_message({:entry, :system, "a system line"})
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "streaming "})
         |> State.stream_message({:token, "through"})
-        |> Map.put(:phase, :streaming)
 
       {ticked, :cont} = State.tick(state, 1_000)
 
@@ -224,7 +208,7 @@ defmodule DashFloat.TUI.ViewTest do
 
       widget = log_widget(state, 80, 24)
       lines = widget.text
-      assert length(lines) == 18
+      assert length(lines) == 17
       assert flatten(List.last(lines)) =~ "line 100"
       # the window is pre-scrolled; the paragraph itself does no scrolling
       assert widget.scroll == {0, 0}
@@ -288,7 +272,7 @@ defmodule DashFloat.TUI.ViewTest do
         end)
 
       widget = log_widget(state, 80, 24)
-      assert length(widget.text) == 18
+      assert length(widget.text) == 17
     end
 
     test "the status position never shows an inverted range on tiny frames" do
@@ -332,15 +316,15 @@ defmodule DashFloat.TUI.ViewTest do
       assert Enum.map_join(entry.lines, &flatten/1) == long
 
       # The windowed view agrees with the accounting: follow shows the last
-      # 18 display rows — 17 full rows plus the 8-char tail, nothing else.
+      # 17 display rows — 16 full rows plus the 8-char tail, nothing else.
       visible = log_lines(state)
-      assert length(visible) == 18
-      assert Enum.map_join(visible, &flatten/1) == String.duplicate("x", 17 * 78 + 8)
+      assert length(visible) == 17
+      assert Enum.map_join(visible, &flatten/1) == String.duplicate("x", 16 * 78 + 8)
     end
 
     test "a tiny frame renders without raising" do
       widgets = View.render(new_state(), %ExRatatui.Frame{width: 1, height: 1})
-      assert length(widgets) == 4
+      assert length(widgets) == 5
     end
 
     # Issue #28: a selection highlights its covered rows in reverse video —
@@ -416,6 +400,82 @@ defmodule DashFloat.TUI.ViewTest do
       Enum.with_index(widget.text, fn row, i ->
         refute Enum.any?(row.spans, &(:reversed in &1.style.modifiers)), "row #{i} reversed"
       end)
+    end
+  end
+
+  # The stats footer under the composer (ADR 0015 §2): the cwd, model, and
+  # rate assertions moved here off the status bar — moved, not duplicated.
+  describe "stats footer" do
+    test "carries the cwd and the model placeholder, no rate before anything streamed" do
+      text = footer_text(new_state())
+
+      assert text =~ "❯ ~/"
+      assert text =~ "—"
+      refute text =~ "tok/s"
+    end
+
+    test "one line with the old status-bar span vocabulary: dim cwd, assistant model, dim separators" do
+      [line] = footer_line(new_state())
+      assert length(line.spans) >= 3
+
+      [cwd, sep, model | _rest] = line.spans
+      assert String.starts_with?(cwd.content, "❯ ~/")
+      assert cwd.style == Theme.style(:dim)
+      assert sep.content == " · "
+      assert sep.style == Theme.style(:hint)
+      assert model.content == "—"
+      assert model.style == Theme.style(:assistant)
+    end
+
+    test "the configured model replaces the placeholder" do
+      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "gpt-test", api_key: "k"}}
+      assert footer_text(new_state(provider: provider)) =~ "gpt-test"
+    end
+
+    test "the label shows nickname and profile when configured (ADR 0008)" do
+      provider =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "http://x",
+           model: "glm-5.3",
+           api_key: "k",
+           nickname: "Sol",
+           profile: "work"
+         }}
+
+      assert footer_text(new_state(provider: provider)) =~ "Sol (work)"
+    end
+
+    test "the rate shows only once one exists" do
+      refute footer_text(new_state()) =~ "tok/s"
+
+      state =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "a"}, 1_000)
+        |> State.stream_message({:token, "b"}, 1_000)
+        |> State.stream_message({:phase, :idle}, 2_000)
+
+      assert footer_text(state) =~ "2.0 tok/s"
+    end
+
+    test "the usage-reconciled frozen rate follows the model, in ADR order" do
+      base = new_state(provider: provider(128_000))
+
+      state =
+        base
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "a"}, 1_000)
+        |> State.stream_message({:token, "b"}, 1_000)
+        |> State.stream_message(
+          {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 4_100}},
+          1_500
+        )
+        |> State.stream_message({:phase, :idle}, 2_000)
+
+      # The usage frame reconciles the count (2 deltas batched 5 tokens), so
+      # the frozen rate uses the authoritative 5 tokens over the 1 s window.
+      assert footer_text(state) =~ ~r/test-model · 5\.0 tok\/s/
     end
   end
 
@@ -870,6 +930,92 @@ defmodule DashFloat.TUI.ViewTest do
     end
   end
 
+  # The composer's cursor artifact (ADR 0015 §1): focus-gated, static at
+  # idle, blink-riding-the-tick in active phases.
+  describe "input cursor" do
+    defp cursor_style(state) do
+      {widget, _rect} = input(state)
+      widget.cursor_style
+    end
+
+    test "unfocused: the artifact is absent in every phase" do
+      for phase <- [:idle, :streaming, :executing_tool, :confirming] do
+        state = %{new_state() | phase: phase, focused?: false}
+        assert cursor_style(state) == %ExRatatui.Style{}, "phase #{phase}"
+      end
+    end
+
+    test "focused and idle: static reversed, regardless of anim_step (zero timers)" do
+      for step <- 0..7 do
+        state = %{new_state() | phase: :idle, anim_step: step}
+        assert cursor_style(state) == Theme.style(:cursor), "step #{step}"
+      end
+    end
+
+    test "focused and streaming: the blink alternates 4 ticks on / 4 ticks off" do
+      base = new_state()
+
+      for step <- 0..7 do
+        state = %{base | phase: :streaming, anim_step: step}
+
+        expected =
+          if step < 4, do: Theme.style(:cursor), else: %ExRatatui.Style{}
+
+        assert cursor_style(state) == expected, "step #{step}"
+      end
+    end
+  end
+
+  # The cursor artifact proven at the DRAWN CELLS (ADR 0015 §1): the test
+  # terminal's styled-cell API (ExRatatui.CellSession) renders through the
+  # real Rust renderer, so the per-cell modifiers are the terminal truth —
+  # not just the widget struct the renderer consumes.
+  describe "input cursor drawn cells" do
+    alias ExRatatui.CellSession
+
+    defp reversed_cells(state) do
+      session = CellSession.new(80, 24)
+
+      :ok =
+        CellSession.draw(session, View.render(state, %ExRatatui.Frame{width: 80, height: 24}))
+
+      count =
+        session
+        |> CellSession.take_cells()
+        |> Map.get(:cells, [])
+        |> Enum.count(&(:reversed in &1.modifiers))
+
+      CellSession.close(session)
+      count
+    end
+
+    test "focused and idle: exactly one reversed cell" do
+      idle = %{new_state() | phase: :idle}
+      assert reversed_cells(idle) == 1
+    end
+
+    test "unfocused: zero reversed cells in every phase" do
+      for phase <- [:idle, :streaming, :executing_tool, :confirming] do
+        state = %{new_state() | phase: phase, focused?: false}
+        assert reversed_cells(state) == 0, "phase #{phase}"
+      end
+    end
+
+    test "focused and streaming: the blink draws on steps 0 and 3, not 4 and 7" do
+      base = new_state()
+
+      for step <- [0, 3] do
+        assert reversed_cells(%{base | phase: :streaming, anim_step: step}) == 1,
+               "step #{step}"
+      end
+
+      for step <- [4, 7] do
+        assert reversed_cells(%{base | phase: :streaming, anim_step: step}) == 0,
+               "step #{step}"
+      end
+    end
+  end
+
   ## helpers
 
   # The error-styled rows of a rendered setup box (issue #42 probes): the
@@ -923,6 +1069,17 @@ defmodule DashFloat.TUI.ViewTest do
     widgets = View.render(state, %ExRatatui.Frame{width: w, height: h})
     {widget, _rect} = List.first(widgets)
     widget.text
+  end
+
+  defp footer_line(state) do
+    widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+    {widget, _rect} = Enum.at(widgets, 4)
+    widget.text
+  end
+
+  defp footer_text(state) do
+    [line] = footer_line(state)
+    Enum.map_join(line.spans, "", & &1.content)
   end
 
   defp activity(state) do

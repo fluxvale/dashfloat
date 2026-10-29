@@ -54,15 +54,16 @@ defmodule DashFloat.Config do
   ]
 
   @context_var "DASHFLOAT_CONTEXT_TOKENS"
+  @suggest_var "DASHFLOAT_SUGGEST"
   @profile_var "DASHFLOAT_PROFILE"
 
   @main_file "settings.json5"
   @keys_file "keys.json5"
   @oauth_file "oauth.json5"
   @main_version 3
-  # The one settings key selection reads today; everything else is tolerated
+  # The settings keys selection reads today; everything else is tolerated
   # with a warning so future dimensions need no migration (ADR 0008).
-  @known_settings ["defaultModel"]
+  @known_settings ["defaultModel", "suggest"]
   # keys.json5 values and mcp tokens may be env references instead of
   # literals — the strict shape is what disambiguates a literal key that
   # merely starts with `$` (ADR 0009).
@@ -71,7 +72,19 @@ defmodule DashFloat.Config do
   # The provider rides in the TUI state, and a UI crash logs that state: never
   # let a key into a log line (ADR 0005) — including the per-provider keys.
   @derive {Inspect, except: [:api_key, :providers]}
-  defstruct [:base_url, :model, :api_key, :context_tokens, :nickname, :profile, providers: []]
+  defstruct [
+    :base_url,
+    :model,
+    :api_key,
+    :context_tokens,
+    # The ghost-text suggestion's model tri-state (ADR 0015 §3): `false`
+    # opts out entirely, a string pins that exact model id, `nil` enables
+    # with the provider's default cheap model.
+    :suggest,
+    :nickname,
+    :profile,
+    providers: []
+  ]
 
   @type provider :: %{
           label: String.t(),
@@ -84,6 +97,7 @@ defmodule DashFloat.Config do
           model: String.t(),
           api_key: String.t(),
           context_tokens: pos_integer() | nil,
+          suggest: false | String.t() | nil,
           nickname: String.t() | nil,
           profile: String.t() | nil,
           providers: [provider()]
@@ -275,7 +289,9 @@ defmodule DashFloat.Config do
   after the merge yield an error naming only the missing field names —
   values are never echoed. `context_tokens` is optional: env wins over the
   file, and anything that is not a positive integer is nil — never an error
-  (ADR 0006).
+  (ADR 0006). `suggest` flows the same way (ADR 0015): `false` opts the
+  ghost-text suggestion out, a string pins that model id, and absent or
+  unusable is nil — the provider's default cheap model, never an error.
   """
   @spec load(Path.t(), map(), keyword()) :: classification()
   def load(dir, env, cli) when is_binary(dir) and is_map(env) and is_list(cli) do
@@ -517,7 +533,14 @@ defmodule DashFloat.Config do
   defp build_result(_profiles, nil, _keys, env, cli) do
     entry = select_entry([], nil, cli)
 
-    build(effective(nil, nil, nil, nil, env), context(env, entry), nil, nil, [])
+    build(
+      effective(nil, nil, nil, nil, env),
+      context(env, entry),
+      suggest(env, nil),
+      nil,
+      nil,
+      []
+    )
   end
 
   defp build_result(_profiles, profile, keys, env, cli) do
@@ -528,6 +551,7 @@ defmodule DashFloat.Config do
     build(
       effective(provider, entry, keys, profile, env),
       context(env, entry),
+      suggest(env, profile.settings),
       entry && entry.nickname,
       profile.name,
       providers
@@ -666,7 +690,56 @@ defmodule DashFloat.Config do
     end
   end
 
-  defp build(values, context_tokens, nickname, profile, providers) do
+  # The suggest tri-state (ADR 0015 §3), threaded exactly like context_tokens:
+  # env wins over the active profile's settings.suggest; a blank/absent env
+  # var falls to the file; blank/absent everywhere is nil (the provider's
+  # default cheap model).
+  defp suggest(env, settings) do
+    case env_value(env, @suggest_var) do
+      nil -> parse_suggest(settings && Map.get(settings, "suggest"))
+      raw -> parse_suggest(suggest_env_keyword(raw))
+    end
+  end
+
+  # The env spellings normalize onto the shared parser's boolean arms; any
+  # other non-blank string is the model id verbatim (never downcased, never
+  # trimmed — the id arm passes the raw value through). The boolean match
+  # trims BOTH ends: an env `" false"` must stay the opt-out, not become a
+  # model id with a leading space.
+  defp suggest_env_keyword(raw) do
+    keyword =
+      raw
+      |> String.trim()
+      |> String.downcase()
+
+    case keyword do
+      kw when kw in ["false", "0"] -> false
+      kw when kw in ["true", "1"] -> true
+      _other -> raw
+    end
+  end
+
+  # ONE shared parser (ADR 0015 §3): `false` opts out, `true` is the default
+  # cheap model (nil), a usable non-blank string is that exact model id,
+  # absent/blank is nil. Anything else warns naming the field and degrades to
+  # the default — never a load error (ADR 0009's tolerance principle).
+  defp parse_suggest(nil), do: nil
+  defp parse_suggest(false), do: false
+  defp parse_suggest(true), do: nil
+
+  defp parse_suggest(raw) when is_binary(raw) do
+    case String.trim_trailing(raw) do
+      "" -> nil
+      id -> id
+    end
+  end
+
+  defp parse_suggest(_other) do
+    Logger.warning("suggest is not a usable value — using the provider's default cheap model")
+    nil
+  end
+
+  defp build(values, context_tokens, suggest, nickname, profile, providers) do
     case Enum.reject(@fields, fn {field, _var} -> value(values[field]) end) do
       [] ->
         config =
@@ -679,6 +752,7 @@ defmodule DashFloat.Config do
          %{
            config
            | context_tokens: context_tokens,
+             suggest: suggest,
              nickname: value(nickname),
              profile: profile,
              providers: providers

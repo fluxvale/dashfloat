@@ -22,6 +22,7 @@ defmodule DashFloat.TUI do
   alias DashFloat.Config.Catalog
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
+  alias DashFloat.TUI.Suggest
   alias DashFloat.TUI.View
 
   require Logger
@@ -29,6 +30,7 @@ defmodule DashFloat.TUI do
   @tick :dashfloat_tick
   @tick_ms 125
   @exit_guard :dashfloat_exit_guard
+  @suggest :dashfloat_suggest
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -49,6 +51,11 @@ defmodule DashFloat.TUI do
     # history eats them. A default here — not an Application opt — so the
     # connect-span test can pin it for every starter.
     |> Keyword.put_new(:mouse_capture, true)
+    # Focus reporting is the TUI's own policy too (ADR 0015 §1) — the same
+    # pattern as mouse capture (issue #21): it gates the composer's cursor,
+    # and terminals that ignore the request send nothing, so the state
+    # stays focused — the status quo ante.
+    |> Keyword.put_new(:focus_events, true)
     |> Keyword.put(:mod, __MODULE__)
     |> ExRatatui.App.dispatch_start()
   end
@@ -153,6 +160,15 @@ defmodule DashFloat.TUI do
   def handle_event(%ExRatatui.Event.Resize{width: w, height: h}, state),
     do: schedule(State.resize(state, w, h))
 
+  # Focus events gate the composer's cursor artifact (ADR 0015 §1): an
+  # unfocused pane shows no cursor, so a multiplexer glance shows which
+  # pane holds focus. User-paced events — they may draw a frame, like keys.
+  def handle_event(%ExRatatui.Event.FocusGained{}, state),
+    do: schedule(%{state | focused?: true})
+
+  def handle_event(%ExRatatui.Event.FocusLost{}, state),
+    do: schedule(%{state | focused?: false})
+
   def handle_event(_event, state), do: schedule(state)
 
   # The startup phase's actions (ADR 0009) — the chat actions stay above.
@@ -206,6 +222,41 @@ defmodule DashFloat.TUI do
     end
   end
 
+  # The suggest debounce fired (ADR 0015 §3 — sanctioned exception #4):
+  # staleness first, exactly like the tick's, then the one-shot dispatch —
+  # render-suppressed, there is nothing to draw until a result lands.
+  def handle_info(@suggest, state) do
+    if stale_suggest?(state) do
+      {:noreply, state, %{render?: false}}
+    else
+      {:noreply, dispatch_suggest(state), %{render?: false}}
+    end
+  end
+
+  # A suggestion landed (ADR 0015 §3): the text arrives ALREADY normalized —
+  # fetch_async/3 normalizes inside the supervised task, so the UI process
+  # never touches the raw body. Accepted only while its epoch is current, the
+  # UI is idle, the draft is empty, suggestions are on, and the ghost is
+  # non-blank — "" is a truthy binary and would blank the composer's
+  # placeholder. A stale epoch is dropped with the state UNTOUCHED — a newer
+  # request may still be in flight, and clearing its task here would orphan
+  # it.
+  def handle_info({:suggestion, epoch, _text}, state) when epoch != state.suggest_epoch,
+    do: {:noreply, state, %{render?: false}}
+
+  def handle_info({:suggestion, epoch, text}, state) do
+    # The visible-remainder test is the module's own normalize: it refuses
+    # not just blank but INVISIBLE ghosts (soft hyphen, word joiner, bare
+    # combining marks) — anything that would blank the placeholder or
+    # materialize an unseen submit on Tab.
+    if accept_suggestion?(state, epoch) and is_binary(text) and
+         Suggest.normalize({:ok, text}) != nil do
+      {:noreply, %{state | suggestion: text, suggest_task: nil}}
+    else
+      {:noreply, %{state | suggest_task: nil}, %{render?: false}}
+    end
+  end
+
   def handle_info({:entry, _kind, _text} = msg, state),
     do: schedule(State.stream_message(state, msg))
 
@@ -247,14 +298,61 @@ defmodule DashFloat.TUI do
 
   defp stale_guard?(%{exit_guard_ref: ref}), do: Process.read_timer(ref) != false
 
+  # Same staleness rule for the suggest debounce (ADR 0015 §3): a message
+  # from a cancelled or superseded timer must be inert.
+  defp stale_suggest?(%{suggest_ref: nil}), do: true
+  defp stale_suggest?(%{suggest_ref: ref}), do: Process.read_timer(ref) != false
+
+  # The debounce fired for real: clear the ref, then resolve the model
+  # config and start the supervised side-request on the reply tail.
+  defp dispatch_suggest(state) do
+    case state.provider do
+      {:ok, %Config{suggest: false}} -> %{state | suggest_ref: nil}
+      {:ok, config} -> start_suggest(state, config)
+      _other -> %{state | suggest_ref: nil}
+    end
+  end
+
+  defp start_suggest(state, config) do
+    epoch = state.suggest_epoch + 1
+
+    # A dead task supervisor EXITS the start call instead of returning an
+    # error tuple — caught here, because the side-request is fail-open
+    # absolutely (ADR 0015 §3): a missing ghost, never a UI crash.
+    result =
+      try do
+        Suggest.fetch_async(config, Suggest.tail(state.entries),
+          send_to: self(),
+          epoch: epoch,
+          fetcher: state.suggest_fetcher
+        )
+      catch
+        :exit, _reason -> :error
+      end
+
+    case result do
+      {:ok, pid} -> %{state | suggest_ref: nil, suggest_task: pid, suggest_epoch: epoch}
+      _no_task -> %{state | suggest_ref: nil}
+    end
+  end
+
+  defp accept_suggestion?(state, epoch) do
+    epoch == state.suggest_epoch and state.phase == :idle and
+      State.input_text(state) == "" and
+      match?({:ok, %Config{suggest: suggest}} when suggest != false, state.provider)
+  end
+
   # The single tick choke point (ADR 0006): any active phase keeps exactly one
-  # timer pending; idle always cancels it. Idle => no timers => no renders
-  # (the exit guard's one-shot is the sole, user-armed exception).
+  # timer pending; idle always cancels it. Idle => no timers => no renders.
+  # The two sanctioned one-shot exceptions: the user-armed exit guard (issue
+  # #28) and the suggest debounce (sanctioned exception #4, ADR 0015 §3).
   defp schedule(state) do
     state =
       state
       |> schedule_tick()
       |> schedule_guard(System.monotonic_time(:millisecond))
+      |> suggest_reap()
+      |> suggest_arm()
 
     {:noreply, state}
   end
@@ -298,6 +396,51 @@ defmodule DashFloat.TUI do
   defp arm_guard(state, now) do
     delay = State.exit_guard_delay(state, now)
     %{state | exit_guard_ref: Process.send_after(self(), @exit_guard, delay)}
+  end
+
+  # The suggest reap (ADR 0015 §3): a dismiss intent cancels the pending
+  # debounce and kills an in-flight task (the socket dies mid-request); the
+  # epoch bump orphans any already-queued straggler result. One choke point,
+  # like the tick's.
+  defp suggest_reap(%{suggest_reap: false} = state), do: state
+
+  defp suggest_reap(state) do
+    if is_reference(state.suggest_ref), do: Process.cancel_timer(state.suggest_ref)
+    if is_pid(state.suggest_task), do: Process.exit(state.suggest_task, :kill)
+
+    %{
+      state
+      | suggest_reap: false,
+        suggest_ref: nil,
+        suggest_task: nil,
+        suggest_epoch: state.suggest_epoch + 1
+    }
+  end
+
+  # The suggest arm (ADR 0015 §3 — sanctioned timer #4): the one-shot
+  # debounce send, turn-paced and render-suppressed at dispatch. Live runs
+  # use the real HTTP path; tests inject `suggest_fetcher:` (the
+  # catalog_fetcher pattern) — the default suite stays hermetic: no
+  # fetcher, no timer, no network.
+  defp suggest_arm(%{suggest_arm: false} = state), do: state
+
+  defp suggest_arm(state) do
+    if state.live? or state.suggest_fetcher do
+      # No orphan-kill at the arm: a pending debounce/task was already reaped
+      # by suggest_reap/1 earlier in this pipeline; the ordering is the
+      # guarantee.
+      arm_suggest_debounce(state)
+    else
+      %{state | suggest_arm: false}
+    end
+  end
+
+  defp arm_suggest_debounce(state) do
+    %{
+      state
+      | suggest_arm: false,
+        suggest_ref: Process.send_after(self(), @suggest, state.suggest_debounce_ms)
+    }
   end
 
   @impl ExRatatui.App

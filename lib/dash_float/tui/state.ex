@@ -108,6 +108,10 @@ defmodule DashFloat.TUI.State do
     },
     scroll: 0,
     follow?: true,
+    # Terminal-pane focus (ADR 0015 §1): gates the composer's cursor
+    # artifact. Terminals without focus reporting send nothing, so the
+    # default keeps the status quo ante.
+    focused?: true,
     history: [],
     history_index: nil,
     draft: "",
@@ -117,7 +121,19 @@ defmodule DashFloat.TUI.State do
     selection: nil,
     # The standing catalog refresh's landing state (ADR 0009): per-provider
     # fetched entries, keyed by baseUrl. In-memory per session only.
-    catalog: %{}
+    catalog: %{},
+    # Ghost text (ADR 0015 §3): the landed suggestion, the debounce timer
+    # and in-flight task, the straggler epoch, the one-shot arm/reap
+    # intents, and the injected fetcher + debounce delay (the
+    # catalog_fetcher pattern).
+    suggestion: nil,
+    suggest_ref: nil,
+    suggest_task: nil,
+    suggest_epoch: 0,
+    suggest_arm: false,
+    suggest_reap: false,
+    suggest_fetcher: nil,
+    suggest_debounce_ms: 600
   ]
 
   @type t :: %__MODULE__{
@@ -135,6 +151,7 @@ defmodule DashFloat.TUI.State do
           stats: stats(),
           scroll: non_neg_integer(),
           follow?: boolean(),
+          focused?: boolean(),
           history: [String.t()],
           history_index: non_neg_integer() | nil,
           draft: String.t(),
@@ -151,7 +168,18 @@ defmodule DashFloat.TUI.State do
           catalog: %{optional(String.t()) => [DashFloat.Config.Catalog.entry()]},
           catalog_fetcher:
             (String.t(), String.t() | nil -> {:ok, [DashFloat.Config.Catalog.entry()]} | :error)
-            | nil
+            | nil,
+          suggestion: String.t() | nil,
+          suggest_ref: reference() | nil,
+          suggest_task: pid() | nil,
+          suggest_epoch: non_neg_integer(),
+          suggest_arm: boolean(),
+          suggest_reap: boolean(),
+          suggest_fetcher:
+            (DashFloat.Config.t(), String.t() -> {:ok, String.t()} | :error)
+            | {module(), atom()}
+            | nil,
+          suggest_debounce_ms: non_neg_integer()
         }
 
   @typedoc """
@@ -220,7 +248,12 @@ defmodule DashFloat.TUI.State do
       setup: Keyword.get(opts, :setup),
       config_dir: Keyword.get(opts, :config_dir),
       resolve: Keyword.get(opts, :resolve),
-      catalog_fetcher: Keyword.get(opts, :catalog_fetcher)
+      catalog_fetcher: Keyword.get(opts, :catalog_fetcher),
+      # The ghost-text side-request's seams (ADR 0015 §3): the injected
+      # fetcher gates the runner's arm (the default suite stays hermetic)
+      # and the debounce delay is injectable for the timing tests.
+      suggest_fetcher: Keyword.get(opts, :suggest_fetcher),
+      suggest_debounce_ms: Keyword.get(opts, :suggest_debounce_ms, 600)
     }
 
     replay(state, Keyword.get(opts, :transcript, []), Keyword.get(opts, :resume_note))
@@ -545,7 +578,7 @@ defmodule DashFloat.TUI.State do
   @spec paste(t(), String.t()) :: t()
   def paste(%__MODULE__{input: input} = state, content) when is_binary(content) do
     ExRatatui.textarea_insert_str(input, normalize_newlines(content))
-    leave_history(state)
+    dismiss_suggestion(leave_history(state))
   end
 
   defp normalize_newlines(content) do
@@ -632,6 +665,21 @@ defmodule DashFloat.TUI.State do
     if on_last_row?(state), do: {history_next(state), nil}, else: forward(state, "down", [])
   end
 
+  # Tab materializes the ghost (ADR 0015 §3): the draft becomes the landed
+  # suggestion (editable, cursor at end). No ghost — or a non-empty draft —
+  # falls through to the textarea unchanged.
+  defp route_key(%{suggestion: suggestion} = state, "tab", _modifiers, _now)
+       when suggestion != nil do
+    if input_text(state) == "" do
+      state
+      |> set_draft(suggestion)
+      |> dismiss_suggestion()
+      |> then(&{&1, nil})
+    else
+      forward(state, "tab", [])
+    end
+  end
+
   # Everything else (typing, editing, Emacs shortcuts) goes to the textarea.
   defp route_key(state, code, modifiers, _now) when is_binary(code) and is_list(modifiers),
     do: forward(state, code, modifiers)
@@ -640,7 +688,7 @@ defmodule DashFloat.TUI.State do
     ExRatatui.textarea_handle_key(state.input, code, modifiers)
     # Editing while browsing history keeps the edited text: it becomes the
     # live draft (no longer restorable by navigating down).
-    {leave_history(state), nil}
+    {dismiss_suggestion(leave_history(state)), nil}
   end
 
   ## Exit guard (issue #28; ADR 0006 amendment)
@@ -714,6 +762,7 @@ defmodule DashFloat.TUI.State do
       # A new question re-pins the log: the user wants to watch its answer
       # arrive even if they had paged up first.
       |> Map.put(:follow?, true)
+      |> dismiss_suggestion()
       |> then(&{&1, {:submit, text}})
     else
       {state, nil}
@@ -765,6 +814,14 @@ defmodule DashFloat.TUI.State do
   @spec stream_message(t(), stream_msg(), integer()) :: t()
   def stream_message(state, msg, now \\ System.monotonic_time(:millisecond))
 
+  # A token arriving at idle belongs to a turn that is already over —
+  # ignored like a late usage frame below: applying it would set in_flight,
+  # and a later {:phase, :idle} would then finalize and arm a suggestion for
+  # it, re-opening the duplicate-arm window (ADR 0015 §3's once-per-turn arm
+  # stays true).
+  def stream_message(%{phase: :idle} = state, {:token, text}, _now) when is_binary(text),
+    do: state
+
   def stream_message(state, {:token, text}, now) when is_binary(text) do
     %{
       state
@@ -810,14 +867,30 @@ defmodule DashFloat.TUI.State do
   # Any phase message supersedes a pending confirm: the agent is the single
   # voice, and a confirm the UI never decided must not outlive the turn it
   # belonged to (agent death included — agent_down routes through here).
+  # A new turn also kills the old ghost — the reap intent rides the
+  # resulting state (ADR 0015 §3).
   def stream_message(state, {:phase, :streaming}, _now),
-    do: %{state | phase: :streaming, confirm: nil}
+    do: dismiss_suggestion(%{state | phase: :streaming, confirm: nil})
 
-  def stream_message(state, {:phase, phase}, now) when phase in [:executing_tool, :idle] do
+  def stream_message(state, {:phase, :idle}, now) do
+    # Arm only when THIS transition actually finalized an assistant reply:
+    # a re-sent idle (agent_down(:normal), a late phase echo) finalizes
+    # nothing, and re-arming would fire a second side-request for one turn
+    # (ADR 0015 §3: at most one per completed turn).
+    finalized? = state.in_flight not in [nil, ""]
+
     state
-    |> finalize_in_flight(now)
-    |> Map.put(:phase, phase)
-    |> Map.put(:confirm, nil)
+    |> finalize_phase(:idle, now)
+    |> maybe_arm_suggestion(finalized?)
+  end
+
+  # Tool interludes are mid-turn: the phase changes and any in-flight
+  # partial reply finalizes, but the turn is not complete — never an arm
+  # (and every new phase still sets the reap intent, ADR 0015 §3).
+  def stream_message(state, {:phase, :executing_tool}, now) do
+    state
+    |> finalize_phase(:executing_tool, now)
+    |> dismiss_suggestion()
   end
 
   def stream_message(state, {:entry, kind, text}, _now)
@@ -857,6 +930,36 @@ defmodule DashFloat.TUI.State do
   # finalized entry's rows: a selection reaching into the rows that were
   # live at its anchor loses the content under its highlight and clears —
   # see clear_selection_over_reply for the boundary rule.
+  defp finalize_phase(state, phase, now) do
+    state
+    |> finalize_in_flight(now)
+    |> Map.put(:phase, phase)
+    |> Map.put(:confirm, nil)
+  end
+
+  # One-shot arm intent (ADR 0015 §3): only a finalized assistant turn with
+  # an empty draft and suggestions enabled arms — at most one side-request
+  # per completed turn; draft churn later never re-arms. `false` (nothing
+  # finalized here) leaves the state untouched.
+  defp maybe_arm_suggestion(state, false), do: state
+
+  defp maybe_arm_suggestion(state, true) do
+    armed? =
+      match?(%{kind: :assistant}, List.last(state.entries)) and
+        input_text(state) == "" and
+        suggest_enabled?(state.provider)
+
+    %{state | suggest_arm: armed?}
+  end
+
+  defp suggest_enabled?({:ok, %DashFloat.Config{suggest: suggest}}), do: suggest != false
+  defp suggest_enabled?(_other), do: false
+
+  # A dismiss clears the landed ghost and sets the reap intent: the TUI's
+  # choke point cancels the debounce, kills an in-flight task, and bumps the
+  # epoch so any straggler result is dead on arrival (ADR 0015 §3).
+  defp dismiss_suggestion(state), do: %{state | suggestion: nil, suggest_reap: true}
+
   defp finalize_in_flight(%{in_flight: in_flight} = state, now) when in_flight in [nil, ""] do
     %{
       state
@@ -1057,6 +1160,7 @@ defmodule DashFloat.TUI.State do
     state
     |> maybe_save_draft()
     |> set_history_index(next)
+    |> dismiss_suggestion()
   end
 
   defp history_next(%{history_index: nil} = state), do: state
@@ -1065,10 +1169,14 @@ defmodule DashFloat.TUI.State do
     next = state.history_index - 1
 
     if next < 0 do
-      set_draft(state, state.draft)
-      %{state | history_index: nil}
+      restored =
+        state
+        |> set_draft(state.draft)
+        |> Map.put(:history_index, nil)
+
+      dismiss_suggestion(restored)
     else
-      set_history_index(state, next)
+      dismiss_suggestion(set_history_index(state, next))
     end
   end
 
