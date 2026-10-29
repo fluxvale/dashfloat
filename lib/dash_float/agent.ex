@@ -1095,6 +1095,7 @@ defmodule DashFloat.Agent do
            session_title: nil,
            title_fired?: false,
            title_fetcher: fetcher,
+           supervisor: supervisor,
            messages: messages,
            provider: {:ok, %Config{auto_title: auto_title} = config}
          } = state,
@@ -1103,25 +1104,33 @@ defmodule DashFloat.Agent do
        when content != "" and not is_nil(dir) and auto_title != false do
     ref = make_ref()
 
-    case Title.fetch_async(config, first_exchange_context(messages), ref: ref, fetcher: fetcher) do
+    # The task rides the agent's own supervisor (the :supervisor opt's
+    # constituency — embedded starters — must not depend on the global
+    # name), and fetch_async rescues the start: a supervisor that cannot
+    # start the task is a miss, never a crash (ADR 0023 §8).
+    case Title.fetch_async(config, first_exchange_context(messages),
+           ref: ref,
+           fetcher: fetcher,
+           supervisor: supervisor
+         ) do
       {:ok, _pid} ->
         %{state | title_fired?: true, title_ref: ref}
 
-      # coveralls-ignore-start
-      # Unreachable while DashFloat.TaskSupervisor is alive (the
-      # application's permanent child) — belt over a dead-supervisor boot.
+      # A supervisor that could not start the task (dead, absent, full) —
+      # the latch stays unarmed, the next settled turn retries.
       {:error, _reason} ->
         state
-        # coveralls-ignore-stop
     end
   end
 
   defp maybe_fire_title(state, _content), do: state
 
   # The first exchange: the first user message's content and the first
-  # assistant message's content found in the transcript — atom-keyed
-  # in-session, string-keyed after a resume. A missing or nil side reads ""
-  # (the instruction alone can still title).
+  # assistant REPLY's content (a tool_calls-only announcement carries nil —
+  # the common first assistant message in a coding harness — so the find
+  # skips to the first message with real content) — atom-keyed in-session,
+  # string-keyed after a resume. A missing side reads "" (the instruction
+  # alone can still title).
   defp first_exchange_context(messages) do
     %{
       user: first_content(messages, "user"),
@@ -1131,9 +1140,14 @@ defmodule DashFloat.Agent do
 
   defp first_content(messages, role) do
     case Enum.find(messages, fn
-           %{role: ^role} -> true
-           %{"role" => ^role} -> true
-           _other -> false
+           %{role: ^role, content: content} when is_binary(content) and content != "" ->
+             true
+
+           %{"role" => ^role, "content" => content} when is_binary(content) and content != "" ->
+             true
+
+           _other ->
+             false
          end) do
       %{content: content} when is_binary(content) -> content
       %{"content" => content} when is_binary(content) -> content

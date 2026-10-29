@@ -15,6 +15,7 @@ defmodule DashFloat.Session.Title do
 
   alias DashFloat.Config
   alias DashFloat.Config.Presets
+  alias DashFloat.Session
 
   @display_cap 80
 
@@ -30,10 +31,10 @@ defmodule DashFloat.Session.Title do
 
   @instruction "Propose a concise title for this conversation: 3-6 words, plain text only — no quotes, no explanation, no trailing punctuation."
 
-  # Session's @id_shape, locally: titles and session ids share the `--resume`
-  # surface, so a UUID-shaped title would make resume ambiguous. Strict
-  # lowercase — we mint lowercase ids. See #80.
-  @id_shape ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/
+  # Titles and session ids share the `--resume` surface, so a UUID-shaped
+  # title would make resume ambiguous (ADR 0023 §3) — Session owns the one
+  # shape test (`valid_id?/1`); no drifting regex copy here.
+  defp reserved?(title), do: Session.valid_id?(title)
 
   # The same character set DashFloat.TUI.Suggest scrubs (control bytes, the
   # C1 range U+0080–U+009F, bidi/format characters) — defined locally, the
@@ -57,18 +58,20 @@ defmodule DashFloat.Session.Title do
   @doc """
   Normalizes a raw title for storage: invalid UTF-8 repaired at the trust
   boundary, control/C1/bidi characters scrubbed, whitespace runs collapsed,
-  trimmed — case-preserved. `{:error, :empty}` when nothing visible remains,
-  `{:error, :too_long}` past `@display_cap` (80) graphemes, `{:error,
-  :reserved}` when the result is a UUID-shaped string.
+  trimmed — case-preserved. `{:error, :empty}` when nothing visible remains
+  (blank after the widthless set — format characters, combining marks — is
+  removed; the same gate the proposal path applies), `{:error, :too_long}`
+  past `@display_cap` (80) graphemes, `{:error, :reserved}` when the result
+  is a UUID-shaped string.
   """
   @spec normalize(term()) :: {:ok, String.t()} | {:error, :empty | :too_long | :reserved}
   def normalize(raw) when is_binary(raw) do
     title = clean(raw)
 
     cond do
-      title == "" -> {:error, :empty}
+      not visible?(title) -> {:error, :empty}
       String.length(title) > @display_cap -> {:error, :too_long}
-      Regex.match?(@id_shape, title) -> {:error, :reserved}
+      reserved?(title) -> {:error, :reserved}
       true -> {:ok, title}
     end
   end
@@ -128,14 +131,24 @@ defmodule DashFloat.Session.Title do
     end
   end
 
-  # Filename order — the ids sort with their files.
+  # The sweep and this scan must see the same store (ADR 0023 §4): File.ls,
+  # not Path.wildcard — wildcard is blind to dot-named files.
   defp holders(dir, key) do
-    dir
-    |> Path.join("*.json")
-    |> Path.wildcard()
-    |> Enum.sort()
-    |> Enum.flat_map(fn path ->
-      case decode_title(path) do
+    case File.ls(dir) do
+      {:ok, names} ->
+        names
+        |> Enum.sort()
+        |> Enum.filter(&String.ends_with?(&1, ".json"))
+        |> holder_ids(dir, key)
+
+      {:error, _reason} ->
+        []
+    end
+  end
+
+  defp holder_ids(names, dir, key) do
+    Enum.flat_map(names, fn name ->
+      case decode_title(Path.join(dir, name)) do
         {id, ^key} -> [id]
         _other -> []
       end
@@ -234,15 +247,19 @@ defmodule DashFloat.Session.Title do
   defp parse(_other), do: :error
 
   @doc """
-  Starts the supervised side-request (the `TUI.Suggest.fetch_async` shape):
-  under `DashFloat.TaskSupervisor`, the fetcher (an `{m, f}` MFA or fun/2;
-  default the real HTTP path) runs rescued and caught to nil — a raising
-  fetcher, or one returning something off the `{:ok, _} | :error` contract,
-  is just another failure — and the ALREADY-NORMALIZED proposal lands as
-  `{:title_proposal, ref, text}` (`String.t() | nil`) on `send_to` (default
-  `self()`). The message must always land: a dead task would strand the
-  agent's one-shot latch — normalization runs inside the supervised task,
-  never in the agent loop.
+  Starts the supervised side-request (the `TUI.Suggest.fetch_async` shape)
+  under `:supervisor` (default `DashFloat.TaskSupervisor` — the agent passes
+  its own): the fetcher (an `{m, f}` MFA or fun/2; default the real HTTP
+  path) runs rescued and caught to nil — a raising fetcher, or one returning
+  something off the `{:ok, _} | :error` contract, is just another failure —
+  and the ALREADY-NORMALIZED proposal lands as `{:title_proposal, ref, text}`
+  (`String.t() | nil`) on `send_to` (default `self()`). The message must
+  always land: a dead task would strand the agent's one-shot latch —
+  normalization runs inside the supervised task, never in the agent loop.
+  The START itself is rescued too: a dead or absent supervisor RAISES from
+  `Task.Supervisor.start_child/2` rather than returning `{:error, _}`, and
+  the side-channel must never take the caller down with it (ADR 0023 §8's
+  task-that-cannot-start rule).
   """
   @spec fetch_async(Config.t(), %{user: String.t(), assistant: String.t()}, keyword()) ::
           {:ok, pid()} | {:error, term()}
@@ -250,22 +267,33 @@ defmodule DashFloat.Session.Title do
     send_to = Keyword.get(opts, :send_to, self())
     ref = Keyword.fetch!(opts, :ref)
     fetcher = Keyword.get(opts, :fetcher) || {__MODULE__, :request}
+    supervisor = Keyword.get(opts, :supervisor, DashFloat.TaskSupervisor)
 
-    Task.Supervisor.start_child(DashFloat.TaskSupervisor, fn ->
-      # Normalize HERE, inside the supervised task — never in the agent loop.
-      text =
-        try do
-          proposal(run(fetcher, config, context))
-        rescue
-          _reason -> nil
-        catch
-          # throw/exit from a fetcher are failures too — the message must
-          # land either way, or the agent's title_ref stays set forever.
-          _kind, _reason -> nil
-        end
+    # The rescue is the load-bearing half (ADR 0023 §8): the reachable
+    # cannot-start failure is this raise, not an error tuple.
+    try do
+      Task.Supervisor.start_child(supervisor, fn ->
+        # Normalize HERE, inside the supervised task — never in the agent loop.
+        text =
+          try do
+            proposal(run(fetcher, config, context))
+          rescue
+            _reason -> nil
+          catch
+            # throw/exit from a fetcher are failures too — the message must
+            # land either way, or the agent's title_ref stays set forever.
+            _kind, _reason -> nil
+          end
 
-      send(send_to, {:title_proposal, ref, text})
-    end)
+        send(send_to, {:title_proposal, ref, text})
+      end)
+    rescue
+      _reason -> {:error, :supervisor_unavailable}
+    catch
+      # GenServer.call on a dead name arrives as an :exit, not a raise —
+      # both shapes are the same miss.
+      :exit, _reason -> {:error, :supervisor_unavailable}
+    end
   end
 
   # The fetch runs INSIDE the rescue: a raising fetcher is just another

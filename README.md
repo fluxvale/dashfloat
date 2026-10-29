@@ -182,8 +182,8 @@ output read from your disk. Each session is named by a time-sorting UUID id
 `dashfloat --title "My session"`, and pick a conversation back up with
 `dashfloat --resume <id-or-title>` — the id is the UUID file name, the title
 is the session's unique title (a title that would duplicate another session's
-is refused at creation or rename, so a title always resolves to exactly one
-session) — the transcript replays in the log and your next send continues
+is refused at creation or rename, so a title resolves to one session or the
+resume refuses) — the transcript replays in the log and your next send continues
 it. Sessions created by older versions are renamed to UUID ids automatically
 at startup. A session records the profile and model it started under;
 resuming under a different one warns and continues, and the session keeps its

@@ -61,6 +61,15 @@ defmodule DashFloat.Session do
     uuid_hex(<<ts::48, 7::4, rand_a::12, 2::2, rand_b::62>>)
   end
 
+  @doc """
+  Whether `id` is the canonical shape `new_id/0` mints (strict lowercase).
+  The one source of the shape: `--resume`'s id-or-title routing (ADR 0023
+  §5) and the title reservation (§3) ask here rather than keeping regex
+  copies that could drift apart.
+  """
+  @spec valid_id?(String.t()) :: boolean()
+  def valid_id?(id) when is_binary(id), do: Regex.match?(@id_shape, id)
+
   # RFC 9562: 48-bit unix ms, version 7, variant `10`, 62 random bits —
   # collision safety is those 62 bits per millisecond.
   defp uuid_hex(<<payload::binary-size(16)>>) do
@@ -150,16 +159,33 @@ defmodule DashFloat.Session do
   end
 
   defp rewrite(dir, session) do
-    case save(dir, %{session | id: new_id()}) do
-      :ok -> remove_legacy(dir, session.id)
+    fresh_id = new_id()
+
+    case save(dir, %{session | id: fresh_id}) do
+      :ok -> remove_legacy(dir, session.id, path_for(dir, fresh_id))
       {:error, _reason} = error -> error
     end
   end
 
-  defp remove_legacy(dir, old_id) do
-    path = path_for(dir, old_id)
+  # If the old name cannot be removed, remove the fresh copy instead: a
+  # persistently un-removable legacy file must not mint one orphan UUID
+  # duplicate per boot (ADR 0023 §2 accepts a ONE-TIME kill-window
+  # duplicate, not a multiplier) — the next boot retries the rewrite whole.
+  defp remove_legacy(dir, old_id, new_path) do
+    old_path = path_for(dir, old_id)
 
-    if File.rm(path) == :ok, do: :ok, else: {:error, "cannot remove #{path}"}
+    # coveralls-ignore-start
+    # Deterministic rm-failure with a successful save needs a filesystem
+    # condition the suite cannot produce unprivileged (immutable file);
+    # probe-verified in review, not suite-reachable.
+    if File.rm(old_path) == :ok do
+      :ok
+    else
+      _removed = File.rm(new_path)
+      {:error, "cannot remove #{old_path}"}
+    end
+
+    # coveralls-ignore-stop
   end
 
   defp do_save(dir, session) do

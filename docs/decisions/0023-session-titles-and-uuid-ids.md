@@ -42,7 +42,8 @@ variant `10`, 74 random bits — canonical lowercase, ~15 lines on
 future session picker wants recency order for free); v4 would discard it
 permanently. **A dependency over in-module** was rejected — fifteen lines of
 vendored arithmetic beats a dep for a value this central. Collision safety
-is the 62 random bits per millisecond; ids minted within one millisecond may
+is the 74 random bits (12 in `rand_a`, 62 in `rand_b`) per millisecond; ids
+minted within one millisecond may
 sort out of order (random tails) — accepted, they are still unique and
 time-clustered.
 
@@ -69,7 +70,10 @@ after classification, before resume resolution):
 - **Kill window:** a kill after the write and before the delete leaves both
   files; the next sweep mints a second UUID for the legacy name — an orphan
   duplicate, no data loss. Accepted (a lock file would buy less than it
-  costs, the ADR 0014 §7 stance).
+  costs, the ADR 0014 §7 stance). A *persistent* remove failure is rolled
+  back instead: the fresh copy is removed with it, so an un-removable legacy
+  file cannot mint one orphan per boot — the acceptance is a one-time
+  duplicate, not a multiplier.
 - **A failed sweep degrades:** warn and continue; resume-by-UUID still
   works, the next boot retries.
 - **Accepted consequence:** old timestamp ids stop being resumable the
@@ -141,7 +145,8 @@ exists to prevent), then uniqueness (`title_holder`, naming the holder and
 the remedy). With `--resume` it is a boot-time rename — the loaded session
 is exempt from its own current title, any other holder refuses. The
 normalized storage form threads to the agent (`boot_title/1`); the refusal
-messages quote the typed form.
+messages quote the typed value where a value is worth quoting (the
+taken-refusal names it; the shape refusals state the rule).
 
 ### 7. The rename seam (the command registry's future home)
 

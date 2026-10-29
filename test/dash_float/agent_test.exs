@@ -2897,11 +2897,20 @@ defmodule DashFloat.AgentTest do
     assert session.title == "Booted Title"
   end
 
-  test "no fire when auto_title is false or persistence is off" do
+  @tag :tmp_dir
+  test "no fire when auto_title is false or persistence is off", ctx do
     server = start_server([final_episode("a"), final_episode("b")])
 
-    for provider <- [title_provider(server, auto_title: false), title_provider(server)] do
-      {agent, _sup} = start_agent(server, System.tmp_dir!(), provider: provider)
+    # The two opt-outs are exercised APART (review: a shared iteration never
+    # proves the auto_title guard with persistence on): a directory-holding
+    # agent under auto_title: false, and a dir-less agent under the default.
+    for {provider, session_dir} <- [
+          {title_provider(server, auto_title: false), Path.join(ctx.tmp_dir, "sessions-off")},
+          {title_provider(server), nil}
+        ] do
+      {agent, _sup} =
+        start_agent(server, ctx.tmp_dir, provider: provider, session_dir: session_dir)
+
       send(agent, {:prompt, self(), "hello"})
       assert_receive {:phase, :idle}, 2_000
     end
@@ -3107,7 +3116,7 @@ defmodule DashFloat.AgentTest do
   end
 
   @tag :tmp_dir
-  test "a nil-content first assistant message reads an empty side of the context", ctx do
+  test "the context skips a nil-content tool announcement to the first real reply", ctx do
     write_sandbox(ctx, "notes.md", "seed\n")
 
     server =
@@ -3132,8 +3141,9 @@ defmodule DashFloat.AgentTest do
     assert_receive {:phase, :idle}, 2_000
     assert_receive {:title_context, context}, 2_000
 
-    # The first assistant message is the nil-content tool batch.
-    assert context == %{user: "go", assistant: ""}
+    # The first assistant message is the nil-content tool batch; the first
+    # assistant REPLY is the episode that follows it.
+    assert context == %{user: "go", assistant: "done"}
   end
 
   @tag :tmp_dir

@@ -10,12 +10,6 @@ defmodule DashFloat.Application do
 
   require Logger
 
-  # Session's @id_shape, locally (Title's precedent): routing a typed
-  # `--resume` value between the id path and the title path needs only the
-  # shape test, not a store dependency on it. Strict lowercase — we mint
-  # lowercase ids (ADR 0014 §6).
-  @id_shape ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/
-
   # The resume hand-off (ADR 0014 §6): one load, two consumers — the agent
   # adopts the transcript, the TUI replays it.
   @typep resume :: %{session: Session.t(), note: String.t() | nil} | nil
@@ -181,7 +175,7 @@ defmodule DashFloat.Application do
       requested ->
         id = String.replace_suffix(requested, ".json", "")
 
-        if Regex.match?(@id_shape, id) do
+        if Session.valid_id?(id) do
           resume_session(Session.load(sessions_dir, requested), classification)
         else
           resume_by_title(requested, classification, sessions_dir)

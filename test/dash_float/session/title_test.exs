@@ -30,6 +30,24 @@ defmodule DashFloat.Session.TitleTest do
       assert Title.normalize(nil) == {:error, :empty}
     end
 
+    test "widthless-only input is :empty — the proposal path's gate, shared" do
+      # Soft hyphens (Cf), a word joiner (Cf), and lone combining marks
+      # (Mn/Me) carry no width: a title made only of them is untypeable and
+      # unresolvable — the manual path refuses exactly what the auto path
+      # refuses (review P2).
+      soft_hyphens = String.duplicate("\u{ad}", 3)
+      assert Title.normalize(soft_hyphens) == {:error, :empty}
+      assert Title.normalize("\u{2060}\u{2060}") == {:error, :empty}
+
+      marks = String.duplicate("\u{301}", 4)
+      assert Title.normalize(marks) == {:error, :empty}
+    end
+
+    test "widthless characters WITHIN a visible title survive" do
+      assert Title.normalize("e\u{301}clair") == {:ok, "e\u{301}clair"}
+      assert Title.normalize("soft\u{ad}ened") == {:ok, "soft\u{ad}ened"}
+    end
+
     test "a uuid-shaped title is :reserved — ids and titles share --resume" do
       assert Title.normalize("0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c") == {:error, :reserved}
 
@@ -99,6 +117,20 @@ defmodule DashFloat.Session.TitleTest do
     test "a missing directory is free", ctx do
       dir = Path.join(ctx.tmp_dir, "does-not-exist")
       assert Title.title_holder(dir, "Fix the bug") == nil
+    end
+
+    @tag :tmp_dir
+    test "dot-named files are scanned — the sweep's File.ls view, not wildcard's", ctx do
+      # Path.wildcard is blind to dotfiles while the migration sweep's
+      # File.ls sees them; the scans and the sweep must agree on the store
+      # (review P3).
+      id = "0192aa10-a006-7b00-8000-000000000006"
+
+      hidden_path = Path.join(ctx.tmp_dir, ".hidden.json")
+      body = Jason.encode!(%{id: id, title: "Hidden"})
+      assert File.write!(hidden_path, body) == :ok
+      assert Title.title_holder(ctx.tmp_dir, "hidden") == id
+      assert Title.find_by_title(ctx.tmp_dir, "Hidden") == {:ok, id}
     end
   end
 
@@ -393,5 +425,36 @@ defmodule DashFloat.Session.TitleTest do
 
     @spec ok_fetcher(term(), term()) :: {:ok, String.t()}
     def ok_fetcher(_config, _context), do: {:ok, "mfa title"}
+
+    test "a supervisor that cannot start the task is an error tuple, never a raise" do
+      # Task.Supervisor.start_child/2 RAISES on a dead/absent supervisor —
+      # the side-channel must degrade, not take the agent down (review P2).
+      bogus = :"dashfloat-title-no-such-supervisor"
+
+      assert {:error, :supervisor_unavailable} =
+               Title.fetch_async(config(), context("q", "a"),
+                 send_to: self(),
+                 ref: make_ref(),
+                 fetcher: fn _config, _ctx -> {:ok, "never runs"} end,
+                 supervisor: bogus
+               )
+
+      refute_received {:title_proposal, _ref, _text}
+    end
+
+    test "the task rides the caller's supervisor via :supervisor" do
+      {:ok, sup} = Task.Supervisor.start_link()
+      ref = make_ref()
+
+      assert {:ok, _pid} =
+               Title.fetch_async(config(), context("q", "a"),
+                 send_to: self(),
+                 ref: ref,
+                 fetcher: fn _config, _ctx -> {:ok, "own supervisor"} end,
+                 supervisor: sup
+               )
+
+      assert_receive {:title_proposal, ^ref, "own supervisor"}, 1_000
+    end
   end
 end
