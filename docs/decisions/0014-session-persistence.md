@@ -117,10 +117,28 @@ receives display-contract messages.
   version (which old binaries then refuse). This is the #43 seam —
   accounting/compaction reads the same `messages` and may add fields, not
   reinterpret them.
-- **Never any credential.** The file holds `version`, `id`, `created_at`,
-  `pin`, `messages` — nothing else. `api_key` values, keys.json5 contents,
-  and environment values have no path into it: the writer receives the
-  message list and the three pin strings, never the key.
+- **Never a credential by the writer's own hand.** The file holds `version`,
+  `id`, `created_at`, `pin`, `messages` — nothing else. The writer receives
+  the message list and three pin strings, never the key: `api_key` values,
+  keys.json5 contents, and environment values have no path into what the
+  writer serializes. **What the transcript itself carries is different and
+  deliberate:** user text and tool results are persisted *verbatim* — the
+  transcript must replay exactly what the model saw, so a tool that printed
+  a secret (`env`, a build log) persists it too. That is precisely why the
+  0600 mode is mandatory (the issue's own rationale: transcripts carry
+  source code and tool output read off disk). `pin.base_url` is sanitized
+  to `scheme://host[:port]/path` (userinfo, query, and fragment dropped) —
+  it is our metadata, not conversation, and a URL-carried key must not sit
+  in it.
+- **Unknown top-level fields are ignored AND dropped:** an older binary
+  that resumes a file with newer top-level fields tolerates them at load
+  and omits them on its next save (tolerance means no crash, not
+  preservation). Additive fields that must survive an older binary's
+  re-save live **inside** `messages` entries or `pin`, which are carried
+  verbatim. Anything that changes how existing fields are *read* bumps the
+  version (which old binaries then refuse). This is the #43 seam —
+  accounting/compaction reads the same `messages` and nests its additions
+  there.
 
 ### 4. Load: tolerance, refusals, repair
 
@@ -134,11 +152,12 @@ receives display-contract messages.
   migration's discipline per file.
 - **Shape validation:** the top level must be a map with `version` (above),
   a string `id` equal to the requested id (a renamed or shuffled file
-  refuses), a string `created_at` (our writer always records it; a file
-  without it is malformed), and a `messages` list. The `pin` degrades
-  tolerantly — missing, non-map, or non-string fields compare as nil
-  (§6's nil-compare rule) rather than refusing. Each message must match
-  its role's
+  refuses; a requested id ending in `.json` is tolerated — the README's own
+  `ls` prints the file name), a string `created_at` (our writer always
+  records it; a file without it is malformed), and a `messages` list. The
+  `pin` degrades tolerantly — missing, non-map, or non-string fields
+  compare as nil (§6's nil-compare rule) rather than refusing. Each
+  message must match its role's
   provider shape — `user`: binary `content`; `assistant`: binary-or-nil
   `content` and an optional list `tool_calls` (each with binary `id`,
   `type`, `function.name`, `function.arguments`); `tool`: binary
@@ -158,7 +177,24 @@ receives display-contract messages.
   not rewritten by the repair; it converges on the next save.
 - **Orphan tool messages** (a `tool_call_id` matching no announced call)
   refuse as malformed — no write path of ours can produce one, so it is
-  hand damage, and the refusal names it.
+  hand damage, and the refusal names it. **Two further shape rules from
+  the hostile review:** a batch whose `tool_calls` repeat an id refuses
+  (dup ids make one answer "cover" two calls — the repair would serve an
+  unbalanced transcript), and a tool message must sit in the **contiguous**
+  tool block following its batch — an answer detached past a user or
+  assistant message refuses (validation and repair must agree on what a
+  batch's block is).
+
+- **Id uniqueness is owned at the persistence boundary (ADR 0007 §1
+  refinement).** ADR 0007 left id uniqueness to providers for the *live*
+  round trip; persistence makes ids load-bearing across processes, so the
+  agent de-duplicates ids when it appends the assistant `tool_calls`
+  message (occurrence rename: `id`, `id-2`, … — the assistant message,
+  dispatch, results, and tool messages all carry the renamed ids, so the
+  round trip stays internally consistent), and `DashFloat.LLM.ToolCalls`
+  treats an empty-string id like a missing one (the sloppy-provider
+  synthesis). The loader's dup refusal above is the backstop for
+  hand-damage.
 
 **Never bricks startup:** every load failure is a `{:error, message}`, and
 the boot path (§7) turns it into a clean refusal or a warning — never a
@@ -261,10 +297,15 @@ sends the full restored history — no truncation, no accounting. That is
 ### 7. Concurrency and truth
 
 No locking: two DashFloat instances resuming the same session both write
-the same file; each save is atomic, so the file is always one process's
-consistent last write (last-writer-wins). Accepted — a single-user local
-harness; the alternative (lock files) buys little and bricks resume after
-a kill, the exact case this slice exists for.
+the same file. Each save is atomic through a **unique temp name**
+(`Posture.write_private` stages at `<path>.tmp.<random>` — two concurrent
+writers never share a staging file, so neither can tear the other's
+write), and the file is always one writer's consistent payload;
+last-writer-wins. Accepted — a single-user local harness; the alternative
+(lock files) buys little and bricks resume after a kill, the exact case
+this slice exists for. *(The unique tmp name is the hostile review's fix:
+a shared fixed `.tmp` path let two writers interleave and, at rest,
+corrupt the destination permanently.)*
 
 ## Interface freeze
 
@@ -366,3 +407,10 @@ All under tmp-dir discipline; network only via the loopback SSE server.
 10. **Pinning:** resume under a different `--profile` starts, warns naming
     the pinned and the active profile (system entry + log), and leaves the
     session's pin unchanged on the next save.
+11. **Hostile-review pins:** duplicate or empty tool-call ids never reach
+    disk (batch-boundary rename; empty synthesizes like nil); a hand file
+    with a duplicate batch id refuses; a detached tool answer refuses;
+    concurrent saves on one id never tear (a reader under concurrent
+    writers sees only whole payloads); a save whose encoding raises
+    degrades to a warning; `pin.base_url` carries no query, fragment, or
+    userinfo; the pin survives the next save after a cross-profile resume.
