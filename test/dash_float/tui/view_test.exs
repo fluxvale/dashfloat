@@ -139,9 +139,17 @@ defmodule DashFloat.TUI.ViewTest do
     test "the status bar is one line of styled spans, dim separators between" do
       [line] = status_line(new_state())
 
-      # Exact fresh-session truth — phase cluster, one separator, the log
-      # position: a wrong separator layout must fail here, not pass on count.
-      assert Enum.map(line.spans, & &1.content) == ["● ", "Idle", " · ", "log empty"]
+      # Exact fresh-session truth — the mode label, phase cluster, one
+      # separator between each group, the log position: a wrong separator
+      # layout must fail here, not pass on count (mode first, ADR 0016 §7).
+      assert Enum.map(line.spans, & &1.content) == [
+               "Build",
+               " · ",
+               "● ",
+               "Idle",
+               " · ",
+               "log empty"
+             ]
 
       separators = Enum.filter(line.spans, &(&1.content == " · "))
       assert Enum.all?(separators, &(&1.style.fg == :dark_gray))

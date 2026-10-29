@@ -458,11 +458,13 @@ defmodule DashFloat.TUI.View do
     }
   end
 
+  # The mode group is bare — the bar intersperses separators between groups
+  # (ADR 0016 §7): always present, so the bar opens with the mode label.
   defp mode_spans(state) do
     role = Map.fetch!(@mode_roles, state.mode)
     label = Mode.label(state.mode)
 
-    [separator(), Span.new(label, style: Theme.style(role))]
+    [Span.new(label, style: Theme.style(role))]
   end
 
   defp context_spans(%{stats: %{context_total: 0}}), do: []

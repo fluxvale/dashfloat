@@ -791,10 +791,11 @@ defmodule DashFloat.TUI.StateTest do
         assert {^state, {:set_mode, :auto}} = State.handle_key(state, "back_tab", mods)
       end
 
-      # Bare tab is an editing key: it forwards to the textarea, never cycles.
+      # Bare tab is an editing key: it forwards to the textarea (which may
+      # arm the ghost-reap intent, ADR 0015 §3), never cycles the mode.
       idle = new_state()
-      assert {^idle, nil} = State.handle_key(idle, "tab", [])
-      assert idle.mode == :build
+      {after_tab, nil} = State.handle_key(idle, "tab", [])
+      assert after_tab.mode == :build
     end
 
     test "shift+tab is swallowed while a confirmation is pending" do
