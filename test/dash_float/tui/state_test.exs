@@ -2499,4 +2499,395 @@ defmodule DashFloat.TUI.StateTest do
       assert new_state(transcript: [], resume_note: nil).entries == []
     end
   end
+
+  ## Slash commands and the palette (ADR 0020)
+
+  describe "slash filter palette (ADR 0020)" do
+    test "typing a slash prefix derives the popup, selected 0" do
+      state = type(new_state(), "/he")
+
+      assert %{mode: :filter, kind: :commands, selected: 0} = state.palette
+      assert Enum.map(state.palette.items, & &1.name) == ["help"]
+    end
+
+    test "typing narrows the matches and resets the selection" do
+      typed = type(new_state(), "/")
+      broad = press(typed, "down", [])
+
+      assert length(broad.palette.items) == 7
+      assert broad.palette.selected == 1
+
+      narrow = type(broad, "c")
+      assert Enum.map(narrow.palette.items, & &1.name) == ["clear"]
+      assert narrow.palette.selected == 0
+    end
+
+    test "an edit that keeps the match set keeps the selection" do
+      typed = type(new_state(), "/mod")
+      state = press(typed, "down", [])
+
+      assert Enum.map(state.palette.items, & &1.name) == ["mode", "model"]
+
+      kept = type(state, "e")
+      assert Enum.map(kept.palette.items, & &1.name) == ["mode", "model"]
+      assert kept.palette.selected == 1
+    end
+
+    test "a non-matching prefix shows nothing" do
+      state = type(new_state(), "/zz")
+      assert state.palette == nil
+    end
+
+    test "a typed space ends the token: the popup dismisses, the draft keeps the args" do
+      state = type(new_state(), "/mode ")
+
+      assert state.palette == nil
+      assert State.input_text(state) == "/mode "
+    end
+
+    test "esc dismisses until the next edit re-derives" do
+      typed = type(new_state(), "/he")
+      dismissed = press(typed, "esc", [])
+
+      assert dismissed.palette == nil
+
+      redone = press(dismissed, "l", [])
+      assert %{mode: :filter} = redone.palette
+    end
+
+    test "up/down move the popup selection and never touch history" do
+      moved =
+        new_state()
+        |> idle_submit("past prompt")
+        |> type("/m")
+        |> press("down", [])
+        |> press("down", [])
+
+      assert moved.palette.selected == 1
+      assert moved.history_index == nil
+
+      back = press(moved, "up", [])
+
+      assert back.palette.selected == 0
+      assert State.input_text(back) == "/m"
+    end
+
+    test "enter executes the SELECTED match, not the typed text" do
+      base = cataloged()
+      typed = type(base, "/mo")
+      state = press(typed, "down", [])
+
+      assert Enum.map(state.palette.items, & &1.name) == ["mode", "model"]
+
+      {picked, nil} = State.handle_key(state, "enter", [])
+
+      assert %{mode: :modal, kind: :models, selected: 1} = picked.palette
+      assert picked.history == ["/mo"]
+    end
+
+    test "the popup is idle-only: typing while streaming derives nothing" do
+      state = type(%{new_state() | phase: :streaming}, "/he")
+      assert state.palette == nil
+    end
+
+    test "a paste derives the popup too" do
+      state = State.paste(new_state(), "/he")
+      assert %{mode: :filter, kind: :commands} = state.palette
+    end
+
+    test "history navigation re-derives the popup for a command-shaped entry" do
+      state = press(%{new_state() | history: ["/help"], draft: "x"}, "up", [])
+
+      assert %{mode: :filter, kind: :commands} = state.palette
+      assert State.input_text(state) == "/help"
+    end
+  end
+
+  describe "slash commands (ADR 0020)" do
+    defp cataloged do
+      config = %DashFloat.Config{
+        base_url: "http://x",
+        model: "m2",
+        api_key: "k",
+        nickname: "Nick",
+        context_tokens: 1_000
+      }
+
+      state = new_state(provider: {:ok, config})
+
+      catalog = %{
+        "http://x" => [
+          %{model: "m1", context: 128_000},
+          %{model: "m2", context: nil},
+          %{model: "m3", context: 200_000}
+        ]
+      }
+
+      State.catalog_arrived(state, catalog)
+    end
+
+    # Types the draft, then Enter — the full submit/command path.
+    defp enter_typed(state, text) do
+      state
+      |> type(text)
+      |> State.handle_key("enter", [])
+    end
+
+    test "/clear via the popup's Enter resets the log but keeps the input history" do
+      state =
+        new_state()
+        |> State.stream_message({:entry, :system, "old"})
+        |> type("/clear")
+
+      {cleared, nil} = State.handle_key(state, "enter", [])
+
+      assert cleared.entries == []
+      assert cleared.history == ["/clear"]
+      assert State.input_text(cleared) == ""
+      assert cleared.phase == :idle
+      assert cleared.palette == nil
+    end
+
+    test "/clear via the submit path (args typed, popup dismissed) behaves the same" do
+      state =
+        new_state()
+        |> State.stream_message({:entry, :system, "old"})
+        |> Map.put(:history, ["kept"])
+        |> type("/clear ")
+
+      assert state.palette == nil
+
+      {cleared, nil} = State.handle_key(state, "enter", [])
+
+      assert cleared.entries == []
+      assert cleared.history == ["kept", "/clear "]
+      assert cleared.phase == :idle
+    end
+
+    test "/help lists the registry and the key hints" do
+      {helped, nil} = enter_typed(new_state(), "/help")
+
+      assert [{:system, text}] = pairs(helped)
+
+      for name <- ~w(clear help mode model profile quit title) do
+        assert text =~ "/#{name} — "
+      end
+
+      assert text =~ "Enter send · Shift+Enter newline"
+      assert text =~ "Ctrl+P commands"
+      assert text =~ "Shift+Tab mode"
+    end
+
+    test "/quit returns :quit" do
+      assert {state, :quit} = enter_typed(new_state(), "/quit")
+      assert state.palette == nil
+    end
+
+    test "bare /mode names the current mode" do
+      planning = Map.put(new_state(), :mode, :plan)
+      {printed, nil} = enter_typed(planning, "/mode ")
+
+      assert printed.mode == :plan
+      assert pairs(printed) == [{:system, "[mode: Plan — /mode <plan|build|auto|unchained>]"}]
+    end
+
+    test "/mode <name> returns {:set_mode, _} with no local mode change" do
+      {state, action} = enter_typed(new_state(), "/mode plan")
+
+      assert action == {:set_mode, :plan}
+      assert state.mode == :build
+      assert state.history == ["/mode plan"]
+      assert State.input_text(state) == ""
+    end
+
+    test "an unknown mode warns with the four names" do
+      {state, nil} = enter_typed(new_state(), "/mode bogus")
+
+      assert pairs(state) == [{:system, "unknown mode: bogus (plan, build, auto, unchained)"}]
+      assert state.mode == :build
+    end
+
+    test "/title carries its args to the agent" do
+      assert {state, {:set_title, "fix the login"}} =
+               enter_typed(new_state(), "/title fix the login")
+
+      assert State.input_text(state) == ""
+    end
+
+    test "a bare /title sends the empty title — the agent owns validation" do
+      assert {_state, {:set_title, ""}} = enter_typed(new_state(), "/title ")
+    end
+
+    test "/model opens the picker preselected on the current model" do
+      base = cataloged()
+      {opened, nil} = enter_typed(base, "/model")
+
+      assert %{mode: :modal, kind: :models, selected: 1} = opened.palette
+      assert Enum.map(opened.palette.items, & &1.model) == ["m1", "m2", "m3"]
+    end
+
+    test "the picker's Enter swaps the provider for the highlighted entry" do
+      base = cataloged()
+      {opened, nil} = enter_typed(base, "/model")
+      assert %{mode: :modal, kind: :models, selected: 1} = opened.palette
+
+      moved = press(opened, "down", [])
+      assert moved.palette.selected == 2
+
+      {picked, {:switch_model, {:ok, config}}} = State.handle_key(moved, "enter", [])
+
+      assert config.model == "m3"
+      assert config.nickname == nil
+      assert config.context_tokens == nil
+      assert config.base_url == "http://x"
+      assert picked.provider == {:ok, config}
+      assert picked.palette == nil
+    end
+
+    test "/model with an empty catalog warns" do
+      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "m", api_key: "k"}}
+      {state, nil} = enter_typed(new_state(provider: provider), "/model")
+
+      assert pairs(state) == [{:system, "[model catalog is empty — nothing to pick]"}]
+      assert state.palette == nil
+    end
+
+    test "/model with no provider warns" do
+      {state, nil} = enter_typed(new_state(), "/model")
+
+      assert pairs(state) == [{:system, "[model catalog is empty — nothing to pick]"}]
+    end
+
+    test "/profile returns :list_profiles" do
+      assert {state, :list_profiles} = enter_typed(new_state(), "/profile")
+      assert state.palette == nil
+    end
+
+    test "profiles_arrived opens the picker" do
+      state = State.profiles_arrived(new_state(), ["personal", "work"])
+
+      assert %{mode: :modal, kind: :profiles, items: ["personal", "work"], selected: 0} =
+               state.palette
+    end
+
+    test "profiles_arrived with nothing to list warns" do
+      state = State.profiles_arrived(new_state(), [])
+      assert pairs(state) == [{:system, "[no profiles configured]"}]
+    end
+
+    test "the profiles picker's Enter rides the existing select_profile action" do
+      listed = State.profiles_arrived(new_state(), ["personal", "work"])
+      state = press(listed, "down", [])
+
+      {picked, {:select_profile, "work"}} = State.handle_key(state, "enter", [])
+
+      assert picked.palette == nil
+    end
+
+    test "an unknown bare command warns instead of submitting" do
+      {state, nil} = enter_typed(new_state(), "/nope")
+
+      assert pairs(state) == [{:system, "unknown command: /nope — try /help"}]
+      assert state.phase == :idle
+      assert state.history == ["/nope"]
+      assert State.input_text(state) == ""
+    end
+
+    test "slash text with an argument is an ordinary message — the escape hatch" do
+      {state, {:submit, "/etc/hosts is weird"}} =
+        enter_typed(new_state(), "/etc/hosts is weird")
+
+      assert [{:user, "/etc/hosts is weird"}] = pairs(state)
+      assert state.phase == :streaming
+    end
+
+    test "commands are idle-gated: a /clear submit mid-stream is a no-op" do
+      typed = type(%{new_state() | phase: :streaming}, "/clear")
+      assert typed.palette == nil
+
+      {kept, nil} = State.handle_key(typed, "enter", [])
+
+      assert kept.phase == :streaming
+      assert kept.entries == []
+      assert kept.history == []
+    end
+  end
+
+  describe "the modal palette (ADR 0020)" do
+    test "ctrl+p opens the command palette from idle" do
+      state = press(new_state(), "p", ["ctrl"])
+
+      assert %{mode: :modal, kind: :commands, selected: 0} = state.palette
+
+      assert Enum.map(state.palette.items, & &1.name) ==
+               ~w(clear help mode model profile quit title)
+    end
+
+    test "ctrl+p is idle-gated like submit" do
+      state = press(%{new_state() | phase: :streaming}, "p", ["ctrl"])
+      assert state.palette == nil
+    end
+
+    test "ctrl+p toggles a modal or filter palette closed" do
+      opened = press(new_state(), "p", ["ctrl"])
+      modal = press(opened, "p", ["ctrl"])
+
+      assert modal.palette == nil
+
+      typed = type(new_state(), "/he")
+      filter = press(typed, "p", ["ctrl"])
+
+      assert filter.palette == nil
+    end
+
+    test "the modal swallows everything but up/down/enter/esc — the mode cycle included" do
+      state =
+        new_state()
+        |> press("p", ["ctrl"])
+        |> press("x", [])
+        |> press("page_up", [])
+        |> press("back_tab", [])
+
+      assert State.input_text(state) == ""
+      assert state.mode == :build
+      assert %{mode: :modal} = state.palette
+    end
+
+    test "up/down move and enter executes the highlighted entry" do
+      state =
+        new_state()
+        |> press("p", ["ctrl"])
+        |> press("down", [])
+        |> press("up", [])
+        |> press("down", [])
+
+      assert state.palette.selected == 1
+
+      {helped, nil} = State.handle_key(state, "enter", [])
+
+      assert helped.palette == nil
+      assert [{:system, text}] = pairs(helped)
+      assert text =~ "/help — "
+    end
+
+    test "esc closes the modal" do
+      opened = press(new_state(), "p", ["ctrl"])
+      state = press(opened, "esc", [])
+
+      assert state.palette == nil
+    end
+
+    test "ctrl+q still quits while a modal is open" do
+      state = press(new_state(), "p", ["ctrl"])
+      assert {^state, :quit} = State.handle_key(state, "q", ["ctrl"])
+    end
+
+    test "a pending confirm outranks the palette (ADR 0016 §3)" do
+      {state, _ref} = confirming()
+      {swallowed, nil} = State.handle_key(state, "p", ["ctrl"])
+
+      assert swallowed.palette == nil
+      assert swallowed.confirm != nil
+    end
+  end
 end

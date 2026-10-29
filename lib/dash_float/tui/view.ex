@@ -8,6 +8,7 @@ defmodule DashFloat.TUI.View do
 
   alias DashFloat.Config.Onboarding
   alias DashFloat.Mode
+  alias DashFloat.TUI.Palette
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Theme
@@ -18,6 +19,8 @@ defmodule DashFloat.TUI.View do
   alias ExRatatui.Text.Span
   alias ExRatatui.Widgets.Block
   alias ExRatatui.Widgets.Paragraph
+  alias ExRatatui.Widgets.Popup
+  alias ExRatatui.Widgets.SlashCommands
   alias ExRatatui.Widgets.Textarea
 
   @phases %{
@@ -108,8 +111,9 @@ defmodule DashFloat.TUI.View do
 
   @doc """
   Renders the five regions — status, log, activity, input, and the stats
-  footer — or, while the startup phase owns the screen, the one setup box
-  instead (ADR 0009). Pure; never raises on odd sizes.
+  footer — plus any open command palette on top (ADR 0020), or, while the
+  startup phase owns the screen, the one setup box instead (ADR 0009). Pure;
+  never raises on odd sizes.
   """
   @spec render(State.t(), ExRatatui.Frame.t()) :: [{ExRatatui.widget(), Rect.t()}]
   def render(%State{setup: setup} = _state, %ExRatatui.Frame{width: width, height: height})
@@ -130,7 +134,7 @@ defmodule DashFloat.TUI.View do
       {activity_widget(state), regions.activity},
       {input_widget(state), regions.input},
       {footer_widget(state), regions.footer}
-    ]
+    ] ++ palette_widgets(state, inset_area(width, height))
   end
 
   ## Setup screens (ADR 0009: forced selection + onboarding wizard)
@@ -671,5 +675,78 @@ defmodule DashFloat.TUI.View do
 
   defp cursor_style(%State{anim_step: step}) do
     if rem(div(step, 4), 2) == 0, do: Theme.style(:cursor), else: %Style{}
+  end
+
+  ## Command palette (ADR 0020)
+
+  # The palette renders last — on top of every region. A filter popup is the
+  # composer's derived state and additionally gates on idle.
+  defp palette_widgets(%State{palette: %Palette{mode: :filter}, phase: phase}, _area)
+       when phase != :idle,
+       do: []
+
+  defp palette_widgets(%State{palette: nil}, _area), do: []
+
+  defp palette_widgets(%State{} = state, area), do: render_palette(state, area)
+
+  # The command lists — autocomplete and Ctrl+P alike, "the same list" — go
+  # through the widget's renderer; the model and profile pickers build
+  # Popup + List with custom labels. Styles are Theme roles only (ADR 0006).
+  defp render_palette(
+         %State{palette: %Palette{kind: :commands, items: items, selected: selected}},
+         area
+       ) do
+    SlashCommands.render_autocomplete(items,
+      area: area,
+      selected: selected,
+      highlight_style: Theme.style(:accent),
+      style: Theme.style(:dim)
+    )
+  end
+
+  # "id (context detail) · current" — the marker only on the provider's
+  # current model, the detail only when the catalog carries a context.
+  defp render_palette(
+         %State{
+           palette: %Palette{kind: :models, items: entries, selected: selected},
+           provider: {:ok, config}
+         },
+         area
+       ) do
+    items = Enum.map(entries, &model_item(&1.model, &1.context, config.model))
+    [picker("Models", items, selected, area)]
+  end
+
+  defp render_palette(
+         %State{palette: %Palette{kind: :profiles, items: names, selected: selected}},
+         area
+       ) do
+    [picker("Profiles", names, selected, area)]
+  end
+
+  defp model_item(id, context, current) do
+    detail = if is_integer(context), do: " (#{div(context, 1000)}k)", else: ""
+    marker = if id == current, do: " · current", else: ""
+
+    id <> detail <> marker
+  end
+
+  defp picker(title, items, selected, area) do
+    {%Popup{
+       content: %ExRatatui.Widgets.List{
+         items: items,
+         selected: selected,
+         highlight_style: Theme.style(:accent),
+         style: Theme.style(:dim),
+         block: %Block{
+           title: Span.new(" #{title} ", style: Theme.style(:accent)),
+           borders: [:all],
+           border_type: :rounded,
+           border_style: Theme.style(:dim)
+         }
+       },
+       percent_width: 50,
+       percent_height: 40
+     }, area}
   end
 end

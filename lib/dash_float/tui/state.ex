@@ -8,15 +8,18 @@ defmodule DashFloat.TUI.State do
   textarea's Rust-side state, reached through its synchronous in-memory API.
   Transitions return `{state, action}` where `action` is `:quit`,
   `{:submit, prompt}`, `{:confirm, decision}`, `:cancel`, `{:set_mode, mode}`,
-  `nil`, or one of the setup actions; the TUI interprets actions. The one
-  clock is injectable (`now` arguments, defaulting
-  to the monotonic clock) so the animation tick and rate math stay pure.
-  See ADRs 0002, 0006, and 0007.
+  the command actions (`{:set_title, title}`, `{:switch_model, _}`,
+  `:list_profiles` — ADR 0020), `nil`, or one of the setup actions; the TUI
+  interprets actions. The one clock is injectable (`now` arguments,
+  defaulting to the monotonic clock) so the animation tick and rate math stay
+  pure. See ADRs 0002, 0006, and 0007.
   """
 
   alias DashFloat.Config.Onboarding
   alias DashFloat.Mode
   alias DashFloat.Tools
+  alias DashFloat.TUI.Commands
+  alias DashFloat.TUI.Palette
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.View
@@ -49,6 +52,9 @@ defmodule DashFloat.TUI.State do
           | {:confirm, :approved | :rejected}
           | :cancel
           | {:set_mode, Mode.mode()}
+          | {:set_title, String.t()}
+          | {:switch_model, DashFloat.Config.classification()}
+          | :list_profiles
           | nil
           | {:select_profile, String.t()}
           | :setup_finish
@@ -74,6 +80,9 @@ defmodule DashFloat.TUI.State do
   @in_flight_cap 64 * 1024
   # The double Ctrl+C exit window (issue #28; ADR 0006 amendment).
   @exit_window_ms 2_000
+  # /help's key hints (ADR 0020) — the composer's static hints plus the
+  # palette and mode keys.
+  @key_hints "Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit · Ctrl+P commands · Shift+Tab mode"
 
   @enforce_keys [:input]
 
@@ -143,7 +152,10 @@ defmodule DashFloat.TUI.State do
     suggest_arm: false,
     suggest_reap: false,
     suggest_fetcher: nil,
-    suggest_debounce_ms: 600
+    suggest_debounce_ms: 600,
+    # The command palette (ADR 0020): nil closed; :filter is the composer's
+    # derived slash autocomplete, :modal is Ctrl+P or a picker.
+    palette: nil
   ]
 
   @type t :: %__MODULE__{
@@ -190,7 +202,8 @@ defmodule DashFloat.TUI.State do
             (DashFloat.Config.t(), String.t() -> {:ok, String.t()} | :error)
             | {module(), atom()}
             | nil,
-          suggest_debounce_ms: non_neg_integer()
+          suggest_debounce_ms: non_neg_integer(),
+          palette: Palette.t() | nil
         }
 
   @typedoc """
@@ -599,7 +612,7 @@ defmodule DashFloat.TUI.State do
   @spec paste(t(), String.t()) :: t()
   def paste(%__MODULE__{input: input} = state, content) when is_binary(content) do
     ExRatatui.textarea_insert_str(input, normalize_newlines(content))
-    dismiss_suggestion(leave_history(state))
+    refresh_palette(dismiss_suggestion(leave_history(state)))
   end
 
   defp normalize_newlines(content) do
@@ -658,6 +671,53 @@ defmodule DashFloat.TUI.State do
     do: {state, {:confirm, :rejected}}
 
   defp route_key(%{confirm: pending} = state, _code, _modifiers, _now) when pending != nil,
+    do: {state, nil}
+
+  # The command palette (ADR 0020). Ctrl+P toggles: open from idle, close
+  # whatever kind is open. A modal palette swallows every key but
+  # Up/Down/Enter/Esc — the mode cycle included — while the global quits and
+  # the pending-confirm clauses above keep outranking it (ADR 0016 §3). The
+  # filter popup's Up/Down sit above the history clauses: while the popup is
+  # visible the arrows address it, never history; its other keys fall
+  # through.
+  defp route_key(%{palette: %Palette{}} = state, "p", ["ctrl"], _now),
+    do: {%{state | palette: nil}, nil}
+
+  defp route_key(%{palette: nil, phase: :idle} = state, "p", ["ctrl"], _now) do
+    palette = %Palette{mode: :modal, kind: :commands, items: Commands.all(), selected: 0}
+    {%{state | palette: palette}, nil}
+  end
+
+  defp route_key(%{palette: %Palette{mode: :modal} = palette} = state, "up", _modifiers, _now),
+    do: {%{state | palette: Palette.move(palette, :up)}, nil}
+
+  defp route_key(%{palette: %Palette{mode: :modal} = palette} = state, "down", _modifiers, _now),
+    do: {%{state | palette: Palette.move(palette, :down)}, nil}
+
+  defp route_key(%{palette: %Palette{mode: :modal} = palette} = state, "enter", mods, _now)
+       when mods in [[], ["ctrl"]],
+       do: execute_palette(state, palette)
+
+  defp route_key(%{palette: %Palette{mode: :filter} = palette} = state, "up", _modifiers, _now),
+    do: {%{state | palette: Palette.move(palette, :up)}, nil}
+
+  defp route_key(%{palette: %Palette{mode: :filter} = palette} = state, "down", _modifiers, _now),
+    do: {%{state | palette: Palette.move(palette, :down)}, nil}
+
+  # Filter Enter executes the SELECTED match (not the typed text) with the
+  # submit path's bookkeeping.
+  defp route_key(%{palette: %Palette{mode: :filter} = palette} = state, "enter", mods, _now)
+       when mods in [[], ["ctrl"]] do
+    command = Enum.at(palette.items, palette.selected)
+    run_submitted_command(state, input_text(state), command.name, "")
+  end
+
+  # Esc dismisses either palette; the filter's dismissal survives until the
+  # next draft edit re-derives it.
+  defp route_key(%{palette: palette} = state, "esc", _modifiers, _now) when palette != nil,
+    do: {%{state | palette: nil}, nil}
+
+  defp route_key(%{palette: %Palette{mode: :modal}} = state, _code, _modifiers, _now),
     do: {state, nil}
 
   # Shift+Tab cycles the interaction mode (ADR 0016 §7): the action carries
@@ -720,8 +780,48 @@ defmodule DashFloat.TUI.State do
   defp forward(state, code, modifiers) do
     ExRatatui.textarea_handle_key(state.input, code, modifiers)
     # Editing while browsing history keeps the edited text: it becomes the
-    # live draft (no longer restorable by navigating down).
-    {dismiss_suggestion(leave_history(state)), nil}
+    # live draft (no longer restorable by navigating down). The edit also
+    # re-derives the filter palette from the new draft (ADR 0020).
+    {refresh_palette(dismiss_suggestion(leave_history(state))), nil}
+  end
+
+  ## Filter palette (ADR 0020)
+
+  # Derived state: recomputed after every draft change. Visible only while
+  # idle, the draft is a bare slash prefix ("/he" — no whitespace yet), and at
+  # least one command matches. An identical match set keeps the selection; any
+  # change resets it to 0. Esc's dismissal survives because this only runs on
+  # edits.
+  defp refresh_palette(%{phase: :idle} = state) do
+    case filter_matches(input_text(state)) do
+      nil -> %{state | palette: nil}
+      items -> upsert_filter(state, items)
+    end
+  end
+
+  defp refresh_palette(%__MODULE__{} = state), do: %{state | palette: nil}
+
+  defp upsert_filter(%{palette: %Palette{mode: :filter, items: items}} = state, items),
+    do: state
+
+  defp upsert_filter(state, items) do
+    %{state | palette: %Palette{mode: :filter, kind: :commands, items: items, selected: 0}}
+  end
+
+  # The popup's match set: only while the draft ITSELF is a bare slash token —
+  # a typed space (args coming) or any other edit hides it (ADR 0020).
+  defp filter_matches(text) do
+    case bare_slash_prefix(text) do
+      nil -> nil
+      prefix -> nonempty_matches(prefix)
+    end
+  end
+
+  defp nonempty_matches(prefix) do
+    case Commands.match(prefix) do
+      [] -> nil
+      items -> items
+    end
   end
 
   ## Exit guard (issue #28; ADR 0006 amendment)
@@ -778,27 +878,67 @@ defmodule DashFloat.TUI.State do
 
   @doc """
   Submits the draft: appends a `:user` entry, pushes history, clears the
-  draft, and flips the phase to `:streaming`. Returns `{state, nil}` when the
-  draft is blank or a request is already in flight (one at a time; queueing is
-  Phase 2).
+  draft, and flips the phase to `:streaming`. A command-shaped draft (ADR
+  0020) runs the command instead — no `:user` entry, no phase flip; a bare
+  unknown `/foo` warns; other slash text submits as an ordinary message. The
+  command paths keep submit's idle gate and bookkeeping. Returns `{state,
+  nil}` when the draft is blank or a request is already in flight (one at a
+  time; queueing is Phase 2).
   """
   @spec submit(t()) :: {t(), {:submit, String.t()} | nil}
   def submit(%__MODULE__{} = state) do
     text = input_text(state)
 
     if state.phase == :idle and text != "" and String.trim(text) != "" do
-      state
-      |> push_history(text)
-      |> append_entry(:user, text)
-      |> clear_input()
-      |> Map.put(:phase, :streaming)
-      # A new question re-pins the log: the user wants to watch its answer
-      # arrive even if they had paged up first.
-      |> Map.put(:follow?, true)
-      |> dismiss_suggestion()
-      |> then(&{&1, {:submit, text}})
+      dispatch_submit(state, text)
     else
       {state, nil}
+    end
+  end
+
+  defp dispatch_submit(state, text) do
+    trimmed = String.trim(text)
+
+    case Commands.split_command(trimmed) do
+      {name, rest} -> run_submitted_command(state, text, name, rest)
+      nil -> plain_or_unknown(state, text, trimmed)
+    end
+  end
+
+  defp plain_or_unknown(state, text, trimmed) do
+    case bare_slash_prefix(trimmed) do
+      nil ->
+        state
+        |> push_history(text)
+        |> append_entry(:user, text)
+        |> clear_input()
+        |> Map.put(:phase, :streaming)
+        # A new question re-pins the log: the user wants to watch its answer
+        # arrive even if they had paged up first.
+        |> Map.put(:follow?, true)
+        |> dismiss_suggestion()
+        |> then(&{&1, {:submit, text}})
+
+      # A bare token that is not a registry name can never be an ordinary
+      # message — warn instead (ADR 0020).
+      prefix ->
+        state
+        |> push_history(text)
+        |> clear_input()
+        |> Map.put(:palette, nil)
+        |> append_entry(:system, "unknown command: /#{prefix} — try /help")
+        |> then(&{&1, nil})
+    end
+  end
+
+  # The bare-slash-token test (ADR 0020): the text is exactly
+  # "/" + one whitespace-free token ("/he", "/" — not "/he x", not "hi").
+  # Callers pass the shape they mean: the raw draft for the popup, the
+  # trimmed draft for submit.
+  defp bare_slash_prefix(text) do
+    case Commands.parse(text) do
+      {:command, prefix} -> if text == "/" <> prefix, do: prefix, else: nil
+      :no_command -> nil
     end
   end
 
@@ -816,6 +956,128 @@ defmodule DashFloat.TUI.State do
   defp clear_input(state) do
     ExRatatui.textarea_set_value(state.input, "")
     state
+  end
+
+  ## Slash commands (ADR 0020 — the registry is data; transitions live here)
+
+  # Command execution with submit's bookkeeping: history push and draft clear
+  # like any submit, palette closed, then the command runs — no `:user` entry,
+  # no phase flip. `name` may be the filter's SELECTED match rather than the
+  # typed token.
+  defp run_submitted_command(state, text, name, rest) do
+    state
+    |> push_history(text)
+    |> clear_input()
+    |> Map.put(:palette, nil)
+    |> then(&run_command(&1, name, rest))
+  end
+
+  # Palette Enter — the same rule in both modes (ADR 0020). The modal command
+  # palette runs with empty args and pushes NO history: nothing was typed.
+  defp execute_palette(state, %Palette{kind: :commands, items: items, selected: selected}) do
+    run_command(%{state | palette: nil}, Enum.at(items, selected).name, "")
+  end
+
+  defp execute_palette(state, %Palette{kind: :models} = palette), do: pick_model(state, palette)
+
+  defp execute_palette(state, %Palette{kind: :profiles, items: names, selected: selected}) do
+    {%{state | palette: nil}, {:select_profile, Enum.at(names, selected)}}
+  end
+
+  # One clause per registry entry; the actions ride to the TUI ({:set_mode,
+  # _}, {:set_title, _}, {:switch_model, _}, :list_profiles, :quit).
+
+  # /clear resets the log; the input history survives (ADR 0020).
+  defp run_command(state, "clear", _rest) do
+    {%{
+       state
+       | entries: [],
+         in_flight: nil,
+         in_flight_lines: nil,
+         in_flight_dirty: false,
+         selection: nil,
+         scroll: 0,
+         follow?: true
+     }, nil}
+  end
+
+  defp run_command(state, "help", _rest) do
+    listing = Enum.map_join(Commands.all(), "\n", &"/#{&1.name} — #{&1.description}")
+    {append_entry(state, :system, listing <> "\n\n" <> @key_hints), nil}
+  end
+
+  defp run_command(state, "quit", _rest), do: {state, :quit}
+
+  # Bare /mode names the current mode; /mode <name> rides shift+tab's seam —
+  # the agent validates, applies, and echoes; no local change (ADR 0016 §7).
+  defp run_command(state, "mode", "") do
+    entry = "[mode: #{Mode.label(state.mode)} — /mode <plan|build|auto|unchained>]"
+    {append_entry(state, :system, entry), nil}
+  end
+
+  defp run_command(state, "mode", rest) do
+    case Mode.from_string(rest) do
+      {:ok, mode} ->
+        {state, {:set_mode, mode}}
+
+      :error ->
+        {append_entry(state, :system, "unknown mode: #{rest} (plan, build, auto, unchained)"),
+         nil}
+    end
+  end
+
+  # The agent owns title normalization, uniqueness, and validation — even ""
+  # goes through (ADR 0023 §7's rename seam).
+  defp run_command(state, "title", rest), do: {state, {:set_title, rest}}
+
+  # /model opens the picker over this provider's catalog entries (ADR 0009's
+  # landed sweep), the current model preselected; an empty catalog warns.
+  defp run_command(%{provider: {:ok, config}} = state, "model", _rest) do
+    case Map.get(state.catalog, config.base_url, []) do
+      [] ->
+        {append_entry(state, :system, "[model catalog is empty — nothing to pick]"), nil}
+
+      entries ->
+        selected = Enum.find_index(entries, &(&1.model == config.model)) || 0
+        palette = %Palette{mode: :modal, kind: :models, items: entries, selected: selected}
+        {%{state | palette: palette}, nil}
+    end
+  end
+
+  defp run_command(state, "model", _rest),
+    do: {append_entry(state, :system, "[model catalog is empty — nothing to pick]"), nil}
+
+  defp run_command(state, "profile", _rest), do: {state, :list_profiles}
+
+  # The model picker's Enter: a catalog id has no nickname or configured
+  # context — both nil out and the label/context denominator fall back to the
+  # catalog (ADR 0020). The switch lands on the NEXT request.
+  defp pick_model(
+         %{provider: {:ok, %DashFloat.Config{} = config}} = state,
+         %Palette{items: entries, selected: selected}
+       ) do
+    switched =
+      %DashFloat.Config{
+        config
+        | model: Enum.at(entries, selected).model,
+          nickname: nil,
+          context_tokens: nil
+      }
+
+    {%{state | provider: {:ok, switched}, palette: nil}, {:switch_model, {:ok, switched}}}
+  end
+
+  @doc """
+  The profile names for /profile's picker landed (the TUI reads
+  `DashFloat.Config.profile_names/1`, ADR 0020): the modal opens over them,
+  or an empty list warns — nothing to switch to.
+  """
+  @spec profiles_arrived(t(), [String.t()]) :: t()
+  def profiles_arrived(%__MODULE__{} = state, []),
+    do: append_entry(state, :system, "[no profiles configured]")
+
+  def profiles_arrived(%__MODULE__{} = state, names) when is_list(names) do
+    %{state | palette: %Palette{mode: :modal, kind: :profiles, items: names, selected: 0}}
   end
 
   ## Stream messages (the Phase 2 seam)
@@ -1212,10 +1474,12 @@ defmodule DashFloat.TUI.State do
   defp history_prev(state) do
     next = min((state.history_index || -1) + 1, length(state.history) - 1)
 
-    state
-    |> maybe_save_draft()
-    |> set_history_index(next)
-    |> dismiss_suggestion()
+    refresh_palette(
+      state
+      |> maybe_save_draft()
+      |> set_history_index(next)
+      |> dismiss_suggestion()
+    )
   end
 
   defp history_next(%{history_index: nil} = state), do: state
@@ -1229,9 +1493,9 @@ defmodule DashFloat.TUI.State do
         |> set_draft(state.draft)
         |> Map.put(:history_index, nil)
 
-      dismiss_suggestion(restored)
+      refresh_palette(dismiss_suggestion(restored))
     else
-      dismiss_suggestion(set_history_index(state, next))
+      refresh_palette(dismiss_suggestion(set_history_index(state, next)))
     end
   end
 
