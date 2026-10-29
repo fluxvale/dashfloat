@@ -213,6 +213,8 @@ defmodule DashFloat.TUI.Suggest do
     end
   end
 
+  def normalize({:ok, _other}), do: nil
+
   # The visibility gate: format characters (Cf — soft hyphen, word joiner)
   # and combining marks (Mn/Me) carry no width, so a ghost made ONLY of
   # them would blank the placeholder and Tab could materialize an unseen
@@ -226,8 +228,6 @@ defmodule DashFloat.TUI.Suggest do
     |> String.trim()
     |> Kernel.!=("")
   end
-
-  def normalize({:ok, _other}), do: nil
 
   defp scrub(line), do: String.replace(line, @scrub, "")
 
