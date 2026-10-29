@@ -168,6 +168,18 @@ instructions instead of a reply. This live-key run is the manual smoke step —
 the test suite is offline and deterministic (recorded SSE fixtures plus a
 loopback server).
 
+**Sessions persist.** Every turn is saved under
+`~/.local/share/dashfloat/sessions/` (`XDG_DATA_HOME` respected) — one JSON
+file per session, mode 0600, because a transcript carries code and tool
+output read from your disk. Ids sort by time; list them with
+`ls ~/.local/share/dashfloat/sessions/` and pick a conversation back up with
+`dashfloat --resume <id>` — the transcript replays in the log and your next
+send continues it. A session records the profile and model it started under;
+resuming under a different one warns and continues, and the session keeps its
+pin. A malformed or newer-version session file refuses loudly, naming the
+path — it is never auto-deleted or rewritten. Details:
+[ADR 0014](docs/decisions/0014-session-persistence.md).
+
 ## Stack
 
 - [Elixir](https://elixir-lang.org) 1.20 / Erlang/OTP 29

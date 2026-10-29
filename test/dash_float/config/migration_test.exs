@@ -564,7 +564,10 @@ defmodule DashFloat.Config.MigrationTest do
   ## tmp+rename atomic, so every intermediate is either whole or absent,
   ## and the cells below ARE those intermediates (keys written + identical
   ## .bak + v1 main = post-keys crash; identical .bak + v1 main = post-
-  ## backup crash; occupied .bak.tmp = blocked re-run).
+  ## backup crash; occupied .bak = the backup never lands). Since the
+  ## unique staging name (ADR 0014 §7) the planted .tmp cells are inert
+  ## leftovers rather than blockers — kept as pre-states the outcome must
+  ## stay safe under.
 
   describe "invariant sweep: no credential value is ever silently lost" do
     @shapes %{
@@ -667,9 +670,10 @@ defmodule DashFloat.Config.MigrationTest do
           write_keys_file!(dir, "{ broken")
 
         :keys_tmp_blocked ->
-          # The keys WRITE failure state (delta-2 modeling note): the split
-          # reaches write_keys with a blocked tmp path — backup already
-          # written, settings still untouched.
+          # Was the keys WRITE failure state; the unique staging name
+          # (ADR 0014 §7) made a planted tmp path inert — the split now
+          # writes around it. The cell stays: a directory at the legacy
+          # staging name must change nothing about the outcome's safety.
           keys_tmp = Path.join(dir, "keys.json5.tmp")
           File.mkdir!(keys_tmp)
 
@@ -710,6 +714,9 @@ defmodule DashFloat.Config.MigrationTest do
           write_backup!(dir, "// stale pre-split backup")
 
         :tmp_occupied ->
+          # Was a blocked backup write; the unique staging name (ADR 0014
+          # §7) made a planted tmp inert. The cell stays as a constructible
+          # pre-state the outcome must stay safe under.
           File.mkdir!(backup_tmp)
 
         # Delta-2 P2 shapes: a .bak that is a symlink (lstat, never the
@@ -843,7 +850,7 @@ defmodule DashFloat.Config.MigrationTest do
           assert File.lstat!(backup_path).type == :symlink, "cell #{cell}: .bak link replaced"
         end
 
-        # The blocked keys tmp path is likewise untouched.
+        # The planted legacy tmp directory is likewise untouched.
         if keys_state == :keys_tmp_blocked do
           blocked = Path.join(dir, "keys.json5.tmp")
           assert File.lstat!(blocked).type == :directory, "cell #{cell}: keys tmp replaced"
@@ -1170,10 +1177,11 @@ defmodule DashFloat.Config.MigrationTest do
       assert mode(legacy) == 0o600
     end
 
-    # Hostile review P2-2: a pre-planted keys.json5.tmp symlink was chmod'd
-    # and written THROUGH — the victim lost its mode and content, and
-    # keys.json5 ended as the symlink itself.
-    test "a pre-planted .tmp symlink is refused, never written through" do
+    # Hostile review P2-2 pinned a pre-planted keys.json5.tmp symlink being
+    # chmod'd and written THROUGH. The unique staging name (ADR 0014 §7)
+    # retires that staging path: the write now succeeds around a planted
+    # .tmp, and the link is untouched — never written through.
+    test "a pre-planted .tmp symlink is untouched by the write" do
       dir = write_v1!(tmp_dir())
 
       victim = Path.join(dir, "user-notes.txt")
@@ -1181,21 +1189,24 @@ defmodule DashFloat.Config.MigrationTest do
       File.chmod!(victim, 0o644)
       File.ln_s!(victim, Path.join(dir, "keys.json5.tmp"))
 
-      logs =
-        capture_log(fn ->
-          assert {:error, message} = @migration.maybe_migrate(dir)
-          assert message =~ "not a regular file"
-          assert message =~ "keys.json5.tmp"
-        end)
+      capture_log(fn ->
+        assert {:ok, :migrated} = @migration.maybe_migrate(dir)
+      end)
 
-      assert logs == ""
+      planted = Path.join(dir, "keys.json5.tmp")
+      assert %File.Stat{type: :symlink} = File.lstat!(planted)
       assert File.read!(victim) == "keep me"
       assert mode(victim) == 0o644
-      refute File.exists?(paths(dir).keys)
-      assert File.read!(paths(dir).main) == v1_inline()
+
+      assert {:ok, %{"work" => %{"https://provider.example/v1" => "PLACEHOLDER-work-key"}}} =
+               decoded_keys(dir)
+
+      # The split completed around the planted link: the live settings file
+      # carries no credential anymore.
+      refute File.read!(paths(dir).main) =~ "PLACEHOLDER"
     end
 
-    test "regular .tmp crash debris is replaced by the write" do
+    test "a stale regular .tmp is inert debris: the write stages at a unique name" do
       dir = write_v1!(tmp_dir())
       tmp = Path.join(dir, "keys.json5.tmp")
       File.write!(tmp, "// debris from an interrupted run")
@@ -1205,18 +1216,22 @@ defmodule DashFloat.Config.MigrationTest do
       assert {:ok, %{"work" => %{"https://provider.example/v1" => "PLACEHOLDER-work-key"}}} =
                decoded_keys(dir)
 
-      refute File.exists?(tmp)
+      # The debris is no longer the staging name: the write neither consumed
+      # nor removed it.
+      assert File.read!(tmp) == "// debris from an interrupted run"
     end
 
     # Round-2 P1: the no-loss decision must be made from the backup's
-    # ACTUAL outcome, not from the .bak's pre-existence — a failing backup
-    # write (occupied .bak.tmp) plus a differing key used to "migrate" with
-    # the key in no file.
-    test "an occupied .bak.tmp with a differing key refuses — the backup's failure feeds the decision" do
+    # ACTUAL outcome, not from a prediction. (The occupied path moved from
+    # .bak.tmp to the .bak destination itself: the unique staging name made
+    # a planted tmp inert, so the closest constructible state blocks the
+    # backup destination — the backup is then KEPT, never clobbered, and
+    # the decision refuses the same way.)
+    test "an occupied .bak with a differing key refuses — the backup's outcome feeds the decision" do
       dir = write_v1!(tmp_dir())
       keys = write_keys_file!(dir, "{'work': 'PLACEHOLDER-work-old',}")
-      blocked_tmp = Path.join(dir, "settings.json5.bak.tmp")
-      File.mkdir!(blocked_tmp)
+      blocked = Path.join(dir, "settings.json5.bak")
+      File.mkdir!(blocked)
 
       logs =
         capture_log(fn ->
@@ -1225,15 +1240,13 @@ defmodule DashFloat.Config.MigrationTest do
           refute message =~ "PLACEHOLDER"
         end)
 
-      # No destructive step, and the user's occupied tmp path is untouched.
-      assert logs =~ "cannot write settings.json5.bak"
-      refute logs =~ "backed up first"
+      # No destructive step, and the user's occupied path is untouched.
+      assert logs =~ "not a regular file"
       main = File.read!(paths(dir).main)
       assert main =~ "PLACEHOLDER-work-key"
       assert main =~ "PLACEHOLDER-personal-key"
       assert File.read!(keys) =~ "PLACEHOLDER-work-old"
-      assert File.lstat!(blocked_tmp).type == :directory
-      refute File.exists?(paths(dir).settings_backup)
+      assert File.lstat!(blocked).type == :directory
     end
 
     # Round-2 P1-adjacent: duplicate profile names — the loader tolerates

@@ -238,9 +238,11 @@ defmodule DashFloat.TUITest do
     keys_file = Path.join(dir, "keys.json5")
     File.write!(keys_file, "{}")
     File.chmod!(keys_file, 0o600)
-    # Block the settings write: its tmp staging path is a directory.
-    blocked_tmp = Path.join(dir, "settings.json5.tmp")
-    File.mkdir_p!(blocked_tmp)
+    # Block the settings WRITE itself (the unique staging name made a
+    # planted .tmp inert): the directory is read-but-not-writable, so the
+    # pre-write checks pass and Posture's touch of the staging file fails.
+    on_exit(fn -> File.chmod!(dir, 0o700) end)
+    File.chmod!(dir, 0o500)
 
     {:ok, pid} =
       start_tui(
@@ -262,8 +264,6 @@ defmodule DashFloat.TUITest do
 
     # The refusal bounced the wizard off :done — the error and remedy are on
     # screen, the done screen's copy never rendered, no file appeared.
-    settings_path = Path.join(dir, "settings.json5")
-
     bounced =
       eventually(pid, fn s ->
         s.setup != nil and s.setup.step == :loop and s.setup.error != nil
@@ -272,6 +272,8 @@ defmodule DashFloat.TUITest do
     assert bounced.setup.error =~ "cannot write"
     assert screen_text(bounced) =~ "cannot write"
     refute screen_text(bounced) =~ "All set"
+
+    settings_path = Path.join(dir, "settings.json5")
     refute File.exists?(settings_path)
   end
 

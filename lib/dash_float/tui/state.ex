@@ -14,6 +14,7 @@ defmodule DashFloat.TUI.State do
   """
 
   alias DashFloat.Config.Onboarding
+  alias DashFloat.Tools
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.View
@@ -200,10 +201,15 @@ defmodule DashFloat.TUI.State do
   (ADR 0005); the agent the UI talks to as `:agent` (pid or name, default
   `DashFloat.Agent` — ADR 0007). The `cwd` label is computed here, once —
   status truth, not I/O per frame (ADR 0006).
+
+  The resume opts (ADR 0014 §6) derive the resumed log: `:transcript` is the
+  decoded string-keyed message list `DashFloat.Session.load` returns, replayed
+  through the exact render path live entries use; `:resume_note` appends last
+  as a `:system` entry when non-nil. Replay is pure and stats stay zeroed.
   """
   @spec new(keyword()) :: t()
   def new(opts) do
-    %__MODULE__{
+    state = %__MODULE__{
       input: ExRatatui.textarea_new(),
       provider: Keyword.get(opts, :provider),
       agent: Keyword.get(opts, :agent, DashFloat.Agent),
@@ -216,6 +222,97 @@ defmodule DashFloat.TUI.State do
       resolve: Keyword.get(opts, :resolve),
       catalog_fetcher: Keyword.get(opts, :catalog_fetcher)
     }
+
+    replay(state, Keyword.get(opts, :transcript, []), Keyword.get(opts, :resume_note))
+  end
+
+  ## Transcript replay (ADR 0014 §6)
+
+  # The resumed log is derived, never read from disk: each loaded message
+  # rides the exact render path live entries use and lands through put_entry,
+  # so `logical` is freshly built and `lines` wrap at the current width.
+  # Pure — Render/Markdown/Wrap only, like live appends.
+  defp replay(state, transcript, note) do
+    {replayed, _names} = Enum.reduce(transcript, {state, %{}}, &replay_message/2)
+    resume_note(replayed, note)
+  end
+
+  defp resume_note(state, nil), do: state
+  defp resume_note(state, note) when is_binary(note), do: append_entry(state, :system, note)
+
+  defp replay_message(%{"role" => "user", "content" => text}, {state, names}) do
+    {append_entry(state, :user, text), names}
+  end
+
+  # The prose lands first (markdown path), then one gear row per announced
+  # call — a nil/empty content makes no assistant entry. Each call id
+  # registers its name for the tool rows that follow it.
+  defp replay_message(%{"role" => "assistant"} = message, {state, names}) do
+    content = message["content"]
+
+    state =
+      if is_binary(content) and content != "" do
+        append_entry(state, :assistant, content)
+      else
+        state
+      end
+
+    Enum.reduce(message["tool_calls"] || [], {state, names}, fn call, {st, nm} ->
+      function = call["function"]
+      name = function["name"]
+      {text, lines} = Render.tool_call(name, decoded_args(function["arguments"]))
+      {put_entry(st, :tool, text, lines), Map.put(nm, call["id"], name)}
+    end)
+  end
+
+  # The call name comes from the announcing batch; an id no batch announced
+  # (hand damage the loader's refusals exist to catch) degrades the row to
+  # the literal name "tool" — a malformed transcript must never kill the
+  # mount (ADR 0014 §6). Status and display excerpt re-derive through the
+  # same Tools helpers the live display messages use — one derivation, two
+  # callers.
+  defp replay_message(
+         %{"role" => "tool", "tool_call_id" => id, "content" => content},
+         {state, names}
+       ) do
+    {name, names} = Map.pop(names, id, "tool")
+    result = replay_result(content)
+
+    {text, lines} =
+      Render.tool_result(name, Tools.display_status(result), Tools.display_excerpt(result))
+
+    {put_entry(state, :tool, text, lines), names}
+  end
+
+  # `function.arguments` is opaque at load; replay decodes it for the summary
+  # only. Anything but a JSON object renders the "(invalid arguments)" arm.
+  defp decoded_args(args) do
+    case Jason.decode(args) do
+      {:ok, %{} = args} -> args
+      _other -> nil
+    end
+  end
+
+  # The stored result is the JSON the agent gave the model. A payload that
+  # does not decode to a JSON object displays as an error row with no output —
+  # never a crash. Its keys are our own closed result shape, so the known
+  # fields are picked back to atoms for the Tools helpers' matchers (no
+  # dynamic atoms — ADR 0014 §3).
+  defp replay_result(content) do
+    case Jason.decode(content) do
+      {:ok, %{} = result} ->
+        %{
+          ok: result["ok"],
+          rejected: result["rejected"],
+          cancelled: result["cancelled"],
+          error: result["error"],
+          output: result["output"],
+          content: result["content"]
+        }
+
+      _other ->
+        %{}
+    end
   end
 
   @doc """

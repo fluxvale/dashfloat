@@ -1,21 +1,26 @@
 defmodule DashFloat.CLI do
   @moduledoc """
   Startup-argument parsing for the profile/model selection flags
-  ([ADR 0008](../decisions/0008-config-layout-profiles-json5.md)).
+  ([ADR 0008](../decisions/0008-config-layout-profiles-json5.md)) and the
+  session-resume flag ([ADR 0014](../decisions/0014-session-persistence.md)
+  §6).
 
-  `parse/1` turns argv into a keyword list the config loader consumes:
-  `[profile: "work", model: "Sol"]`. Accepted forms: `--profile work`,
-  `--profile=work`, `--model Sol`, `--model=Sol`. A switch without a value,
+  `parse/1` turns argv into a keyword list the config loader and the boot
+  consume: `[profile: "work", model: "Sol", resume: "20261027-143052-a1b2c3"]`.
+  Accepted forms: `--profile work`, `--profile=work`, `--model Sol`,
+  `--model=Sol`, `--resume <id>`, `--resume=<id>`. A switch without a value,
   an unrecognized argument, or a repeated switch warns and is ignored —
   argument mistakes must not crash startup, and the config loader's own
   unknown-profile/model warnings still surface the miss. Everything is
-  startup-time; runtime switching is a named future slice in the ADR.
+  startup-time; runtime switching is a named future slice in the ADR. The
+  resume id is a plain session-file id (never a secret); the boot consumes it
+  after config classification.
   """
 
   require Logger
 
-  @flags ["--profile", "--model"]
-  @keys %{"--profile" => :profile, "--model" => :model}
+  @flags ["--profile", "--model", "--resume"]
+  @keys %{"--profile" => :profile, "--model" => :model, "--resume" => :resume}
 
   @doc """
   Whether argv asks for the version (`--version`), which the boot handles and

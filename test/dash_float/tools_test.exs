@@ -262,4 +262,51 @@ defmodule DashFloat.ToolsTest do
       end
     end
   end
+
+  describe "cancelled_result/0" do
+    test "is the cancelled result the agent writes and the loader synthesizes" do
+      assert Tools.cancelled_result() == %{ok: false, cancelled: true}
+      assert Jason.encode!(Tools.cancelled_result()) == ~s({"ok":false,"cancelled":true})
+    end
+  end
+
+  describe "display_status/1" do
+    test "derives the row status from the result shape" do
+      assert Tools.display_status(%{rejected: true}) == "rejected"
+      assert Tools.display_status(%{cancelled: true}) == "cancelled"
+      assert Tools.display_status(%{ok: true}) == "ok"
+      assert Tools.display_status(%{ok: false, error: "boom"}) == "error: boom"
+    end
+
+    test "caps the error message at 160 characters" do
+      assert Tools.display_status(%{error: String.duplicate("x", 200)}) ==
+               "error: " <> String.duplicate("x", 160)
+    end
+
+    test "anything else is a plain error" do
+      assert Tools.display_status(%{}) == "error"
+      assert Tools.display_status(%{ok: false}) == "error"
+    end
+  end
+
+  describe "display_excerpt/1" do
+    test "passes a body of at most 30 lines through whole" do
+      assert Tools.display_excerpt(%{output: "a\nb"}) == "a\nb"
+      assert Tools.display_excerpt(%{content: "one line"}) == "one line"
+
+      body = Enum.map_join(1..30, "\n", &to_string/1)
+      assert Tools.display_excerpt(%{output: body}) == body
+    end
+
+    test "caps longer bodies at 30 lines" do
+      body = Enum.map_join(1..31, "\n", &to_string/1)
+
+      assert Tools.display_excerpt(%{output: body}) == Enum.map_join(1..30, "\n", &to_string/1)
+    end
+
+    test "output wins over content; neither means nil" do
+      assert Tools.display_excerpt(%{output: "out", content: "in"}) == "out"
+      assert Tools.display_excerpt(%{ok: true}) == nil
+    end
+  end
 end

@@ -11,7 +11,12 @@
   modal and the onboarding wizard, rendered in place of the chat chrome
   until setup clears; specification and screens:
   [ADR 0009](0009-config-v3-persona-profiles.md) § "Startup classification"
-  and § "First-run onboarding wizard")
+  and § "First-run onboarding wizard"); **amended 2026-10-27**
+  ([issue #27](https://github.com/fluxvale/dashfloat/issues/27) — the
+  agent transcript, not entry text, is the persistence truth; entries are
+  derived; see
+  [Amendment (2026-10-27, issue #27): persistence truth moves to the transcript](#amendment-2026-10-27-issue-27-persistence-truth-moves-to-the-transcript)
+  below)
 - **Date:** 2026-10-24
 - **Implements:** [issue #16](https://github.com/fluxvale/dashfloat/issues/16) — Phase 2.5 of the
   [ADR 0001](0001-founding-stack-and-architecture.md) roadmap.
@@ -524,6 +529,36 @@ owns selection over the log.
   vocabulary exactly; confirmation UI remains out of scope until then.
 
 ---
+
+## Amendment (2026-10-27, issue #27): persistence truth moves to the transcript
+
+**Status:** Accepted. Supersedes exactly one clause of this ADR — the
+"Entries carry rendered lines" section's claim that `text` is "kept verbatim
+for persistence (Phase 4)" (retained by the word-wrap amendment as "`text`
+stays the persistence truth"). Everything else about entries stands:
+`text` remains the verbatim plain-text render cache, `logical` the width-free
+render truth, `lines` its wrap at the current width.
+
+- **The persistence truth is the agent transcript** — `DashFloat.Agent`'s
+  `state.messages`, provider-shaped (assistant messages carry `tool_calls`
+  with ids and full argument JSON; tool messages carry `tool_call_id` and the
+  complete bounded result). Only the transcript round-trips: a log persisted
+  from `text` has no tool ids, no argument JSON, and 30-line excerpts where
+  the model needs the full result — reloading it would replay prettily and
+  then die on ADR 0007 §1's dangling-`tool_calls` API error.
+- **Entries are derived state.** Live, they derive from the display contract
+  as today. After resume, they are rebuilt by replaying the transcript
+  through the same render path — user/assistant content through
+  `Render.entry_lines/2`, tool calls through `Render.tool_call/2`, tool
+  results through `Render.tool_result/3` — so `logical`/`lines` are freshly
+  built, never loaded.
+- **Nothing display-only is persisted or survives resume**: `[cancelled]`,
+  `[stream failed: …]`, `[model returned nothing]`, `[tool run cancelled]`,
+  and confirmation previews exist for the screen; the 30-line excerpt cap
+  stays a display cap (recomputed from the full result at replay).
+
+Specification, file format, and resume semantics:
+[ADR 0014](0014-session-persistence.md).
 
 ## Amendment (2026-10-24, issue #21): mouse wheel routing
 

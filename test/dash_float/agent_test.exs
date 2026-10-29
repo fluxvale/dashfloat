@@ -12,6 +12,7 @@ defmodule DashFloat.AgentTest do
 
   alias DashFloat.Agent
   alias DashFloat.Config
+  alias DashFloat.Session
   alias DashFloat.SSEServer
   alias DashFloat.TUI.State
 
@@ -46,6 +47,19 @@ defmodule DashFloat.AgentTest do
     rest =
       for frag <- arg_fragments do
         ~s(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":#{Jason.encode!(frag)}}}]}}]}\n\n)
+      end
+
+    [opening | rest]
+  end
+
+  # A third parallel call on index 2.
+  defp tool_frames_2(id, name, arg_fragments) do
+    opening =
+      ~s(data: {"choices":[{"index":2,"delta":{"tool_calls":[{"index":2,"id":"#{id}","type":"function","function":{"name":"#{name}","arguments":""}}]}}]}\n\n)
+
+    rest =
+      for frag <- arg_fragments do
+        ~s(data: {"choices":[{"index":2,"delta":{"tool_calls":[{"index":2,"function":{"arguments":#{Jason.encode!(frag)}}}]}}]}\n\n)
       end
 
     [opening | rest]
@@ -88,6 +102,8 @@ defmodule DashFloat.AgentTest do
         cwd: cwd,
         exec_timeout: Keyword.get(opts, :exec_timeout, 500),
         supervisor: sup,
+        session_dir: Keyword.get(opts, :session_dir),
+        resume: Keyword.get(opts, :resume),
         name: nil
       )
 
@@ -97,6 +113,18 @@ defmodule DashFloat.AgentTest do
     end)
 
     {agent, sup}
+  end
+
+  # The id of the single session file in a test's sessions dir.
+  defp session_id(dir) do
+    [file] = File.ls!(dir)
+    Path.rootname(file)
+  end
+
+  defp read_session(dir) do
+    dir
+    |> Path.join(session_id(dir) <> ".json")
+    |> File.read!()
   end
 
   # Decodes the messages array of a forwarded request body.
@@ -811,6 +839,619 @@ defmodule DashFloat.AgentTest do
     refute_receive {:token, _text}, 100
     refute_receive {:entry, :system, _text}, 100
     assert Process.alive?(agent)
+  end
+
+  ## Session persistence (ADR 0014 §5)
+
+  @tag :tmp_dir
+  test "no session file appears before the first prompt", ctx do
+    server = start_server([final_episode("unused")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    # The directory is created on demand at the first save — a launch that
+    # never prompts leaves nothing.
+    refute File.exists?(sessions)
+
+    DashFloat.TestTeardown.stop(agent)
+  end
+
+  @tag :tmp_dir
+  test "a completed read_file turn persists the full transcript, untruncated", ctx do
+    # 40 lines: the log row shows a 30-line excerpt, the transcript must hold
+    # the whole result the model received.
+    body = Enum.map_join(1..40, "\n", &"line #{&1}")
+    write_sandbox(ctx, "long.txt", body <> "\n")
+
+    server =
+      start_server([
+        call_tool_episode("call_1", "read_file", %{"path" => "long.txt"}),
+        final_episode("read it all")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "read it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+    assert_receive {:tool_result, %{id: "call_1", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    id = session_id(sessions)
+    {:ok, session} = Session.load(sessions, id)
+
+    assert session.version == 1
+    assert session.id == id
+    assert is_binary(session.created_at)
+
+    assert session.pin == %{
+             profile: nil,
+             model: "test-model",
+             base_url: SSEServer.base_url(server)
+           }
+
+    args_json = Jason.encode!(%{"path" => "long.txt"})
+
+    result_json =
+      Jason.encode!(%{
+        ok: true,
+        path: "long.txt",
+        content: body,
+        lines: 40,
+        total_lines: 40,
+        total_bytes: byte_size(body) + 1,
+        truncated: false
+      })
+
+    assert session.messages == [
+             %{"role" => "user", "content" => "read it"},
+             %{
+               "role" => "assistant",
+               "content" => nil,
+               "tool_calls" => [
+                 %{
+                   "id" => "call_1",
+                   "type" => "function",
+                   "function" => %{"name" => "read_file", "arguments" => args_json}
+                 }
+               ]
+             },
+             %{"role" => "tool", "tool_call_id" => "call_1", "content" => result_json},
+             %{"role" => "assistant", "content" => "read it all"}
+           ]
+  end
+
+  @tag :tmp_dir
+  test "paused at the confirmation the file holds the dangling batch; approval completes it",
+       ctx do
+    args = %{"path" => "out/hello.txt", "content" => "hi there"}
+
+    server =
+      start_server([
+        call_tool_episode("call_1", "write_file", args),
+        final_episode("wrote it")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "create the file"})
+    assert_receive {:confirm, ref, %{id: "call_1"}}, 2_000
+
+    id = session_id(sessions)
+    bytes = read_session(sessions)
+
+    # The deliberately-dangling write: the batch is on disk with no tool
+    # message yet — exactly the shape load repairs after a kill.
+    assert %{
+             "version" => 1,
+             "id" => ^id,
+             "created_at" => created_at,
+             "pin" => %{"profile" => nil, "model" => "test-model"},
+             "messages" => [
+               %{"role" => "user", "content" => "create the file"},
+               %{
+                 "role" => "assistant",
+                 "content" => nil,
+                 "tool_calls" => [
+                   %{
+                     "id" => "call_1",
+                     "type" => "function",
+                     "function" => %{"name" => "write_file", "arguments" => args_json}
+                   }
+                 ]
+               }
+             ]
+           } = Jason.decode!(bytes)
+
+    assert is_binary(created_at)
+    assert args_json == Jason.encode!(args)
+    assert String.ends_with?(bytes, "\n")
+
+    send(agent, {:confirm_decision, ref, :approved})
+    assert_receive {:tool_result, %{id: "call_1", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    {:ok, session} = Session.load(sessions, id)
+
+    assert [%{"role" => "user"}, %{"role" => "assistant"}, tool, final] = session.messages
+
+    assert Jason.decode!(tool["content"]) == %{
+             "ok" => true,
+             "path" => "out/hello.txt",
+             "bytes" => 8,
+             "created" => true
+           }
+
+    assert final["content"] == "wrote it"
+  end
+
+  @tag :tmp_dir
+  test "a base_url carrying a query never pins its secret into the session file", ctx do
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    secret = "SECRET-QUERY-SENTINEL"
+
+    leaked_url = SSEServer.base_url(server) <> "?api_key=" <> secret
+
+    {:ok, sup} = Task.Supervisor.start_link()
+
+    {:ok, agent} =
+      Agent.start_link(
+        provider: {:ok, %Config{base_url: leaked_url, model: "test-model", api_key: "k"}},
+        cwd: ctx.tmp_dir,
+        session_dir: sessions,
+        supervisor: sup,
+        name: nil
+      )
+
+    on_exit(fn ->
+      DashFloat.TestTeardown.stop(agent)
+      if Process.alive?(sup), do: Process.exit(sup, :kill)
+    end)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+
+    id = session_id(sessions)
+    {:ok, session} = Session.load(sessions, id)
+
+    # The pin is the query-free endpoint; the secret reaches neither.
+    assert session.pin.base_url == SSEServer.base_url(server)
+
+    session_path = Path.join(sessions, id <> ".json")
+    bytes = File.read!(session_path)
+    refute bytes =~ secret
+    refute bytes =~ "api_key"
+
+    ## The unparsable fallback: a base_url URI.parse cannot split into
+    ## scheme+host pins the RAW string — endpoint identity as given, never
+    ## mangled. The turn cannot stream, but the prompt-time save already
+    ## pinned the endpoint.
+    raw_sessions = Path.join(ctx.tmp_dir, "raw-sessions")
+
+    {:ok, raw_sup} = Task.Supervisor.start_link()
+
+    {:ok, raw_agent} =
+      Agent.start_link(
+        provider: {:ok, %Config{base_url: "not-a-url", model: "test-model", api_key: "k"}},
+        cwd: ctx.tmp_dir,
+        session_dir: raw_sessions,
+        supervisor: raw_sup,
+        name: nil
+      )
+
+    on_exit(fn ->
+      DashFloat.TestTeardown.stop(raw_agent)
+      if Process.alive?(raw_sup), do: Process.exit(raw_sup, :kill)
+    end)
+
+    send(raw_agent, {:prompt, self(), "hello"})
+    assert_receive {:entry, :system, failure}, 2_000
+    assert failure =~ "llm:"
+    assert_receive {:phase, :idle}, 2_000
+
+    raw_id = session_id(raw_sessions)
+    assert {:ok, raw_session} = Session.load(raw_sessions, raw_id)
+    assert raw_session.pin.base_url == "not-a-url"
+  end
+
+  @tag :tmp_dir
+  test "a batch announcing the SAME id twice: both calls execute and persist distinct ids", ctx do
+    write_sandbox(ctx, "notes.md", "seed\n")
+
+    # Both parallel calls announce the same id — a sloppy provider's batch.
+    frames =
+      tool_frames("call_dup", "read_file", [~s({"path":"notes.md"})]) ++
+        tool_frames_1("call_dup", "list_directory", [~s({"path":"."})])
+
+    server =
+      start_server([
+        [{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close],
+        final_episode("both done")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "run both"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    # Both calls execute; the repeat carries its occurrence rename.
+    assert_receive {:tool_result, %{id: "call_dup", ok: true}}, 2_000
+    assert_receive {:tool_result, %{id: "call_dup-2", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # The persisted transcript carries distinct ids, answered one-to-one —
+    # a file with a repeated id would refuse to load at all (ADR 0014 §4).
+    id = session_id(sessions)
+    {:ok, session} = Session.load(sessions, id)
+
+    assert [
+             %{"role" => "user"},
+             %{"role" => "assistant", "content" => nil, "tool_calls" => calls},
+             tool_a,
+             tool_b,
+             %{"role" => "assistant", "content" => "both done"}
+           ] = session.messages
+
+    assert Enum.map(calls, & &1["id"]) == ["call_dup", "call_dup-2"]
+    assert Enum.map([tool_a, tool_b], & &1["tool_call_id"]) == ["call_dup", "call_dup-2"]
+
+    # Each answer is its own call's result, not one call's twice.
+    assert Jason.decode!(tool_a["content"])["path"] == "notes.md"
+
+    result_b = Jason.decode!(tool_b["content"])
+    assert Map.has_key?(result_b, "entries")
+  end
+
+  @tag :tmp_dir
+  test "a batch of call_1/call_1/call_1-2 renames to distinct ids that load", ctx do
+    # The third call's ORIGINAL id is exactly the second call's rename: a
+    # counter-only rename would produce [call_1, call_1-2, call_1-2] — a
+    # file load refuses and the model gets two answers under one id. The
+    # used-id-set rename continues the sequence instead: [call_1, call_1-2,
+    # call_1-3].
+    write_sandbox(ctx, "notes.md", "seed\n")
+
+    frames =
+      tool_frames("call_1", "read_file", [~s({"path":"notes.md"})]) ++
+        tool_frames_1("call_1", "list_directory", [~s({"path":"."})]) ++
+        tool_frames_2("call_1-2", "read_file", [~s({"path":"notes.md"})])
+
+    server =
+      start_server([
+        [{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close],
+        final_episode("three done")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "run all three"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:tool_result, %{id: "call_1", ok: true}}, 2_000
+    assert_receive {:tool_result, %{id: "call_1-2", ok: true}}, 2_000
+    assert_receive {:tool_result, %{id: "call_1-3", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    id = session_id(sessions)
+
+    # The persisted file carries the three distinct ids and LOADS — a
+    # duplicate would refuse at load (ADR 0014 §4).
+    assert {:ok, session} = Session.load(sessions, id)
+
+    assert [
+             %{"role" => "user"},
+             %{"role" => "assistant", "content" => nil, "tool_calls" => calls},
+             tool_a,
+             tool_b,
+             tool_c,
+             %{"role" => "assistant", "content" => "three done"}
+           ] = session.messages
+
+    assert Enum.map(calls, & &1["id"]) == ["call_1", "call_1-2", "call_1-3"]
+
+    assert Enum.map([tool_a, tool_b, tool_c], & &1["tool_call_id"]) == [
+             "call_1",
+             "call_1-2",
+             "call_1-3"
+           ]
+  end
+
+  @tag :tmp_dir
+  test "a colliding id that is itself a rename form with an unused base continues its own name",
+       ctx do
+    # ["dup-2", "dup-2"]: the second dup-2 collides, but its base "dup" was
+    # never announced — the sequence continues on the id itself (dup-2-2),
+    # not on the never-used base.
+    write_sandbox(ctx, "notes.md", "seed\n")
+
+    frames =
+      tool_frames("dup-2", "read_file", [~s({"path":"notes.md"})]) ++
+        tool_frames_1("dup-2", "list_directory", [~s({"path":"."})])
+
+    server =
+      start_server([
+        [{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close],
+        final_episode("pair done")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "run the pair"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:tool_result, %{id: "dup-2", ok: true}}, 2_000
+    assert_receive {:tool_result, %{id: "dup-2-2", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    id = session_id(sessions)
+    assert {:ok, session} = Session.load(sessions, id)
+
+    assert [
+             %{"role" => "user"},
+             %{"role" => "assistant", "content" => nil, "tool_calls" => calls},
+             tool_a,
+             tool_b,
+             %{"role" => "assistant", "content" => "pair done"}
+           ] = session.messages
+
+    assert Enum.map(calls, & &1["id"]) == ["dup-2", "dup-2-2"]
+    assert Enum.map([tool_a, tool_b], & &1["tool_call_id"]) == ["dup-2", "dup-2-2"]
+  end
+
+  @tag :tmp_dir
+  test "a mid-batch cancel persists cancelled results for the whole batch", ctx do
+    frames =
+      tool_frames("call_run", "execute_command", [~s({"command":"sleep 10"})]) ++
+        tool_frames_1("call_read", "read_file", [~s({"path":"never.txt"})])
+
+    server = start_server([[{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close]])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir, session_dir: sessions, exec_timeout: 30_000)
+
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:confirm, ref, %{id: "call_run"}}, 2_000
+    send(agent, {:confirm_decision, ref, :approved})
+    assert_receive {:phase, :executing_tool}, 1_000
+
+    send(agent, {:cancel})
+
+    assert_receive {:tool_result, %{id: "call_run", status: "cancelled"}}, 3_000
+    assert_receive {:entry, :system, "[tool run cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+
+    assert [
+             %{"role" => "user"},
+             %{"role" => "assistant", "tool_calls" => calls},
+             tool_run,
+             tool_read
+           ] = session.messages
+
+    assert Enum.map(calls, & &1["id"]) == ["call_run", "call_read"]
+    assert tool_run["tool_call_id"] == "call_run"
+    assert tool_read["tool_call_id"] == "call_read"
+
+    # The executed call keeps Exec's own cancelled report; the queued call is
+    # filled with the bare cancelled result — both real JSON, never "null".
+    assert %{"ok" => false, "cancelled" => true} = Jason.decode!(tool_run["content"])
+    assert Jason.decode!(tool_read["content"]) == %{"ok" => false, "cancelled" => true}
+  end
+
+  @tag :tmp_dir
+  test "a save failure degrades to a system entry and the turn still completes", ctx do
+    # A regular file where the sessions directory should be: mkdir_p refuses.
+    blocked = Path.join(ctx.tmp_dir, "not-a-dir")
+    File.write!(blocked, "a file, not a directory")
+
+    server = start_server([final_episode("still fine")])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: blocked)
+
+    send(agent, {:prompt, self(), "hello"})
+
+    # Each failing save warns once and names the path; the episode continues.
+    assert_receive {:entry, :system, text}, 2_000
+    assert String.starts_with?(text, "[session not saved: ")
+    assert text =~ blocked
+
+    assert_receive {:token, "still fine"}, 2_000
+    assert_receive {:entry, :system, "[session not saved: " <> _}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+    assert Process.alive?(agent)
+  end
+
+  @tag :tmp_dir
+  test "session_dir nil (the default) writes no session file anywhere", ctx do
+    write_sandbox(ctx, "notes.md", "seed\n")
+
+    server =
+      start_server([
+        call_tool_episode("call_1", "read_file", %{"path" => "notes.md"}),
+        final_episode()
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    send(agent, {:prompt, self(), "read it"})
+    assert_receive {:tool_result, %{id: "call_1", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # The sandbox holds only what the tool itself wrote.
+    assert File.ls!(ctx.tmp_dir) == ["notes.md"]
+  end
+
+  @tag :tmp_dir
+  test "the provider's api_key never reaches the session file", ctx do
+    sentinel = "sentinel-key-" <> String.duplicate("x", 32)
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {:ok, sup} = Task.Supervisor.start_link()
+
+    {:ok, agent} =
+      Agent.start_link(
+        provider:
+          {:ok,
+           %Config{base_url: SSEServer.base_url(server), model: "test-model", api_key: sentinel}},
+        cwd: ctx.tmp_dir,
+        session_dir: sessions,
+        supervisor: sup,
+        name: nil
+      )
+
+    on_exit(fn ->
+      DashFloat.TestTeardown.stop(agent)
+      if Process.alive?(sup), do: Process.exit(sup, :kill)
+    end)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+
+    bytes = read_session(sessions)
+    refute bytes =~ sentinel
+    refute bytes =~ "api_key"
+  end
+
+  @tag :tmp_dir
+  test "kill round-trip: a mid-batch kill resumes with the repaired transcript", ctx do
+    args = %{"path" => "out/killed.txt", "content" => "never finished"}
+
+    server =
+      start_server([
+        call_tool_episode("call_k", "write_file", args),
+        final_episode("picked up where we left off")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "write it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+    assert_receive {:confirm, _ref, %{id: "call_k"}}, 2_000
+
+    # Uncatchable: no terminate callback runs, so the on-disk truth is the
+    # last completed atomic write — the dangling batch. Unlink first: the
+    # test process started the agent, and :kill rides links.
+    Process.unlink(agent)
+    Process.exit(agent, :kill)
+
+    id = session_id(sessions)
+    bytes = read_session(sessions)
+    decoded = Jason.decode!(bytes)
+
+    assert %{
+             "messages" => [
+               %{"role" => "user", "content" => "write it"},
+               %{"role" => "assistant", "tool_calls" => [call]}
+             ]
+           } = decoded
+
+    assert call["id"] == "call_k"
+
+    # Load repaired the dangling batch in memory: one synthesized cancelled
+    # result, the file itself untouched.
+    {:ok, session} = Session.load(sessions, id)
+
+    assert [%{"role" => "user"}, %{"role" => "assistant"}, tool] = session.messages
+
+    assert %{"role" => "tool", "tool_call_id" => "call_k", "content" => repair_json} = tool
+    assert Jason.decode!(repair_json) == %{"ok" => false, "cancelled" => true}
+
+    # A fresh agent adopts the repaired history; its first request carries
+    # the original ids, the matching tool_call_ids, and the message order.
+    {resumed, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        resume: %{id: session.id, pin: session.pin, messages: session.messages}
+      )
+
+    send(resumed, {:prompt, self(), "continue"})
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+
+    assert [
+             %{"role" => "user", "content" => "write it"},
+             %{"role" => "assistant", "content" => nil, "tool_calls" => [resumed_call]},
+             %{"role" => "tool", "tool_call_id" => "call_k", "content" => content},
+             %{"role" => "user", "content" => "continue"}
+           ] = request_messages(body)
+
+    assert resumed_call == call
+    assert Jason.decode!(content) == %{"ok" => false, "cancelled" => true}
+
+    assert_receive {:phase, :idle}, 2_000
+
+    # The next save rewrites the same file under the same id.
+    assert session_id(sessions) == id
+
+    {:ok, next} = Session.load(sessions, id)
+    assert length(next.messages) == 5
+    assert List.last(next.messages)["content"] == "picked up where we left off"
+  end
+
+  @tag :tmp_dir
+  test "a cross-profile resume keeps the original pin on the next save", ctx do
+    # ADR 0014 test plan 10: the active provider's identity differs from the
+    # pinned one, yet the session's pin is immutable — the next save rewrites
+    # the file under the original pin, never the active provider's.
+    server = start_server([final_episode("continued")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    original_pin = %{profile: "work", model: "other-model", base_url: "https://pinned.example/v1"}
+
+    {resumed, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        resume: %{
+          id: "20261001-000000-aabbcc",
+          pin: original_pin,
+          messages: [%{"role" => "user", "content" => "earlier"}]
+        }
+      )
+
+    send(resumed, {:prompt, self(), "continue"})
+    assert_receive {:phase, :idle}, 2_000
+
+    {:ok, saved} = Session.load(sessions, "20261001-000000-aabbcc")
+    assert saved.pin == original_pin
+  end
+
+  @tag :tmp_dir
+  test "a resumed agent writes the hand-off's created_at verbatim on its first save", ctx do
+    server = start_server([final_episode("resumed fine")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {resumed, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        resume: %{
+          id: "20261001-000000-aabbcc",
+          created_at: "2026-10-01T00:00:00Z",
+          pin: %{profile: nil, model: "test-model", base_url: SSEServer.base_url(server)},
+          messages: [%{"role" => "user", "content" => "earlier"}]
+        }
+      )
+
+    send(resumed, {:prompt, self(), "continue"})
+    assert_receive {:phase, :idle}, 2_000
+
+    # The same file, under the adopted id, with the adopted created_at.
+    assert session_id(sessions) == "20261001-000000-aabbcc"
+
+    {:ok, session} = Session.load(sessions, "20261001-000000-aabbcc")
+    assert session.created_at == "2026-10-01T00:00:00Z"
+
+    assert session.messages == [
+             %{"role" => "user", "content" => "earlier"},
+             %{"role" => "user", "content" => "continue"},
+             %{"role" => "assistant", "content" => "resumed fine"}
+           ]
   end
 
   # The tool_call row is announced before the runner task is spawned; poll

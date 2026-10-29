@@ -10,14 +10,16 @@ defmodule DashFloat.Agent do
 
   use GenServer
 
+  alias DashFloat.Config
   alias DashFloat.LLM.ChatStream
+  alias DashFloat.Session
   alias DashFloat.Tools
   alias DashFloat.Tools.Preview
   alias DashFloat.Tools.Runner
 
+  require Logger
+
   @default_exec_timeout 30_000
-  # Display excerpt for tool-result rows; the model gets the bounded full result.
-  @display_lines 30
 
   # P2-3 (hostile review): the no-provider notice CARRIES the actual error —
   # an unknown --profile hard error or a migration refusal is the user's
@@ -35,6 +37,12 @@ defmodule DashFloat.Agent do
     :supervisor,
     :exec_timeout,
     :ui,
+    # Session identity (ADR 0014 §5): a nil session_dir means persistence is
+    # off; the rest are minted at the first save or adopted from :resume.
+    :session_dir,
+    :session_id,
+    :session_pin,
+    :session_created_at,
     # :idle | :streaming | :tools
     status: :idle,
     messages: [],
@@ -60,6 +68,11 @@ defmodule DashFloat.Agent do
     * `:exec_timeout` — execute_command timeout in ms (default #{@default_exec_timeout})
     * `:supervisor` — the Task.Supervisor for stream/runner tasks
       (default: `DashFloat.TaskSupervisor`)
+    * `:session_dir` — the sessions directory; transcript persistence stays
+      off unless it is set (default: nil — deliberate, ADR 0014 §5)
+    * `:resume` — `%{id: _, pin: _, messages: _}` from `DashFloat.Session.load/2`,
+      optionally with the session's `:created_at`; the agent adopts them
+      (default: nil)
     * `:name` — GenServer name (default: `__MODULE__`)
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -68,20 +81,39 @@ defmodule DashFloat.Agent do
       Keyword.fetch!(opts, :provider),
       Keyword.get(opts, :cwd) || File.cwd!(),
       Keyword.get(opts, :supervisor, DashFloat.TaskSupervisor),
-      Keyword.get(opts, :exec_timeout, @default_exec_timeout)
+      Keyword.get(opts, :exec_timeout, @default_exec_timeout),
+      Keyword.get(opts, :session_dir),
+      Keyword.get(opts, :resume)
     }
 
     GenServer.start_link(__MODULE__, init_args, name: Keyword.get(opts, :name, __MODULE__))
   end
 
   @impl GenServer
-  def init({provider, cwd, supervisor, exec_timeout}) do
+  def init({provider, cwd, supervisor, exec_timeout, session_dir, resume}) do
+    # A resumed agent adopts the loaded session's id, pin, created_at, and
+    # history in one move: the first prompt streams the restored transcript
+    # and the next save rewrites the same file under the same id (ADR 0014 §6).
+    {session_id, session_pin, session_created_at, messages} =
+      case resume do
+        %{id: id, pin: pin, messages: messages} ->
+          {id, pin, Map.get(resume, :created_at), messages}
+
+        nil ->
+          {nil, nil, nil, []}
+      end
+
     {:ok,
      %__MODULE__{
        provider: provider,
        cwd: cwd,
        supervisor: supervisor,
-       exec_timeout: exec_timeout
+       exec_timeout: exec_timeout,
+       session_dir: session_dir,
+       session_id: session_id,
+       session_pin: session_pin,
+       session_created_at: session_created_at,
+       messages: messages
      }}
   end
 
@@ -98,6 +130,9 @@ defmodule DashFloat.Agent do
 
       {:ok, _config} ->
         state = %{state | ui: ui, messages: state.messages ++ [%{role: "user", content: text}]}
+        # Persist before the episode starts: a kill mid-stream must lose at
+        # most the reply, never the question (ADR 0014 §5).
+        state = persist(state)
         start_episode(state)
     end
   end
@@ -351,6 +386,8 @@ defmodule DashFloat.Agent do
   end
 
   defp begin_tool_batch(state, content, calls) do
+    calls = dedup_ids(calls)
+
     assistant = %{
       role: "assistant",
       content: if(content == "", do: nil, else: content),
@@ -364,18 +401,70 @@ defmodule DashFloat.Agent do
         end)
     }
 
-    state = %{
-      state
-      | messages: state.messages ++ [assistant],
-        status: :tools,
-        calls: calls,
-        call_index: 0,
-        results: %{},
-        tool_slot: :none
-    }
+    # The deliberately-dangling write (ADR 0014 §5): the batch is on disk
+    # before any tool runs, so a kill mid-batch leaves the repairable shape.
+    state =
+      persist(%{
+        state
+        | messages: state.messages ++ [assistant],
+          status: :tools,
+          calls: calls,
+          call_index: 0,
+          results: %{},
+          tool_slot: :none
+      })
 
     display(state.ui, {:phase, :executing_tool})
     next_call(state)
+  end
+
+  # Id uniqueness is owned at the batch boundary (ADR 0014 §4): persistence
+  # makes ids load-bearing across processes, and `state.results` is keyed by
+  # call id, so a repeated id would serve one call's answer to two calls.
+  # Renames are decided against a used-id set — the original ids and every
+  # rename so far — so a colliding original can never re-create a rename:
+  # [a, a, a-2] becomes [a, a-2, a-3], not [a, a-2, a-2]. Applied BEFORE the
+  # assistant message is built, so the assistant `tool_calls`, the dispatch,
+  # the results map, and the flushed tool messages all carry the renamed ids
+  # consistently.
+  defp dedup_ids(calls) do
+    {renamed, _used} =
+      Enum.map_reduce(calls, MapSet.new(), fn %{id: id} = call, used ->
+        id = if MapSet.member?(used, id), do: next_free_id(id, used), else: id
+        {%{call | id: id}, MapSet.put(used, id)}
+      end)
+
+    renamed
+  end
+
+  # The first unused "#{id}-#{n}", n >= 2 — except when `id` itself is a
+  # taken "<base>-<n>" rename of an also-used base, where the sequence
+  # continues on the base (a-2 taken beside a → a-3, not a-2-2).
+  defp next_free_id(id, used) do
+    case renamed_form(id) do
+      {base, n} when is_integer(n) ->
+        if MapSet.member?(used, base) do
+          free_suffix(base, n + 1, used)
+        else
+          free_suffix(id, 2, used)
+        end
+
+      _not_a_rename ->
+        free_suffix(id, 2, used)
+    end
+  end
+
+  defp free_suffix(base, n, used) do
+    candidate = "#{base}-#{n}"
+
+    if MapSet.member?(used, candidate), do: free_suffix(base, n + 1, used), else: candidate
+  end
+
+  defp renamed_form(id) do
+    case Regex.run(~r/\A(.*)-(\d+)\z/, id) do
+      [_full, base, n] -> {base, String.to_integer(n)}
+      nil -> :error
+    end
   end
 
   defp next_call(%__MODULE__{call_index: index, calls: calls} = state)
@@ -503,7 +592,8 @@ defmodule DashFloat.Agent do
         }
       end)
 
-    start_episode(%{state | messages: state.messages ++ tool_messages})
+    state = persist(%{state | messages: state.messages ++ tool_messages})
+    start_episode(state)
   end
 
   # Abort the batch: unresolved calls (from the current index on) get cancelled
@@ -516,12 +606,12 @@ defmodule DashFloat.Agent do
   end
 
   defp abort_tool_run(state, current) do
-    display(state.ui, {:tool_result, tool_result_msg(current, %{ok: false, cancelled: true})})
+    display(state.ui, {:tool_result, tool_result_msg(current, Tools.cancelled_result())})
     fill_cancelled(%{state | tool_slot: :none})
   end
 
   defp fill_cancelled(state) do
-    cancelled = %{ok: false, cancelled: true}
+    cancelled = Tools.cancelled_result()
 
     results =
       state.calls
@@ -533,13 +623,14 @@ defmodule DashFloat.Agent do
         %{role: "tool", tool_call_id: call.id, content: Jason.encode!(results[call.id])}
       end)
 
-    state = %{
-      state
-      | status: :idle,
-        messages: state.messages ++ tool_messages,
-        results: results,
-        call_index: length(state.calls)
-    }
+    state =
+      persist(%{
+        state
+        | status: :idle,
+          messages: state.messages ++ tool_messages,
+          results: results,
+          call_index: length(state.calls)
+      })
 
     display(state.ui, {:entry, :system, "[tool run cancelled]"})
     display(state.ui, {:phase, :idle})
@@ -548,7 +639,7 @@ defmodule DashFloat.Agent do
 
   defp finalize_episode(state, content) do
     if content != "" do
-      %{state | messages: state.messages ++ [%{role: "assistant", content: content}]}
+      persist(%{state | messages: state.messages ++ [%{role: "assistant", content: content}]})
     else
       state
     end
@@ -568,6 +659,82 @@ defmodule DashFloat.Agent do
     }
   end
 
+  ## Session persistence
+
+  # A full-file rewrite at every message-list mutation, opt-in via
+  # :session_dir — the nil default keeps tests and embedded starters off the
+  # user's XDG dir. A failed save degrades to a warning plus one system
+  # entry; the turn continues — persistence never joins the episode loop
+  # (ADR 0014 §5).
+  defp persist(%__MODULE__{session_dir: nil} = state), do: state
+
+  # Id, pin, and created_at are minted once, at the first save. An error
+  # provider never reaches a persist (the prompt arm guards it), so the pin
+  # always reads off an {:ok, config}.
+  defp persist(%__MODULE__{session_id: nil} = state) do
+    persist(%{
+      state
+      | session_id: Session.new_id(),
+        session_created_at: now_iso8601_utc(),
+        session_pin: session_pin(state.provider)
+    })
+  end
+
+  # A hand-built resume map may carry no created_at; the first save stamps it.
+  defp persist(%__MODULE__{session_created_at: nil} = state) do
+    persist(%{state | session_created_at: now_iso8601_utc()})
+  end
+
+  defp persist(
+         %__MODULE__{
+           ui: ui,
+           session_dir: dir,
+           session_id: id,
+           session_created_at: created_at,
+           session_pin: pin,
+           messages: messages
+         } = state
+       ) do
+    session = %{version: 1, id: id, created_at: created_at, pin: pin, messages: messages}
+
+    case Session.save(dir, session) do
+      :ok ->
+        state
+
+      {:error, message} ->
+        Logger.warning(message)
+        display(ui, {:entry, :system, "[session not saved: " <> message <> "]"})
+        state
+    end
+  end
+
+  defp now_iso8601_utc, do: DateTime.to_iso8601(DateTime.utc_now())
+
+  # Picked field-by-field off the effective provider config — never the
+  # struct — so api_key has no path into the session file (ADR 0014 §3).
+  defp session_pin({:ok, %Config{profile: profile, model: model, base_url: base_url}}) do
+    %{profile: profile, model: model, base_url: sanitize_base_url(base_url)}
+  end
+
+  # pin.base_url is endpoint identity, not a credential store (ADR 0014 §3):
+  # scheme://host[:port]/path — userinfo, query, and fragment dropped, so a
+  # URL-carried key never sits in our metadata. A string without a parsable
+  # scheme//host stays raw rather than mangling a working endpoint.
+  defp sanitize_base_url(base_url) when is_binary(base_url) do
+    case URI.parse(base_url) do
+      %URI{scheme: scheme, host: host} = uri when is_binary(scheme) and is_binary(host) ->
+        URI.to_string(%URI{
+          scheme: scheme,
+          host: host,
+          port: uri.port,
+          path: uri.path
+        })
+
+      _unparsable ->
+        base_url
+    end
+  end
+
   ## Display helpers
 
   defp display(ui, message) when is_pid(ui), do: send(ui, message)
@@ -577,37 +744,9 @@ defmodule DashFloat.Agent do
       id: call.id,
       name: call.name,
       ok: result[:ok] == true,
-      status: result_status(result),
-      output: display_excerpt(result)
+      status: Tools.display_status(result),
+      output: Tools.display_excerpt(result)
     }
-  end
-
-  defp result_status(%{rejected: true}), do: "rejected"
-  defp result_status(%{cancelled: true}), do: "cancelled"
-  defp result_status(%{ok: true}), do: "ok"
-
-  defp result_status(%{error: error}) when is_binary(error),
-    do: "error: " <> String.slice(error, 0, 160)
-
-  defp result_status(_other), do: "error"
-
-  # The model receives the bounded full result; the log row gets ≤ 30 lines.
-  defp display_excerpt(result) do
-    case result[:output] || result[:content] do
-      nil ->
-        nil
-
-      body ->
-        lines = String.split(body, "\n")
-
-        if length(lines) <= @display_lines do
-          body
-        else
-          lines
-          |> Enum.take(@display_lines)
-          |> Enum.join("\n")
-        end
-    end
   end
 
   defp inspect_slice(reason) do
