@@ -2448,5 +2448,15 @@ defmodule DashFloat.TUITest do
       assert {:noreply, ^state, %{render?: false}} =
                TUI.handle_info({:suggestion, 5, ""}, state)
     end
+
+    # Whitespace-only is the same refusal: it is truthy, so a " " ghost
+    # would blank the composer's placeholder entirely (the F5 class, at the
+    # transport seam).
+    test "a whitespace-only ghost is refused like the empty string" do
+      state = %{State.new(provider: provider()) | suggest_epoch: 5}
+
+      assert {:noreply, ^state, %{render?: false}} =
+               TUI.handle_info({:suggestion, 5, "   "}, state)
+    end
   end
 end

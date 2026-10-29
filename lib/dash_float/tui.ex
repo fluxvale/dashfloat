@@ -245,7 +245,7 @@ defmodule DashFloat.TUI do
     do: {:noreply, state, %{render?: false}}
 
   def handle_info({:suggestion, epoch, text}, state) do
-    if accept_suggestion?(state, epoch) and is_binary(text) and text != "" do
+    if accept_suggestion?(state, epoch) and is_binary(text) and String.trim(text) != "" do
       {:noreply, %{state | suggestion: text, suggest_task: nil}}
     else
       {:noreply, %{state | suggest_task: nil}, %{render?: false}}

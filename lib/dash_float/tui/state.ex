@@ -819,7 +819,8 @@ defmodule DashFloat.TUI.State do
   # and a later {:phase, :idle} would then finalize and arm a suggestion for
   # it, re-opening the duplicate-arm window (ADR 0015 §3's once-per-turn arm
   # stays true).
-  def stream_message(%{phase: :idle} = state, {:token, _text}, _now), do: state
+  def stream_message(%{phase: :idle} = state, {:token, text}, _now) when is_binary(text),
+    do: state
 
   def stream_message(state, {:token, text}, now) when is_binary(text) do
     %{

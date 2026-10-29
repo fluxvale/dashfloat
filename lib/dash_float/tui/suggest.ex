@@ -142,6 +142,10 @@ defmodule DashFloat.TUI.Suggest do
           normalize(run(fetcher, config, tail))
         rescue
           _reason -> nil
+        catch
+          # throw/exit from a fetcher are failures too — the message must
+          # land either way, or suggest_task stays a dead pid forever.
+          _kind, _reason -> nil
         end
 
       send(send_to, {:suggestion, epoch, text})

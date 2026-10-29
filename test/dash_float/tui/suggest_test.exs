@@ -263,5 +263,21 @@ defmodule DashFloat.TUI.SuggestTest do
 
       assert_receive {:suggestion, 2, nil}, 1_000
     end
+
+    # throw/exit from a fetcher are failures too — rescue alone does not
+    # catch them, and a task that dies uncaught never delivers, leaving
+    # suggest_task a dead pid until an unrelated reap.
+    test "a throwing or exiting fetcher still delivers {:suggestion, epoch, nil}" do
+      for payload <- [fn _config, _tail -> throw(:ball) end, fn _config, _tail -> exit(:die) end] do
+        assert {:ok, _pid} =
+                 Suggest.fetch_async(config(), "tail",
+                   send_to: self(),
+                   epoch: 3,
+                   fetcher: payload
+                 )
+
+        assert_receive {:suggestion, 3, nil}, 1_000
+      end
+    end
   end
 end

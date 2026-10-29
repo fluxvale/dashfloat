@@ -893,6 +893,15 @@ defmodule DashFloat.TUI.StateTest do
       assert state.suggest_arm == false
     end
 
+    # The guard keeps the module's own contract rule intact: only a WELL-
+    # FORMED late token is ignored; a malformed one still crashes —
+    # contract violations are bugs, silent no-ops hide producer errors.
+    test "a malformed token at idle still crashes (the contract rule)" do
+      assert_raise FunctionClauseError, fn ->
+        State.stream_message(new_state(), {:token, :not_binary}, 1_000)
+      end
+    end
+
     test "re-announcing :streaming never finalizes the in-flight entry" do
       state =
         new_state()
