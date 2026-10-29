@@ -267,18 +267,20 @@ defmodule DashFloat.SessionTest do
 
       writer = fn content ->
         fn ->
-          for _ <- 1..300 do
+          for _i <- 1..300 do
             assert :ok = Session.save(ctx.tmp_dir, session([%{role: "user", content: content}]))
           end
         end
       end
 
-      task_a = Task.async(writer.(a))
-      task_b = Task.async(writer.(b))
+      run_a = writer.(a)
+      run_b = writer.(b)
+      task_a = Task.async(run_a)
+      task_b = Task.async(run_b)
 
       reader =
         Task.async(fn ->
-          for _ <- 1..600 do
+          for _i <- 1..600 do
             case Session.load(ctx.tmp_dir, @id) do
               {:ok, loaded} ->
                 assert [%{"role" => "user", "content" => content}] = loaded.messages

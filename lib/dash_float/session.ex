@@ -58,24 +58,28 @@ defmodule DashFloat.Session do
     # The id names the file (ADR 0014 §2): only the minted shape ever
     # reaches the filesystem, so no hand-supplied id can carry a path.
     with :ok <- check_id_shape(session.id) do
-      case ensure_dir(dir) do
-        :ok ->
-          path = path_for(dir, session.id)
+      do_save(dir, session)
+    end
+  end
 
-          # A session the encoder refuses (a tool result carrying an invalid
-          # byte, say) must degrade like any other failed save, never raise
-          # out of the agent loop. The error names the path, never the bytes.
-          case Jason.encode(session) do
-            {:ok, contents} ->
-              Posture.write_private(path, contents <> "\n")
+  defp do_save(dir, session) do
+    case ensure_dir(dir) do
+      :ok ->
+        path = path_for(dir, session.id)
 
-            {:error, _reason} ->
-              {:error, "cannot write #{path}: session is not encodable"}
-          end
+        # A session the encoder refuses (a tool result carrying an invalid
+        # byte, say) must degrade like any other failed save, never raise
+        # out of the agent loop. The error names the path, never the bytes.
+        case Jason.encode(session) do
+          {:ok, contents} ->
+            Posture.write_private(path, contents <> "\n")
 
-        {:error, _reason} = error ->
-          error
-      end
+          {:error, _reason} ->
+            {:error, "cannot write #{path}: session is not encodable"}
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

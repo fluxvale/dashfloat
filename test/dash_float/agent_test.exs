@@ -1006,7 +1006,8 @@ defmodule DashFloat.AgentTest do
     # The pin is the query-free endpoint; the secret reaches neither.
     assert session.pin.base_url == SSEServer.base_url(server)
 
-    bytes = File.read!(Path.join(sessions, id <> ".json"))
+    session_path = Path.join(sessions, id <> ".json")
+    bytes = File.read!(session_path)
     refute bytes =~ secret
     refute bytes =~ "api_key"
   end
@@ -1055,7 +1056,9 @@ defmodule DashFloat.AgentTest do
 
     # Each answer is its own call's result, not one call's twice.
     assert Jason.decode!(tool_a["content"])["path"] == "notes.md"
-    assert Map.has_key?(Jason.decode!(tool_b["content"]), "entries")
+
+    result_b = Jason.decode!(tool_b["content"])
+    assert Map.has_key?(result_b, "entries")
   end
 
   @tag :tmp_dir

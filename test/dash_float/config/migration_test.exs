@@ -1193,7 +1193,8 @@ defmodule DashFloat.Config.MigrationTest do
         assert {:ok, :migrated} = @migration.maybe_migrate(dir)
       end)
 
-      assert File.lstat!(Path.join(dir, "keys.json5.tmp")).type == :symlink
+      planted = Path.join(dir, "keys.json5.tmp")
+      assert %File.Stat{type: :symlink} = File.lstat!(planted)
       assert File.read!(victim) == "keep me"
       assert mode(victim) == 0o644
 

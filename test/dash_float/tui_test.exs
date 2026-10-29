@@ -272,7 +272,9 @@ defmodule DashFloat.TUITest do
     assert bounced.setup.error =~ "cannot write"
     assert screen_text(bounced) =~ "cannot write"
     refute screen_text(bounced) =~ "All set"
-    refute File.exists?(Path.join(dir, "settings.json5"))
+
+    settings_path = Path.join(dir, "settings.json5")
+    refute File.exists?(settings_path)
   end
 
   test "P2-1 regression: a non-empty zero-profile settings.json5 refuses on the wizard surface, never lies (issue #39)" do

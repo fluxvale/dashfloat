@@ -54,7 +54,9 @@ defmodule DashFloat.Config.Posture do
   """
   @spec write_private(Path.t(), binary()) :: :ok | {:error, String.t()}
   def write_private(path, contents) when is_binary(path) and is_binary(contents) do
-    tmp = path <> ".tmp." <> Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
+    bytes = :crypto.strong_rand_bytes(4)
+    rand = Base.encode16(bytes, case: :lower)
+    tmp = path <> ".tmp." <> rand
 
     with :ok <- guard_tmp(path, tmp),
          :ok <- File.touch(tmp),
