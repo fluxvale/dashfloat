@@ -48,8 +48,8 @@ defmodule DashFloat.Session do
 
   @doc """
   Writes the session as compact JSON + newline via
-  `DashFloat.Config.Posture.write_private/2` (0600, atomic tmp+rename, `.tmp`
-  symlink refusal), creating `dir` on demand. Errors name paths only.
+  `DashFloat.Config.Posture.write_private/2` (0600, atomic rename over a
+  unique tmp staging name), creating `dir` on demand. Errors name paths only.
   """
   @spec save(Path.t(), t()) :: :ok | {:error, String.t()}
   def save(dir, session) do

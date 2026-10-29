@@ -224,23 +224,25 @@ defmodule DashFloat.SessionTest do
     end
 
     @tag :tmp_dir
-    test "refuses a pre-planted .tmp symlink and never writes through it", ctx do
+    test "a pre-planted .tmp symlink is no longer the staging name: the save succeeds around it",
+         ctx do
       save_ok(ctx, [%{role: "user", content: "original"}])
       file = path(ctx)
-      original = File.read!(file)
 
       decoy = Path.join(ctx.tmp_dir, "decoy")
       File.write!(decoy, "decoy bytes")
       :ok = File.ln_s(decoy, file <> ".tmp")
 
-      assert {:error, error} =
-               Session.save(ctx.tmp_dir, session([%{role: "user", content: "evil"}]))
+      assert :ok = Session.save(ctx.tmp_dir, session([%{role: "user", content: "evil"}]))
+      assert File.read!(file) =~ "evil"
 
-      assert error =~ ~s(.tmp is a symlink)
-      assert error =~ @id
-
-      assert File.read!(file) == original
+      # The symlink is untouched, and the unique staging name is renamed
+      # away — no .tmp* debris remains after a successful save.
+      assert File.lstat!(file <> ".tmp").type == :symlink
       assert File.read!(decoy) == "decoy bytes"
+
+      others = File.ls!(ctx.tmp_dir) -- [@id <> ".json", @id <> ".json.tmp"]
+      refute Enum.any?(others, &String.contains?(&1, ".tmp"))
     end
 
     @tag :tmp_dir
@@ -251,6 +253,52 @@ defmodule DashFloat.SessionTest do
       save_ok(ctx, [%{role: "user", content: "v2"}])
       assert {:ok, loaded} = load(ctx)
       assert loaded.messages == [%{"role" => "user", "content" => "v2"}]
+    end
+
+    @tag :tmp_dir
+    test "two concurrent writers and a reader: every read is one whole payload", ctx do
+      # The unique staging name (ADR 0014 §7) means interleaved saves of one
+      # session can never share a tmp file: a reader under concurrent writers
+      # sees only whole payloads — the pre-write state or one writer's file —
+      # never a torn mix. A parse error (or any other refusal) fails the test.
+      a = String.duplicate("a", 4096)
+      b = String.duplicate("b", 4096)
+      payloads = MapSet.new([a, b])
+
+      writer = fn content ->
+        fn ->
+          for _ <- 1..300 do
+            assert :ok = Session.save(ctx.tmp_dir, session([%{role: "user", content: content}]))
+          end
+        end
+      end
+
+      task_a = Task.async(writer.(a))
+      task_b = Task.async(writer.(b))
+
+      reader =
+        Task.async(fn ->
+          for _ <- 1..600 do
+            case Session.load(ctx.tmp_dir, @id) do
+              {:ok, loaded} ->
+                assert [%{"role" => "user", "content" => content}] = loaded.messages
+                assert MapSet.member?(payloads, content)
+
+              # The reader may outrun the first write: the pre-write state.
+              {:error, "no session " <> _rest} ->
+                :ok
+            end
+          end
+        end)
+
+      Task.await(task_a, 30_000)
+      Task.await(task_b, 30_000)
+      Task.await(reader, 30_000)
+
+      # The final file loads and is exactly one writer's payload.
+      assert {:ok, loaded} = Session.load(ctx.tmp_dir, @id)
+      assert [%{"role" => "user", "content" => content}] = loaded.messages
+      assert MapSet.member?(payloads, content)
     end
 
     @tag :tmp_dir

@@ -17,7 +17,6 @@ defmodule DashFloat.Config.Posture do
   require Logger
 
   @secret_mode 0o600
-  @tmp_suffix ".tmp"
 
   @doc "Tightens `path` to 0600 when too permissive; `label` names it in warnings."
   @spec tighten(Path.t(), String.t()) :: :ok
@@ -47,12 +46,15 @@ defmodule DashFloat.Config.Posture do
   Writes `contents` to `path` atomically at 0600 (ADR 0008/0009): tmp file
   created empty under 0600, filled, renamed — no crash can leave a torn or
   half-written destination, and every byte the file ever holds is
-  private-only. The tmp path is lstat-guarded: a pre-planted `.tmp` symlink
-  is refused, never written through. `{:error, message}` names paths only.
+  private-only. The staging name is unique per write (`<path>.tmp.<random>`,
+  ADR 0014 §7): two concurrent writers of one path never share a tmp file,
+  so neither can tear the other's write. The tmp path is lstat-guarded: a
+  symlink at the staging name is refused, never written through.
+  `{:error, message}` names paths only.
   """
   @spec write_private(Path.t(), binary()) :: :ok | {:error, String.t()}
   def write_private(path, contents) when is_binary(path) and is_binary(contents) do
-    tmp = path <> @tmp_suffix
+    tmp = path <> ".tmp." <> Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
 
     with :ok <- guard_tmp(path, tmp),
          :ok <- File.touch(tmp),
