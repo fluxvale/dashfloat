@@ -63,7 +63,8 @@ defmodule DashFloat.Config do
   @main_version 3
   # The settings keys selection reads today; everything else is tolerated
   # with a warning so future dimensions need no migration (ADR 0008).
-  @known_settings ["defaultModel", "suggest"]
+  # "compaction" is known and deliberately inert — the stage-2 seam (ADR 0022 §8).
+  @known_settings ["defaultModel", "suggest", "compaction"]
   # keys.json5 values and mcp tokens may be env references instead of
   # literals — the strict shape is what disambiguates a literal key that
   # merely starts with `$` (ADR 0009).

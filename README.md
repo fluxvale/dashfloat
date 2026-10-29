@@ -115,6 +115,11 @@ the status bar's context denominator filling in for a selected model whose
 entry carried no `context` — fetched models are not added to your menus,
 and nothing is written back to your config.
 
+Profile settings also accept a `compaction` object (e.g.
+`settings: { compaction: { instructions: 'keep the design decisions' } }`) —
+reserved for the upcoming compaction summaries; it is accepted without a
+warning and has no effect yet.
+
 Damaged configs degrade with warnings, never crashes: a deleted
 `defaultProfile`, a mistyped `profiles` list, junk entries — each names the
 field and falls back to the least-surprising working state. An unparseable
@@ -176,8 +181,11 @@ output read from your disk. Ids sort by time; list them with
 `dashfloat --resume <id>` — the transcript replays in the log and your next
 send continues it. A session records the profile and model it started under;
 resuming under a different one warns and continues, and the session keeps its
-pin. A malformed or newer-version session file refuses loudly, naming the
-path — it is never auto-deleted or rewritten. Details:
+pin. When the configured context window is roughly 80% full, the oldest
+complete turns are dropped to stay inside it — a visible notice names the
+count, and the session file records what was dropped. A malformed or
+newer-version session file refuses loudly, naming the path — it is never
+auto-deleted or rewritten. Details:
 [ADR 0014](docs/decisions/0014-session-persistence.md).
 
 ## Stack
