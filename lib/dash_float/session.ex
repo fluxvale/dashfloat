@@ -145,8 +145,10 @@ defmodule DashFloat.Session do
   end
 
   defp check_load_id(dir, other) do
+    # inspect, not interpolation: a pid/map/tuple id has no String.Chars and
+    # the refusal must never itself raise.
     {:error,
-     "no session #{other} under #{dir} — session ids look like #{@id_example}; list sessions with: ls #{dir}"}
+     "no session #{inspect(other)} under #{dir} — session ids look like #{@id_example}; list sessions with: ls #{dir}"}
   end
 
   defp path_for(dir, id), do: Path.join(dir, id <> ".json")

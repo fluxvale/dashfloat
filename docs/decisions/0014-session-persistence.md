@@ -185,8 +185,9 @@ receives display-contract messages.
   (dup ids make one answer "cover" two calls — the repair would serve an
   unbalanced transcript), and a tool message must sit in the **contiguous**
   tool block following its batch — an answer detached past a user or
-  assistant message refuses (validation and repair must agree on what a
-  batch's block is).
+  assistant message refuses, and so does a second answer for a call the
+  same block already answered (validation and repair must agree on what a
+  batch's block is, and one call takes exactly one answer).
 
 - **Id uniqueness is owned at the persistence boundary (ADR 0007 §1
   refinement).** ADR 0007 left id uniqueness to providers for the *live*
@@ -414,7 +415,7 @@ All under tmp-dir discipline; network only via the loopback SSE server.
     session's pin unchanged on the next save.
 11. **Hostile-review pins:** duplicate or empty tool-call ids never reach
     disk (batch-boundary rename; empty synthesizes like nil); a hand file
-    with a duplicate batch id refuses; a detached tool answer refuses;
+    with a duplicate batch id refuses; a detached tool answer refuses; a duplicate answer refuses;
     concurrent saves on one id never tear (a reader under concurrent
     writers sees only whole payloads); a save whose encoding raises
     degrades to a warning; `pin.base_url` carries no query, fragment, or

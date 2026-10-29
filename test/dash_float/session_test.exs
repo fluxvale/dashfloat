@@ -586,6 +586,11 @@ defmodule DashFloat.SessionTest do
 
       assert msg ==
                "no session 123 under #{ctx.tmp_dir} — session ids look like 20261027-143052-a1b2c3; list sessions with: ls #{ctx.tmp_dir}"
+
+      # No String.Chars implementation: interpolation would raise here.
+      assert {:error, _msg} = Session.load(ctx.tmp_dir, self())
+      assert {:error, _msg} = Session.load(ctx.tmp_dir, %{id: :x})
+      assert {:error, _msg} = Session.load(ctx.tmp_dir, {:tuple, :id})
     end
 
     @tag :tmp_dir
