@@ -68,9 +68,11 @@ receives display-contract messages.
   newline-terminated). Machine files, not hand-editing targets — but
   readable enough to hand-repair, which the tolerance rules rely on.
 - **0600, atomically, always:** every write goes through
-  `DashFloat.Config.Posture.write_private/2` — temp file created empty at
-  0600, filled, renamed; no reader or crash ever sees a torn file; a
-  pre-planted `.tmp` symlink is refused, never written through. Transcripts
+  `DashFloat.Config.Posture.write_private/2` — a temp file created empty at
+  0600 under a **unique** staging name (`<path>.tmp.<random>`), filled,
+  renamed into place. No reader or crash ever sees a torn file; concurrent
+  writers of one path never share a staging file (§7); a symlink planted
+  at a predictable staging name has nothing to intercept. Transcripts
   carry source code and tool output read off the user's disk — the mode is
   mandatory, not courtesy.
 - **Session ids:** `YYYYMMDD-HHMMSS-xxxxxx` — UTC wall clock plus six hex
@@ -134,9 +136,10 @@ receives display-contract messages.
   that resumes a file with newer top-level fields tolerates them at load
   and omits them on its next save (tolerance means no crash, not
   preservation). Additive fields that must survive an older binary's
-  re-save live **inside** `messages` entries or `pin`, which are carried
-  verbatim. Anything that changes how existing fields are *read* bumps the
-  version (which old binaries then refuse). This is the #43 seam —
+  re-save live **inside** `messages` entries, which are carried verbatim
+  (`pin` is rebuilt from its three fields at load — extras inside it do
+  not survive). Anything that changes how existing fields are *read* bumps
+  the version (which old binaries then refuse). This is the #43 seam —
   accounting/compaction reads the same `messages` and nests its additions
   there.
 
@@ -396,8 +399,10 @@ All under tmp-dir discipline; network only via the loopback SSE server.
 6. **Secrets:** a turn run with a unique sentinel as the active
    `api_key` leaves `grep -R <sentinel>` over the sessions directory
    empty, and the string `api_key` appears as no key in any session file.
-7. **Atomicity:** a stale `.tmp` file leaves the previous file loadable; a
-   pre-planted `.tmp` symlink is refused, not written through.
+7. **Atomicity:** a stale `.tmp.*` file leaves the previous file loadable;
+   concurrent saves on one id never tear (reader-under-writers test); the
+   staging name is unpredictable, so a pre-planted symlink has nothing to
+   intercept.
 8. **Tolerance:** a truncated file, a garbage file, a missing directory,
    and an unreadable file each fail `load` with a message (no raise); under
    `--resume` each refuses the boot on stderr with no blank session;

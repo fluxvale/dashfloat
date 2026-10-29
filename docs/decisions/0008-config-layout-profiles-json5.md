@@ -407,7 +407,10 @@ up-front per-field representability checks so its field-name error survives.
   regular-files-only, lstat-guarded (never chmod through a symlink; a
   directory by a secrets name keeps its own semantics). The `.tmp` staging
   paths get the same guard — a pre-planted `keys.json5.tmp` symlink is
-  refused, never written through.
+  refused, never written through. *(Amended 2026-10-29 by
+  [ADR 0014](0014-session-persistence.md) §7: staging names are now unique
+  per write, `<path>.tmp.<random>` — the guard stands, and a planted
+  symlink at any predictable name has nothing to intercept.)*
 - `DashFloat.Config.load/2,3` reads both `settings.json5` and `keys.json5`
   (missing = empty map; malformed = load error naming the file; invalid
   UTF-8 included — any parser crash degrades to the fixed error string, so
