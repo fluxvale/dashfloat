@@ -530,6 +530,96 @@ defmodule DashFloat.SessionTest do
     end
   end
 
+  describe "duplicate batch ids" do
+    @tag :tmp_dir
+    test "a batch that repeats an id refuses, naming the index and the id", ctx do
+      write_body(
+        ctx,
+        body_with([
+          %{"role" => "user", "content" => "go"},
+          %{
+            "role" => "assistant",
+            "content" => nil,
+            "tool_calls" => [call("call_1"), call("call_1")]
+          },
+          tool_result("call_1", ~s({"ok":true})),
+          tool_result("call_1", ~s({"ok":true}))
+        ])
+      )
+
+      assert {:error, msg} = load(ctx)
+      assert msg =~ "message 1"
+      assert msg =~ "call_1"
+    end
+
+    @tag :tmp_dir
+    test "distinct ids across different batches still load", ctx do
+      write_body(
+        ctx,
+        body_with([
+          %{"role" => "assistant", "content" => nil, "tool_calls" => [call("call_1")]},
+          tool_result("call_1", ~s({"ok":true})),
+          %{"role" => "user", "content" => "next turn"},
+          %{"role" => "assistant", "content" => nil, "tool_calls" => [call("call_2")]},
+          tool_result("call_2", ~s({"ok":true}))
+        ])
+      )
+
+      assert {:ok, loaded} = load(ctx)
+      assert length(loaded.messages) == 5
+    end
+  end
+
+  describe "detached tool answers" do
+    @tag :tmp_dir
+    test "an answer after an intervening user message refuses as detached from its batch", ctx do
+      write_body(
+        ctx,
+        body_with([
+          %{"role" => "assistant", "content" => nil, "tool_calls" => [call("call_1")]},
+          %{"role" => "user", "content" => "interrupted"},
+          tool_result("call_1", ~s({"ok":true}))
+        ])
+      )
+
+      assert {:error, msg} = load(ctx)
+      assert msg =~ "message 2"
+      assert msg =~ "detached from its batch"
+    end
+
+    @tag :tmp_dir
+    test "an answer after an intervening assistant message refuses the same way", ctx do
+      write_body(
+        ctx,
+        body_with([
+          %{"role" => "assistant", "content" => nil, "tool_calls" => [call("call_1")]},
+          %{"role" => "assistant", "content" => "meanwhile"},
+          tool_result("call_1", ~s({"ok":true}))
+        ])
+      )
+
+      assert {:error, msg} = load(ctx)
+      assert msg =~ "message 2"
+      assert msg =~ "detached from its batch"
+    end
+
+    @tag :tmp_dir
+    test "the contiguous equivalent loads unchanged", ctx do
+      write_body(
+        ctx,
+        body_with([
+          %{"role" => "assistant", "content" => nil, "tool_calls" => [call("call_1")]},
+          tool_result("call_1", ~s({"ok":true})),
+          %{"role" => "user", "content" => "next turn"},
+          %{"role" => "assistant", "content" => "done"}
+        ])
+      )
+
+      assert {:ok, loaded} = load(ctx)
+      assert length(loaded.messages) == 4
+    end
+  end
+
   describe "dangling repair" do
     @tag :tmp_dir
     test "one dangling call gains exactly one cancelled result", ctx do

@@ -162,40 +162,46 @@ defmodule DashFloat.Session do
   defp check_messages_list(_decoded, path),
     do: {:error, "#{path}: \"messages\" must be a list"}
 
-  @spec check_messages(String.t(), list(), non_neg_integer(), MapSet.t()) ::
-          {:ok, [map()]} | {:error, String.t()}
-  defp check_messages(path, messages, index \\ 0, announced \\ MapSet.new())
-  defp check_messages(_path, [], _index, _announced), do: {:ok, []}
+  # The batch state threaded through validation: the ids the most recent
+  # batch announced, and whether its contiguous tool block is still open —
+  # the same block rule repair/1 applies, so validation and repair agree on
+  # what a batch's block is (ADR 0014 §4).
+  @type batch_state :: {MapSet.t(String.t()), boolean()}
 
-  defp check_messages(path, [message | rest], index, announced) do
-    with {:ok, announced} <- check_message(path, index, message, announced) do
-      case check_messages(path, rest, index + 1, announced) do
+  @spec check_messages(String.t(), list(), non_neg_integer(), batch_state()) ::
+          {:ok, [map()]} | {:error, String.t()}
+  defp check_messages(path, messages, index \\ 0, batch \\ {MapSet.new(), false})
+  defp check_messages(_path, [], _index, _batch), do: {:ok, []}
+
+  defp check_messages(path, [message | rest], index, batch) do
+    with {:ok, batch} <- check_message(path, index, message, batch) do
+      case check_messages(path, rest, index + 1, batch) do
         {:ok, tail} -> {:ok, [message | tail]}
         {:error, _reason} = error -> error
       end
     end
   end
 
-  defp check_message(path, index, %{"role" => "user"} = message, announced) do
+  defp check_message(path, index, %{"role" => "user"} = message, batch) do
     with :ok <- check_string(path, index, "content", Map.get(message, "content")) do
-      {:ok, announced}
+      {:ok, close_block(batch)}
     end
   end
 
-  defp check_message(path, index, %{"role" => "assistant"} = message, announced) do
+  defp check_message(path, index, %{"role" => "assistant"} = message, batch) do
     with :ok <- check_assistant_content(path, index, Map.get(message, "content")),
          :ok <- check_tool_calls(path, index, Map.get(message, "tool_calls")) do
-      {:ok, update_announced(announced, message)}
+      {:ok, announce(message, batch)}
     end
   end
 
-  defp check_message(path, index, %{"role" => "tool"} = message, announced) do
+  defp check_message(path, index, %{"role" => "tool"} = message, batch) do
     tool_call_id = Map.get(message, "tool_call_id")
 
     with :ok <- check_string(path, index, "tool_call_id", tool_call_id),
          :ok <- check_string(path, index, "content", Map.get(message, "content")),
-         :ok <- check_announced(path, index, tool_call_id, announced) do
-      {:ok, announced}
+         :ok <- check_announced(path, index, tool_call_id, batch) do
+      {:ok, batch}
     end
   end
 
@@ -216,12 +222,42 @@ defmodule DashFloat.Session do
   defp check_tool_calls(_path, _index, nil), do: :ok
 
   defp check_tool_calls(path, index, calls) when is_list(calls) do
+    with :ok <- check_call_shapes(path, index, calls) do
+      check_unique_ids(path, index, calls)
+    end
+  end
+
+  defp check_call_shapes(path, index, calls) do
     Enum.reduce_while(calls, :ok, fn call, :ok ->
       case check_call(path, index, call) do
         :ok -> {:cont, :ok}
         {:error, _reason} = error -> {:halt, error}
       end
     end)
+  end
+
+  # A batch that repeats an id makes one answer cover two calls — the repair
+  # would serve an unbalanced transcript (ADR 0014 §4). No write path of ours
+  # produces one (the agent renames at the batch boundary), so it is hand
+  # damage and the refusal names the index and the repeated id.
+  defp check_unique_ids(path, index, calls) do
+    seen =
+      Enum.reduce_while(calls, MapSet.new(), fn call, seen ->
+        id = call["id"]
+
+        if MapSet.member?(seen, id) do
+          {:halt,
+           {:error,
+            "#{path}: message #{index} repeats tool call id \"#{id}\" — a batch may not announce an id twice"}}
+        else
+          {:cont, MapSet.put(seen, id)}
+        end
+      end)
+
+    case seen do
+      {:error, _reason} = error -> error
+      %MapSet{} -> :ok
+    end
   end
 
   defp check_tool_calls(path, index, _other),
@@ -240,21 +276,30 @@ defmodule DashFloat.Session do
       {:error,
        "#{path}: message #{index} field \"tool_calls\" needs entries with string \"id\" and \"type\" and a \"function\" with string \"name\" and \"arguments\""}
 
-  # The nearest preceding batch stays announced across user turns and
-  # batch-less assistant messages (ADR 0014 §4).
-  defp update_announced(announced, message) do
+  # A batch opens the contiguous tool block that follows it; any other
+  # message closes the previous batch's block. The ids stay known after the
+  # close so a later stray answer is named as detached, not orphaned.
+  defp announce(message, {pending, _open?}) do
     case batch_calls(message) do
-      nil -> announced
-      calls -> MapSet.new(calls)
+      nil -> {pending, false}
+      calls -> {MapSet.new(calls), true}
     end
   end
 
-  defp check_announced(path, index, tool_call_id, announced) do
-    if MapSet.member?(announced, tool_call_id) do
-      :ok
-    else
-      {:error,
-       "#{path}: message #{index} answers a call no batch announced — \"tool_call_id\" is orphaned"}
+  defp close_block({pending, _open?}), do: {pending, false}
+
+  defp check_announced(path, index, tool_call_id, {pending, open?}) do
+    cond do
+      open? and MapSet.member?(pending, tool_call_id) ->
+        :ok
+
+      MapSet.member?(pending, tool_call_id) ->
+        {:error,
+         "#{path}: message #{index} answers a call detached from its batch — a tool message must sit in the tool block directly after the batch it answers"}
+
+      true ->
+        {:error,
+         "#{path}: message #{index} answers a call no batch announced — \"tool_call_id\" is orphaned"}
     end
   end
 
