@@ -185,6 +185,7 @@ defmodule DashFloat.SessionTest do
                  },
                  %{"role" => "assistant", "content" => "Done — ✓"}
                ],
+               title: nil,
                context: nil,
                compactions: []
              }
@@ -302,6 +303,32 @@ defmodule DashFloat.SessionTest do
       assert {:error, msg} = load(ctx)
       assert msg =~ "message 0"
       assert msg =~ ~s("content")
+    end
+  end
+
+  describe "title (ADR 0014 §3's additive seam, #80)" do
+    @tag :tmp_dir
+    test "a titled session round-trips verbatim, case-preserved", ctx do
+      save_ok(ctx, [%{role: "user", content: "hi"}], title: "Fix the  Login Bug ")
+      assert {:ok, loaded} = load(ctx)
+      assert loaded.title == "Fix the  Login Bug "
+      assert Jason.decode!(File.read!(path(ctx)))["title"] == "Fix the  Login Bug "
+    end
+
+    @tag :tmp_dir
+    test "an untitled session file carries no title key at all", ctx do
+      save_ok(ctx, [%{role: "user", content: "hi"}])
+      assert {:ok, loaded} = load(ctx)
+      assert loaded.title == nil
+      # Byte-level: the encoded JSON has no "title" outside messages.
+      refute File.read!(path(ctx)) =~ "title"
+    end
+
+    @tag :tmp_dir
+    test "a non-string title in a hand-written file loads as nil, never a refusal", ctx do
+      write_body(ctx, body_with([], %{"title" => 42}))
+      assert {:ok, loaded} = load(ctx)
+      assert loaded.title == nil
     end
   end
 

@@ -36,6 +36,7 @@ defmodule DashFloat.Session do
           required(:created_at) => String.t(),
           required(:pin) => pin(),
           required(:messages) => [map()],
+          optional(:title) => String.t(),
           optional(:context) => context() | nil,
           optional(:compactions) => [map()]
         }
@@ -83,11 +84,12 @@ defmodule DashFloat.Session do
     end
   end
 
-  # The additive diagnostics are written only once they exist (ADR 0022 §6),
-  # so a loaded map — which always carries `context: nil, compactions: []` —
-  # re-saves byte-identically to a pre-compaction file (hostile review m3).
+  # The additive fields are written only once they exist (ADR 0022 §6, plus
+  # the title — #80), so a loaded map re-saves byte-identically to a file
+  # that never carried them (hostile review m3).
   defp normalize(session) do
     session
+    |> drop_empty(:title, &is_nil/1)
     |> drop_empty(:context, &is_nil/1)
     |> drop_empty(:compactions, &(&1 == []))
   end
@@ -158,6 +160,7 @@ defmodule DashFloat.Session do
          version: @version,
          id: id,
          created_at: created_at,
+         title: build_title(decoded),
          pin: build_pin(decoded),
          messages: repair(messages),
          context: build_context(decoded),
@@ -452,6 +455,12 @@ defmodule DashFloat.Session do
 
   defp tool_message?(%{"role" => "tool"}), do: true
   defp tool_message?(_other), do: false
+
+  # The title rides along tolerantly (the pin precedent, #80): absent or not
+  # a string it loads as nil — never a refusal.
+  defp build_title(%{"title" => title}) when is_binary(title), do: title
+
+  defp build_title(_decoded), do: nil
 
   # The pin rides along as diagnostics for the resume compare (ADR 0014 §6);
   # a missing or malformed pin compares nothing.
