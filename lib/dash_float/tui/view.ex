@@ -96,8 +96,9 @@ defmodule DashFloat.TUI.View do
   end
 
   @doc """
-  Renders the four regions — or, while the startup phase owns the screen,
-  the one setup box instead (ADR 0009). Pure; never raises on odd sizes.
+  Renders the five regions — status, log, activity, input, and the stats
+  footer — or, while the startup phase owns the screen, the one setup box
+  instead (ADR 0009). Pure; never raises on odd sizes.
   """
   @spec render(State.t(), ExRatatui.Frame.t()) :: [{ExRatatui.widget(), Rect.t()}]
   def render(%State{setup: setup} = _state, %ExRatatui.Frame{width: width, height: height})
@@ -400,19 +401,24 @@ defmodule DashFloat.TUI.View do
 
   ## Status bar
 
-  # One left-flowing line: context, phase, log position. cwd, model, and
-  # rate moved to the stats footer (ADR 0015 §2) — moved, not duplicated.
+  # One left-flowing line: context, phase, log position — non-empty groups
+  # joined with a separator BETWEEN them, so a fresh session opens with the
+  # phase dot, never a dangling leading separator. cwd, model, and rate
+  # moved to the stats footer (ADR 0015 §2) — moved, not duplicated.
   defp status_widget(state, log_height) do
     {label, role} = Map.fetch!(@phases, state.phase)
 
-    %Paragraph{
-      text: [
-        Line.new(
-          context_spans(state) ++
-            phase_spans(label, role) ++ position_spans(state, log_height)
-        )
+    spans =
+      [
+        context_spans(state),
+        phase_spans(label, role),
+        position_spans(state, log_height)
       ]
-    }
+      |> Enum.reject(&(&1 == []))
+      |> Enum.intersperse([separator()])
+      |> List.flatten()
+
+    %Paragraph{text: [Line.new(spans)]}
   end
 
   # The stats footer under the composer (ADR 0015 §2): cwd, model, live
@@ -442,12 +448,11 @@ defmodule DashFloat.TUI.View do
   defp context_spans(%{stats: %{context_total: 0}}), do: []
 
   defp context_spans(state) do
-    [separator(), Span.new("ctx " <> State.context_label(state), style: Theme.style(:dim))]
+    [Span.new("ctx " <> State.context_label(state), style: Theme.style(:dim))]
   end
 
   defp phase_spans(label, role) do
     [
-      separator(),
       Span.new("● ", style: Theme.style(role)),
       Span.new(label, style: Theme.style(role))
     ]
@@ -455,7 +460,7 @@ defmodule DashFloat.TUI.View do
 
   defp position_spans(state, log_height) do
     position = position(state, log_height)
-    [separator(), Span.new(position, style: Theme.style(:dim))]
+    [Span.new(position, style: Theme.style(:dim))]
   end
 
   defp separator, do: Span.new(" · ", style: Theme.style(:hint))

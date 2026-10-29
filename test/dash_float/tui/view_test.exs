@@ -106,6 +106,15 @@ defmodule DashFloat.TUI.ViewTest do
       assert text =~ "● Idle"
     end
 
+    # Nothing has streamed and the phase cluster is the bar's first group:
+    # a fresh session never opens with a dangling leading separator.
+    test "a fresh session's status opens with the phase dot, no leading separator" do
+      text = status_text(new_state())
+
+      assert String.starts_with?(text, "● ")
+      refute String.starts_with?(text, " · ")
+    end
+
     test "token fields appear only once something has streamed, in ADR order" do
       base = new_state(provider: provider(128_000))
 
@@ -127,7 +136,7 @@ defmodule DashFloat.TUI.ViewTest do
 
     test "the status bar is one line of styled spans, dim separators between" do
       [line] = status_line(new_state())
-      assert length(line.spans) > 4
+      assert length(line.spans) > 3
 
       separators = Enum.filter(line.spans, &(&1.content == " · "))
       assert separators != []
@@ -950,6 +959,56 @@ defmodule DashFloat.TUI.ViewTest do
           if step < 4, do: Theme.style(:cursor), else: %ExRatatui.Style{}
 
         assert cursor_style(state) == expected, "step #{step}"
+      end
+    end
+  end
+
+  # The cursor artifact proven at the DRAWN CELLS (ADR 0015 §1): the test
+  # terminal's styled-cell API (ExRatatui.CellSession) renders through the
+  # real Rust renderer, so the per-cell modifiers are the terminal truth —
+  # not just the widget struct the renderer consumes.
+  describe "input cursor drawn cells" do
+    alias ExRatatui.CellSession
+
+    defp reversed_cells(state) do
+      session = CellSession.new(80, 24)
+
+      :ok =
+        CellSession.draw(session, View.render(state, %ExRatatui.Frame{width: 80, height: 24}))
+
+      count =
+        session
+        |> CellSession.take_cells()
+        |> Map.get(:cells, [])
+        |> Enum.count(&(:reversed in &1.modifiers))
+
+      CellSession.close(session)
+      count
+    end
+
+    test "focused and idle: exactly one reversed cell" do
+      idle = %{new_state() | phase: :idle}
+      assert reversed_cells(idle) == 1
+    end
+
+    test "unfocused: zero reversed cells in every phase" do
+      for phase <- [:idle, :streaming, :executing_tool, :confirming] do
+        state = %{new_state() | phase: phase, focused?: false}
+        assert reversed_cells(state) == 0, "phase #{phase}"
+      end
+    end
+
+    test "focused and streaming: the blink draws on steps 0 and 3, not 4 and 7" do
+      base = new_state()
+
+      for step <- [0, 3] do
+        assert reversed_cells(%{base | phase: :streaming, anim_step: step}) == 1,
+               "step #{step}"
+      end
+
+      for step <- [4, 7] do
+        assert reversed_cells(%{base | phase: :streaming, anim_step: step}) == 0,
+               "step #{step}"
       end
     end
   end

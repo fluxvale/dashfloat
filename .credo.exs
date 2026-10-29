@@ -10,9 +10,10 @@
 # reference's Phoenix-web-only exemptions (flux_vale_web modules, generated
 # components, telemetry, test/support, and Readability.Specs' web-layer file
 # exclusion) are dropped — nothing they match exists here. Specs are required
-# everywhere. StructFieldAmount allows 40 fields: `TUI.State` is deliberately
-# one flat pure struct (ADRs 0002/0006/0015), and slicing it would fight the
-# transitions that read it whole.
+# everywhere. StructFieldAmount allows 40 fields (ADR 0004, amended
+# 2026-10-29): `TUI.State` is deliberately one flat pure struct
+# (ADRs 0002/0006/0015), and slicing it would fight the transitions that
+# read it whole.
 #
 %{
   configs: [

@@ -3,6 +3,7 @@ defmodule DashFloat.TUI.SuggestTest do
   use ExUnit.Case, async: true
 
   alias DashFloat.Config
+  alias DashFloat.SSEServer
   alias DashFloat.TUI.Suggest
 
   @zai "https://api.z.ai/api/coding/paas/v4"
@@ -126,9 +127,61 @@ defmodule DashFloat.TUI.SuggestTest do
       assert Suggest.normalize({:ok, 42}) == nil
     end
 
+    # A blank after quote-stripping is nil too: the empty string is truthy
+    # and would blank the composer's placeholder entirely.
+    test "a quote-only body is no ghost" do
+      assert Suggest.normalize({:ok, "\"\""}) == nil
+      assert Suggest.normalize({:ok, "''"}) == nil
+      assert Suggest.normalize({:ok, "`"}) == nil
+    end
+
+    # Control bytes never reach the terminal byte stream: the ghost is
+    # drawn as placeholder text, so a smuggled ESC byte would be interpreted
+    # by the terminal (the printable remainder is inert text).
+    test "control bytes are scrubbed before display" do
+      ghost = Suggest.normalize({:ok, "\e[2Jtell me more"})
+
+      assert ghost == "[2Jtell me more"
+      refute ghost =~ "\e"
+
+      assert Suggest.normalize({:ok, "tell\a me\b more\x7f"}) == "tell me more"
+    end
+
+    test "a body that scrubs to blank is nil" do
+      assert Suggest.normalize({:ok, "\e\a\b\x7f"}) == nil
+    end
+
     test "a raise inside the HTTP path is rescued to :error (fail-open)" do
       c = config(base_url: "not-a-url")
       assert Suggest.request(c, "tail") == :error
+    end
+  end
+
+  describe "request/2 against the loopback" do
+    # A followed redirect would relay the conversation tail to a third host
+    # / re-bill it: a 3xx is just another failure (the ChatStream
+    # precedent). The relative location points back at this server, so a
+    # followed redirect would surface as a second connection.
+    test "a 307 is never followed: :error and no second connection" do
+      {:ok, server} = SSEServer.start_link([redirect_step(), :close])
+      on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+
+      base = SSEServer.base_url(server)
+      config = loopback_config(base)
+
+      assert Suggest.request(config, "tail") == :error
+
+      assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 1_000
+      Process.sleep(300)
+      refute_receive {:sse_request, _, _, _, _}
+    end
+
+    defp loopback_config(base) do
+      struct!(Config, base_url: base, model: "active-m", api_key: "k")
+    end
+
+    defp redirect_step do
+      {:send, "HTTP/1.1 307 Temporary Redirect\r\nlocation: /x\r\ncontent-length: 0\r\n\r\n"}
     end
   end
 

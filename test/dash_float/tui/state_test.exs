@@ -2028,6 +2028,33 @@ defmodule DashFloat.TUI.StateTest do
       assert state.suggest_arm == false
     end
 
+    # agent_down(:normal) re-sends {:phase, :idle}: nothing finalizes, so
+    # an already-consumed arm intent must not be re-armed into a SECOND
+    # side-request for one turn (ADR 0015 §3).
+    test "a re-sent idle does not re-arm the consumed intent" do
+      base = new_state(provider: @provider)
+      armed = turn_with_reply(base, "all done")
+      assert armed.suggest_arm == true
+
+      # The runner consumed the one-shot intent (tui.ex suggest_arm/1).
+      consumed = %{armed | suggest_arm: false}
+
+      state = State.stream_message(consumed, {:phase, :idle}, 3_000)
+
+      assert state.suggest_arm == false
+    end
+
+    test "a tool interlude never arms (mid-turn), even after a reply" do
+      base = new_state(provider: @provider)
+
+      state =
+        %{base | phase: :streaming}
+        |> State.stream_message({:token, "answer"}, 1_000)
+        |> State.stream_message({:phase, :executing_tool}, 1_100)
+
+      assert state.suggest_arm == false
+    end
+
     test "Tab materializes the ghost into the draft and dismisses it" do
       ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
 
@@ -2077,6 +2104,16 @@ defmodule DashFloat.TUI.StateTest do
     test "a new streaming phase dismisses the ghost" do
       ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
       state = State.stream_message(ghosted, {:phase, :streaming}, 1_000)
+
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+    end
+
+    # Every new phase sets a reap intent (ADR 0015 §3) — a ghost must not
+    # survive a tool interlude.
+    test "an executing_tool phase dismisses the ghost" do
+      ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
+      state = State.stream_message(ghosted, {:phase, :executing_tool}, 1_000)
 
       assert state.suggestion == nil
       assert state.suggest_reap == true

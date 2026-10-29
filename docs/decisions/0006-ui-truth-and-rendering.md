@@ -16,7 +16,12 @@
   agent transcript, not entry text, is the persistence truth; entries are
   derived; see
   [Amendment (2026-10-27, issue #27): persistence truth moves to the transcript](#amendment-2026-10-27-issue-27-persistence-truth-moves-to-the-transcript)
-  below)
+  below); **amended 2026-10-29**
+  ([issue #66](https://github.com/fluxvale/dashfloat/issues/66) /
+  [issue #67](https://github.com/fluxvale/dashfloat/issues/67) /
+  [issue #70](https://github.com/fluxvale/dashfloat/issues/70) —
+  composer cursor, stats footer under the input, ghost-text suggestion;
+  see [ADR 0015](0015-input-surface-cursor-stats-ghost.md))
 - **Date:** 2026-10-24
 - **Implements:** [issue #16](https://github.com/fluxvale/dashfloat/issues/16) — Phase 2.5 of the
   [ADR 0001](0001-founding-stack-and-architecture.md) roadmap.
@@ -73,6 +78,9 @@ Four regions; the activity row exists only while work is in flight:
   when configured), `<rate> tok/s` (only after/while a stream has produced
   tokens), phase dot + label (accent while busy, dim idle), log position
   (dim). The bar omits token fields entirely until something has streamed.
+  (cwd/model/rate moved to the input footer per
+  [ADR 0015](0015-input-surface-cursor-stats-ghost.md) §2; cursor per §1;
+  ghost text per §3.)
 - **Activity line** — spinner glyph + action label + dim interrupt hint,
   accent-colored, on the 1-row region above the input. Labels: `Thinking…`
   (streaming, no token yet), `Streaming…` (tokens arrived), `Running tool…`

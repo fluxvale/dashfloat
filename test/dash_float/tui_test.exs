@@ -17,6 +17,7 @@ defmodule DashFloat.TUITest do
   alias DashFloat.SSEServer
   alias DashFloat.TUI
   alias DashFloat.TUI.State
+  alias DashFloat.TUI.Suggest
   alias DashFloat.TUI.Theme
   alias DashFloat.TUI.View
   alias ExRatatui.Runtime
@@ -2211,6 +2212,62 @@ defmodule DashFloat.TUITest do
       assert Jason.decode!(body)["model"] == "cheap-override-m"
     end
 
+    # The preset DEFAULT cheap model was never proven at this seam: the
+    # provider config is the genuine preset shape (trailing slash, flagship
+    # active model, suggest unset) and only the transport redirects to the
+    # loopback — the real model-resolution chain (F1's normalization
+    # included) decides the wire model.
+    test "the preset default cheap model reaches the wire and the ghost lands" do
+      provider =
+        {:ok,
+         struct!(Config,
+           base_url: "https://api.z.ai/api/coding/paas/v4/",
+           model: "glm-5.3",
+           api_key: "k"
+         )}
+
+      {:ok, server} =
+        SSEServer.start_link(:per_connection, [[http_ok(ghost_completion()), :close]])
+
+      on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+      base = SSEServer.base_url(server)
+
+      {:ok, pid} =
+        start_tui(
+          provider: provider,
+          suggest_fetcher: fn config, tail ->
+            # The model resolves on the REAL preset base_url; only the
+            # transport redirects to the loopback.
+            model = Suggest.model(config)
+            Suggest.request(%{config | base_url: base, suggest: model}, tail)
+          end,
+          suggest_debounce_ms: 25
+        )
+
+      complete_turn(pid)
+
+      assert_receive {:sse_request, "POST", "/chat/completions", _headers, body}, 1_000
+      assert Jason.decode!(body)["model"] == "glm-5.3-flash"
+
+      state = eventually(pid, &(&1.suggestion == "tell me more"))
+      assert screen_text(state) =~ "tell me more"
+    end
+
+    # agent_down(:normal) re-sends {:phase, :idle}: the turn was already
+    # finalized and the one-shot consumed — a second side-request for one
+    # turn would be a budget bug (ADR 0015 §3).
+    test "a re-sent idle never fires a second side-request for the same turn" do
+      {:ok, pid} = start_suggest_tui([], 20, [[http_ok(ghost_completion()), :close]])
+
+      complete_turn(pid)
+      assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 1_000
+
+      send(pid, {:phase, :idle})
+      Process.sleep(300)
+
+      refute_receive {:sse_request, _, _, _, _}
+    end
+
     test "suggest: false never builds a side-request at all" do
       {:ok, pid} =
         start_suggest_tui([suggest: false], 20, [[http_ok(ghost_completion()), :close]])
@@ -2276,7 +2333,7 @@ defmodule DashFloat.TUITest do
              |> State.input_text() == "tell me more!"
 
       press(pid, "enter")
-      assert_receive {:prompt, ui, "tell me more!"}, 1_000
+      assert_receive {:prompt, _ui, "tell me more!"}, 1_000
     end
 
     test "typing over a landed ghost dismisses it; the late response is dropped (epoch stale)" do
@@ -2367,6 +2424,16 @@ defmodule DashFloat.TUITest do
                TUI.handle_info(:dashfloat_suggest, %{state | suggest_ref: fired})
 
       assert dispatched.suggest_ref == nil
+    end
+
+    # A stale-epoch result must not untrack a NEWER live request: the state
+    # is untouched, render-suppressed (ADR 0015 §3's straggler rule).
+    test "a stale-epoch straggler leaves a live request tracked and the state untouched" do
+      task = spawn(fn -> Process.sleep(1_000) end)
+      state = %{State.new(provider: provider()) | suggest_task: task, suggest_epoch: 2}
+
+      assert {:noreply, ^state, %{render?: false}} =
+               TUI.handle_info({:suggestion, 1, {:ok, "stale"}}, state)
     end
   end
 end

@@ -702,11 +702,14 @@ defmodule DashFloat.Config do
   end
 
   # The env spellings normalize onto the shared parser's boolean arms; any
-  # other non-blank string is the model id verbatim (never downcased).
+  # other non-blank string is the model id verbatim (never downcased, never
+  # trimmed — the id arm passes the raw value through). The boolean match
+  # trims BOTH ends: an env `" false"` must stay the opt-out, not become a
+  # model id with a leading space.
   defp suggest_env_keyword(raw) do
     keyword =
       raw
-      |> String.trim_trailing()
+      |> String.trim()
       |> String.downcase()
 
     case keyword do

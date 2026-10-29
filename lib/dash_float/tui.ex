@@ -234,10 +234,12 @@ defmodule DashFloat.TUI do
   end
 
   # A suggestion landed (ADR 0015 §3): accepted only while its epoch is
-  # current, the UI is idle, the draft is empty, and suggestions are on —
-  # every other case (a stale straggler, a blank or failed result) is
-  # dropped render-suppressed. An accepted ghost is the one idle frame it
-  # draws.
+  # current, the UI is idle, the draft is empty, and suggestions are on.
+  # A stale epoch is dropped with the state UNTOUCHED — a newer request may
+  # still be in flight, and clearing its task here would orphan it.
+  def handle_info({:suggestion, epoch, _result}, state) when epoch != state.suggest_epoch,
+    do: {:noreply, state, %{render?: false}}
+
   def handle_info({:suggestion, epoch, result}, state) do
     text = if accept_suggestion?(state, epoch), do: Suggest.normalize(result), else: nil
 
@@ -323,8 +325,9 @@ defmodule DashFloat.TUI do
   end
 
   # The single tick choke point (ADR 0006): any active phase keeps exactly one
-  # timer pending; idle always cancels it. Idle => no timers => no renders
-  # (the exit guard's one-shot is the sole, user-armed exception).
+  # timer pending; idle always cancels it. Idle => no timers => no renders.
+  # The two sanctioned one-shot exceptions: the user-armed exit guard (issue
+  # #28) and the suggest debounce (sanctioned exception #4, ADR 0015 §3).
   defp schedule(state) do
     state =
       state
@@ -405,14 +408,27 @@ defmodule DashFloat.TUI do
 
   defp suggest_arm(state) do
     if state.live? or state.suggest_fetcher do
-      %{
-        state
-        | suggest_arm: false,
-          suggest_ref: Process.send_after(self(), @suggest, state.suggest_debounce_ms)
-      }
+      state
+      |> kill_pending_suggest()
+      |> arm_suggest_debounce()
     else
       %{state | suggest_arm: false}
     end
+  end
+
+  # A re-arm must never orphan a pending debounce or an in-flight task (the
+  # dismiss path's cancel rule, ADR 0015 §3): the existing reap runs first —
+  # kill, clear, epoch bump — so the old request is dead on arrival before
+  # the new one schedules.
+  defp kill_pending_suggest(%{suggest_ref: nil, suggest_task: nil} = state), do: state
+  defp kill_pending_suggest(state), do: suggest_reap(%{state | suggest_reap: true})
+
+  defp arm_suggest_debounce(state) do
+    %{
+      state
+      | suggest_arm: false,
+        suggest_ref: Process.send_after(self(), @suggest, state.suggest_debounce_ms)
+    }
   end
 
   @impl ExRatatui.App

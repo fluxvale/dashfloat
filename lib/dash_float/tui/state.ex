@@ -865,13 +865,25 @@ defmodule DashFloat.TUI.State do
     do: dismiss_suggestion(%{state | phase: :streaming, confirm: nil})
 
   def stream_message(state, {:phase, :idle}, now) do
+    # Arm only when THIS transition actually finalized an assistant reply:
+    # a re-sent idle (agent_down(:normal), a late phase echo) finalizes
+    # nothing, and re-arming would fire a second side-request for one turn
+    # (ADR 0015 §3: at most one per completed turn).
+    finalized? = state.in_flight not in [nil, ""]
+
     state
     |> finalize_phase(:idle, now)
-    |> maybe_arm_suggestion()
+    |> maybe_arm_suggestion(finalized?)
   end
 
-  def stream_message(state, {:phase, :executing_tool}, now),
-    do: finalize_phase(state, :executing_tool, now)
+  # Tool interludes are mid-turn: the phase changes and any in-flight
+  # partial reply finalizes, but the turn is not complete — never an arm
+  # (and every new phase still sets the reap intent, ADR 0015 §3).
+  def stream_message(state, {:phase, :executing_tool}, now) do
+    state
+    |> finalize_phase(:executing_tool, now)
+    |> dismiss_suggestion()
+  end
 
   def stream_message(state, {:entry, kind, text}, _now)
       when kind in [:tool, :system] and is_binary(text),
@@ -919,8 +931,11 @@ defmodule DashFloat.TUI.State do
 
   # One-shot arm intent (ADR 0015 §3): only a finalized assistant turn with
   # an empty draft and suggestions enabled arms — at most one side-request
-  # per completed turn; draft churn later never re-arms.
-  defp maybe_arm_suggestion(state) do
+  # per completed turn; draft churn later never re-arms. `false` (nothing
+  # finalized here) leaves the state untouched.
+  defp maybe_arm_suggestion(state, false), do: state
+
+  defp maybe_arm_suggestion(state, true) do
     armed? =
       match?(%{kind: :assistant}, List.last(state.entries)) and
         input_text(state) == "" and

@@ -742,6 +742,18 @@ defmodule DashFloat.ConfigTest do
                Config.load(opted_out, %{"DASHFLOAT_SUGGEST" => "1"}, [])
     end
 
+    # Leading whitespace trims too: an env `" false"` is the opt-out, never
+    # a model id " false" (which would silently become a side-request).
+    test "the env spellings trim BOTH ends: ' false' and ' 0' opt out" do
+      pinned = suggest_dir("suggest: 'file-m'")
+
+      assert {:ok, %Config{suggest: false}} =
+               Config.load(pinned, %{"DASHFLOAT_SUGGEST" => " false"}, [])
+
+      assert {:ok, %Config{suggest: false}} =
+               Config.load(pinned, %{"DASHFLOAT_SUGGEST" => " 0"}, [])
+    end
+
     test "a blank env var counts as absent and falls to the file" do
       dir = suggest_dir("suggest: 'file-m'")
 
@@ -762,6 +774,18 @@ defmodule DashFloat.ConfigTest do
       assert Presets.suggest_model("https://api.z.ai/api/coding/paas/v4") == "glm-5.3-flash"
       assert Presets.suggest_model("https://api.synthetic.new/openai/v1") == "glm-4.7-flash"
       assert Presets.suggest_model("https://custom.example/v1") == nil
+    end
+
+    # Catalog.fetch's URL convention: a trailing slash is convention, not
+    # identity — a preset URL stored with one must still map to the cheap
+    # model, never silently fall back to the flagship.
+    test "trailing-slash forms of the preset URLs resolve; custom URLs stay nil" do
+      assert Presets.suggest_model("https://api.z.ai/api/coding/paas/v4/") == "glm-5.3-flash"
+
+      assert Presets.suggest_model("https://api.synthetic.new/openai/v1/") ==
+               "glm-4.7-flash"
+
+      assert Presets.suggest_model("https://custom.example/v1/") == nil
     end
   end
 

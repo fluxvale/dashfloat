@@ -28,10 +28,12 @@ deciding (`ex_ratatui` 0.17.1):
   opted in at start (`focus_events:` — the same connect-path option shape
   as `mouse_capture:`, and the connect telemetry span carries both in its
   metadata).
-- The test terminal (`init_test_terminal` + `get_buffer_content`) exposes
-  **text-only** buffer contents — there is no styled-cell API — so a style
-  artifact is proven at the render-output seam (the widget struct the Rust
-  renderer consumes) plus the render counter, never from the text dump.
+- `ExRatatui.CellSession` is a styled-cell API for tests:
+  `CellSession.new(w, h)` builds a test terminal, `CellSession.draw(session,
+  widgets)` renders through the real Rust renderer, and
+  `CellSession.take_cells(session)` returns `%{cells: [...]}` with per-cell
+  `modifiers` — so a style artifact is proven by asserting the drawn cells
+  themselves, not the widget struct and not a text dump.
 - `Req` is already the one-shot HTTP client (`Config.Catalog.fetch`),
   `DashFloat.TaskSupervisor` the supervised-task home, and `SSEServer`
   forwards every loopback request to its owner as

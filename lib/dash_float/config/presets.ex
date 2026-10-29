@@ -44,8 +44,11 @@ defmodule DashFloat.Config.Presets do
   @doc """
   The provider's default cheap suggestion model (ADR 0015 §3), keyed by
   base URL; nil for custom providers (the caller falls back to the active
-  model).
+  model). The URL is normalized like `Config.Catalog.fetch`'s (a trailing
+  slash is convention, not identity), so a preset URL pasted with one
+  still resolves.
   """
   @spec suggest_model(String.t()) :: String.t() | nil
-  def suggest_model(base_url), do: Map.get(@suggest_models, base_url)
+  def suggest_model(base_url),
+    do: Map.get(@suggest_models, String.trim_trailing(base_url, "/"))
 end

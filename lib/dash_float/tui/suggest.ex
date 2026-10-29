@@ -19,6 +19,7 @@ defmodule DashFloat.TUI.Suggest do
   @max_tokens 48
   @timeout_ms 5_000
   @display_cap 80
+  @quote_chars ["\"", "'", "`"]
 
   @instruction "Suggest the user's next message: one short line, at most 8 words, plain text only — no quotes, no explanation."
 
@@ -77,7 +78,11 @@ defmodule DashFloat.TUI.Suggest do
            headers: headers,
            json: body(config, tail),
            receive_timeout: @timeout_ms,
-           retry: false
+           retry: false,
+           # Never follow a redirect: a followed 3xx would relay the
+           # conversation tail to a third host (and re-bill it). A redirect
+           # is just another failure (the ChatStream precedent).
+           redirect: false
          ) do
       {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
         parse(body)
@@ -128,8 +133,10 @@ defmodule DashFloat.TUI.Suggest do
 
   @doc """
   Display normalization: `:error` → nil; `{:ok, raw}` → the first non-blank
-  line, trimmed, ONE pair of surrounding quotes stripped, hard-capped to
-  `@display_cap` chars. Blank → nil — no ghost at all.
+  line, trimmed, control bytes scrubbed (an escape byte must never reach
+  the terminal byte stream), ONE pair of surrounding quotes stripped,
+  hard-capped to `@display_cap` chars. Blank at any point → nil — no ghost
+  at all.
   """
   @spec normalize({:ok, term()} | :error) :: String.t() | nil
   def normalize(:error), do: nil
@@ -145,23 +152,44 @@ defmodule DashFloat.TUI.Suggest do
         nil
 
       line ->
-        line
-        |> String.trim()
-        |> strip_quotes()
-        |> String.slice(0, @display_cap)
+        ghost =
+          line
+          |> String.trim()
+          |> scrub_control_bytes()
+          |> strip_quotes()
+          |> String.slice(0, @display_cap)
+
+        if String.trim(ghost) == "", do: nil, else: ghost
     end
   end
 
   def normalize({:ok, _other}), do: nil
 
-  defp strip_quotes(line) do
-    first = String.first(line)
-    last = String.last(line)
+  # Control bytes (ESC, BEL, NUL, DEL...) never reach the composer: the
+  # ghost is drawn as placeholder text, so a smuggled escape byte would be
+  # interpreted by the terminal. The printable remainder is inert text.
+  defp scrub_control_bytes(line), do: String.replace(line, ~r/[\x00-\x1f\x7f]/, "")
 
-    if byte_size(line) >= 2 and first in ["\"", "'", "`"] and last == first do
-      String.slice(line, 1..-2//1)
-    else
-      line
+  defp strip_quotes(line) do
+    cond do
+      quote_only?(line) ->
+        ""
+
+      line != "" and byte_size(line) >= 2 and
+        String.first(line) in @quote_chars and String.last(line) == String.first(line) ->
+        String.slice(line, 1..-2//1)
+
+      true ->
+        line
     end
+  end
+
+  # A body that is nothing but quote characters is no ghost (the model
+  # echoed the instruction's "no quotes" back as punctuation).
+  defp quote_only?(line) do
+    line != "" and
+      line
+      |> String.graphemes()
+      |> Enum.all?(&(&1 in @quote_chars))
   end
 end
