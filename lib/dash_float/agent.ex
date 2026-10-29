@@ -663,7 +663,11 @@ defmodule DashFloat.Agent do
 
       {:ok, preview} ->
         preview = %{id: call.id, name: call.name, args: call.args, lines: preview.lines}
-        resolve_gate(state, call, outcome, preview)
+
+        case outcome do
+          :run -> run_with_receipt(state, call, preview)
+          gate -> resolve_gate(state, call, gate, preview)
+        end
     end
   end
 
@@ -672,13 +676,6 @@ defmodule DashFloat.Agent do
     ref = make_ref()
     display(state.ui, {:confirm, ref, preview})
     {:noreply, %{state | tool_slot: {:confirming, ref, call}}}
-  end
-
-  # :run — UNCHAINED (any no-keypress run): no confirm, no check; the preview
-  # entry is the execution receipt (ADR 0016 §4).
-  defp resolve_gate(state, call, :run, preview) do
-    display(state.ui, {:tool_preview, preview})
-    dispatch_runner(state, call)
   end
 
   # :propose — PLAN: the change is previewed, never executed, and the model
@@ -692,6 +689,13 @@ defmodule DashFloat.Agent do
 
   # :vet — AUTO: the safety check decides run-vs-confirm per call (ADR 0016 §6).
   defp resolve_gate(state, call, :vet, preview), do: start_vet(state, call, preview)
+
+  # :run — UNCHAINED (any no-keypress run): no confirm, no check; the preview
+  # entry is the execution receipt (ADR 0016 §4).
+  defp run_with_receipt(state, call, preview) do
+    display(state.ui, {:tool_preview, preview})
+    dispatch_runner(state, call)
+  end
 
   # The check runs as a temporary task under the supervisor (a crash is a
   # report, never a node crash — ADR 0001), its hard timeout owned inside the
@@ -750,7 +754,7 @@ defmodule DashFloat.Agent do
   defp resolve_vet(state, call, preview, verdict) do
     case Mode.gate(state.mode, Tools.class(call.name)) do
       # Switched to unchained mid-check: dispatch regardless of the verdict.
-      :run -> resolve_gate(state, call, :run, preview)
+      :run -> run_with_receipt(state, call, preview)
       # Switched to plan mid-check: the change is proposed, never executed —
       # exactly the plan path in resolve_gate (ADR 0016 §4).
       :propose -> resolve_gate(state, call, :propose, preview)
@@ -763,21 +767,27 @@ defmodule DashFloat.Agent do
   end
 
   defp resolve_verdict(state, call, preview, {:allow}) do
-    resolve_gate(state, call, :run, preview)
+    run_with_receipt(state, call, preview)
   end
 
   defp resolve_verdict(state, call, preview, verdict) do
     vet_confirm(state, call, preview, vet_entry(verdict))
   end
 
-  # The resolution entry names what actually happened; an allow verdict under
-  # a newly-confirming gate adds no safety-check line — nothing asked,
-  # nothing failed.
+  # The confirm-arming entry names what actually happened. An {:allow}
+  # reaches vet_entry only on a mid-check re-gate to :confirm — there it adds
+  # no safety-check line (nothing asked, nothing failed); under a live :vet
+  # gate an allow never reaches vet_entry at all (it runs with the receipt).
   defp vet_entry({:allow}), do: nil
   defp vet_entry({:ask}), do: "[safety check: needs confirmation]"
 
   defp vet_entry({:error, _reason}),
     do: "[safety check unavailable — confirming]"
+
+  # Fail-safe (ADR 0016 §6's fail-closed direction): any out-of-contract
+  # verdict — an injected or regressed vetter — confirms instead of crashing
+  # the batch mid-check.
+  defp vet_entry(_other), do: "[safety check unavailable — confirming]"
 
   # Ask, failure, and a mid-check switch to build all arm BUILD's confirm on
   # the already-built preview — the human answers on exactly the evidence

@@ -16,6 +16,14 @@ defmodule AgentTestVetFail do
   def verdict(_provider, _call, _lines, _opts), do: {:error, "boom"}
 end
 
+defmodule AgentTestVetGarbage do
+  @moduledoc false
+  # Out of contract on purpose: none of {:allow}/{:ask}/{:error, _}. The
+  # agent must fail safe to confirm — never crash the batch (ADR 0016 §6).
+  @spec verdict(term(), term(), term(), term()) :: :run
+  def verdict(_provider, _call, _lines, _opts), do: :run
+end
+
 defmodule AgentTestVetParked do
   @moduledoc false
   # Parks until messaged — the agent's cancel is the message that resolves it.
@@ -924,6 +932,31 @@ defmodule DashFloat.AgentTest do
     refute sandbox_exists?(ctx, "failed.txt")
   end
 
+  @tag :tmp_dir
+  test "an out-of-contract verdict fails safe: confirm with the unavailable entry, no crash",
+       ctx do
+    server =
+      start_server([
+        call_tool_episode("call_g", "execute_command", %{"command" => "touch garbage.txt"}),
+        final_episode("done")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetGarbage)
+    send(agent, {:prompt, self(), "run it"})
+    assert_receive {:phase, :checking}, 2_000
+
+    # The garbage verdict may neither run the call nor kill the GenServer:
+    # the fail-safe arms the confirm, the entry naming what happened.
+    assert_receive {:entry, :system, "[safety check unavailable — confirming]"}, 2_000
+    assert_receive {:confirm, ref, %{id: "call_g"}}, 2_000
+    refute sandbox_exists?(ctx, "garbage.txt")
+
+    send(agent, {:confirm_decision, ref, :rejected})
+    assert_receive {:tool_result, %{id: "call_g", ok: false, status: "rejected"}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+    assert Process.alive?(agent)
+  end
+
   test "a fabricated vet_done while idle is ignored, never dispatched" do
     server = start_server([final_episode("unused")])
     {agent, _sup} = start_agent(server, System.tmp_dir!(), mode: :auto, vetter: AgentTestVetAllow)
@@ -988,11 +1021,14 @@ defmodule DashFloat.AgentTest do
     send(agent, {:prompt, self(), "go"})
     assert_receive {:phase, :checking}, 2_000
 
+    vet = vetting_pid(agent)
     send(agent, {:cancel})
 
-    # The parked vetter answers the cancel by message and the batch aborts
-    # within this 2 s bound — an order of magnitude under the 10 s vet
-    # timeout, so the promptness is the cancel's work, not the deadline's.
+    # The parked vetter can only exit by unblocking on the agent's forwarded
+    # cancel: its death within this tight bound is the wiring's work — not
+    # the 10 s deadline's, and not any-message luck.
+    assert dead_within?(vet, 100)
+
     assert_receive {:tool_result, %{id: "call_pc", status: "cancelled"}}, 2_000
     assert_receive {:entry, :system, "[tool run cancelled]"}, 2_000
     assert_receive {:phase, :idle}, 2_000
@@ -1998,6 +2034,19 @@ defmodule DashFloat.AgentTest do
       _other when tries > 0 ->
         Process.sleep(10)
         vetting_pid(agent, tries - 1)
+    end
+  end
+
+  # True iff `pid` is dead within `ms` — a tight liveness bound, polled with
+  # no fixed sleep.
+  defp dead_within?(pid, ms) when ms <= 0, do: not Process.alive?(pid)
+
+  defp dead_within?(pid, ms) do
+    if Process.alive?(pid) do
+      Process.sleep(5)
+      dead_within?(pid, ms - 5)
+    else
+      true
     end
   end
 
