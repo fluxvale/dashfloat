@@ -353,24 +353,6 @@ defmodule DashFloat.ApplicationTest do
 
   ## --resume at the boot seam (ADR 0014 §6)
 
-  # chmod-000 assertions are meaningless for root.
-  setup :skip_permission_test_for_root
-
-  defp skip_permission_test_for_root(context) do
-    if context[:skip_if_root] && root?() do
-      {:skip, "chmod-000 is not a permission barrier for root"}
-    else
-      :ok
-    end
-  end
-
-  defp root? do
-    case System.cmd("id", ["-u"]) do
-      {"0\n", 0} -> true
-      _other -> false
-    end
-  end
-
   defp write_session_file(sessions, id, contents) do
     File.mkdir_p!(sessions)
     path = Path.join(sessions, id <> ".json")
@@ -477,26 +459,21 @@ defmodule DashFloat.ApplicationTest do
       assert File.read!(path) == before
     end
 
-    @tag :skip_if_root
-    test "an unreadable file refuses loudly and stays byte-identical" do
+    # A path that cannot be File.read is a deterministic refusal on every
+    # filesystem when it is a directory — no chmod-000 and no root caveat
+    # (the session_test pattern).
+    test "a session path that is a directory refuses loudly and stays put" do
       sessions = tmp_dir()
       id = "20261027-093000-cde345"
-      contents = session_json(id, %{}, [])
-      path = write_session_file(sessions, id, contents)
-      File.chmod!(path, 0)
+      path = Path.join(sessions, id <> ".json")
+      File.mkdir!(path)
 
-      on_exit(fn -> File.chmod!(path, 0o600) end)
+      {result, stderr} = resume_boot(sessions, id)
 
-      if File.read(path) == {:error, :eacces} do
-        {result, stderr} = resume_boot(sessions, id)
-
-        assert {:error, :session_resume_failed} = result
-        assert_received {:halted, 1}
-        assert stderr =~ path
-
-        File.chmod!(path, 0o600)
-        assert File.read!(path) == contents
-      end
+      assert {:error, :session_resume_failed} = result
+      assert_received {:halted, 1}
+      assert stderr =~ path
+      assert File.dir?(path)
     end
 
     test "a version 2 file refuses naming the field and stays byte-identical" do

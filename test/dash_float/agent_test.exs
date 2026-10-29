@@ -1251,6 +1251,33 @@ defmodule DashFloat.AgentTest do
   end
 
   @tag :tmp_dir
+  test "a cross-profile resume keeps the original pin on the next save", ctx do
+    # ADR 0014 test plan 10: the active provider's identity differs from the
+    # pinned one, yet the session's pin is immutable — the next save rewrites
+    # the file under the original pin, never the active provider's.
+    server = start_server([final_episode("continued")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    original_pin = %{profile: "work", model: "other-model", base_url: "https://pinned.example/v1"}
+
+    {resumed, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        resume: %{
+          id: "20261001-000000-aabbcc",
+          pin: original_pin,
+          messages: [%{"role" => "user", "content" => "earlier"}]
+        }
+      )
+
+    send(resumed, {:prompt, self(), "continue"})
+    assert_receive {:phase, :idle}, 2_000
+
+    {:ok, saved} = Session.load(sessions, "20261001-000000-aabbcc")
+    assert saved.pin == original_pin
+  end
+
+  @tag :tmp_dir
   test "a resumed agent writes the hand-off's created_at verbatim on its first save", ctx do
     server = start_server([final_episode("resumed fine")])
     sessions = Path.join(ctx.tmp_dir, "sessions")
