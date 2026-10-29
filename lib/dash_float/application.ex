@@ -6,8 +6,15 @@ defmodule DashFloat.Application do
   alias DashFloat.Config
   alias DashFloat.Config.Onboarding
   alias DashFloat.Session
+  alias DashFloat.Session.Title
 
   require Logger
+
+  # Session's @id_shape, locally (Title's precedent): routing a typed
+  # `--resume` value between the id path and the title path needs only the
+  # shape test, not a store dependency on it. Strict lowercase — we mint
+  # lowercase ids (ADR 0014 §6).
+  @id_shape ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/
 
   # The resume hand-off (ADR 0014 §6): one load, two consumers — the agent
   # adopts the transcript, the TUI replays it.
@@ -75,10 +82,11 @@ defmodule DashFloat.Application do
     else
       case boot_resume(cli, classification, sessions_dir, test?) do
         {:error, message} ->
-          # The user named a conversation; silently starting blank is the one
-          # outcome a resume must never produce (ADR 0014 §6). Same refusal
-          # shape as the interactive-setup refusal above: stderr, then the
-          # boundary halt, with the error tuple as the test seam's value.
+          # The user named a conversation or a title; silently starting blank
+          # is the one outcome a named request must never produce (ADR 0014
+          # §6). Same refusal shape as the interactive-setup refusal above:
+          # stderr, then the boundary halt, with the error tuple as the test
+          # seam's value.
           IO.binwrite(:stderr, message <> "\n")
           halt.(1)
 
@@ -160,13 +168,43 @@ defmodule DashFloat.Application do
   # a load never writes.
   @doc false
   # Public so the boot tests drive the real load-and-compare the boot runs
-  # (see boot_resolver).
+  # (see boot_resolver). The typed value routes on shape: a UUID (today's `ls`
+  # tolerance — one `.json` suffix, which `Session.load/2` also strips) is the
+  # id path verbatim; anything else is a title to resolve.
   @spec boot_resume(keyword(), Config.classification(), Path.t()) ::
           {:ok, resume()} | {:error, String.t()}
   def boot_resume(cli, classification, sessions_dir) do
     case Keyword.get(cli, :resume) do
-      nil -> {:ok, nil}
-      id -> resume_session(Session.load(sessions_dir, id), classification)
+      nil ->
+        {:ok, nil}
+
+      requested ->
+        id = String.replace_suffix(requested, ".json", "")
+
+        if Regex.match?(@id_shape, id) do
+          resume_session(Session.load(sessions_dir, requested), classification)
+        else
+          resume_by_title(requested, classification, sessions_dir)
+        end
+    end
+  end
+
+  # The title path (ADR 0014 §6): the value names a session's unique title;
+  # the refusals name it as typed and carry the same ls remedy as the
+  # unknown-id arm.
+  defp resume_by_title(value, classification, sessions_dir) do
+    case Title.find_by_title(sessions_dir, value) do
+      {:ok, id} ->
+        resume_session(Session.load(sessions_dir, id), classification)
+
+      :none ->
+        {:error,
+         "no session titled \"#{value}\" under #{sessions_dir} — list sessions with: ls #{sessions_dir}"}
+
+      {:ambiguous, ids} ->
+        {:error,
+         "multiple sessions are titled \"#{value}\": #{Enum.join(ids, ", ")} — resume one by its " <>
+           "id; list sessions with: ls #{sessions_dir}"}
     end
   end
 
@@ -181,10 +219,76 @@ defmodule DashFloat.Application do
 
   defp resume_session({:error, message}, _classification), do: {:error, message}
 
+  # The boot-time session flow (ADR 0014 §6): the legacy-id sweep first — a
+  # timestamp-named file must be UUID-named before any resolution can name it
+  # — then resume resolution, then the --title checks (a rename needs the
+  # loaded session's id, and every refusal must land before any child starts).
   defp boot_resume(_cli, _classification, _sessions_dir, true), do: {:ok, nil}
 
-  defp boot_resume(cli, classification, sessions_dir, false),
-    do: boot_resume(cli, classification, sessions_dir)
+  defp boot_resume(cli, classification, sessions_dir, false) do
+    with :ok <- migrate_sweep(sessions_dir),
+         {:ok, resume} <- boot_resume(cli, classification, sessions_dir),
+         :ok <- apply_title(cli, resume, sessions_dir) do
+      {:ok, resume}
+    end
+  end
+
+  # The one-shot legacy-id sweep (ADR 0014 §2): a failed sweep warns and
+  # continues — resume-by-UUID still works and the next boot retries — and a
+  # steady-state boot (missing or all-UUID directory) logs nothing.
+  defp migrate_sweep(sessions_dir) do
+    case Session.migrate_legacy_ids(sessions_dir) do
+      {:ok, 0} ->
+        :ok
+
+      {:ok, count} ->
+        Logger.info("renamed #{count} legacy session file(s) to UUID ids")
+        :ok
+
+      {:error, message} ->
+        Logger.warning("legacy session id sweep skipped: #{message}")
+        :ok
+    end
+  end
+
+  # The --title checks (ADR 0014 §6): the value must normalize and the title
+  # must be free — silently starting untitled is the blank-session outcome
+  # the refusal exists to prevent. A resume is exempt from its own current
+  # title (the boot-time rename); any other holder refuses.
+  defp apply_title(cli, resume, sessions_dir) do
+    case Keyword.get(cli, :title) do
+      nil -> :ok
+      raw -> check_title(raw, resume, sessions_dir)
+    end
+  end
+
+  defp check_title(raw, resume, sessions_dir) do
+    case Title.normalize(raw) do
+      {:ok, _title} -> title_free(raw, resume, sessions_dir)
+      {:error, reason} -> {:error, title_refusal(reason)}
+    end
+  end
+
+  defp title_refusal(:empty), do: "--title may not be empty or blank"
+  defp title_refusal(:too_long), do: "--title may not exceed 80 characters"
+
+  defp title_refusal(:reserved),
+    do: "--title may not look like a session id (UUID)"
+
+  defp title_free(raw, resume, sessions_dir) do
+    case Title.title_holder(sessions_dir, raw, session_id(resume)) do
+      nil ->
+        :ok
+
+      holder ->
+        {:error,
+         "title \"#{raw}\" is already taken by session #{holder} — choose another title " <>
+           "or resume that session; list sessions with: ls #{sessions_dir}"}
+    end
+  end
+
+  defp session_id(%{session: %{id: id}}), do: id
+  defp session_id(nil), do: nil
 
   # ADR 0014 §6: warn, never refuse, never rewrite. A field compares only
   # when both sides are non-nil (an env-only session pins nil profile fields
@@ -242,7 +346,7 @@ defmodule DashFloat.Application do
   def boot_children(false, classification, config_dir, env, cli, resume, sessions_dir) do
     [
       {Task.Supervisor, name: DashFloat.TaskSupervisor}
-      | engine_children(classification, resume, sessions_dir) ++
+      | engine_children(classification, resume, cli, sessions_dir) ++
           tui_child(classification, config_dir, env, cli, resume)
     ]
   end
@@ -252,14 +356,16 @@ defmodule DashFloat.Application do
   # 0007). Setup states boot it on the error arm — the setup completion
   # delivers the resolved provider via {:set_provider, _} (ADR 0009).
   # Persistence is always on outside test (ADR 0014 §5); a resume additionally
-  # carries the loaded id/pin/messages/created_at, so the next save rewrites
-  # the same file under the same id (ADR 0014 §6), plus the ADR 0022 §6
-  # diagnostics (the persisted context anchor and the eviction history).
-  defp engine_children(classification, resume, sessions_dir) do
+  # carries the loaded id/pin/messages/created_at/title, so the next save
+  # rewrites the same file under the same id with its title (ADR 0014 §6),
+  # plus the ADR 0022 §6 diagnostics (the persisted context anchor and the
+  # eviction history). `title:` threads the boot's `--title` — the override
+  # wins over the loaded file's title.
+  defp engine_children(classification, resume, cli, sessions_dir) do
     resume_opts =
       case resume do
         nil ->
-          []
+          [title: Keyword.get(cli, :title)]
 
         %{session: session} ->
           [
@@ -269,8 +375,10 @@ defmodule DashFloat.Application do
               messages: session.messages,
               created_at: session.created_at,
               context: session.context,
-              compactions: session.compactions
-            }
+              compactions: session.compactions,
+              title: session.title
+            },
+            title: Keyword.get(cli, :title) || session.title
           ]
       end
 

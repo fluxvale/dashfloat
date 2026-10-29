@@ -135,4 +135,37 @@ defmodule DashFloat.CLITest do
 
     assert logs == ""
   end
+
+  # --title rides the same parse discipline; the boot consumes the title
+  # after config classification.
+  test "--title parses in space and equals forms" do
+    assert CLI.parse(["--title", "My session"]) == [title: "My session"]
+    assert CLI.parse(["--title=My session"]) == [title: "My session"]
+  end
+
+  test "--title sits alongside the other flags in argv order" do
+    assert CLI.parse(["--profile", "work", "--title=Fixer", "--model", "Sol"]) == [
+             profile: "work",
+             title: "Fixer",
+             model: "Sol"
+           ]
+  end
+
+  test "--title without a value warns and is ignored" do
+    logs =
+      capture_log(fn ->
+        assert CLI.parse(["--title"]) == []
+      end)
+
+    assert logs =~ "--title given without a value"
+  end
+
+  test "a repeated --title keeps the first value and warns" do
+    logs =
+      capture_log(fn ->
+        assert CLI.parse(["--title", "first", "--title", "second"]) == [title: "first"]
+      end)
+
+    assert logs =~ "given more than once"
+  end
 end

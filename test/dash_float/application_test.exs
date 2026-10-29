@@ -370,9 +370,22 @@ defmodule DashFloat.ApplicationTest do
     })
   end
 
+  # A titled session file as the store writes it (ADR 0014 §3's title field).
+  defp titled_session_json(id, title, pin \\ %{profile: "work", model: "m1", base_url: nil}) do
+    Jason.encode!(%{
+      version: 1,
+      id: id,
+      created_at: "2026-10-27T14:30:52Z",
+      title: title,
+      pin: pin,
+      messages: [%{"role" => "user", "content" => "hello"}]
+    })
+  end
+
   # Drives a real (non-test) boot with --resume. The halt is always the
   # recording seam: the refusal path halts at the boot boundary (ADR 0011),
-  # and a real halt would take the test VM with it.
+  # and a real halt would take the test VM with it. The `:argv` opt
+  # substitutes the flags wholesale (the --title boots).
   defp resume_boot(sessions, id, opts \\ []) do
     parent = self()
     halt = fn code -> send(parent, {:halted, code}) end
@@ -384,7 +397,7 @@ defmodule DashFloat.ApplicationTest do
             test?: false,
             config_dir: Keyword.get(opts, :config_dir, tmp_dir()),
             env: Keyword.get(opts, :env, %{}),
-            argv: ["--resume", id],
+            argv: Keyword.get(opts, :argv, ["--resume", id]),
             sessions_dir: sessions,
             interactive?: true,
             halt: halt
@@ -608,7 +621,8 @@ defmodule DashFloat.ApplicationTest do
                messages: messages,
                created_at: session.created_at,
                context: session.context,
-               compactions: session.compactions
+               compactions: session.compactions,
+               title: session.title
              }
 
       assert agent_opts[:name] == DashFloat.Agent
@@ -712,9 +726,334 @@ defmodule DashFloat.ApplicationTest do
                )
 
       assert agent_opts[:session_dir] == "/tmp/opencode/some-sessions"
+      assert agent_opts[:title] == nil
       refute Keyword.has_key?(agent_opts, :resume)
       refute Keyword.has_key?(tui_opts, :transcript)
       refute Keyword.has_key?(tui_opts, :resume_note)
+    end
+  end
+
+  ## --title at the boot seam (ADR 0014 §6)
+
+  describe "--title refusing the boot" do
+    test "an empty or blank title refuses naming the flag, with no children" do
+      sessions = tmp_dir()
+
+      {result, stderr} = resume_boot(sessions, nil, argv: ["--title", "   "])
+
+      assert {:error, :session_resume_failed} = result
+      assert_received {:halted, 1}
+      assert stderr =~ "--title may not be empty or blank"
+      refute Process.whereis(DashFloat.Agent)
+    end
+
+    test "a title over 80 graphemes refuses" do
+      sessions = tmp_dir()
+
+      {result, stderr} = resume_boot(sessions, nil, argv: ["--title", String.duplicate("x", 81)])
+
+      assert {:error, :session_resume_failed} = result
+      assert_received {:halted, 1}
+      assert stderr =~ "--title may not exceed 80 characters"
+    end
+
+    test "a UUID-shaped title refuses" do
+      sessions = tmp_dir()
+
+      {result, stderr} =
+        resume_boot(sessions, nil, argv: ["--title", "0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c"])
+
+      assert {:error, :session_resume_failed} = result
+      assert_received {:halted, 1}
+      assert stderr =~ "--title may not look like a session id (UUID)"
+    end
+
+    test "a title another session holds refuses naming the holder and the remedy" do
+      sessions = tmp_dir()
+      holder = "0192aa10-8e2f-7c11-9a2b-1a2b3c4d5e01"
+      write_session_file(sessions, holder, titled_session_json(holder, "My Title"))
+
+      {result, stderr} = resume_boot(sessions, nil, argv: ["--title", "My Title"])
+
+      assert {:error, :session_resume_failed} = result
+      assert_received {:halted, 1}
+      # The em dash double-encodes under capture_io (IO.binwrite sends latin1
+      # data; the capture re-encodes), so the segments are asserted apart —
+      # the same discipline as the unknown-id test above.
+      assert stderr =~ ~s(title "My Title" is already taken by session #{holder})
+
+      assert stderr =~
+               "choose another title or resume that session; list sessions with: ls #{sessions}"
+
+      refute Process.whereis(DashFloat.Agent)
+    end
+  end
+
+  describe "--title with --resume: the boot-time rename" do
+    test "the override threads to the agent opts while the resume map keeps the file's title" do
+      config_dir = v3_dir()
+      sessions = tmp_dir()
+      id = "0192aa11-9031-7c22-8b3c-2b3c4d5e6f02"
+
+      write_session_file(sessions, id, titled_session_json(id, "Old Name"))
+
+      {result, stderr} =
+        resume_boot(sessions, id,
+          config_dir: config_dir,
+          argv: ["--resume", id, "--title", "New Name"]
+        )
+
+      assert {:error, {:already_started, _pid}} = result
+      assert stderr == ""
+      refute_received {:halted, _}
+
+      {:ok, session} = Session.load(sessions, id)
+      {:ok, config} = Config.load(config_dir, %{}, [])
+
+      assert [_task, {DashFloat.Agent, agent_opts}, _tui] =
+               Application.boot_children(
+                 false,
+                 {:ok, config},
+                 config_dir,
+                 %{},
+                 [resume: id, title: "New Name"],
+                 %{session: session, note: nil},
+                 sessions
+               )
+
+      assert agent_opts[:title] == "New Name"
+      assert agent_opts[:resume][:title] == "Old Name"
+    end
+
+    test "a title another session holds refuses, naming that other session" do
+      sessions = tmp_dir()
+      target = "0192aa12-a254-7c33-9d4e-3c4d5e6f7a03"
+      other = "0192aa13-b476-7c44-8f5f-4d5e6f7a8b04"
+
+      write_session_file(sessions, target, titled_session_json(target, "Target"))
+      write_session_file(sessions, other, titled_session_json(other, "Wanted"))
+
+      {result, stderr} =
+        resume_boot(sessions, target, argv: ["--resume", target, "--title", "Wanted"])
+
+      assert {:error, :session_resume_failed} = result
+      assert_received {:halted, 1}
+      assert stderr =~ ~s(title "Wanted" is already taken by session #{other})
+      refute Process.whereis(DashFloat.Agent)
+    end
+
+    test "re-taking the session's own current title proceeds" do
+      sessions = tmp_dir()
+      id = "0192aa14-c698-7d55-9170-5e6f7a8b9c05"
+
+      write_session_file(sessions, id, titled_session_json(id, "Same"))
+
+      {result, stderr} = resume_boot(sessions, id, argv: ["--resume", id, "--title", "Same"])
+
+      assert {:error, {:already_started, _pid}} = result
+      assert stderr == ""
+      refute_received {:halted, _}
+    end
+  end
+
+  describe "title threading to the agent opts" do
+    test "a fresh --title boots and the built children carry the title opt" do
+      config_dir = v3_dir()
+      sessions = tmp_dir()
+
+      {result, stderr} =
+        resume_boot(sessions, nil, config_dir: config_dir, argv: ["--title", "Fresh Start"])
+
+      assert {:error, {:already_started, _pid}} = result
+      assert stderr == ""
+
+      {:ok, config} = Config.load(config_dir, %{}, [])
+
+      assert [_task, {DashFloat.Agent, agent_opts}, _tui] =
+               Application.boot_children(
+                 false,
+                 {:ok, config},
+                 config_dir,
+                 %{},
+                 [title: "Fresh Start"],
+                 nil,
+                 sessions
+               )
+
+      assert agent_opts[:title] == "Fresh Start"
+      refute Keyword.has_key?(agent_opts, :resume)
+    end
+
+    test "a titled resume file carries its title in both the resume map and the opt" do
+      config_dir = v3_dir()
+      sessions = tmp_dir()
+      id = "0192aa15-e1da-7d66-a281-6f7a8b9c0d06"
+
+      write_session_file(sessions, id, titled_session_json(id, "The Title"))
+
+      {:ok, session} = Session.load(sessions, id)
+      {:ok, config} = Config.load(config_dir, %{}, [])
+
+      assert [_task, {DashFloat.Agent, agent_opts}, _tui] =
+               Application.boot_children(
+                 false,
+                 {:ok, config},
+                 config_dir,
+                 %{},
+                 [resume: id],
+                 %{session: session, note: nil},
+                 sessions
+               )
+
+      assert agent_opts[:title] == "The Title"
+      assert agent_opts[:resume][:title] == "The Title"
+    end
+  end
+
+  describe "the legacy-id sweep at boot (ADR 0014 §6)" do
+    test "a timestamp-named file is UUID-renamed before title resolution runs" do
+      sessions = tmp_dir()
+      legacy = "20261027-143052-a1b2c3"
+
+      write_session_file(sessions, legacy, titled_session_json(legacy, "Legacy Title"))
+
+      {result, stderr} =
+        resume_boot(sessions, nil, argv: ["--resume", "Legacy Title"])
+
+      assert {:error, {:already_started, _pid}} = result
+      assert stderr == ""
+
+      # The sweep ran before resolution: one UUID-named file, id field equal
+      # to its name, title preserved — and resolution found it by title.
+      [name] = File.ls!(sessions)
+      new_id = Path.rootname(name)
+      {:ok, session} = Session.load(sessions, new_id)
+      assert session.id == new_id
+      assert session.title == "Legacy Title"
+
+      old_path = Path.join(sessions, legacy <> ".json")
+      refute File.exists?(old_path)
+    end
+
+    test "a missing sessions directory sweeps as a silent no-op and the boot refuses on the id" do
+      sessions = Path.join(tmp_dir(), "does-not-exist")
+      id = "0192aa16-f3ec-7d77-b392-7a8b9c0d1e07"
+
+      logs =
+        capture_log(fn ->
+          {result, stderr} = resume_boot(sessions, id)
+
+          assert {:error, :session_resume_failed} = result
+          assert_received {:halted, 1}
+          assert stderr =~ "no session #{id} under #{sessions}"
+        end)
+
+      refute logs =~ "renamed"
+      refute logs =~ "sweep skipped"
+    end
+  end
+
+  describe "--resume by title (ADR 0014 §6)" do
+    test "a titled session resolves and the transcript threads to the TUI mount opts" do
+      config_dir = v3_dir()
+      sessions = tmp_dir()
+      id = "0192aa17-05fd-7e88-c4a3-8b9c0d1e2f08"
+      messages = [%{"role" => "user", "content" => "from the titled file"}]
+      pin = %{profile: "work", model: "m1", base_url: nil}
+
+      contents =
+        Jason.encode!(%{
+          version: 1,
+          id: id,
+          created_at: "2026-10-27T14:30:52Z",
+          title: "My Title",
+          pin: pin,
+          messages: messages
+        })
+
+      write_session_file(sessions, id, contents)
+
+      {result, stderr} =
+        resume_boot(sessions, nil, argv: ["--resume", "My Title"], config_dir: config_dir)
+
+      assert {:error, {:already_started, _pid}} = result
+      assert stderr == ""
+
+      {:ok, session} = Session.load(sessions, id)
+      {:ok, config} = Config.load(config_dir, %{}, [])
+
+      assert [_task, _agent, {DashFloat.TUI, tui_opts}] =
+               Application.boot_children(
+                 false,
+                 {:ok, config},
+                 config_dir,
+                 %{},
+                 [resume: "My Title"],
+                 %{session: session, note: nil},
+                 sessions
+               )
+
+      assert tui_opts[:transcript] == messages
+    end
+
+    test "a case- and whitespace-different title still resolves" do
+      sessions = tmp_dir()
+      id = "0192aa18-170e-7e99-d5b4-9c0d1e2f3a09"
+
+      write_session_file(sessions, id, titled_session_json(id, "My Title"))
+
+      {result, stderr} =
+        resume_boot(sessions, nil, argv: ["--resume", "  my title "])
+
+      assert {:error, {:already_started, _pid}} = result
+      assert stderr == ""
+    end
+
+    test "an unknown title refuses naming the value as typed and the directory" do
+      sessions = tmp_dir()
+
+      {result, stderr} = resume_boot(sessions, nil, argv: ["--resume", "Ghost Title"])
+
+      assert {:error, :session_resume_failed} = result
+      assert_received {:halted, 1}
+      # Segments apart — the em dash double-encodes under capture_io.
+      assert stderr =~ ~s(no session titled "Ghost Title" under #{sessions})
+      assert stderr =~ "list sessions with: ls #{sessions}"
+
+      refute Process.whereis(DashFloat.Agent)
+    end
+
+    test "an ambiguous title refuses naming both ids, sorted" do
+      sessions = tmp_dir()
+      low = "0192aa20-3a30-7eaa-e6c5-0d1e2f3a4b20"
+      high = "0192aa21-4b41-7fbb-f7d6-1e2f3a4b5c21"
+
+      # Written high-first: the refusal must name them sorted.
+      write_session_file(sessions, high, titled_session_json(high, "Dup"))
+      write_session_file(sessions, low, titled_session_json(low, "Dup"))
+
+      {result, stderr} = resume_boot(sessions, nil, argv: ["--resume", "Dup"])
+
+      assert {:error, :session_resume_failed} = result
+      assert_received {:halted, 1}
+      # Segments apart — the em dash double-encodes under capture_io.
+      assert stderr =~ ~s(multiple sessions are titled "Dup": #{low}, #{high})
+      assert stderr =~ "resume one by its id; list sessions with: ls #{sessions}"
+    end
+
+    test "a legacy timestamp id takes the title path and refuses as a title" do
+      sessions = tmp_dir()
+
+      {result, stderr} =
+        resume_boot(sessions, nil, argv: ["--resume", "20261027-143052-a1b2c3"])
+
+      assert {:error, :session_resume_failed} = result
+      assert_received {:halted, 1}
+
+      assert stderr =~
+               ~s(no session titled "20261027-143052-a1b2c3" under #{sessions})
+
+      refute Process.whereis(DashFloat.Agent)
     end
   end
 

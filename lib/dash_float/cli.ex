@@ -2,25 +2,30 @@ defmodule DashFloat.CLI do
   @moduledoc """
   Startup-argument parsing for the profile/model selection flags
   ([ADR 0008](../decisions/0008-config-layout-profiles-json5.md)) and the
-  session-resume flag ([ADR 0014](../decisions/0014-session-persistence.md)
-  §6).
+  session flags ([ADR 0014](../decisions/0014-session-persistence.md) §6).
 
   `parse/1` turns argv into a keyword list the config loader and the boot
-  consume: `[profile: "work", model: "Sol", resume: "0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c"]`.
+  consume: `[profile: "work", model: "Sol", resume: "0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c", title: "My session"]`.
   Accepted forms: `--profile work`, `--profile=work`, `--model Sol`,
-  `--model=Sol`, `--resume <id>`, `--resume=<id>`. A switch without a value,
-  an unrecognized argument, or a repeated switch warns and is ignored —
-  argument mistakes must not crash startup, and the config loader's own
-  unknown-profile/model warnings still surface the miss. Everything is
-  startup-time; runtime switching is a named future slice in the ADR. The
-  resume id is a plain session-file id (never a secret); the boot consumes it
-  after config classification.
+  `--model=Sol`, `--resume <id>`, `--resume=<id>`, `--title <title>`,
+  `--title=<title>`. A switch without a value, an unrecognized argument, or a
+  repeated switch warns and is ignored — argument mistakes must not crash
+  startup, and the config loader's own unknown-profile/model warnings still
+  surface the miss. Everything is startup-time; runtime switching is a named
+  future slice in the ADR. The resume id is a plain session-file id and the
+  title is plain user text (never a secret); the boot consumes both after
+  config classification.
   """
 
   require Logger
 
-  @flags ["--profile", "--model", "--resume"]
-  @keys %{"--profile" => :profile, "--model" => :model, "--resume" => :resume}
+  @flags ["--profile", "--model", "--resume", "--title"]
+  @keys %{
+    "--profile" => :profile,
+    "--model" => :model,
+    "--resume" => :resume,
+    "--title" => :title
+  }
 
   @doc """
   Whether argv asks for the version (`--version`), which the boot handles and
