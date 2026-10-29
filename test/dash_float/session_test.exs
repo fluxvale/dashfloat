@@ -302,6 +302,14 @@ defmodule DashFloat.SessionTest do
     end
 
     @tag :tmp_dir
+    test "an unencodable session errors naming the path only, never raising", ctx do
+      assert {:error, error} =
+               Session.save(ctx.tmp_dir, session([%{role: "user", content: <<0xFF>>}]))
+
+      assert error == "cannot write #{path(ctx)}: session is not encodable"
+    end
+
+    @tag :tmp_dir
     test "an unwritable directory errors naming the path", ctx do
       blocker = Path.join(ctx.tmp_dir, "blocker")
       File.write!(blocker, "a file where a directory should be")

@@ -61,8 +61,17 @@ defmodule DashFloat.Session do
       case ensure_dir(dir) do
         :ok ->
           path = path_for(dir, session.id)
-          contents = Jason.encode!(session)
-          Posture.write_private(path, contents <> "\n")
+
+          # A session the encoder refuses (a tool result carrying an invalid
+          # byte, say) must degrade like any other failed save, never raise
+          # out of the agent loop. The error names the path, never the bytes.
+          case Jason.encode(session) do
+            {:ok, contents} ->
+              Posture.write_private(path, contents <> "\n")
+
+            {:error, _reason} ->
+              {:error, "cannot write #{path}: session is not encodable"}
+          end
 
         {:error, _reason} = error ->
           error
