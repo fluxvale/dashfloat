@@ -263,6 +263,20 @@ defmodule DashFloat.ToolsTest do
     end
   end
 
+  describe "class/1" do
+    test "declares the risk class per ADR 0016 §2" do
+      assert Tools.class("read_file") == :safe
+      assert Tools.class("list_directory") == :safe
+      assert Tools.class("write_file") == :mutating
+      assert Tools.class("edit_file") == :mutating
+      assert Tools.class("execute_command") == :risky
+    end
+
+    test "unknown names fail closed to :risky" do
+      assert Tools.class("rm_rf") == :risky
+    end
+  end
+
   describe "cancelled_result/0" do
     test "is the cancelled result the agent writes and the loader synthesizes" do
       assert Tools.cancelled_result() == %{ok: false, cancelled: true}

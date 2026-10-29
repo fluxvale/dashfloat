@@ -141,8 +141,20 @@ defmodule DashFloat.Tools do
 
   @order ["read_file", "write_file", "edit_file", "execute_command", "list_directory"]
 
+  @classes %{
+    "read_file" => :safe,
+    "list_directory" => :safe,
+    "write_file" => :mutating,
+    "edit_file" => :mutating,
+    "execute_command" => :risky
+  }
+
   # Display excerpt for tool-result rows; the model gets the bounded full result.
   @display_lines 30
+
+  @doc "Risk class per ADR 0016 §2. Unknown names are :risky (fail closed)."
+  @spec class(String.t()) :: :safe | :mutating | :risky
+  def class(name), do: Map.get(@classes, name, :risky)
 
   @doc "The OpenAI `tools` array advertising the catalogue."
   @spec schema() :: [map()]
