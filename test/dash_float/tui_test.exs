@@ -2413,6 +2413,32 @@ defmodule DashFloat.TUITest do
       assert dispatched.suggest_ref == nil
     end
 
+    # A dead task supervisor EXITS the start call — the dispatch catches it
+    # and fails open (ADR 0015 §3): the armed timer clears, no task is
+    # tracked, and the UI process never crashes. In :test the application
+    # supervisor owns ONLY the task supervisor (the TUI and agent are gated
+    # out), so stopping the application takes exactly that name down.
+    test "a dispatch with the task supervisor down fails open, no crash" do
+      Application.stop(:dash_float)
+      on_exit(fn -> {:ok, _} = Application.ensure_all_started(:dash_float) end)
+
+      state =
+        State.new(
+          provider: {:ok, %Config{base_url: "http://127.0.0.1:1", model: "m", api_key: "k"}},
+          suggest_fetcher: {DashFloat.TUI.Suggest, :request}
+        )
+
+      fired = Process.send_after(self(), :ignore, 1)
+      Process.sleep(5)
+
+      assert {:noreply, dispatched, %{render?: false}} =
+               TUI.handle_info(:dashfloat_suggest, %{state | suggest_ref: fired})
+
+      assert dispatched.suggest_ref == nil
+      assert dispatched.suggest_task == nil
+      assert dispatched.suggestion == nil
+    end
+
     test "a provider error at dispatch clears the armed timer" do
       state =
         State.new(

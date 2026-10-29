@@ -316,13 +316,23 @@ defmodule DashFloat.TUI do
   defp start_suggest(state, config) do
     epoch = state.suggest_epoch + 1
 
-    case Suggest.fetch_async(config, Suggest.tail(state.entries),
-           send_to: self(),
-           epoch: epoch,
-           fetcher: state.suggest_fetcher
-         ) do
+    # A dead task supervisor EXITS the start call instead of returning an
+    # error tuple — caught here, because the side-request is fail-open
+    # absolutely (ADR 0015 §3): a missing ghost, never a UI crash.
+    result =
+      try do
+        Suggest.fetch_async(config, Suggest.tail(state.entries),
+          send_to: self(),
+          epoch: epoch,
+          fetcher: state.suggest_fetcher
+        )
+      catch
+        :exit, _reason -> :error
+      end
+
+    case result do
       {:ok, pid} -> %{state | suggest_ref: nil, suggest_task: pid, suggest_epoch: epoch}
-      {:error, _reason} -> %{state | suggest_ref: nil}
+      _no_task -> %{state | suggest_ref: nil}
     end
   end
 
