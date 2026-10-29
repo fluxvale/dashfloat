@@ -186,12 +186,15 @@ for mutating/risky calls, never to UNCHAINED. A check that says ask gets
 `[safety check: needs confirmation]` and the standard confirm flow.
 
 **Lifecycle.** The vetter runs as a `restart: :temporary` task under the TaskSupervisor
-and reports `{:vet_done, id, verdict}`; the agent monitors it under the runner
-discipline of ADRs 0012/0013: the task self-reports every death its body can observe, a
-DOWN the body could not report resolves as a **failed check → confirm**, and a stale
-`vet_done` (ref mismatch) is ignored exactly like a stale confirm decision. Esc during a
-check cancels by message: the vetter cancels its stream child, and the batch aborts per
-ADR 0007 §4 (cancelled results keep the transcript round-trippable).
+and reports `{:vet_done, check_ref, id, verdict}` — the check ref is minted at
+`start_vet`, captured by the task closure, and stored in the slot, so a late report
+from an earlier batch can never match even over a reused call id. The agent monitors
+it under the runner discipline of ADRs 0012/0013: the task self-reports every death
+its body can observe, a DOWN the body could not report resolves as a **failed check
+→ confirm**, and a stale `vet_done` (ref mismatch) is ignored exactly like a stale
+confirm decision. Esc during a check cancels by message: the vetter consumes the
+`:cancel`, cancels its stream child, and resolves within milliseconds — the batch
+then aborts per ADR 0007 §4 (cancelled results keep the transcript round-trippable).
 
 **Conversation contract unchanged.** The vet never enters the conversation messages;
 its usage frames are dropped engine-side (they are not the UI's conversation truth); the
@@ -279,8 +282,9 @@ moves. Specifically:
 - Agent: start opts `:mode` (default `:build`; invalid raises `ArgumentError`), `:vetter`
   (module implementing `verdict/4`, default `DashFloat.Tools.Vetter` — the injection
   seam for tests), `:vet_timeout` (default 10 000). Messages per §6/§7/§9; internal
-  `{:vet_done, id, verdict}`. `tool_slot` gains `{:vetting, ref, pid, call, preview}`.
-  Result shape `{"ok":false,"blocked":"plan"}`.
+  `{:vet_done, check_ref, id, verdict}` matched by check ref.
+  `tool_slot` gains `{:vetting, check_ref, monitor_ref, pid, call, preview}` and its
+  cancelled shape. Result shape `{"ok":false,"blocked":"plan"}`.
 - State: field `mode` (default `:build`; no mount opt — the echo is the single writer),
   phase `:checking` in the phase type, action `{:set_mode, DashFloat.Mode.t()}`,
   keybinding `shift+tab`.
