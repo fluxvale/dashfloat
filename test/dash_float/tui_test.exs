@@ -3,10 +3,10 @@ defmodule DashFloat.TUITest do
   App-level tests under `test_mode`: supervised lifecycle, teardown paths
   (including crashes), the agent seam (fake agents are this test process or
   plain spawned processes — the TUI only ever sends
-  `{:prompt, ui, text}` / `{:confirm_decision, ref, decision}` / `{:cancel}`
-  and receives the frozen stream contract, ADR 0007), and the responsiveness
-  proof. Not async: they measure timing, share telemetry handlers, and drive
-  one supervised TUI per test.
+  `{:prompt, ui, text}` / `{:confirm_decision, ref, decision}` / `{:cancel}` /
+  `{:set_mode, ui, mode}` and receives the frozen stream contract, ADR 0007),
+  and the responsiveness proof. Not async: they measure timing, share
+  telemetry handlers, and drive one supervised TUI per test.
   """
 
   use ExUnit.Case, async: false
@@ -813,6 +813,21 @@ defmodule DashFloat.TUITest do
     # Input is usable again.
     submit(pid, "again")
     assert_receive {:prompt, ^ui_pid, "again"}, 1_000
+  end
+
+  # Shift+Tab rides the agent seam (ADR 0016 §7): send, then the echo applies.
+  test "shift+tab sends the mode to the agent; the echo applies it" do
+    {:ok, pid} = start_tui()
+
+    press(pid, "tab", ["shift"])
+
+    assert_receive {:set_mode, ^pid, :auto}, 1_000
+    # No optimistic apply: the chrome waits for the agent's single voice.
+    assert get_state(pid).mode == :build
+
+    send(pid, {:mode, :auto})
+    state = eventually(pid, &(&1.mode == :auto))
+    assert state.mode == :auto
   end
 
   test "quit keys stop the supervised app with reason :normal" do

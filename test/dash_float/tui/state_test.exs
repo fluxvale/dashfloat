@@ -768,6 +768,28 @@ defmodule DashFloat.TUI.StateTest do
     end
   end
 
+  describe "handle_key/3 — mode cycling (ADR 0016)" do
+    test "shift+tab yields the cycle action in every chat phase; state unchanged" do
+      idle = new_state()
+      assert {^idle, {:set_mode, :auto}} = State.handle_key(idle, "tab", ["shift"])
+
+      for phase <- [:streaming, :executing_tool, :checking] do
+        state = %{new_state() | phase: phase}
+        assert {^state, {:set_mode, :auto}} = State.handle_key(state, "tab", ["shift"])
+      end
+
+      unchained = %{new_state() | mode: :unchained}
+      assert {^unchained, {:set_mode, :plan}} = State.handle_key(unchained, "tab", ["shift"])
+    end
+
+    test "shift+tab is swallowed while a confirmation is pending" do
+      {state, _ref} = confirming()
+
+      assert {^state, nil} = State.handle_key(state, "tab", ["shift"])
+      assert state.mode == :build
+    end
+  end
+
   describe "handle_key/3 — history-aware Up/Down" do
     test "Up on the first row enters history; Down on the last row leaves it" do
       base =
@@ -1082,6 +1104,54 @@ defmodule DashFloat.TUI.StateTest do
       assert_raise FunctionClauseError, fn ->
         State.stream_message(new_state(), bad_entry)
       end
+    end
+  end
+
+  describe "stream_message/3 — mode messages (ADR 0016)" do
+    test "{:mode, mode} echo sets the mode; no entry, no phase change" do
+      state = State.stream_message(new_state(), {:mode, :auto})
+
+      assert state.mode == :auto
+      assert state.entries == []
+      assert state.phase == :idle
+    end
+
+    test "tool_preview appends the preview entry without arming the confirm" do
+      preview = %{id: 1, name: "edit_file", args: %{}, lines: ["@@ hunk"]}
+
+      state = State.stream_message(new_state(), {:tool_preview, preview})
+
+      [entry] = state.entries
+      assert entry.kind == :tool
+      assert entry.text == "@@ hunk"
+      assert state.confirm == nil
+      assert state.phase == :idle
+
+      # The contrast case: {:confirm, ref, same} arms and flips the phase.
+      ref = make_ref()
+      confirmed = State.stream_message(new_state(), {:confirm, ref, preview})
+
+      assert confirmed.confirm == %{ref: ref, id: 1, name: "edit_file"}
+      assert confirmed.phase == :confirming
+    end
+
+    test "{:phase, :checking} finalizes the in-flight entry, clears the confirm, ticks" do
+      state =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "partial"}, 1_000)
+        |> State.stream_message({:confirm, make_ref(), confirm_request(["+ x"])})
+        |> State.stream_message({:phase, :checking}, 1_100)
+
+      # The preview entry stays; the in-flight reply finalized.
+      assert pairs(state) == [tool: "+ x", assistant: "partial"]
+      assert state.in_flight == nil
+      assert state.phase == :checking
+      assert state.confirm == nil
+      assert State.needs_tick?(state)
+
+      # Esc interrupts the check.
+      assert {^state, :cancel} = State.handle_key(state, "esc", [])
     end
   end
 
