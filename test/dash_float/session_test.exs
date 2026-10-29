@@ -312,7 +312,10 @@ defmodule DashFloat.SessionTest do
       save_ok(ctx, [%{role: "user", content: "hi"}], title: "Fix the  Login Bug ")
       assert {:ok, loaded} = load(ctx)
       assert loaded.title == "Fix the  Login Bug "
-      assert Jason.decode!(File.read!(path(ctx)))["title"] == "Fix the  Login Bug "
+      file = path(ctx)
+      contents = File.read!(file)
+      decoded = Jason.decode!(contents)
+      assert decoded["title"] == "Fix the  Login Bug "
     end
 
     @tag :tmp_dir
@@ -321,7 +324,9 @@ defmodule DashFloat.SessionTest do
       assert {:ok, loaded} = load(ctx)
       assert loaded.title == nil
       # Byte-level: the encoded JSON has no "title" outside messages.
-      refute File.read!(path(ctx)) =~ "title"
+      file = path(ctx)
+      contents = File.read!(file)
+      refute contents =~ "title"
     end
 
     @tag :tmp_dir
@@ -749,10 +754,12 @@ defmodule DashFloat.SessionTest do
       )
     end
 
-    defp write_legacy(ctx, id \\ @legacy_id, body \\ nil) do
-      body = body || legacy_body()
-      File.write!(Path.join(ctx.tmp_dir, id <> ".json"), Jason.encode!(body))
+    defp write_legacy(ctx, body \\ legacy_body()) do
+      file = legacy_path(ctx)
+      File.write!(file, Jason.encode!(body))
     end
+
+    defp legacy_path(ctx, id \\ @legacy_id), do: Path.join(ctx.tmp_dir, id <> ".json")
 
     @tag :tmp_dir
     test "a fully-loading legacy file is rewritten under a fresh id, fields verbatim", ctx do
@@ -762,27 +769,29 @@ defmodule DashFloat.SessionTest do
           "context" => %{"prompt_tokens" => 3, "messages" => 1}
         })
 
-      write_legacy(ctx, @legacy_id, body)
+      write_legacy(ctx, body)
 
       assert {:ok, 1} = Session.migrate_legacy_ids(ctx.tmp_dir)
-      refute File.exists?(Path.join(ctx.tmp_dir, @legacy_id <> ".json"))
+      legacy = legacy_path(ctx)
+      refute File.exists?(legacy)
 
       assert [new_name] = File.ls!(ctx.tmp_dir)
       new_id = Path.rootname(new_name)
-      assert {:ok, loaded} = Session.load(ctx.tmp_dir, new_id)
+      new_file = Path.join(ctx.tmp_dir, new_name)
+      assert mode(new_file) == 0o600
 
+      assert {:ok, loaded} = Session.load(ctx.tmp_dir, new_id)
       assert loaded.id == new_id
       assert loaded.created_at == "2026-10-27T09:00:00Z"
       assert loaded.pin == %{profile: "personal", model: "glm-5.3", base_url: nil}
       assert loaded.messages == [%{"role" => "user", "content" => "legacy"}]
       assert loaded.title == "Kept Title"
       assert loaded.context == %{prompt_tokens: 3, messages: 1}
-      assert mode(Path.join(ctx.tmp_dir, new_name)) == 0o600
     end
 
     @tag :tmp_dir
     test "a legacy file that does not fully load is left untouched", ctx do
-      file = Path.join(ctx.tmp_dir, @legacy_id <> ".json")
+      file = legacy_path(ctx)
       File.write!(file, "definitely {{{ not json")
 
       assert {:ok, 0} = Session.migrate_legacy_ids(ctx.tmp_dir)
@@ -813,22 +822,26 @@ defmodule DashFloat.SessionTest do
     test "a mixed directory migrates only the legacy names", ctx do
       save_ok(ctx, [%{role: "user", content: "already uuid"}])
       write_legacy(ctx)
-      bad = Path.join(ctx.tmp_dir, @bad_legacy_id <> ".json")
+      bad = legacy_path(ctx, @bad_legacy_id)
       File.write!(bad, "garbage {{{")
-      File.write!(Path.join(ctx.tmp_dir, "notes.txt"), "not a session file")
+      notes = Path.join(ctx.tmp_dir, "notes.txt")
+      File.write!(notes, "not a session file")
 
       assert {:ok, 1} = Session.migrate_legacy_ids(ctx.tmp_dir)
 
       assert File.read!(bad) == "garbage {{{"
-      assert File.read!(Path.join(ctx.tmp_dir, "notes.txt")) == "not a session file"
+      assert File.read!(notes) == "not a session file"
       assert {:ok, _loaded} = Session.load(ctx.tmp_dir, @id)
-      refute File.exists?(Path.join(ctx.tmp_dir, @legacy_id <> ".json"))
+      legacy = legacy_path(ctx)
+      refute File.exists?(legacy)
 
-      rest = File.ls!(ctx.tmp_dir) -- [@id <> ".json", @bad_legacy_id <> ".json", "notes.txt"]
+      kept = [@id <> ".json", @bad_legacy_id <> ".json", "notes.txt"]
+      rest = File.ls!(ctx.tmp_dir) -- kept
       assert [new_name] = rest
+      new_id = Path.rootname(new_name)
 
       assert {:ok, %{messages: [%{"role" => "user", "content" => "legacy"}]}} =
-               Session.load(ctx.tmp_dir, Path.rootname(new_name))
+               Session.load(ctx.tmp_dir, new_id)
     end
 
     @tag :tmp_dir
@@ -855,7 +868,8 @@ defmodule DashFloat.SessionTest do
       assert {:error, error} = Session.migrate_legacy_ids(dir)
       assert error =~ dir
       # The legacy file survived the failed rewrite.
-      assert File.exists?(Path.join(dir, @legacy_id <> ".json"))
+      legacy = legacy_path(ctx)
+      assert File.exists?(legacy)
     end
   end
 

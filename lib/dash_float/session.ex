@@ -57,7 +57,7 @@ defmodule DashFloat.Session do
   @spec new_id() :: String.t()
   def new_id do
     ts = System.system_time(:millisecond)
-    <<rand_a::12, rand_b::62, _::22>> = :crypto.strong_rand_bytes(12)
+    <<rand_a::12, rand_b::62, _spare::22>> = :crypto.strong_rand_bytes(12)
     uuid_hex(<<ts::48, 7::4, rand_a::12, 2::2, rand_b::62>>)
   end
 
@@ -126,8 +126,7 @@ defmodule DashFloat.Session do
   defp migrate_names(dir, names) do
     legacy =
       names
-      |> Enum.filter(&json_name?/1)
-      |> Enum.reject(&uuid_name?/1)
+      |> Enum.filter(fn name -> json_name?(name) and not uuid_name?(name) end)
       |> Enum.sort()
 
     Enum.reduce_while(legacy, {:ok, 0}, fn name, {:ok, count} ->

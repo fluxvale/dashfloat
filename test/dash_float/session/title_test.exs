@@ -14,8 +14,11 @@ defmodule DashFloat.Session.TitleTest do
     end
 
     test "80 graphemes pass, 81 refuse as :too_long" do
-      assert Title.normalize(String.duplicate("a", 80)) == {:ok, String.duplicate("a", 80)}
-      assert Title.normalize(String.duplicate("a", 81)) == {:error, :too_long}
+      exactly_80 = String.duplicate("a", 80)
+      too_long = String.duplicate("a", 81)
+
+      assert Title.normalize(exactly_80) == {:ok, exactly_80}
+      assert Title.normalize(too_long) == {:error, :too_long}
     end
 
     test "blank, whitespace-only, control-only, and non-string input are :empty" do
@@ -79,8 +82,11 @@ defmodule DashFloat.Session.TitleTest do
 
     @tag :tmp_dir
     test "undecodable and non-map files are skipped silently", ctx do
-      File.write!(Path.join(ctx.tmp_dir, "garbage.json"), "not json {{{")
-      File.write!(Path.join(ctx.tmp_dir, "list.json"), Jason.encode!([1, 2]))
+      garbage = Path.join(ctx.tmp_dir, "garbage.json")
+      File.write!(garbage, "not json {{{")
+      list = Path.join(ctx.tmp_dir, "list.json")
+      body = Jason.encode!([1, 2])
+      File.write!(list, body)
 
       id = "0192aa10-a003-7b00-8000-000000000003"
       save_titled(ctx, id, "Fix the bug")
@@ -89,7 +95,8 @@ defmodule DashFloat.Session.TitleTest do
 
     @tag :tmp_dir
     test "a missing directory is free", ctx do
-      assert Title.title_holder(Path.join(ctx.tmp_dir, "does-not-exist"), "Fix the bug") == nil
+      dir = Path.join(ctx.tmp_dir, "does-not-exist")
+      assert Title.title_holder(dir, "Fix the bug") == nil
     end
   end
 

@@ -52,7 +52,11 @@ defmodule DashFloat.Session.Title do
   a non-normalizable input returns its best-effort downcased trim.
   """
   @spec normalize_key(term()) :: String.t()
-  def normalize_key(raw) when is_binary(raw), do: raw |> clean() |> String.downcase()
+  def normalize_key(raw) when is_binary(raw) do
+    raw
+    |> clean()
+    |> String.downcase()
+  end
 
   def normalize_key(_other), do: ""
 
@@ -75,8 +79,9 @@ defmodule DashFloat.Session.Title do
   """
   @spec title_holder(Path.t(), String.t(), String.t() | nil) :: String.t() | nil
   def title_holder(dir, raw_title, except_id \\ nil) do
-    holders(dir, normalize_key(raw_title))
-    |> Enum.find(&(&1 != except_id))
+    key = normalize_key(raw_title)
+    ids = holders(dir, key)
+    Enum.find(ids, &(&1 != except_id))
   end
 
   @doc """
