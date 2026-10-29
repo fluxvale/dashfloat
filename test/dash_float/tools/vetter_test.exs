@@ -90,29 +90,17 @@ defmodule DashFloat.Tools.VetterTest do
     assert_receive {:sse_closed}, 3_000
   end
 
-  test "a stream child killed without reporting is a failed check" do
-    server =
-      start_server([
-        {:send, [@headers, frame("working")]},
-        {:sleep, 1_000},
-        {:wait_close, 2_000}
-      ])
+  test "a stream child that dies without reporting is a failed check" do
+    # Deterministic child death — no global process scan, nothing killed: a
+    # provider no ChatStream clause matches makes the spawned child raise on
+    # its first call, an abnormal exit with no report, so only the monitor
+    # can resolve the wait. (The scan-and-:kill shape this replaces could
+    # kill the Req/Finch pool owner — a shared harness pid — and take the
+    # whole BEAM down with it.)
+    assert {:error, "safety check stream crashed: " <> reason} =
+             Vetter.verdict(:unmatched_provider, call(), ["$ mix test"], vet_timeout: 10_000)
 
-    task =
-      Task.async(fn ->
-        Vetter.verdict(provider(SSEServer.base_url(server)), call(), ["$ mix test"],
-          vet_timeout: 10_000
-        )
-      end)
-
-    # The vetter holds its stream child as a bare spawn_monitor pid with no
-    # seam to reach it; the child's :monitored_by is the only view of it (the
-    # task spawn_monitors nothing else). Kill without a report so only the
-    # monitor can resolve the wait — ChatStream's own reports never fire.
-    child = wait_for_child(task.pid)
-    Process.exit(child, :kill)
-
-    assert {:error, "safety check stream crashed: :killed"} = Task.await(task, 1_000)
+    assert reason =~ "function_clause"
   end
 
   test "a refused connection is a failed check" do
@@ -243,31 +231,5 @@ defmodule DashFloat.Tools.VetterTest do
     {:ok, port} = :inet.port(listen)
     :gen_tcp.close(listen)
     port
-  end
-
-  # Spawned stream children are anonymous, but a parent's monitor shows up in
-  # the child's :monitored_by — the vetting task's only monitor is the child.
-  defp wait_for_child(parent, tries \\ 100)
-
-  defp wait_for_child(parent, 0), do: flunk("stream child of #{inspect(parent)} not found")
-
-  defp wait_for_child(parent, tries) do
-    case find_child(parent) do
-      nil ->
-        Process.sleep(10)
-        wait_for_child(parent, tries - 1)
-
-      child ->
-        child
-    end
-  end
-
-  defp find_child(parent) do
-    Enum.find(:erlang.processes(), fn pid ->
-      case Process.info(pid, :monitored_by) do
-        {:monitored_by, watchers} -> parent in watchers
-        nil -> false
-      end
-    end)
   end
 end
