@@ -504,6 +504,10 @@ defmodule DashFloat.TUI.ViewTest do
       assert activity_text(%{new_state() | phase: :executing_tool}) =~ "Running tool…"
     end
 
+    test "says Checking… while a safety check is in flight (ADR 0016 §8)" do
+      assert activity_text(%{new_state() | phase: :checking}) =~ "Checking…"
+    end
+
     test "says Approve this change? while confirming, with the decision hint" do
       state = %{new_state() | phase: :confirming}
       assert activity_text(state) =~ "Approve this change?"

@@ -603,6 +603,7 @@ defmodule DashFloat.TUI.View do
 
   defp activity_label(%{phase: :confirming}), do: "Approve this change?"
   defp activity_label(%{phase: :executing_tool}), do: "Running tool…"
+  defp activity_label(%{phase: :checking}), do: "Checking…"
   defp activity_label(%{stats: %{tokens: 0}}), do: "Thinking…"
   defp activity_label(_state), do: "Streaming…"
 
