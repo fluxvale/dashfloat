@@ -64,8 +64,10 @@ mode — previews stay load-bearing, ADR 0016 §4):
     (the receipt) then `dispatch_runner` — no confirm, no vet.
   - **`:propose`** (PLAN) → `display(ui, {:tool_preview, …})` then record
     `%{ok: false, blocked: "plan"}` — no confirm, no dispatch, no
-    `:confirming` phase; `record_and_continue` keeps the batch alive. Add the
-    `result_status/1` clause: `result_status(%{blocked: "plan"}), do: "proposed (plan)"`.
+    `:confirming` phase; `record_and_continue` keeps the batch alive. The
+    status word lives in `Tools.display_status/1` since session persistence
+    (ADR 0014) extracted it: add the clause there —
+    `display_status(%{blocked: "plan"}), do: "proposed (plan)"`.
     The tool message content encodes as exactly `{"ok":false,"blocked":"plan"}`.
   - **`:vet`** (AUTO) → the vetting state machine below.
 
@@ -120,6 +122,15 @@ The confirm flow itself (BUILD), Esc semantics, abort logic, monitors,
 and BUILD-mode behavior — the existing agent tests must pass unmodified. If a
 change to an existing test seems necessary, stop and report; the design says
 none is.
+
+Session persistence (ADR 0014, merged as PR #79) is untouched: the mode is
+session-memory only, `:session_dir`/`:resume` opts and the `persist/1`
+milestones need no changes, and the vetting state machine persists nothing —
+every vet outcome resolves into messages (results/confirm flows) exactly as
+today, so the transcript store is unaffected. `automatic?/1` (lines ~523-525
+after the rebase) and `dispatch_validated/2` sit where the slice says; the
+agent's `tool_result_msg` now derives its status via
+`Tools.display_status/1`.
 
 ## Tests (in `test/dash_float/agent_test.exs`, following its existing
 loopback/fake-UI patterns)
