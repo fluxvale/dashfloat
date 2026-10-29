@@ -1,3 +1,32 @@
+defmodule AgentTestVetAllow do
+  @moduledoc false
+  @spec verdict(term(), term(), term(), term()) :: {:allow}
+  def verdict(_provider, _call, _lines, _opts), do: {:allow}
+end
+
+defmodule AgentTestVetAsk do
+  @moduledoc false
+  @spec verdict(term(), term(), term(), term()) :: {:ask}
+  def verdict(_provider, _call, _lines, _opts), do: {:ask}
+end
+
+defmodule AgentTestVetFail do
+  @moduledoc false
+  @spec verdict(term(), term(), term(), term()) :: {:error, String.t()}
+  def verdict(_provider, _call, _lines, _opts), do: {:error, "boom"}
+end
+
+defmodule AgentTestVetParked do
+  @moduledoc false
+  # Parks until messaged — the agent's cancel is the message that resolves it.
+  @spec verdict(term(), term(), term(), term()) :: {:ask}
+  def verdict(_provider, _call, _lines, _opts) do
+    receive do
+      _any -> {:ask}
+    end
+  end
+end
+
 defmodule DashFloat.AgentTest do
   @moduledoc false
   # The Phase 3 end-to-end suite: a scripted tool-calling stream through the
@@ -78,6 +107,12 @@ defmodule DashFloat.AgentTest do
     [{:send, [@headers | prefix ++ frames ++ suffix]}, {:send, "data: [DONE]\n\n"}, :close]
   end
 
+  # A content frame whose payload carries quotes: Jason escapes it, where
+  # frame/1's raw interpolation would break the delta's JSON.
+  defp json_frame(content) do
+    ~s(data: {"choices":[{"index":0,"delta":{"content":#{Jason.encode!(content)}}}]}\n\n)
+  end
+
   defp final_episode(text \\ "All done.", opts \\ []) do
     prefix = Keyword.get(opts, :prefix, [])
     suffix = if usage = opts[:usage], do: [usage_frame(usage)], else: []
@@ -113,16 +148,20 @@ defmodule DashFloat.AgentTest do
     # tests can enumerate them without leftovers from other tests.
     {:ok, sup} = Task.Supervisor.start_link()
 
+    base = [
+      provider: Keyword.get(opts, :provider, provider(server)),
+      cwd: cwd,
+      exec_timeout: Keyword.get(opts, :exec_timeout, 500),
+      supervisor: sup,
+      session_dir: Keyword.get(opts, :session_dir),
+      resume: Keyword.get(opts, :resume),
+      name: nil
+    ]
+
     {:ok, agent} =
-      Agent.start_link(
-        provider: Keyword.get(opts, :provider, provider(server)),
-        cwd: cwd,
-        exec_timeout: Keyword.get(opts, :exec_timeout, 500),
-        supervisor: sup,
-        session_dir: Keyword.get(opts, :session_dir),
-        resume: Keyword.get(opts, :resume),
-        name: nil
-      )
+      base
+      |> Keyword.merge(Keyword.take(opts, [:mode, :vetter, :vet_timeout]))
+      |> Agent.start_link()
 
     on_exit(fn ->
       DashFloat.TestTeardown.stop(agent)
@@ -770,6 +809,270 @@ defmodule DashFloat.AgentTest do
 
     assert_receive {:entry, :system, "[stream failed: :boom]"}, 2_000
     assert_receive {:phase, :idle}, 2_000
+  end
+
+  ## Modes: the agent gate and the vetting state machine (ADR 0016)
+
+  @tag :tmp_dir
+  test "unchained runs a mutating tool with no confirmation", ctx do
+    args = %{"path" => "out/free.txt", "content" => "unchained"}
+
+    server =
+      start_server([
+        call_tool_episode("call_u", "write_file", args),
+        final_episode("done")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :unchained)
+    send(agent, {:prompt, self(), "write it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    # The receipt lands without arming a confirmation and without a check.
+    assert_receive {:tool_preview, %{id: "call_u", name: "write_file", lines: lines}}, 2_000
+    assert Enum.any?(lines, &String.contains?(&1, "free.txt"))
+
+    assert_receive {:tool_result, %{id: "call_u", ok: true}}, 2_000
+    assert read_sandbox(ctx, "out/free.txt") == "unchained"
+
+    assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
+
+    assert %{"ok" => true, "bytes" => 9, "created" => true} =
+             second_body
+             |> tool_result_of("call_u")
+             |> Map.fetch!("content")
+             |> Jason.decode!()
+
+    assert_receive {:phase, :idle}, 2_000
+    refute_received {:confirm, _ref, _preview}
+    refute_received {:phase, :checking}
+  end
+
+  @tag :tmp_dir
+  test "auto runs when the vetter allows: checking phase, receipt, no confirm", ctx do
+    server =
+      start_server([
+        call_tool_episode("call_a", "execute_command", %{"command" => "echo vet-ran"}),
+        final_episode("done")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetAllow)
+    send(agent, {:prompt, self(), "run it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:phase, :checking}, 2_000
+    assert_receive {:tool_preview, %{id: "call_a", name: "execute_command"}}, 2_000
+
+    assert_receive {:tool_result, %{id: "call_a", ok: true, output: output}}, 2_000
+    assert output =~ "vet-ran"
+
+    assert_receive {:phase, :idle}, 2_000
+    refute_received {:confirm, _ref, _preview}
+  end
+
+  @tag :tmp_dir
+  test "auto confirms when the vetter asks: nothing runs before approval", ctx do
+    server =
+      start_server([
+        call_tool_episode("call_s", "execute_command", %{"command" => "touch asked.txt"}),
+        final_episode("done")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetAsk)
+    send(agent, {:prompt, self(), "run it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:entry, :system, "[safety check: needs confirmation]"}, 2_000
+    assert_receive {:confirm, ref, %{id: "call_s"}}, 2_000
+    refute sandbox_exists?(ctx, "asked.txt")
+
+    send(agent, {:confirm_decision, ref, :approved})
+    assert_receive {:tool_result, %{id: "call_s", ok: true}}, 2_000
+    assert sandbox_exists?(ctx, "asked.txt")
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "a failed check degrades to confirm: auto never becomes unchained", ctx do
+    server =
+      start_server([
+        call_tool_episode("call_f", "execute_command", %{"command" => "touch failed.txt"}),
+        final_episode("done")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetFail)
+    send(agent, {:prompt, self(), "run it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:entry, :system, "[safety check unavailable — confirming]"}, 2_000
+    assert_receive {:confirm, ref, %{id: "call_f"}}, 2_000
+    refute sandbox_exists?(ctx, "failed.txt")
+
+    send(agent, {:confirm_decision, ref, :rejected})
+    assert_receive {:tool_result, %{id: "call_f", ok: false, status: "rejected"}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+    refute sandbox_exists?(ctx, "failed.txt")
+  end
+
+  test "a fabricated vet_done while idle is ignored, never dispatched" do
+    server = start_server([final_episode("unused")])
+    {agent, _sup} = start_agent(server, System.tmp_dir!(), mode: :auto, vetter: AgentTestVetAllow)
+
+    send(agent, {:vet_done, "nope", {:allow}})
+
+    refute_receive {:tool_preview, _preview}, 200
+    refute_receive {:phase, _phase}, 200
+    refute_receive {:sse_request, "POST", _, _, _body}, 200
+    assert Process.alive?(agent)
+  end
+
+  @tag :tmp_dir
+  test "Esc during a check cancels the batch and stays round-trippable", ctx do
+    frames =
+      tool_frames("call_v", "execute_command", [~s({"command":"echo vet-ran"})]) ++
+        tool_frames_1("call_q", "read_file", [~s({"path":"never.txt"})])
+
+    server = start_server([[{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close]])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParked)
+
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:phase, :checking}, 2_000
+
+    send(agent, {:cancel})
+
+    assert_receive {:tool_result, %{id: "call_v", status: "cancelled"}}, 2_000
+    assert_receive {:entry, :system, "[tool run cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # The transcript answers every announced call — no dangling tool_calls.
+    tool_messages =
+      agent
+      |> :sys.get_state()
+      |> Map.fetch!(:messages)
+      |> Enum.filter(&(&1.role == "tool"))
+
+    assert length(tool_messages) == 2
+
+    for id <- ["call_v", "call_q"] do
+      assert %{"ok" => false, "cancelled" => true} =
+               tool_messages
+               |> Enum.find(&(&1.tool_call_id == id))
+               |> Map.fetch!(:content)
+               |> Jason.decode!()
+    end
+  end
+
+  @tag :tmp_dir
+  test "auto end-to-end with the real vetter: the recorded verdict drives dispatch", ctx do
+    vet_reply = ~s({"decision":"run","reason":"echo is reversible"})
+
+    server =
+      start_server([
+        call_tool_episode("call_rv", "execute_command", %{"command" => "echo real-vet"}),
+        [{:send, [@headers, json_frame(vet_reply)]}, {:send, "data: [DONE]\n\n"}, :close],
+        final_episode("done")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto)
+    send(agent, {:prompt, self(), "run it"})
+    assert_receive {:sse_request, "POST", _, _, _model_first}, 2_000
+
+    # The vet is a fresh-context completion: its request carries the static
+    # instruction and the call payload, never the conversation.
+    assert_receive {:phase, :checking}, 2_000
+    assert_receive {:sse_request, "POST", _, _, vet_body}, 2_000
+    assert vet_body =~ "safety check"
+    assert vet_body =~ "execute_command"
+    refute vet_body =~ "run it"
+
+    assert_receive {:tool_preview, %{id: "call_rv", name: "execute_command"}}, 2_000
+
+    assert_receive {:tool_result, %{id: "call_rv", ok: true, output: output}}, 2_000
+    assert output =~ "real-vet"
+    assert_receive {:phase, :idle}, 2_000
+    refute_received {:confirm, _ref, _preview}
+  end
+
+  @tag :tmp_dir
+  test "plan proposes a mutation: previewed, never run, blocked result", ctx do
+    write_sandbox(ctx, "seed.txt", "before\n")
+
+    args = %{"path" => "seed.txt", "search_block" => "before", "replace_block" => "after"}
+
+    server =
+      start_server([
+        call_tool_episode("call_p", "edit_file", args),
+        final_episode("proposed it")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :plan)
+    send(agent, {:prompt, self(), "edit it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:tool_preview, %{id: "call_p", name: "edit_file"}}, 2_000
+    assert_receive {:tool_result, %{id: "call_p", ok: false, status: "proposed (plan)"}}, 2_000
+
+    assert read_sandbox(ctx, "seed.txt") == "before\n"
+
+    assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
+
+    assert %{"content" => result_json} = tool_result_of(second_body, "call_p")
+    assert Jason.decode!(result_json) == %{"ok" => false, "blocked" => "plan"}
+
+    assert_receive {:phase, :idle}, 2_000
+    refute_received {:confirm, _ref, _preview}
+  end
+
+  @tag :tmp_dir
+  test "plan still runs safe tools", ctx do
+    write_sandbox(ctx, "notes.md", "readable\n")
+
+    server =
+      start_server([
+        call_tool_episode("call_pr", "read_file", %{"path" => "notes.md"}),
+        final_episode()
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :plan)
+    send(agent, {:prompt, self(), "read it"})
+
+    assert_receive {:tool_result, %{id: "call_pr", ok: true, output: output}}, 2_000
+    assert output =~ "readable"
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "set_mode echoes, logs, and moves the gate; an invalid mode only logs", ctx do
+    server =
+      start_server([
+        call_tool_episode("call_sm", "write_file", %{"path" => "switched.txt", "content" => "x"}),
+        final_episode("done")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    send(agent, {:set_mode, self(), :unchained})
+    assert_receive {:mode, :unchained}, 2_000
+    assert_receive {:entry, :system, "[mode: Build → Unchained]"}, 2_000
+
+    # The next mutating call runs on the new mode's gate: no confirmation.
+    send(agent, {:prompt, self(), "write it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+    assert_receive {:tool_result, %{id: "call_sm", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+    refute_received {:confirm, _ref, _preview}
+
+    # An invalid mode gets the naming entry, no echo, no change.
+    send(agent, {:set_mode, self(), :yolo})
+    assert_receive {:entry, :system, "unknown mode: :yolo (plan, build, auto, unchained)"}, 2_000
+    refute_received {:mode, _mode}
+    assert %{mode: :unchained} = :sys.get_state(agent)
+  end
+
+  test "an invalid :mode start opt raises ArgumentError" do
+    assert_raise ArgumentError, ~r/unknown mode/, fn ->
+      Agent.start_link(provider: {:error, "unused"}, mode: :yolo, name: nil)
+    end
   end
 
   ## Failure taxonomy and lifecycle

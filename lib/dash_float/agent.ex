@@ -2,8 +2,8 @@ defmodule DashFloat.Agent do
   @moduledoc """
   The Agent Manager ([ADR 0001](0001-founding-stack-and-architecture.md)): owns the
   conversation, runs the episode loop (stream → tools → stream → … → idle), gates
-  mutations behind confirmations, and is the single voice speaking the display
-  contract into the UI. ChatStream and the tool runners report here as plain
+  tool calls through the session mode (ADR 0016), and is the single voice speaking
+  the display contract into the UI. ChatStream and the tool runners report here as plain
   messages; the agent forwards, renders, and orchestrates. It holds no timers —
   timeouts live in ChatStream and the runner Tasks. See ADR 0007.
   """
@@ -13,6 +13,7 @@ defmodule DashFloat.Agent do
   alias DashFloat.Accounting
   alias DashFloat.Config
   alias DashFloat.LLM.ChatStream
+  alias DashFloat.Mode
   alias DashFloat.Session
   alias DashFloat.Tools
   alias DashFloat.Tools.Preview
@@ -21,6 +22,7 @@ defmodule DashFloat.Agent do
   require Logger
 
   @default_exec_timeout 30_000
+  @default_vet_timeout 10_000
 
   # P2-3 (hostile review): the no-provider notice CARRIES the actual error —
   # an unknown --profile hard error or a migration refusal is the user's
@@ -57,13 +59,20 @@ defmodule DashFloat.Agent do
     # :none | {:running, reference(), pid(), map()}
     # | {:running_cancelled, reference(), pid(), map()}
     # | {:confirming, reference(), map()}
+    # | {:vetting, reference(), pid(), map(), map()}
+    # | {:vetting_cancelled, reference(), pid(), map()}
     tool_slot: :none,
     # Context accounting (ADR 0022): the usage-frame anchor, the eviction
     # history, and the current episode's request message count — the count
     # that completes the anchor when the episode's frame lands.
     anchor: nil,
     compactions: [],
-    request_len: 0
+    request_len: 0,
+    # The session mode and the AUTO safety check (ADR 0016): the agent owns
+    # the gate; :vetter is the injectable check module.
+    mode: :build,
+    vetter: DashFloat.Tools.Vetter,
+    vet_timeout: @default_vet_timeout
   ]
 
   @doc """
@@ -81,24 +90,40 @@ defmodule DashFloat.Agent do
       optionally with the session's `:created_at` plus the ADR 0022 §6
       diagnostics `:context` (the persisted anchor) and `:compactions` (the
       eviction history); the agent adopts them (default: nil)
+    * `:mode` — the interaction mode (ADR 0016): `:plan`, `:build`, `:auto`,
+      or `:unchained` (default: `:build`; anything else raises `ArgumentError`)
+    * `:vetter` — the AUTO safety-check module implementing `verdict/4`
+      (default: `DashFloat.Tools.Vetter`; the injection seam for tests)
+    * `:vet_timeout` — the safety check's hard timeout in ms
+      (default: #{@default_vet_timeout})
     * `:name` — GenServer name (default: `__MODULE__`)
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
+    mode = Keyword.get(opts, :mode, :build)
+
+    Mode.valid?(mode) ||
+      raise ArgumentError, "unknown mode: #{inspect(mode)} (plan, build, auto, unchained)"
+
     init_args = {
       Keyword.fetch!(opts, :provider),
       Keyword.get(opts, :cwd) || File.cwd!(),
       Keyword.get(opts, :supervisor, DashFloat.TaskSupervisor),
       Keyword.get(opts, :exec_timeout, @default_exec_timeout),
       Keyword.get(opts, :session_dir),
-      Keyword.get(opts, :resume)
+      Keyword.get(opts, :resume),
+      mode,
+      Keyword.get(opts, :vetter, DashFloat.Tools.Vetter),
+      Keyword.get(opts, :vet_timeout, @default_vet_timeout)
     }
 
     GenServer.start_link(__MODULE__, init_args, name: Keyword.get(opts, :name, __MODULE__))
   end
 
   @impl GenServer
-  def init({provider, cwd, supervisor, exec_timeout, session_dir, resume}) do
+  def init(
+        {provider, cwd, supervisor, exec_timeout, session_dir, resume, mode, vetter, vet_timeout}
+      ) do
     # A resumed agent adopts the loaded session's id, pin, created_at, and
     # history in one move: the first prompt streams the restored transcript
     # and the next save rewrites the same file under the same id (ADR 0014 §6).
@@ -128,7 +153,10 @@ defmodule DashFloat.Agent do
        session_created_at: session_created_at,
        messages: messages,
        anchor: anchor,
-       compactions: compactions
+       compactions: compactions,
+       mode: mode,
+       vetter: vetter,
+       vet_timeout: vet_timeout
      }}
   end
 
@@ -158,6 +186,25 @@ defmodule DashFloat.Agent do
 
   # A prompt while busy is a UI bug (the UI gates on phase): ignore, never crash.
   def handle_info({:prompt, _ui, _text}, state), do: {:noreply, state}
+
+  # The mode seam (ADR 0016 §7): the UI sends, the agent validates, the echo
+  # updates the chrome. Accepted in any phase — the gate reads per call at
+  # dispatch, and a pending confirmation is left standing untouched.
+  def handle_info({:set_mode, ui, mode}, %__MODULE__{mode: old} = state) when is_pid(ui) do
+    if Mode.valid?(mode) do
+      state = %{state | ui: ui, mode: mode}
+      display(ui, {:mode, mode})
+      display(ui, {:entry, :system, "[mode: #{Mode.label(old)} → #{Mode.label(mode)}]"})
+      {:noreply, state}
+    else
+      display(
+        ui,
+        {:entry, :system, "unknown mode: #{inspect(mode)} (plan, build, auto, unchained)"}
+      )
+
+      {:noreply, state}
+    end
+  end
 
   # The startup phase's handoff (ADR 0009): the agent boots with the boot-time
   # classification (an error while the wizard/modal runs); once setup
@@ -201,6 +248,15 @@ defmodule DashFloat.Agent do
   def handle_info({:cancel}, %__MODULE__{tool_slot: {:running, ref, pid, call}} = state) do
     if pid, do: send(pid, :cancel)
     {:noreply, %{state | tool_slot: {:running_cancelled, ref, pid, call}}}
+  end
+
+  # Esc during a check cancels BY MESSAGE (ADR 0016 §6): the vetter cancels
+  # its stream child and reports or dies — a vetter that never checks its
+  # mailbox still dies at its own deadline. The batch aborts then, exactly
+  # like a cancelled running tool.
+  def handle_info({:cancel}, %__MODULE__{tool_slot: {:vetting, ref, pid, call, _preview}} = state) do
+    if pid, do: send(pid, :cancel)
+    {:noreply, %{state | tool_slot: {:vetting_cancelled, ref, pid, call}}}
   end
 
   def handle_info({:cancel}, state), do: {:noreply, state}
@@ -291,6 +347,58 @@ defmodule DashFloat.Agent do
 
   def handle_info({:tool_done, _id, _result}, state), do: {:noreply, state}
 
+  ## Vetter messages (AUTO's safety check, ADR 0016 §6)
+
+  # Allow: the preview entry becomes the execution receipt and the runner
+  # dispatches — the shape an approval produces in BUILD.
+  def handle_info(
+        {:vet_done, id, {:allow}},
+        %__MODULE__{tool_slot: {:vetting, _ref, _pid, call, preview}} = state
+      )
+      when call.id == id do
+    state = %{state | tool_slot: :none}
+    display(state.ui, {:tool_preview, preview})
+    dispatch_runner(state, call)
+  end
+
+  # Ask: the human answers on the evidence the check saw — the already-built
+  # preview arms the standard confirm flow.
+  def handle_info(
+        {:vet_done, id, {:ask}},
+        %__MODULE__{tool_slot: {:vetting, _ref, _pid, call, preview}} = state
+      )
+      when call.id == id do
+    state = %{state | tool_slot: :none}
+    vet_confirm(state, call, preview, "[safety check: needs confirmation]")
+  end
+
+  # Any check failure resolves to confirm — the fail-safe direction: AUTO
+  # with a broken check degrades to BUILD for mutating/risky calls, never to
+  # UNCHAINED.
+  def handle_info(
+        {:vet_done, id, {:error, _reason}},
+        %__MODULE__{tool_slot: {:vetting, _ref, _pid, call, preview}} = state
+      )
+      when call.id == id do
+    state = %{state | tool_slot: :none}
+    vet_confirm(state, call, preview, "[safety check unavailable — confirming]")
+  end
+
+  # A report from a check the user already Esc'd aborts the batch exactly
+  # like a cancelled running tool.
+  def handle_info(
+        {:vet_done, id, _verdict},
+        %__MODULE__{tool_slot: {:vetting_cancelled, _ref, _pid, call}} = state
+      )
+      when call.id == id do
+    state = %{state | tool_slot: :none}
+    abort_tool_run(state, call)
+  end
+
+  # A stale vet report (its check was superseded) is ignored — the same
+  # discipline as a stale confirm decision.
+  def handle_info({:vet_done, _id, _verdict}, state), do: {:noreply, state}
+
   ## Monitors
 
   # A runner dying after the user cancelled (however it died): abort the batch
@@ -338,6 +446,26 @@ defmodule DashFloat.Agent do
     crashed = %{ok: false, error: "tool crashed: " <> inspect_slice(reason)}
     display(state.ui, {:tool_result, tool_result_msg(call, crashed)})
     record_and_continue(state, call, crashed)
+  end
+
+  # A vetter death its body could not report (:killed/:noproc per ADR 0012,
+  # or any unreported exit) is a failed check — the fail-safe direction.
+  def handle_info(
+        {:DOWN, ref, :process, _down_pid, _reason},
+        %__MODULE__{tool_slot: {:vetting, ref, _pid, call, preview}} = state
+      ) do
+    state = %{state | tool_slot: :none}
+    vet_confirm(state, call, preview, "[safety check unavailable — confirming]")
+  end
+
+  # A cancelled vetter dying before it could report aborts the batch like its
+  # running-tool counterpart.
+  def handle_info(
+        {:DOWN, ref, :process, _down_pid, _reason},
+        %__MODULE__{tool_slot: {:vetting_cancelled, ref, _pid, call}} = state
+      ) do
+    state = %{state | tool_slot: :none}
+    abort_tool_run(state, call)
   end
 
   # A stream task going down while still streaming: the producer-of-record rule
@@ -515,7 +643,7 @@ defmodule DashFloat.Agent do
       {:ok, args} ->
         call = %{call | args: args}
         display(state.ui, {:tool_call, %{id: call.id, name: call.name, args: args}})
-        dispatch_validated(state, call)
+        pre_tool_use(state, call)
     end
   end
 
@@ -530,29 +658,112 @@ defmodule DashFloat.Agent do
     end
   end
 
-  defp dispatch_validated(state, call) do
-    if automatic?(call.name) do
-      dispatch_runner(state, call)
-    else
-      case Preview.build(call.name, call.args, state.cwd) do
-        {:error, result} ->
-          display(state.ui, {:tool_result, tool_result_msg(call, result)})
-          record_and_continue(state, call, result)
+  # The PreToolUse seam (ADR 0016 §5): validation has passed; the mode gate
+  # reads per call, here, at the one interception point in the tool path.
+  # Safe tools dispatch with no preview, ever; mutating and risky calls build
+  # their preview first in every mode (ADR 0016 §4) and the gate outcome
+  # decides what follows it.
+  defp pre_tool_use(state, call) do
+    class = Tools.class(call.name)
 
-        {:ok, preview} ->
-          ref = make_ref()
-
-          preview = %{id: call.id, name: call.name, args: call.args, lines: preview.lines}
-
-          display(state.ui, {:confirm, ref, preview})
-          {:noreply, %{state | tool_slot: {:confirming, ref, call}}}
-      end
+    case {class, Mode.gate(state.mode, class)} do
+      {:safe, :run} -> dispatch_runner(state, call)
+      {_class, outcome} -> with_preview(state, call, outcome)
     end
   end
 
-  defp automatic?("read_file"), do: true
-  defp automatic?("list_directory"), do: true
-  defp automatic?(_mutation), do: false
+  defp with_preview(state, call, outcome) do
+    case Preview.build(call.name, call.args, state.cwd) do
+      # A preview error stays the error result it is today, in every mode.
+      {:error, result} ->
+        display(state.ui, {:tool_result, tool_result_msg(call, result)})
+        record_and_continue(state, call, result)
+
+      {:ok, preview} ->
+        preview = %{id: call.id, name: call.name, args: call.args, lines: preview.lines}
+        resolve_gate(state, call, outcome, preview)
+    end
+  end
+
+  # :confirm — BUILD's keypress boundary (ADR 0007 §4), unchanged.
+  defp resolve_gate(state, call, :confirm, preview) do
+    ref = make_ref()
+    display(state.ui, {:confirm, ref, preview})
+    {:noreply, %{state | tool_slot: {:confirming, ref, call}}}
+  end
+
+  # :run — UNCHAINED (any no-keypress run): no confirm, no check; the preview
+  # entry is the execution receipt (ADR 0016 §4).
+  defp resolve_gate(state, call, :run, preview) do
+    display(state.ui, {:tool_preview, preview})
+    dispatch_runner(state, call)
+  end
+
+  # :propose — PLAN: the change is previewed, never executed, and the model
+  # is told the mode blocked it — no human said no (ADR 0016 §4).
+  defp resolve_gate(state, call, :propose, preview) do
+    display(state.ui, {:tool_preview, preview})
+    proposed = %{ok: false, blocked: "plan"}
+    display(state.ui, {:tool_result, tool_result_msg(call, proposed)})
+    record_and_continue(state, call, proposed)
+  end
+
+  # :vet — AUTO: the safety check decides run-vs-confirm per call (ADR 0016 §6).
+  defp resolve_gate(state, call, :vet, preview), do: start_vet(state, call, preview)
+
+  # The check runs as a temporary task under the supervisor (a crash is a
+  # report, never a node crash — ADR 0001), its hard timeout owned inside the
+  # vetter (timers live in tasks — ADR 0001/0007). The body self-reports
+  # every death it can observe (ADR 0012); the monitor placed after spawn
+  # catches the rest as a failed check. The phase names the pause (:checking)
+  # so the user sees why dispatch is holding.
+  defp start_vet(state, call, preview) do
+    display(state.ui, {:phase, :checking})
+    agent = self()
+    vetter = state.vetter
+    provider = state.provider
+    vet_timeout = state.vet_timeout
+    lines = preview.lines
+
+    {:ok, pid} =
+      Task.Supervisor.start_child(
+        state.supervisor,
+        fn ->
+          try do
+            send(
+              agent,
+              {:vet_done, call.id,
+               vetter.verdict(provider, call, lines, vet_timeout: vet_timeout)}
+            )
+          rescue
+            # coveralls-ignore-start
+            # Belt over the vetter's never-raise contract (vetter.ex):
+            # reachable only if a vetter misbehaves — an injected module, a
+            # future regression.
+            reason ->
+              send(
+                agent,
+                {:vet_done, call.id, {:error, "safety check crashed: " <> inspect_slice(reason)}}
+              )
+
+              # coveralls-ignore-stop
+          end
+        end,
+        restart: :temporary
+      )
+
+    {:noreply, %{state | tool_slot: {:vetting, Process.monitor(pid), pid, call, preview}}}
+  end
+
+  # Ask and failed-check outcomes both arm BUILD's confirm on the
+  # already-built preview — the human answers on exactly the evidence the
+  # check saw (ADR 0016 §6).
+  defp vet_confirm(state, call, preview, entry) do
+    display(state.ui, {:entry, :system, entry})
+    ref = make_ref()
+    display(state.ui, {:confirm, ref, preview})
+    {:noreply, %{state | tool_slot: {:confirming, ref, call}}}
+  end
 
   # The mutating runner starts ONLY after the approval keypress (ADR 0007 §4).
   # Re-announcing :executing_tool here keeps the activity line truthful for the
