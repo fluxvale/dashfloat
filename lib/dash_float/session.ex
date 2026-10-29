@@ -14,6 +14,8 @@ defmodule DashFloat.Session do
   @version 1
 
   @id_shape ~r/\A[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\z/
+  @id_example "20261027-143052-a1b2c3"
+  @id_shape_error "session ids look like #{@id_example}"
 
   @type pin :: %{
           profile: String.t() | nil,
@@ -57,7 +59,7 @@ defmodule DashFloat.Session do
   def save(dir, session) do
     # The id names the file (ADR 0014 §2): only the minted shape ever
     # reaches the filesystem, so no hand-supplied id can carry a path.
-    with :ok <- check_id_shape(session.id) do
+    with :ok <- check_save_id(session.id) do
       do_save(dir, session)
     end
   end
@@ -94,10 +96,8 @@ defmodule DashFloat.Session do
   """
   @spec load(Path.t(), String.t()) :: {:ok, t()} | {:error, String.t()}
   def load(dir, requested) do
-    id = String.replace_suffix(requested, ".json", "")
-
-    with :ok <- check_id_shape(id) do
-      do_load(dir, id)
+    with :ok <- check_load_id(dir, requested) do
+      do_load(dir, String.replace_suffix(requested, ".json", ""))
     end
   end
 
@@ -123,11 +123,30 @@ defmodule DashFloat.Session do
     end
   end
 
-  # The error names the expected shape, never the offending id (ADR 0014 §4).
-  defp check_id_shape(id) do
-    if Regex.match?(@id_shape, id),
-      do: :ok,
-      else: {:error, "session ids look like 20261027-143052-a1b2c3"}
+  # Save keeps the shape-only message; load speaks the canonical unknown-id
+  # refusal — directory and ls remedy — because a hand-typed `--resume` id
+  # must land on the same remedy as `--resume does-not-exist` (ADR 0014 §4).
+  # Only a string id can carry the shape; anything else refuses, never raises.
+  defp check_save_id(id) when is_binary(id) do
+    if Regex.match?(@id_shape, id), do: :ok, else: {:error, @id_shape_error}
+  end
+
+  defp check_save_id(_other), do: {:error, @id_shape_error}
+
+  defp check_load_id(dir, requested) when is_binary(requested) do
+    id = String.replace_suffix(requested, ".json", "")
+
+    if Regex.match?(@id_shape, id) do
+      :ok
+    else
+      {:error,
+       "no session #{id} under #{dir} — session ids look like #{@id_example}; list sessions with: ls #{dir}"}
+    end
+  end
+
+  defp check_load_id(dir, other) do
+    {:error,
+     "no session #{other} under #{dir} — session ids look like #{@id_example}; list sessions with: ls #{dir}"}
   end
 
   defp path_for(dir, id), do: Path.join(dir, id <> ".json")
@@ -199,14 +218,14 @@ defmodule DashFloat.Session do
     do: {:error, "#{path}: \"messages\" must be a list"}
 
   # The batch state threaded through validation: the ids the most recent
-  # batch announced, and whether its contiguous tool block is still open —
-  # the same block rule repair/1 applies, so validation and repair agree on
-  # what a batch's block is (ADR 0014 §4).
-  @type batch_state :: {MapSet.t(String.t()), boolean()}
+  # batch announced, the ids that block has already answered, and whether
+  # the block is still open — the same block rule repair/1 applies, so
+  # validation and repair agree on what a batch's block is (ADR 0014 §4).
+  @type batch_state :: {MapSet.t(String.t()), MapSet.t(String.t()), boolean()}
 
   @spec check_messages(String.t(), list(), non_neg_integer(), batch_state()) ::
           {:ok, [map()]} | {:error, String.t()}
-  defp check_messages(path, messages, index \\ 0, batch \\ {MapSet.new(), false})
+  defp check_messages(path, messages, index \\ 0, batch \\ {MapSet.new(), MapSet.new(), false})
   defp check_messages(_path, [], _index, _batch), do: {:ok, []}
 
   defp check_messages(path, [message | rest], index, batch) do
@@ -235,9 +254,8 @@ defmodule DashFloat.Session do
     tool_call_id = Map.get(message, "tool_call_id")
 
     with :ok <- check_string(path, index, "tool_call_id", tool_call_id),
-         :ok <- check_string(path, index, "content", Map.get(message, "content")),
-         :ok <- check_announced(path, index, tool_call_id, batch) do
-      {:ok, batch}
+         :ok <- check_string(path, index, "content", Map.get(message, "content")) do
+      check_answer(path, index, tool_call_id, batch)
     end
   end
 
@@ -313,21 +331,30 @@ defmodule DashFloat.Session do
        "#{path}: message #{index} field \"tool_calls\" needs entries with string \"id\" and \"type\" and a \"function\" with string \"name\" and \"arguments\""}
 
   # A batch opens the contiguous tool block that follows it; any other
-  # message closes the previous batch's block. The ids stay known after the
-  # close so a later stray answer is named as detached, not orphaned.
-  defp announce(message, {pending, _open?}) do
+  # message closes the previous batch's block. The pending ids stay known
+  # after the close so a later stray answer is named as detached, not
+  # orphaned; the answered set resets with each batch.
+  defp announce(message, {pending, _answered, _open?}) do
     case batch_calls(message) do
-      nil -> {pending, false}
-      calls -> {MapSet.new(calls), true}
+      nil -> {pending, MapSet.new(), false}
+      calls -> {MapSet.new(calls), MapSet.new(), true}
     end
   end
 
-  defp close_block({pending, _open?}), do: {pending, false}
+  defp close_block({pending, _answered, _open?}), do: {pending, MapSet.new(), false}
 
-  defp check_announced(path, index, tool_call_id, {pending, open?}) do
+  # Records the answer on the open block, or refuses: an id the block never
+  # announced is orphaned, one announced but answered past the block is
+  # detached, and one answered TWICE in the same block leaves the transcript
+  # unbalanced — one call, two answers (ADR 0014 §4).
+  defp check_answer(path, index, tool_call_id, {pending, answered, open?}) do
     cond do
+      open? and MapSet.member?(pending, tool_call_id) and MapSet.member?(answered, tool_call_id) ->
+        {:error,
+         "#{path}: message #{index} is a duplicate answer for tool call \"#{tool_call_id}\""}
+
       open? and MapSet.member?(pending, tool_call_id) ->
-        :ok
+        {:ok, {pending, MapSet.put(answered, tool_call_id), open?}}
 
       MapSet.member?(pending, tool_call_id) ->
         {:error,

@@ -462,8 +462,8 @@ defmodule DashFloat.Agent do
 
   defp renamed_form(id) do
     case Regex.run(~r/\A(.*)-(\d+)\z/, id) do
-      [_, base, n] -> {base, String.to_integer(n)}
-      _no_match -> :error
+      [_full, base, n] -> {base, String.to_integer(n)}
+      nil -> :error
     end
   end
 

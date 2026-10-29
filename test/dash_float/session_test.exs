@@ -558,8 +558,9 @@ defmodule DashFloat.SessionTest do
   end
 
   describe "session id shape" do
-    test "save refuses an id outside the minted shape, writing nothing" do
-      dir = Path.join("/tmp/opencode", "dashfloat-id-shape-#{System.unique_integer([:positive])}")
+    @tag :tmp_dir
+    test "save refuses an id outside the minted shape, writing nothing", ctx do
+      dir = Path.join(ctx.tmp_dir, "never-created")
 
       assert {:error, msg} = Session.save(dir, session([], id: "../escape"))
       assert msg == "session ids look like 20261027-143052-a1b2c3"
@@ -567,10 +568,24 @@ defmodule DashFloat.SessionTest do
     end
 
     @tag :tmp_dir
-    test "load refuses an id outside the shape, including a traversal attempt", ctx do
+    test "load refuses an id outside the shape naming the dir and the ls remedy", ctx do
       assert {:error, msg} = Session.load(ctx.tmp_dir, "../escape")
-      assert msg == "session ids look like 20261027-143052-a1b2c3"
+
+      assert msg ==
+               "no session ../escape under #{ctx.tmp_dir} — session ids look like 20261027-143052-a1b2c3; list sessions with: ls #{ctx.tmp_dir}"
+
       assert File.ls!(ctx.tmp_dir) == []
+    end
+
+    @tag :tmp_dir
+    test "a non-string id returns the shape error on both paths, never a raise", ctx do
+      assert {:error, msg} = Session.save(ctx.tmp_dir, session([], id: 123))
+      assert msg == "session ids look like 20261027-143052-a1b2c3"
+
+      assert {:error, msg} = Session.load(ctx.tmp_dir, 123)
+
+      assert msg ==
+               "no session 123 under #{ctx.tmp_dir} — session ids look like 20261027-143052-a1b2c3; list sessions with: ls #{ctx.tmp_dir}"
     end
 
     @tag :tmp_dir
@@ -700,6 +715,44 @@ defmodule DashFloat.SessionTest do
 
       assert {:ok, loaded} = load(ctx)
       assert length(loaded.messages) == 4
+    end
+  end
+
+  describe "duplicate answers in one block" do
+    @tag :tmp_dir
+    test "one call answered twice in the same block refuses, naming the index", ctx do
+      write_body(
+        ctx,
+        body_with([
+          %{"role" => "user", "content" => "go"},
+          %{"role" => "assistant", "content" => nil, "tool_calls" => [call("call_1")]},
+          tool_result("call_1", ~s({"ok":true})),
+          tool_result("call_1", ~s({"ok":true}))
+        ])
+      )
+
+      assert {:error, msg} = load(ctx)
+      assert msg =~ "message 3"
+      assert msg =~ "duplicate answer for tool call \"call_1\""
+    end
+
+    @tag :tmp_dir
+    test "two calls answered once each still load", ctx do
+      write_body(
+        ctx,
+        body_with([
+          %{
+            "role" => "assistant",
+            "content" => nil,
+            "tool_calls" => [call("call_1"), call("call_2")]
+          },
+          tool_result("call_1", ~s({"ok":true})),
+          tool_result("call_2", ~s({"ok":true}))
+        ])
+      )
+
+      assert {:ok, loaded} = load(ctx)
+      assert length(loaded.messages) == 3
     end
   end
 
