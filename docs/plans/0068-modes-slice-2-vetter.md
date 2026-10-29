@@ -1,5 +1,10 @@
 # Slice 2 — `DashFloat.Tools.Vetter`: the PreToolUse safety check
 
+> **Superseded in part by [ADR 0016](../decisions/0016-interaction-modes.md) as amended
+> (post-hostile-review):** the prompt payload is fence-free (one bare JSON object,
+> content-capped in both args and preview) and the vetter reads `:cancel`. Where this
+> spec and the ADR disagree, the ADR wins.
+
 Issue [#68](https://github.com/fluxvale/dashfloat/issues/68). Design:
 [ADR 0016](../decisions/0016-interaction-modes.md) — read §5 (the seam) and all
 of §6 (the check) before starting. Depends on slice 1's `Tools.class/1` (the

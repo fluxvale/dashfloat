@@ -1,5 +1,10 @@
 # Slice 3 — Agent: mode state, the pre_tool_use gate, the vetting state machine
 
+> **Superseded in part by [ADR 0016](../decisions/0016-interaction-modes.md) as amended
+> (post-hostile-review):** the vet report is `{:vet_done, check_ref, id, verdict}`
+> matched by per-check ref, the vetting slot is the 6-tuple, and every deferred
+> resolution re-reads the gate. Where this spec and the ADR disagree, the ADR wins.
+
 Issue [#68](https://github.com/fluxvale/dashfloat/issues/68). Design:
 [ADR 0016](../decisions/0016-interaction-modes.md) — read §3–§6 and §10 before
 starting. Depends on **slice 1** (`DashFloat.Mode`, `Tools.class/1`) and

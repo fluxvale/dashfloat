@@ -93,10 +93,15 @@ The gate is read **per call at dispatch time** — and re-read when a deferred
 check resolves. A switch mid-batch affects calls not yet dispatched; a switch
 mid-check re-resolves the call under the new mode at `vet_done`/DOWN (the
 verdict applies only if the gate is still `:vet`: a switch to plan proposes,
-to build arms the confirm, to unchained dispatches) — no deferred resolution
-may execute what the current mode forbids. A pending confirmation is never
-retroactively converted — and while one is
-pending it owns every key (ADR 0007 §4's swallow rule), so the cycle surface simply does
+to build arms the confirm, to unchained dispatches) — no deferred *agent*
+resolution may execute what the current mode forbids. A standing confirmation
+is a different thing: it is the **human's pending answer, not an agent
+resolution** — it was asked under the mode that armed it, and once armed it is
+answered or Esc'd (ADR 0007 §4's swallow rule means no in-session surface can
+switch modes while it stands); an approval executes the previewed change
+regardless of any later mode switch. The keypress outranks the mode: modes
+bind the agent's unattended actions, never the human's explicit answers.
+While a confirmation is pending it owns every key (ADR 0007 §4's swallow rule), so the cycle surface simply does
 not fire mid-decision: answer it or Esc it.
 
 ### 4. The three static outcomes (and previews staying load-bearing)
@@ -152,8 +157,12 @@ so the override is additive). Latency is bounded by the hard timeout and still b
 BUILD's human round-trip.
 
 **The prompt.** Static, code-versioned in the vetter module; a single user message
-(instruction + payload; no system role — DashFloat carries none, ADR 0005). The
-instruction fixes the task and the reply contract — strict JSON
+(instruction + payload; no system role — DashFloat carries none, ADR 0005). The exact
+boundary, frozen so the injection contract is spec rather than test-local: instruction
+prose, one blank line, then the JSON object as the entire remainder of the message —
+the first line that is exactly `{` opens the payload, and every byte after it is JSON
+(the payload decodes as one object; the prose side carries no model-authored bytes).
+The instruction fixes the task and the reply contract — strict JSON
 `{"decision":"run"|"confirm","reason":"…"}` — with the rubric: **run** = routine,
 reversible, project-scoped development work (builds, tests, searches, file edits inside
 the project, lockfile-driven installs); **confirm** = destructive, irreversible, outside
@@ -165,11 +174,15 @@ pure JSON data; **no markdown fence** (a fence is deterministically breakable
 by model-authored bytes containing its own closer, hostile-review finding):
 every tool-authored byte rides inside a JSON string, structurally incapable of
 becoming instruction. Fields: tool name, risk class, normalized arguments
-(encoded, capped at 8 KiB with a disclosed marker), and **the same preview
-lines a human would confirm in BUILD** — capped at 50 lines *and* 8 KiB total
-(line-byte-truncated with the same marker) so a single unbounded content line
-cannot balloon the check. The symmetry is the design: in AUTO a model plays
-the human's role on exactly the evidence the human sees in BUILD.
+(encoded, capped at 8 KiB of **raw content** with a disclosed marker), and
+**the same preview lines a human would confirm in BUILD** — capped at 50
+lines *and* 8 KiB of raw content total (line-byte-truncated with the same
+marker) so a single unbounded content line cannot balloon the check. The caps
+are on content, not wire size: JSON escaping inflates the encoded prompt
+worst-case ~7x (pathological control characters), a bounded ceiling of ~60 KB
+for a maximal pathological call — accepted. The symmetry is the design: in
+AUTO a model plays the human's role on exactly the evidence the human sees in
+BUILD.
 
 **Latency.** The check sits on the tool-dispatch path (synchronous at the seam) and is
 visible, not hidden: the phase becomes `:checking` (§8) so the user sees why the pause
@@ -192,9 +205,11 @@ from an earlier batch can never match even over a reused call id. The agent moni
 it under the runner discipline of ADRs 0012/0013: the task self-reports every death
 its body can observe, a DOWN the body could not report resolves as a **failed check
 → confirm**, and a stale `vet_done` (ref mismatch) is ignored exactly like a stale
-confirm decision. Esc during a check cancels by message: the vetter consumes the
-`:cancel`, cancels its stream child, and resolves within milliseconds — the batch
-then aborts per ADR 0007 §4 (cancelled results keep the transcript round-trippable).
+confirm decision. Esc during a check cancels by message — best-effort: the vetter
+consumes the `:cancel` and forwards it to its stream child, and a child blocked deeper
+than its mailbox is bounded by the stream's own idle timeout (60 s default), not by the
+check — and the batch aborts per ADR 0007 §4 (cancelled results keep the transcript
+round-trippable).
 
 **Conversation contract unchanged.** The vet never enters the conversation messages;
 its usage frames are dropped engine-side (they are not the UI's conversation truth); the
