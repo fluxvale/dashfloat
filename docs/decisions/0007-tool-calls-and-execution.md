@@ -1,6 +1,6 @@
 # 0007 — Tool calls & execution: the agent loop, five tools, safety policy, confirmations
 
-- **Status:** Accepted
+- **Status:** Accepted (§4's confirmation lists are amended by [ADR 0016](0016-interaction-modes.md))
 - **Date:** 2026-10-24
 - **Implements:** [issue #18](https://github.com/fluxvale/dashfloat/issues/18) — Phase 3 of the
   [ADR 0001](0001-founding-stack-and-architecture.md) roadmap.
