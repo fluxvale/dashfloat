@@ -361,11 +361,29 @@ defmodule DashFloat.Application do
   # plus the ADR 0022 §6 diagnostics (the persisted context anchor and the
   # eviction history). `title:` threads the boot's `--title` — the override
   # wins over the loaded file's title.
+  # The storage form of --title: normalized at the threading point so the
+  # agent adopts trim/scrub/collapse output, never the typed form (the gate
+  # above already refused the invalid loud, naming the typed value; its
+  # error arm here — tests bypassing the gate — threads nil, never a raw
+  # invalid string).
+  defp boot_title(cli) do
+    case Keyword.get(cli, :title) do
+      nil ->
+        nil
+
+      raw ->
+        case Title.normalize(raw) do
+          {:ok, title} -> title
+          {:error, _reason} -> nil
+        end
+    end
+  end
+
   defp engine_children(classification, resume, cli, sessions_dir) do
     resume_opts =
       case resume do
         nil ->
-          [title: Keyword.get(cli, :title)]
+          [title: boot_title(cli)]
 
         %{session: session} ->
           [
@@ -378,7 +396,7 @@ defmodule DashFloat.Application do
               compactions: session.compactions,
               title: session.title
             },
-            title: Keyword.get(cli, :title) || session.title
+            title: boot_title(cli) || session.title
           ]
       end
 

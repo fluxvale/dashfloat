@@ -908,6 +908,38 @@ defmodule DashFloat.ApplicationTest do
       assert agent_opts[:title] == "The Title"
       assert agent_opts[:resume][:title] == "The Title"
     end
+
+    test "the storage form threads: a typed title arrives trimmed and collapsed" do
+      config_dir = v3_dir()
+      sessions = tmp_dir()
+
+      # The gate (apply_title) normalizes only to refuse; the threading
+      # normalizes again so the agent adopts the storage form, never the
+      # typed form.
+      {result, stderr} =
+        resume_boot(sessions, nil,
+          config_dir: config_dir,
+          argv: ["--title", "  Spaced   Name  "]
+        )
+
+      assert {:error, {:already_started, _pid}} = result
+      assert stderr == ""
+
+      {:ok, config} = Config.load(config_dir, %{}, [])
+
+      assert [_task, {DashFloat.Agent, agent_opts}, _tui] =
+               Application.boot_children(
+                 false,
+                 {:ok, config},
+                 config_dir,
+                 %{},
+                 [title: "  Spaced   Name  "],
+                 nil,
+                 sessions
+               )
+
+      assert agent_opts[:title] == "Spaced Name"
+    end
   end
 
   describe "the legacy-id sweep at boot (ADR 0014 §6)" do
@@ -950,6 +982,38 @@ defmodule DashFloat.ApplicationTest do
 
       refute logs =~ "renamed"
       refute logs =~ "sweep skipped"
+    end
+
+    test "a sweep that cannot write warns and the boot continues" do
+      config_dir = v3_dir()
+      sessions = tmp_dir()
+      legacy = "20261027-150000-abc123"
+
+      write_session_file(sessions, legacy, titled_session_json(legacy, "Stuck"))
+
+      # The write inside the sweep needs directory write permission (the
+      # Posture staging file); read-only makes the rewrite fail. The warning
+      # arm must not brick the boot — resume still works, the next boot
+      # retries. Restored before the tmp cleanup (on_exit runs reversed).
+      File.chmod!(sessions, 0o555)
+      on_exit(fn -> File.chmod!(sessions, 0o755) end)
+
+      id = "0192aa18-1a2b-7e99-d5b4-9c0d1e2f3a09"
+
+      logs =
+        capture_log(fn ->
+          {result, stderr} =
+            resume_boot(sessions, id, config_dir: config_dir, argv: ["--resume", id])
+
+          # The boot ran to resolution (the unknown-id refusal, not a sweep
+          # crash) — the sweep degraded to a warning.
+          assert {:error, :session_resume_failed} = result
+          assert_received {:halted, 1}
+          assert stderr =~ "no session #{id} under #{sessions}"
+        end)
+
+      assert logs =~ "legacy session id sweep skipped"
+      assert File.exists?(Path.join(sessions, legacy <> ".json"))
     end
   end
 
