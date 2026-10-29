@@ -10,6 +10,7 @@ defmodule DashFloat.Agent do
 
   use GenServer
 
+  alias DashFloat.Accounting
   alias DashFloat.Config
   alias DashFloat.LLM.ChatStream
   alias DashFloat.Session
@@ -56,7 +57,13 @@ defmodule DashFloat.Agent do
     # :none | {:running, reference(), pid(), map()}
     # | {:running_cancelled, reference(), pid(), map()}
     # | {:confirming, reference(), map()}
-    tool_slot: :none
+    tool_slot: :none,
+    # Context accounting (ADR 0022): the usage-frame anchor, the eviction
+    # history, and the current episode's request message count — the count
+    # that completes the anchor when the episode's frame lands.
+    anchor: nil,
+    compactions: [],
+    request_len: 0
   ]
 
   @doc """
@@ -71,8 +78,9 @@ defmodule DashFloat.Agent do
     * `:session_dir` — the sessions directory; transcript persistence stays
       off unless it is set (default: nil — deliberate, ADR 0014 §5)
     * `:resume` — `%{id: _, pin: _, messages: _}` from `DashFloat.Session.load/2`,
-      optionally with the session's `:created_at`; the agent adopts them
-      (default: nil)
+      optionally with the session's `:created_at` plus the ADR 0022 §6
+      diagnostics `:context` (the persisted anchor) and `:compactions` (the
+      eviction history); the agent adopts them (default: nil)
     * `:name` — GenServer name (default: `__MODULE__`)
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -94,13 +102,17 @@ defmodule DashFloat.Agent do
     # A resumed agent adopts the loaded session's id, pin, created_at, and
     # history in one move: the first prompt streams the restored transcript
     # and the next save rewrites the same file under the same id (ADR 0014 §6).
-    {session_id, session_pin, session_created_at, messages} =
+    # The ADR 0022 §6 diagnostics ride the same map: the persisted context
+    # shape converts to the accounting anchor at this boundary, and the
+    # eviction history is adopted verbatim.
+    {session_id, session_pin, session_created_at, messages, anchor, compactions} =
       case resume do
         %{id: id, pin: pin, messages: messages} ->
-          {id, pin, Map.get(resume, :created_at), messages}
+          {id, pin, Map.get(resume, :created_at), messages,
+           anchor_from_context(Map.get(resume, :context)), Map.get(resume, :compactions, [])}
 
         nil ->
-          {nil, nil, nil, []}
+          {nil, nil, nil, [], nil, []}
       end
 
     {:ok,
@@ -113,7 +125,9 @@ defmodule DashFloat.Agent do
        session_id: session_id,
        session_pin: session_pin,
        session_created_at: session_created_at,
-       messages: messages
+       messages: messages,
+       anchor: anchor,
+       compactions: compactions
      }}
   end
 
@@ -130,9 +144,12 @@ defmodule DashFloat.Agent do
 
       {:ok, _config} ->
         state = %{state | ui: ui, messages: state.messages ++ [%{role: "user", content: text}]}
+
         # Persist before the episode starts: a kill mid-stream must lose at
-        # most the reply, never the question (ADR 0014 §5).
-        state = persist(state)
+        # most the reply, never the question (ADR 0014 §5). Compaction rides
+        # the same seam — after the append+persist, before the episode, the
+        # one point every request passes through (ADR 0022 §5).
+        state = maybe_compact(persist(state))
         start_episode(state)
     end
   end
@@ -195,8 +212,18 @@ defmodule DashFloat.Agent do
 
   def handle_info({:token, _text}, state), do: {:noreply, state}
 
+  # The episode's usage frame completes the anchor minted at episode start
+  # (ADR 0022 §1): its prompt_tokens measured over the request's message
+  # count. Display forwarding of pending_usage is unchanged (last frame wins
+  # at turn end, ADR 0007 §5).
   def handle_info({:usage, usage}, %__MODULE__{status: :streaming} = state),
-    do: {:noreply, %{state | pending_usage: usage}}
+    do:
+      {:noreply,
+       %{
+         state
+         | pending_usage: usage,
+           anchor: %{tokens: usage.prompt_tokens, index: state.request_len}
+       }}
 
   def handle_info({:usage, _usage}, state), do: {:noreply, state}
 
@@ -353,7 +380,8 @@ defmodule DashFloat.Agent do
          stream_pid: pid,
          stream_ref: Process.monitor(pid),
          episode_content: "",
-         pending_usage: nil
+         pending_usage: nil,
+         request_len: length(state.messages)
      }}
   end
 
@@ -659,6 +687,74 @@ defmodule DashFloat.Agent do
     }
   end
 
+  ## Context accounting (ADR 0022)
+
+  # The compaction hook (ADR 0022 §5): prompt time, after the user message is
+  # appended and persisted, before the episode starts. Only a configured
+  # window compacts — nil (or non-positive) returns the state unchanged,
+  # nothing is guessed (§2). The no-op path returns the state unchanged; the
+  # compacting path mutates, persists once, and announces what happened (§6).
+  defp maybe_compact(%__MODULE__{provider: {:ok, %Config{context_tokens: window}}} = state)
+       when is_integer(window) and window > 0 do
+    plan = Accounting.compact(state.messages, state.anchor, window)
+
+    if plan.dropped == 0 and not plan.oversize do
+      state
+    else
+      before = Accounting.estimate(state.messages, state.anchor)
+      after_estimate = Accounting.estimate(plan.kept, plan.anchor)
+
+      state =
+        %{state | messages: plan.kept, anchor: plan.anchor}
+        |> with_compaction_record(plan, window, before, after_estimate)
+        |> persist()
+
+      if plan.dropped > 0 do
+        display(
+          state.ui,
+          {:entry, :system,
+           "[context: dropped #{plan.dropped} oldest turn(s) — est #{before}→#{after_estimate} of #{window}]"}
+        )
+      end
+
+      if plan.oversize do
+        display(
+          state.ui,
+          {:entry, :system,
+           "[context: the remaining turn alone exceeds the 80% window budget — kept whole]"}
+        )
+      end
+
+      state
+    end
+  end
+
+  defp maybe_compact(state), do: state
+
+  # One chronological record per dropping compact (ADR 0022 §6); an
+  # oversize-only pass appends nothing.
+  defp with_compaction_record(state, %{dropped: 0}, _window, _before, _after), do: state
+
+  defp with_compaction_record(state, plan, window, before, after_estimate) do
+    record = %{
+      "at" => now_iso8601_utc(),
+      "turns" => plan.dropped,
+      "window" => window,
+      "estimate_before" => before,
+      "estimate_after" => after_estimate
+    }
+
+    %{state | compactions: state.compactions ++ [record]}
+  end
+
+  # The persisted anchor shape (%{prompt_tokens:, messages:}, ADR 0022 §6)
+  # converts to the accounting anchor (%{tokens:, index:}) at the resume
+  # boundary; anything else is no anchor.
+  defp anchor_from_context(%{prompt_tokens: prompt_tokens, messages: messages}),
+    do: %{tokens: prompt_tokens, index: messages}
+
+  defp anchor_from_context(_other), do: nil
+
   ## Session persistence
 
   # A full-file rewrite at every message-list mutation, opt-in via
@@ -695,7 +791,10 @@ defmodule DashFloat.Agent do
            messages: messages
          } = state
        ) do
-    session = %{version: 1, id: id, created_at: created_at, pin: pin, messages: messages}
+    session =
+      %{version: 1, id: id, created_at: created_at, pin: pin, messages: messages}
+      |> put_context(state.anchor)
+      |> put_compactions(state.compactions)
 
     case Session.save(dir, session) do
       :ok ->
@@ -707,6 +806,17 @@ defmodule DashFloat.Agent do
         state
     end
   end
+
+  # The additive v1 fields (ADR 0022 §6): written only once they exist — no
+  # anchor / empty history keeps the pre-compaction file shape exactly.
+  defp put_context(session, nil), do: session
+
+  defp put_context(session, %{tokens: tokens, index: index}) do
+    Map.put(session, :context, %{prompt_tokens: tokens, messages: index})
+  end
+
+  defp put_compactions(session, []), do: session
+  defp put_compactions(session, compactions), do: Map.put(session, :compactions, compactions)
 
   defp now_iso8601_utc, do: DateTime.to_iso8601(DateTime.utc_now())
 
