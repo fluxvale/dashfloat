@@ -974,6 +974,44 @@ defmodule DashFloat.AgentTest do
   end
 
   @tag :tmp_dir
+  test "a base_url carrying a query never pins its secret into the session file", ctx do
+    server = start_server([final_episode("done")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    secret = "SECRET-QUERY-SENTINEL"
+
+    leaked_url = SSEServer.base_url(server) <> "?api_key=" <> secret
+
+    {:ok, sup} = Task.Supervisor.start_link()
+
+    {:ok, agent} =
+      Agent.start_link(
+        provider: {:ok, %Config{base_url: leaked_url, model: "test-model", api_key: "k"}},
+        cwd: ctx.tmp_dir,
+        session_dir: sessions,
+        supervisor: sup,
+        name: nil
+      )
+
+    on_exit(fn ->
+      DashFloat.TestTeardown.stop(agent)
+      if Process.alive?(sup), do: Process.exit(sup, :kill)
+    end)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:phase, :idle}, 2_000
+
+    id = session_id(sessions)
+    {:ok, session} = Session.load(sessions, id)
+
+    # The pin is the query-free endpoint; the secret reaches neither.
+    assert session.pin.base_url == SSEServer.base_url(server)
+
+    bytes = File.read!(Path.join(sessions, id <> ".json"))
+    refute bytes =~ secret
+    refute bytes =~ "api_key"
+  end
+
+  @tag :tmp_dir
   test "a batch announcing the SAME id twice: both calls execute and persist distinct ids", ctx do
     write_sandbox(ctx, "notes.md", "seed\n")
 

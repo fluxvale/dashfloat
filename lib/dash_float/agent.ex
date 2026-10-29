@@ -682,7 +682,26 @@ defmodule DashFloat.Agent do
   # Picked field-by-field off the effective provider config — never the
   # struct — so api_key has no path into the session file (ADR 0014 §3).
   defp session_pin({:ok, %Config{profile: profile, model: model, base_url: base_url}}) do
-    %{profile: profile, model: model, base_url: base_url}
+    %{profile: profile, model: model, base_url: sanitize_base_url(base_url)}
+  end
+
+  # pin.base_url is endpoint identity, not a credential store (ADR 0014 §3):
+  # scheme://host[:port]/path — userinfo, query, and fragment dropped, so a
+  # URL-carried key never sits in our metadata. A string without a parsable
+  # scheme//host stays raw rather than mangling a working endpoint.
+  defp sanitize_base_url(base_url) when is_binary(base_url) do
+    case URI.parse(base_url) do
+      %URI{scheme: scheme, host: host} = uri when is_binary(scheme) and is_binary(host) ->
+        URI.to_string(%URI{
+          scheme: scheme,
+          host: host,
+          port: uri.port,
+          path: uri.path
+        })
+
+      _unparsable ->
+        base_url
+    end
   end
 
   ## Display helpers
