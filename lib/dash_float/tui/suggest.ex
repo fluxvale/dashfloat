@@ -51,14 +51,13 @@ defmodule DashFloat.TUI.Suggest do
   @doc """
   The model the side-request targets: the configured id wins, else the
   provider's preset cheap model, else the active model. `suggest: false`
-  reads nil — the caller never requests then (the hard stop).
+  reads nil — the caller never requests then (the hard stop). The shared
+  resolution is `Config.Presets.side_model/3` (#80's title path rides it too).
   """
   @spec model(Config.t()) :: String.t() | nil
-  def model(%Config{suggest: false}), do: nil
-  def model(%Config{suggest: id}) when is_binary(id), do: id
-
-  def model(%Config{base_url: base_url, model: model}),
-    do: Presets.suggest_model(base_url) || model
+  def model(%Config{suggest: suggest, base_url: base_url, model: model}) do
+    Presets.side_model(suggest, base_url, model)
+  end
 
   @doc """
   The chat-completions body: the fixed instruction plus the reply tail, on

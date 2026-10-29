@@ -659,7 +659,7 @@ defmodule DashFloat.ConfigTest do
   end
 
   # A minimal one-profile layout whose settings map the test varies.
-  defp suggest_dir(settings) do
+  defp settings_dir(settings) do
     dir = tmp_dir()
 
     write!(dir, """
@@ -691,21 +691,21 @@ defmodule DashFloat.ConfigTest do
     end
 
     test "the file tri-state: false opts out, a string pins the id, true is the default" do
-      off = suggest_dir("suggest: false")
+      off = settings_dir("suggest: false")
       assert {:ok, %Config{suggest: false}} = Config.load(off, %{}, [])
 
-      pinned = suggest_dir("suggest: 'cheap-m'")
+      pinned = settings_dir("suggest: 'cheap-m'")
       assert {:ok, %Config{suggest: "cheap-m"}} = Config.load(pinned, %{}, [])
 
-      enabled = suggest_dir("suggest: true")
+      enabled = settings_dir("suggest: true")
       assert {:ok, %Config{suggest: nil}} = Config.load(enabled, %{}, [])
 
-      blank = suggest_dir("suggest: ''")
+      blank = settings_dir("suggest: ''")
       assert {:ok, %Config{suggest: nil}} = Config.load(blank, %{}, [])
     end
 
     test "garbage in the file warns naming the field and degrades to the default" do
-      dir = suggest_dir("suggest: 42")
+      dir = settings_dir("suggest: 42")
 
       logs =
         capture_log(fn ->
@@ -716,24 +716,24 @@ defmodule DashFloat.ConfigTest do
     end
 
     test "env wins both ways: a string over a file opt-out, an opt-out over a file id" do
-      opted_out = suggest_dir("suggest: false")
+      opted_out = settings_dir("suggest: false")
       env = %{"DASHFLOAT_SUGGEST" => "env-cheap-m"}
 
       assert {:ok, %Config{suggest: "env-cheap-m"}} = Config.load(opted_out, env, [])
 
-      pinned = suggest_dir("suggest: 'file-m'")
+      pinned = settings_dir("suggest: 'file-m'")
 
       assert {:ok, %Config{suggest: false}} =
                Config.load(pinned, %{"DASHFLOAT_SUGGEST" => "false"}, [])
     end
 
     test "the env spellings: 0 opts out, true and 1 are the default" do
-      pinned = suggest_dir("suggest: 'file-m'")
+      pinned = settings_dir("suggest: 'file-m'")
 
       assert {:ok, %Config{suggest: false}} =
                Config.load(pinned, %{"DASHFLOAT_SUGGEST" => "0"}, [])
 
-      opted_out = suggest_dir("suggest: false")
+      opted_out = settings_dir("suggest: false")
 
       assert {:ok, %Config{suggest: nil}} =
                Config.load(opted_out, %{"DASHFLOAT_SUGGEST" => "true"}, [])
@@ -745,7 +745,7 @@ defmodule DashFloat.ConfigTest do
     # Leading whitespace trims too: an env `" false"` is the opt-out, never
     # a model id " false" (which would silently become a side-request).
     test "the env spellings trim BOTH ends: ' false' and ' 0' opt out" do
-      pinned = suggest_dir("suggest: 'file-m'")
+      pinned = settings_dir("suggest: 'file-m'")
 
       assert {:ok, %Config{suggest: false}} =
                Config.load(pinned, %{"DASHFLOAT_SUGGEST" => " false"}, [])
@@ -755,17 +755,91 @@ defmodule DashFloat.ConfigTest do
     end
 
     test "a blank env var counts as absent and falls to the file" do
-      dir = suggest_dir("suggest: 'file-m'")
+      dir = settings_dir("suggest: 'file-m'")
 
       assert {:ok, %Config{suggest: "file-m"}} =
                Config.load(dir, %{"DASHFLOAT_SUGGEST" => " "}, [])
     end
 
     test "the env id is taken verbatim (never downcased)" do
-      dir = suggest_dir("suggest: false")
+      dir = settings_dir("suggest: false")
 
       assert {:ok, %Config{suggest: "Cheap-Mixed"}} =
                Config.load(dir, %{"DASHFLOAT_SUGGEST" => "Cheap-Mixed"}, [])
+    end
+  end
+
+  describe "autoTitle: tri-state, file < env (#80)" do
+    test "nothing set is nil — the provider's default cheap model" do
+      assert {:ok, %Config{auto_title: nil}} = Config.load(fleet_dir(), %{}, [])
+    end
+
+    test "the file tri-state: false opts out, a string pins the id, true is the default" do
+      off = settings_dir("autoTitle: false")
+      assert {:ok, %Config{auto_title: false}} = Config.load(off, %{}, [])
+
+      pinned = settings_dir("autoTitle: 'cheap-m'")
+      assert {:ok, %Config{auto_title: "cheap-m"}} = Config.load(pinned, %{}, [])
+
+      enabled = settings_dir("autoTitle: true")
+      assert {:ok, %Config{auto_title: nil}} = Config.load(enabled, %{}, [])
+
+      blank = settings_dir("autoTitle: ''")
+      assert {:ok, %Config{auto_title: nil}} = Config.load(blank, %{}, [])
+    end
+
+    test "garbage in the file warns naming the field and degrades to the default" do
+      dir = settings_dir("autoTitle: 42")
+
+      logs =
+        capture_log(fn ->
+          assert {:ok, %Config{auto_title: nil}} = Config.load(dir, %{}, [])
+        end)
+
+      assert logs =~ "autoTitle is not a usable value"
+    end
+
+    test "env wins both ways: a string over a file opt-out, an opt-out over a file id" do
+      opted_out = settings_dir("autoTitle: false")
+      env = %{"DASHFLOAT_AUTO_TITLE" => "env-cheap-m"}
+
+      assert {:ok, %Config{auto_title: "env-cheap-m"}} = Config.load(opted_out, env, [])
+
+      pinned = settings_dir("autoTitle: 'file-m'")
+
+      assert {:ok, %Config{auto_title: false}} =
+               Config.load(pinned, %{"DASHFLOAT_AUTO_TITLE" => "false"}, [])
+    end
+
+    test "the env spellings: 0 opts out, true and 1 are the default" do
+      pinned = settings_dir("autoTitle: 'file-m'")
+
+      assert {:ok, %Config{auto_title: false}} =
+               Config.load(pinned, %{"DASHFLOAT_AUTO_TITLE" => "0"}, [])
+
+      opted_out = settings_dir("autoTitle: false")
+
+      assert {:ok, %Config{auto_title: nil}} =
+               Config.load(opted_out, %{"DASHFLOAT_AUTO_TITLE" => "true"}, [])
+
+      assert {:ok, %Config{auto_title: nil}} =
+               Config.load(opted_out, %{"DASHFLOAT_AUTO_TITLE" => "1"}, [])
+    end
+
+    test "a blank env var counts as absent and falls to the file" do
+      dir = settings_dir("autoTitle: 'file-m'")
+
+      assert {:ok, %Config{auto_title: "file-m"}} =
+               Config.load(dir, %{"DASHFLOAT_AUTO_TITLE" => " "}, [])
+    end
+
+    test "a known settings key raises no unknown-settings warning" do
+      dir = settings_dir("autoTitle: false, suggest: false")
+
+      logs =
+        capture_log(fn -> assert {:ok, %Config{}} = Config.load(dir, %{}, []) end)
+
+      refute logs =~ "unknown profile settings ignored"
     end
   end
 
@@ -854,6 +928,29 @@ defmodule DashFloat.ConfigTest do
                "glm-4.7-flash"
 
       assert Presets.suggest_model("https://custom.example/v1/") == nil
+    end
+  end
+
+  describe "Presets.side_model/3 (the shared side-request resolution)" do
+    test "false reads nil — the caller never requests then" do
+      assert Presets.side_model(false, @base_url, "active-m") == nil
+    end
+
+    test "a string targets exactly that id, preset or not" do
+      assert Presets.side_model("pinned-m", @base_url, "active-m") == "pinned-m"
+    end
+
+    test "nil reads the preset cheap model" do
+      assert Presets.side_model(nil, "https://api.z.ai/api/coding/paas/v4", "active-m") ==
+               "glm-5.3-flash"
+
+      assert Presets.side_model(nil, "https://api.synthetic.new/openai/v1", "active-m") ==
+               "glm-4.7-flash"
+    end
+
+    test "nil over a custom provider falls back to the active model" do
+      assert Presets.side_model(nil, "https://custom.example/v1", "active-m") == "active-m"
+      assert Presets.side_model(nil, "https://custom.example/v1", nil) == nil
     end
   end
 
