@@ -1152,6 +1152,30 @@ defmodule DashFloat.ConfigTest do
     end
   end
 
+  describe "profile_names/1 (ADR 0020 — the /profile picker's list)" do
+    test "returns the profile names in file order" do
+      dir = tmp_dir()
+      write!(dir, fleet_file())
+
+      assert Config.profile_names(dir) == ["work", "personal"]
+    end
+
+    test "a nil dir is empty" do
+      assert Config.profile_names(nil) == []
+    end
+
+    test "a missing settings.json5 is empty" do
+      assert Config.profile_names(tmp_dir()) == []
+    end
+
+    test "an unparseable settings.json5 is empty" do
+      dir = tmp_dir()
+      write!(dir, "{ broken")
+
+      assert Config.profile_names(dir) == []
+    end
+  end
+
   describe "malformed and unusual files" do
     test "bad entries inside a valid document warn and are skipped" do
       dir = tmp_dir()

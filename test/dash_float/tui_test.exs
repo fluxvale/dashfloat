@@ -4,7 +4,8 @@ defmodule DashFloat.TUITest do
   (including crashes), the agent seam (fake agents are this test process or
   plain spawned processes — the TUI only ever sends
   `{:prompt, ui, text}` / `{:confirm_decision, ref, decision}` / `{:cancel}` /
-  `{:set_mode, ui, mode}` and receives the frozen stream contract, ADR 0007),
+  `{:set_mode, ui, mode}` / `{:set_title, ui, title}` / `{:set_provider, _}`
+  and receives the frozen stream contract, ADR 0007),
   and the responsiveness proof. Not async: they measure timing, share
   telemetry handlers, and drive one supervised TUI per test.
   """
@@ -1293,6 +1294,143 @@ defmodule DashFloat.TUITest do
     send(pid, {:mode, :auto})
     state = eventually(pid, &(&1.mode == :auto))
     assert state.mode == :auto
+  end
+
+  ## The command surface's deliveries (ADR 0020). /title, /mode, and
+  ## /profile are proven against the default fake agent (this test process)
+  ## and the picker state; /model is proven END TO END with a real agent and
+  ## the loopback server — the switch must reach the NEXT request.
+
+  test "/title delivers the rename seam: the typed title, then the bare empty one" do
+    {:ok, pid} = start_tui()
+
+    submit(pid, "/title fix the login")
+    assert_receive {:set_title, ^pid, "fix the login"}, 1_000
+
+    # A command submit never flips the phase, so the bare form follows directly.
+    submit(pid, "/title")
+    assert_receive {:set_title, ^pid, ""}, 1_000
+  end
+
+  test "/mode plan reaches the agent through shift+tab's seam" do
+    {:ok, pid} = start_tui()
+
+    submit(pid, "/mode plan")
+
+    assert_receive {:set_mode, ^pid, :plan}, 1_000
+  end
+
+  test "/profile opens the profiles picker over settings.json5's names; esc closes it" do
+    dir = wizard_dir("dashfloat-tui-profiles")
+    settings = Path.join(dir, "settings.json5")
+    File.write!(settings, "{profiles: [{name: 'work'}, {name: 'personal'}]}")
+
+    {:ok, pid} = start_tui(config_dir: dir)
+
+    submit(pid, "/profile")
+
+    opened =
+      eventually(pid, fn s ->
+        match?(%{mode: :modal, kind: :profiles}, s.palette)
+      end)
+
+    assert opened.palette.items == ["work", "personal"]
+    assert opened.palette.selected == 0
+
+    press(pid, "down")
+
+    moved = eventually(pid, fn s -> s.palette && s.palette.selected == 1 end)
+    assert moved.palette.items == ["work", "personal"]
+
+    press(pid, "esc")
+    eventually(pid, fn s -> s.palette == nil end)
+  end
+
+  # A final-only episode: one content frame, then DONE — the agent returns to
+  # idle after it (agent_test's final_episode shape, mirrored locally).
+  defp final_episode(text) do
+    frame = ~s(data: {"choices":[{"index":0,"delta":{"content":#{Jason.encode!(text)}}}]}\n\n)
+
+    [
+      {:send,
+       ["HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n", frame]},
+      {:send, "data: [DONE]\n\n"},
+      :close
+    ]
+  end
+
+  # THE load-bearing e2e (ADR 0020): /model's switch provably takes effect on
+  # the NEXT request. A real agent (supervised like agent_test wires one)
+  # streams two final-only episodes off the per-connection loopback; the
+  # catalog lands by message (no HTTP for the picker), so the server sees
+  # exactly the two chat POSTs — the second body's model is the assertion.
+  test "/model switches the model for the next request, end to end at the request seam" do
+    {:ok, server} =
+      SSEServer.start_link(:per_connection, [
+        final_episode("first reply"),
+        final_episode("second reply")
+      ])
+
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    base = SSEServer.base_url(server)
+
+    provider =
+      {:ok, %Config{base_url: base, model: "model-a", api_key: "test-key-123", auto_title: false}}
+
+    # A REAL agent, per-test supervised like the app does (agent_test's shape).
+    {:ok, sup} = Task.Supervisor.start_link()
+
+    {:ok, agent} =
+      DashFloat.Agent.start_link(
+        provider: provider,
+        cwd: wizard_dir("dashfloat-tui-model-switch"),
+        exec_timeout: 500,
+        supervisor: sup,
+        name: nil
+      )
+
+    on_exit(fn ->
+      DashFloat.TestTeardown.stop(agent)
+      if Process.alive?(sup), do: Process.exit(sup, :kill)
+    end)
+
+    {:ok, pid} = start_tui(agent: agent, provider: provider)
+
+    # Turn 1: model-a is on the wire.
+    submit(pid, "hello")
+    assert_receive {:sse_request, "POST", _, _, first_body}, 2_000
+    assert Jason.decode!(first_body)["model"] == "model-a"
+
+    # The final-only episode returns the agent — and the UI — to idle.
+    eventually(pid, fn s -> s.phase == :idle end)
+
+    # The standing catalog sweep's result arrives by message (tests never
+    # touch the network for it), so connections stay the two chat POSTs.
+    catalog = %{base => [%{model: "model-a", context: nil}, %{model: "model-b", context: nil}]}
+    send(pid, {:catalog, catalog})
+    eventually(pid, fn s -> s.catalog != %{} end)
+
+    # The picker opens preselected on the active model; down + enter picks model-b.
+    submit(pid, "/model")
+
+    opened =
+      eventually(pid, fn s ->
+        match?(%{mode: :modal, kind: :models}, s.palette)
+      end)
+
+    assert opened.palette.selected == 0
+
+    press(pid, "down")
+    press(pid, "enter")
+
+    eventually(pid, fn s ->
+      match?({:ok, %Config{model: "model-b"}}, s.provider)
+    end)
+
+    # THE load-bearing assertion: the switch took effect on the next request.
+    submit(pid, "again")
+    assert_receive {:sse_request, "POST", _, _, second_body}, 2_000
+    assert Jason.decode!(second_body)["model"] == "model-b"
   end
 
   test "quit keys stop the supervised app with reason :normal" do
