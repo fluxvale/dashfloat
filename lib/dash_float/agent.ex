@@ -59,8 +59,9 @@ defmodule DashFloat.Agent do
     # :none | {:running, reference(), pid(), map()}
     # | {:running_cancelled, reference(), pid(), map()}
     # | {:confirming, reference(), map()}
-    # | {:vetting, reference(), pid(), map(), map()}
-    # | {:vetting_cancelled, reference(), pid(), map()}
+    # | {:vetting, reference(), reference(), pid(), map(), map()} — the
+    #   check ref the vetter's report must carry, then the monitor ref
+    # | {:vetting_cancelled, reference(), reference(), pid(), map()}
     tool_slot: :none,
     # Context accounting (ADR 0022): the usage-frame anchor, the eviction
     # history, and the current episode's request message count — the count
@@ -254,9 +255,12 @@ defmodule DashFloat.Agent do
   # its stream child and reports or dies — a vetter that never checks its
   # mailbox still dies at its own deadline. The batch aborts then, exactly
   # like a cancelled running tool.
-  def handle_info({:cancel}, %__MODULE__{tool_slot: {:vetting, ref, pid, call, _preview}} = state) do
+  def handle_info(
+        {:cancel},
+        %__MODULE__{tool_slot: {:vetting, check_ref, mon_ref, pid, call, _preview}} = state
+      ) do
     if pid, do: send(pid, :cancel)
-    {:noreply, %{state | tool_slot: {:vetting_cancelled, ref, pid, call}}}
+    {:noreply, %{state | tool_slot: {:vetting_cancelled, check_ref, mon_ref, pid, call}}}
   end
 
   def handle_info({:cancel}, state), do: {:noreply, state}
@@ -349,55 +353,32 @@ defmodule DashFloat.Agent do
 
   ## Vetter messages (AUTO's safety check, ADR 0016 §6)
 
-  # Allow: the preview entry becomes the execution receipt and the runner
-  # dispatches — the shape an approval produces in BUILD.
+  # A report matching the live check resolves through the RE-READ gate: a
+  # mode switch mid-check re-resolves the call under the current mode, and
+  # the verdict decides only while that gate is still :vet (ADR 0016 §3).
   def handle_info(
-        {:vet_done, id, {:allow}},
-        %__MODULE__{tool_slot: {:vetting, _ref, _pid, call, preview}} = state
-      )
-      when call.id == id do
+        {:vet_done, check_ref, _id, verdict},
+        %__MODULE__{tool_slot: {:vetting, check_ref, _mon_ref, _pid, call, preview}} = state
+      ) do
     state = %{state | tool_slot: :none}
-    display(state.ui, {:tool_preview, preview})
-    dispatch_runner(state, call)
-  end
-
-  # Ask: the human answers on the evidence the check saw — the already-built
-  # preview arms the standard confirm flow.
-  def handle_info(
-        {:vet_done, id, {:ask}},
-        %__MODULE__{tool_slot: {:vetting, _ref, _pid, call, preview}} = state
-      )
-      when call.id == id do
-    state = %{state | tool_slot: :none}
-    vet_confirm(state, call, preview, "[safety check: needs confirmation]")
-  end
-
-  # Any check failure resolves to confirm — the fail-safe direction: AUTO
-  # with a broken check degrades to BUILD for mutating/risky calls, never to
-  # UNCHAINED.
-  def handle_info(
-        {:vet_done, id, {:error, _reason}},
-        %__MODULE__{tool_slot: {:vetting, _ref, _pid, call, preview}} = state
-      )
-      when call.id == id do
-    state = %{state | tool_slot: :none}
-    vet_confirm(state, call, preview, "[safety check unavailable — confirming]")
+    resolve_vet(state, call, preview, verdict)
   end
 
   # A report from a check the user already Esc'd aborts the batch exactly
-  # like a cancelled running tool.
+  # like a cancelled running tool — no re-gate: the user cancelled it.
   def handle_info(
-        {:vet_done, id, _verdict},
-        %__MODULE__{tool_slot: {:vetting_cancelled, _ref, _pid, call}} = state
-      )
-      when call.id == id do
+        {:vet_done, check_ref, _id, _verdict},
+        %__MODULE__{tool_slot: {:vetting_cancelled, check_ref, _mon_ref, _pid, call}} = state
+      ) do
     state = %{state | tool_slot: :none}
     abort_tool_run(state, call)
   end
 
   # A stale vet report (its check was superseded) is ignored — the same
-  # discipline as a stale confirm decision.
-  def handle_info({:vet_done, _id, _verdict}, state), do: {:noreply, state}
+  # discipline as a stale confirm decision, matched by the per-check ref:
+  # a call id alone could match a late report from an earlier batch that
+  # reused the id.
+  def handle_info({:vet_done, _ref, _id, _verdict}, state), do: {:noreply, state}
 
   ## Monitors
 
@@ -449,20 +430,21 @@ defmodule DashFloat.Agent do
   end
 
   # A vetter death its body could not report (:killed/:noproc per ADR 0012,
-  # or any unreported exit) is a failed check — the fail-safe direction.
+  # or any unreported exit) is a failed check — the fail-safe direction —
+  # resolved through the same re-read gate as a verdict.
   def handle_info(
-        {:DOWN, ref, :process, _down_pid, _reason},
-        %__MODULE__{tool_slot: {:vetting, ref, _pid, call, preview}} = state
+        {:DOWN, mon_ref, :process, _down_pid, _reason},
+        %__MODULE__{tool_slot: {:vetting, _check_ref, mon_ref, _pid, call, preview}} = state
       ) do
     state = %{state | tool_slot: :none}
-    vet_confirm(state, call, preview, "[safety check unavailable — confirming]")
+    resolve_vet(state, call, preview, {:error, :vetter_died})
   end
 
   # A cancelled vetter dying before it could report aborts the batch like its
   # running-tool counterpart.
   def handle_info(
-        {:DOWN, ref, :process, _down_pid, _reason},
-        %__MODULE__{tool_slot: {:vetting_cancelled, ref, _pid, call}} = state
+        {:DOWN, mon_ref, :process, _down_pid, _reason},
+        %__MODULE__{tool_slot: {:vetting_cancelled, _check_ref, mon_ref, _pid, call}} = state
       ) do
     state = %{state | tool_slot: :none}
     abort_tool_run(state, call)
@@ -724,6 +706,10 @@ defmodule DashFloat.Agent do
     provider = state.provider
     vet_timeout = state.vet_timeout
     lines = preview.lines
+    # The check's identity: minted once, captured by the task closure, and
+    # stored in the slot — the report must carry it, so a late report from a
+    # previous batch (even over a reused call id) can never match.
+    check_ref = make_ref()
 
     {:ok, pid} =
       Task.Supervisor.start_child(
@@ -732,7 +718,7 @@ defmodule DashFloat.Agent do
           try do
             send(
               agent,
-              {:vet_done, call.id,
+              {:vet_done, check_ref, call.id,
                vetter.verdict(provider, call, lines, vet_timeout: vet_timeout)}
             )
           rescue
@@ -743,7 +729,8 @@ defmodule DashFloat.Agent do
             reason ->
               send(
                 agent,
-                {:vet_done, call.id, {:error, "safety check crashed: " <> inspect_slice(reason)}}
+                {:vet_done, check_ref, call.id,
+                 {:error, "safety check crashed: " <> inspect_slice(reason)}}
               )
 
               # coveralls-ignore-stop
@@ -752,14 +739,52 @@ defmodule DashFloat.Agent do
         restart: :temporary
       )
 
-    {:noreply, %{state | tool_slot: {:vetting, Process.monitor(pid), pid, call, preview}}}
+    {:noreply,
+     %{state | tool_slot: {:vetting, check_ref, Process.monitor(pid), pid, call, preview}}}
   end
 
-  # Ask and failed-check outcomes both arm BUILD's confirm on the
-  # already-built preview — the human answers on exactly the evidence the
-  # check saw (ADR 0016 §6).
+  # A deferred check resolves here — a report's verdict, or a DOWN
+  # synthesized as the error verdict — and the gate is RE-READ: a mode switch
+  # mid-check re-resolves the call under the current mode, and no deferred
+  # resolution may execute what the current mode forbids (ADR 0016 §3).
+  defp resolve_vet(state, call, preview, verdict) do
+    case Mode.gate(state.mode, Tools.class(call.name)) do
+      # Switched to unchained mid-check: dispatch regardless of the verdict.
+      :run -> resolve_gate(state, call, :run, preview)
+      # Switched to plan mid-check: the change is proposed, never executed —
+      # exactly the plan path in resolve_gate (ADR 0016 §4).
+      :propose -> resolve_gate(state, call, :propose, preview)
+      # Switched to build mid-check: the confirm arms regardless of the
+      # verdict, with an entry truthful to what happened.
+      :confirm -> vet_confirm(state, call, preview, vet_entry(verdict))
+      # The gate is still :vet: the verdict decides (ADR 0016 §6).
+      :vet -> resolve_verdict(state, call, preview, verdict)
+    end
+  end
+
+  defp resolve_verdict(state, call, preview, {:allow}) do
+    resolve_gate(state, call, :run, preview)
+  end
+
+  defp resolve_verdict(state, call, preview, verdict) do
+    vet_confirm(state, call, preview, vet_entry(verdict))
+  end
+
+  # The resolution entry names what actually happened; an allow verdict under
+  # a newly-confirming gate adds no safety-check line — nothing asked,
+  # nothing failed.
+  defp vet_entry({:allow}), do: nil
+  defp vet_entry({:ask}), do: "[safety check: needs confirmation]"
+
+  defp vet_entry({:error, _reason}),
+    do: "[safety check unavailable — confirming]"
+
+  # Ask, failure, and a mid-check switch to build all arm BUILD's confirm on
+  # the already-built preview — the human answers on exactly the evidence
+  # the check saw (ADR 0016 §6).
   defp vet_confirm(state, call, preview, entry) do
-    display(state.ui, {:entry, :system, entry})
+    if entry, do: display(state.ui, {:entry, :system, entry})
+
     ref = make_ref()
     display(state.ui, {:confirm, ref, preview})
     {:noreply, %{state | tool_slot: {:confirming, ref, call}}}

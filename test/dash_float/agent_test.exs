@@ -27,6 +27,17 @@ defmodule AgentTestVetParked do
   end
 end
 
+defmodule AgentTestVetParkedAllow do
+  @moduledoc false
+  # Parks until messaged — an injected message releases an {:allow} verdict,
+  # so a test can switch the session mode while the check is in flight.
+  def verdict(_provider, _call, _lines, _opts) do
+    receive do
+      _any -> {:allow}
+    end
+  end
+end
+
 defmodule DashFloat.AgentTest do
   @moduledoc false
   # The Phase 3 end-to-end suite: a scripted tool-calling stream through the
@@ -917,7 +928,7 @@ defmodule DashFloat.AgentTest do
     server = start_server([final_episode("unused")])
     {agent, _sup} = start_agent(server, System.tmp_dir!(), mode: :auto, vetter: AgentTestVetAllow)
 
-    send(agent, {:vet_done, "nope", {:allow}})
+    send(agent, {:vet_done, make_ref(), "nope", {:allow}})
 
     refute_receive {:tool_preview, _preview}, 200
     refute_receive {:phase, _phase}, 200
@@ -960,6 +971,200 @@ defmodule DashFloat.AgentTest do
                |> Map.fetch!(:content)
                |> Jason.decode!()
     end
+  end
+
+  @tag :tmp_dir
+  test "Esc during a check aborts promptly — via the vetter's cancel, not its timeout", ctx do
+    server =
+      start_server([call_tool_episode("call_pc", "execute_command", %{"command" => "echo x"})])
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        mode: :auto,
+        vetter: AgentTestVetParked,
+        vet_timeout: 10_000
+      )
+
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:phase, :checking}, 2_000
+
+    send(agent, {:cancel})
+
+    # The parked vetter answers the cancel by message and the batch aborts
+    # within this 2 s bound — an order of magnitude under the 10 s vet
+    # timeout, so the promptness is the cancel's work, not the deadline's.
+    assert_receive {:tool_result, %{id: "call_pc", status: "cancelled"}}, 2_000
+    assert_receive {:entry, :system, "[tool run cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "a vetter killed mid-check degrades to confirm — the DOWN fail-safe", ctx do
+    server =
+      start_server([
+        call_tool_episode("call_kd", "execute_command", %{"command" => "touch downed.txt"})
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParked)
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:phase, :checking}, 2_000
+
+    agent
+    |> vetting_pid()
+    |> Process.exit(:kill)
+
+    assert_receive {:entry, :system, "[safety check unavailable — confirming]"}, 2_000
+    assert_receive {:confirm, ref, %{id: "call_kd"}}, 2_000
+    refute sandbox_exists?(ctx, "downed.txt")
+
+    # The armed confirm still completes the batch normally.
+    send(agent, {:confirm_decision, ref, :approved})
+    assert_receive {:tool_result, %{id: "call_kd", ok: true}}, 2_000
+    assert sandbox_exists?(ctx, "downed.txt")
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "a vetter killed after Esc aborts the batch with cancelled results", ctx do
+    server =
+      start_server([call_tool_episode("call_kq", "execute_command", %{"command" => "echo x"})])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParked)
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:phase, :checking}, 2_000
+
+    vet = vetting_pid(agent)
+    send(agent, {:cancel})
+    Process.exit(vet, :kill)
+
+    # Whether the released report or the DOWN lands first, the batch aborts
+    # exactly once.
+    assert_receive {:tool_result, %{id: "call_kq", status: "cancelled"}}, 2_000
+    assert_receive {:entry, :system, "[tool run cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+    refute_receive {:tool_result, %{id: "call_kq"}}, 300
+  end
+
+  ## Mid-check mode switches: the gate is re-read at resolution (ADR 0016 §3)
+
+  @tag :tmp_dir
+  test "auto→plan mid-check: an allow verdict proposes, never executes", ctx do
+    args = %{"path" => "out/late.txt", "content" => "must not land"}
+
+    server =
+      start_server([
+        call_tool_episode("call_pl", "write_file", args),
+        final_episode("done")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParkedAllow)
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+    assert_receive {:phase, :checking}, 2_000
+
+    vet = vetting_pid(agent)
+    send(agent, {:set_mode, self(), :plan})
+    assert_receive {:mode, :plan}, 2_000
+    send(vet, :release)
+
+    # The stale allow may not write in plan: proposed, not executed.
+    assert_receive {:tool_preview, %{id: "call_pl", name: "write_file"}}, 2_000
+    assert_receive {:tool_result, %{id: "call_pl", ok: false, status: "proposed (plan)"}}, 2_000
+    refute sandbox_exists?(ctx, "out/late.txt")
+    refute_received {:confirm, _ref, _preview}
+
+    assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
+
+    assert Jason.decode!(tool_result_of(second_body, "call_pl")["content"]) ==
+             %{"ok" => false, "blocked" => "plan"}
+
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "auto→build mid-check: an allow verdict arms the confirm — no run without the keypress",
+       ctx do
+    server =
+      start_server([
+        call_tool_episode("call_bw", "write_file", %{"path" => "out/late.txt", "content" => "ok"}),
+        final_episode("done")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParkedAllow)
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:phase, :checking}, 2_000
+
+    vet = vetting_pid(agent)
+    send(agent, {:set_mode, self(), :build})
+    assert_receive {:mode, :build}, 2_000
+    send(vet, :release)
+
+    # The stale allow may not run without the keypress the new mode demands:
+    # the confirm arms, with NO safety-check entry (nothing asked, nothing
+    # failed).
+    assert_receive {:confirm, ref, %{id: "call_bw"}}, 2_000
+    refute sandbox_exists?(ctx, "out/late.txt")
+    refute_received {:entry, :system, "[safety check" <> _}
+
+    send(agent, {:confirm_decision, ref, :approved})
+    assert_receive {:tool_result, %{id: "call_bw", ok: true}}, 2_000
+    assert read_sandbox(ctx, "out/late.txt") == "ok"
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "auto→build mid-check: a vetter death confirms with the unavailable entry", ctx do
+    server =
+      start_server([
+        call_tool_episode("call_bd", "execute_command", %{"command" => "touch never.txt"})
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParked)
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:phase, :checking}, 2_000
+
+    vet = vetting_pid(agent)
+    send(agent, {:set_mode, self(), :build})
+    assert_receive {:mode, :build}, 2_000
+    Process.exit(vet, :kill)
+
+    # The failure resolves under the NEW gate — build's confirm — with the
+    # entry naming what happened.
+    assert_receive {:entry, :system, "[safety check unavailable — confirming]"}, 2_000
+    assert_receive {:confirm, ref, %{id: "call_bd"}}, 2_000
+    refute sandbox_exists?(ctx, "never.txt")
+
+    send(agent, {:confirm_decision, ref, :rejected})
+    assert_receive {:tool_result, %{id: "call_bd", ok: false, status: "rejected"}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "auto→unchained mid-check: an ask verdict dispatches, arms no confirm", ctx do
+    server =
+      start_server([
+        call_tool_episode("call_uw", "write_file", %{"path" => "out/free.txt", "content" => "go"}),
+        final_episode("done")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParked)
+    send(agent, {:prompt, self(), "go"})
+    assert_receive {:phase, :checking}, 2_000
+
+    vet = vetting_pid(agent)
+    send(agent, {:set_mode, self(), :unchained})
+    assert_receive {:mode, :unchained}, 2_000
+    send(vet, :release)
+
+    # Unchained can never enter :confirming: the ask degrades to a plain
+    # dispatch — the receipt lands, the tool runs, no keypress, no check
+    # entry (ADR 0016 §3).
+    assert_receive {:tool_preview, %{id: "call_uw"}}, 2_000
+    assert_receive {:tool_result, %{id: "call_uw", ok: true}}, 2_000
+    assert read_sandbox(ctx, "out/free.txt") == "go"
+    assert_receive {:phase, :idle}, 2_000
+    refute_received {:confirm, _ref, _preview}
+    refute_received {:entry, :system, "[safety check" <> _}
   end
 
   @tag :tmp_dir
@@ -1780,6 +1985,19 @@ defmodule DashFloat.AgentTest do
     case Task.Supervisor.children(sup) do
       [pid] -> pid
       [] when tries > 0 -> Process.sleep(10) && await_task(sup, tries - 1)
+    end
+  end
+
+  # The vetter task's pid from the live {:vetting, ...} slot — polled, since
+  # the slot is written just after the :checking phase is announced.
+  defp vetting_pid(agent, tries \\ 100) do
+    case :sys.get_state(agent).tool_slot do
+      {:vetting, _check_ref, _mon_ref, pid, _call, _preview} ->
+        pid
+
+      _other when tries > 0 ->
+        Process.sleep(10)
+        vetting_pid(agent, tries - 1)
     end
   end
 
