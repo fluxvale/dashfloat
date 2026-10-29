@@ -166,7 +166,9 @@ defmodule DashFloat.SessionTest do
                    "content" => ~s({"ok":true,"output":"wrote 3 bytes"})
                  },
                  %{"role" => "assistant", "content" => "Done — ✓"}
-               ]
+               ],
+               context: nil,
+               compactions: []
              }
     end
 
@@ -200,6 +202,88 @@ defmodule DashFloat.SessionTest do
 
       assert {:ok, loaded} = load(ctx)
       assert loaded.pin == %{profile: nil, model: nil, base_url: "x"}
+    end
+  end
+
+  describe "context and compactions (ADR 0022)" do
+    @tag :tmp_dir
+    test "context and compactions round-trip", ctx do
+      compactions = [
+        %{
+          "at" => "2026-10-29T00:00:00Z",
+          "turns" => 2,
+          "window" => 2000,
+          "estimate_before" => 1650,
+          "estimate_after" => 1180
+        }
+      ]
+
+      save_ok(ctx, [],
+        context: %{prompt_tokens: 412, messages: 6},
+        compactions: compactions
+      )
+
+      assert {:ok, loaded} = load(ctx)
+      assert loaded.context == %{prompt_tokens: 412, messages: 6}
+      assert loaded.compactions == compactions
+    end
+
+    @tag :tmp_dir
+    test "a file without the two keys loads with context nil and compactions []", ctx do
+      write_body(ctx, body_with([%{"role" => "user", "content" => "hi"}]))
+
+      assert {:ok, loaded} = load(ctx)
+      assert loaded.context == nil
+      assert loaded.compactions == []
+    end
+
+    @tag :tmp_dir
+    test "malformed context and compactions degrade — never a refusal", ctx do
+      for context <- [
+            42,
+            "nope",
+            %{"prompt_tokens" => "lots", "messages" => 2},
+            %{"prompt_tokens" => 412},
+            %{"messages" => 6},
+            %{}
+          ] do
+        write_body(ctx, body_with([], %{"context" => context}))
+        assert {:ok, loaded} = load(ctx)
+        assert loaded.context == nil
+      end
+
+      for compactions <- ["nope", 42, %{"at" => "x"}] do
+        write_body(ctx, body_with([], %{"compactions" => compactions}))
+        assert {:ok, loaded} = load(ctx)
+        assert loaded.compactions == []
+      end
+    end
+
+    @tag :tmp_dir
+    test "a context of two zeros is valid (non-negative includes zero) and round-trips", ctx do
+      write_body(ctx, body_with([], %{"context" => %{"prompt_tokens" => 0, "messages" => 0}}))
+      assert {:ok, loaded} = load(ctx)
+      assert loaded.context == %{prompt_tokens: 0, messages: 0}
+
+      save_ok(ctx, [], context: %{prompt_tokens: 0, messages: 0})
+      assert {:ok, reloaded} = load(ctx)
+      assert reloaded.context == %{prompt_tokens: 0, messages: 0}
+    end
+
+    @tag :tmp_dir
+    test "messages validation is untouched: a known-bad message refuses with the diagnostics present",
+         ctx do
+      write_body(
+        ctx,
+        body_with([%{"role" => "user", "content" => 42}], %{
+          "context" => %{"prompt_tokens" => 1, "messages" => 1},
+          "compactions" => []
+        })
+      )
+
+      assert {:error, msg} = load(ctx)
+      assert msg =~ "message 0"
+      assert msg =~ ~s("content")
     end
   end
 
