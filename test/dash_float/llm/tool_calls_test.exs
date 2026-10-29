@@ -114,6 +114,22 @@ defmodule DashFloat.LLM.ToolCallsTest do
            ]
   end
 
+  test "an empty-string id synthesizes from the index like a missing one" do
+    acc =
+      ToolCalls.feed(ToolCalls.new(), [
+        %{
+          "index" => 0,
+          "id" => "",
+          "type" => "function",
+          "function" => %{"name" => "list_directory", "arguments" => "{}"}
+        }
+      ])
+
+    assert ToolCalls.finish(acc) == [
+             %{id: "call_0", name: "list_directory", args: %{}, error: nil}
+           ]
+  end
+
   test "a missing name with arguments present is an error with an empty name" do
     acc =
       ToolCalls.feed(ToolCalls.new(), [

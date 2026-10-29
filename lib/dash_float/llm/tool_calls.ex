@@ -94,8 +94,11 @@ defmodule DashFloat.LLM.ToolCalls do
         true -> nil
       end
 
+    # An empty-string id is a sloppy provider's missing id (ADR 0014 §4): it
+    # synthesizes like nil, so no call reaches the batch (and the transcript)
+    # carrying the empty id.
     %{
-      id: entry.id || "call_#{index}",
+      id: if(entry.id in [nil, ""], do: "call_#{index}", else: entry.id),
       name: entry.name || "",
       args: args,
       error: error
