@@ -178,8 +178,8 @@ defmodule DashFloat.TUI.ViewTest do
     test "the first tokens are never announced as an empty log" do
       state =
         new_state()
-        |> State.stream_message({:token, "hello"}, 1_000)
         |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "hello"}, 1_000)
 
       # Before the first tick the lines are not rendered yet, but the log
       # must not claim to be empty.
@@ -190,9 +190,9 @@ defmodule DashFloat.TUI.ViewTest do
       state =
         new_state()
         |> State.stream_message({:entry, :system, "a system line"})
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "streaming "})
         |> State.stream_message({:token, "through"})
-        |> Map.put(:phase, :streaming)
 
       {ticked, :cont} = State.tick(state, 1_000)
 
@@ -451,6 +451,7 @@ defmodule DashFloat.TUI.ViewTest do
 
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "a"}, 1_000)
         |> State.stream_message({:token, "b"}, 1_000)
         |> State.stream_message({:phase, :idle}, 2_000)

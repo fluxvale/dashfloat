@@ -236,14 +236,16 @@ defmodule DashFloat.TUI do
   # A suggestion landed (ADR 0015 §3): the text arrives ALREADY normalized —
   # fetch_async/3 normalizes inside the supervised task, so the UI process
   # never touches the raw body. Accepted only while its epoch is current, the
-  # UI is idle, the draft is empty, and suggestions are on. A stale epoch is
-  # dropped with the state UNTOUCHED — a newer request may still be in
-  # flight, and clearing its task here would orphan it.
+  # UI is idle, the draft is empty, suggestions are on, and the ghost is
+  # non-blank — "" is a truthy binary and would blank the composer's
+  # placeholder. A stale epoch is dropped with the state UNTOUCHED — a newer
+  # request may still be in flight, and clearing its task here would orphan
+  # it.
   def handle_info({:suggestion, epoch, _text}, state) when epoch != state.suggest_epoch,
     do: {:noreply, state, %{render?: false}}
 
   def handle_info({:suggestion, epoch, text}, state) do
-    if accept_suggestion?(state, epoch) and is_binary(text) do
+    if accept_suggestion?(state, epoch) and is_binary(text) and text != "" do
       {:noreply, %{state | suggestion: text, suggest_task: nil}}
     else
       {:noreply, %{state | suggest_task: nil}, %{render?: false}}

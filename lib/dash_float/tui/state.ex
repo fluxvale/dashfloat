@@ -814,6 +814,13 @@ defmodule DashFloat.TUI.State do
   @spec stream_message(t(), stream_msg(), integer()) :: t()
   def stream_message(state, msg, now \\ System.monotonic_time(:millisecond))
 
+  # A token arriving at idle belongs to a turn that is already over —
+  # ignored like a late usage frame below: applying it would set in_flight,
+  # and a later {:phase, :idle} would then finalize and arm a suggestion for
+  # it, re-opening the duplicate-arm window (ADR 0015 §3's once-per-turn arm
+  # stays true).
+  def stream_message(%{phase: :idle} = state, {:token, _text}, _now), do: state
+
   def stream_message(state, {:token, text}, now) when is_binary(text) do
     %{
       state

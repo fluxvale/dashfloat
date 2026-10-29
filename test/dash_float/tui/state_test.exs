@@ -869,6 +869,7 @@ defmodule DashFloat.TUI.StateTest do
     test "tokens accumulate in the in-flight entry and count in stats" do
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "hel"}, 1_000)
         |> State.stream_message({:token, "lo"}, 1_200)
 
@@ -881,9 +882,21 @@ defmodule DashFloat.TUI.StateTest do
       assert state.in_flight_lines == nil
     end
 
+    # A stray token at idle belongs to a turn that is over (the late-usage
+    # rule): letting it set in_flight would let a later {:phase, :idle}
+    # finalize and arm a suggestion for it — a contract-violating producer
+    # would re-open the duplicate-arm window (ADR 0015 §3).
+    test "a token at idle is ignored: in_flight stays nil, no arm" do
+      state = State.stream_message(new_state(), {:token, "x"}, 1_000)
+
+      assert state.in_flight == nil
+      assert state.suggest_arm == false
+    end
+
     test "re-announcing :streaming never finalizes the in-flight entry" do
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "The answer is "}, 1_000)
         |> State.stream_message({:token, "42."}, 1_010)
         |> State.stream_message({:phase, :streaming}, 1_020)
@@ -898,6 +911,7 @@ defmodule DashFloat.TUI.StateTest do
     test "leaving :streaming for :executing_tool finalizes the in-flight entry" do
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "one\ntwo"}, 1_000)
         |> State.stream_message({:phase, :executing_tool}, 1_010)
 
@@ -1048,8 +1062,12 @@ defmodule DashFloat.TUI.StateTest do
         State.stream_message(new_state(), bad_phase)
       end
 
+      # A malformed token payload crashes only mid-turn — at idle the token
+      # is ignored wholesale (the late-usage rule).
+      streaming = Map.put(new_state(), :phase, :streaming)
+
       assert_raise FunctionClauseError, fn ->
-        State.stream_message(new_state(), bad_token)
+        State.stream_message(streaming, bad_token)
       end
 
       assert_raise FunctionClauseError, fn ->
@@ -1144,6 +1162,7 @@ defmodule DashFloat.TUI.StateTest do
     test "finalize freezes the rate and clears the streaming counters" do
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "abc"}, 1_000)
         |> State.stream_message({:token, "def"}, 1_500)
         |> State.stream_message({:phase, :idle}, 2_000)
@@ -1178,6 +1197,7 @@ defmodule DashFloat.TUI.StateTest do
     test "cancel-style finalize with no usage frame still freezes a rate" do
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "partial"}, 1_000)
         |> State.stream_message({:phase, :idle}, 1_500)
 
@@ -1196,6 +1216,7 @@ defmodule DashFloat.TUI.StateTest do
     test "an empty elapsed window keeps the prior rate" do
       state =
         new_state()
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "a"}, 1_000)
         |> State.stream_message({:phase, :idle}, 1_000)
 
@@ -1454,6 +1475,7 @@ defmodule DashFloat.TUI.StateTest do
       state =
         new_state()
         |> State.stream_message({:entry, :system, "a\nb"})
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "c\nd"})
 
       # system entry: blank + a + b; the in-flight text is not rendered until
@@ -1495,6 +1517,7 @@ defmodule DashFloat.TUI.StateTest do
       state =
         new_state()
         |> Map.put(:agent_ref, ref)
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "partial"}, 1_000)
 
       {after_down, handled} = State.agent_down(state, ref, :normal)
@@ -1522,6 +1545,7 @@ defmodule DashFloat.TUI.StateTest do
       state =
         new_state()
         |> Map.put(:agent_ref, ref)
+        |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "partial reply"}, 1_000)
 
       {after_down, handled} = State.agent_down(state, ref, :killed)

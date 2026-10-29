@@ -174,18 +174,23 @@ defmodule DashFloat.TUI.SuggestTest do
     end
 
     # The unbounded-scan regression: the raw body is capped to @raw_cap
-    # chars before any other work, so a misbehaving provider cannot stall
-    # the composer (max_tokens only bounds well-behaved ones). 100 ms is a
-    # generous wall-clock ceiling (the input round-trip backstop precedent);
-    # the capped call measures ~2 ms at 5 MB.
-    test "a 5 MB body stays bounded: ≤80-char ghost, under a 100 ms ceiling" do
-      {micros, ghost} =
-        :timer.tc(fn -> Suggest.normalize({:ok, String.duplicate("a", 5_000_000)}) end)
+    # BYTES before any other work, so a misbehaving provider cannot stall
+    # the composer (max_tokens only bounds well-behaved ones).
+    test "a 5 MB body stays bounded: ≤80-char ghost" do
+      ghost = Suggest.normalize({:ok, String.duplicate("a", 5_000_000)})
 
       assert String.length(ghost) == 80
+    end
 
-      assert div(micros, 1000) < 100,
-             "normalize took #{div(micros, 1000)}ms on 5 MB — the unbounded scan is back"
+    # The deterministic bound (no wall clock — a timing guard flakes under
+    # CPU oversubscription and an ASCII body cannot catch this failure
+    # mode): one base char + 8M combining marks is a SINGLE grapheme, so a
+    # grapheme cap would pass it whole and the downstream scan would be
+    # unbounded. The byte prefix cuts the result to ≤ @raw_cap bytes.
+    test "a single multi-megabyte grapheme cluster is byte-capped" do
+      ghost = Suggest.normalize({:ok, "a" <> String.duplicate("\u0301", 8_000_000)})
+
+      assert byte_size(ghost) <= 16_384
     end
 
     test "a raise inside the HTTP path is rescued to :error (fail-open)" do
@@ -243,6 +248,20 @@ defmodule DashFloat.TUI.SuggestTest do
                )
 
       assert_receive {:suggestion, 1, nil}, 1_000
+    end
+
+    # A fetcher returning something off the {:ok, _} | :error contract must
+    # not kill the task inside the send expression — the message has to land
+    # (fail-open), or suggest_task would stay a dead pid forever.
+    test "an off-contract fetcher result still delivers {:suggestion, epoch, nil}" do
+      assert {:ok, _pid} =
+               Suggest.fetch_async(config(), "tail",
+                 send_to: self(),
+                 epoch: 2,
+                 fetcher: fn _config, _tail -> :weird end
+               )
+
+      assert_receive {:suggestion, 2, nil}, 1_000
     end
   end
 end

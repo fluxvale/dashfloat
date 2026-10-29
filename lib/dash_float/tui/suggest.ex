@@ -19,9 +19,11 @@ defmodule DashFloat.TUI.Suggest do
   @max_tokens 48
   @timeout_ms 5_000
   @display_cap 80
-  # The raw-body cap: everything downstream of normalize/1 runs on ≤ 4 KiB —
-  # max_tokens only bounds well-behaved providers (ADR 0015 §3's bounds).
-  @raw_cap 4096
+  # The raw-body cap: a BYTE prefix, taken before any grapheme work, so
+  # everything downstream of normalize/1 runs on ≤ 16 KiB — even a body that
+  # is one giant grapheme (a base char + N combining marks). max_tokens only
+  # bounds well-behaved providers (ADR 0015 §3's bounds).
+  @raw_cap 16_384
   @quote_chars ["\"", "'", "`"]
 
   # Control bytes (ESC, BEL, NUL, DEL), the C1 range U+0080–U+009F (the 8-bit
@@ -116,8 +118,9 @@ defmodule DashFloat.TUI.Suggest do
   @doc """
   Starts the supervised side-request (the `Catalog.refresh_async` shape):
   under `DashFloat.TaskSupervisor`, the fetcher (an `{m, f}` MFA or fun/2;
-  default the real HTTP path) runs rescued to `:error` — a raising fetcher
-  is just another failure — and the ALREADY-NORMALIZED ghost lands as
+  default the real HTTP path) runs rescued to `:error` — a raising fetcher,
+  or one returning something off the `{:ok, _} | :error` contract, is just
+  another failure — and the ALREADY-NORMALIZED ghost lands as
   `{:suggestion, epoch, text}` (`String.t() | nil`) on `send_to` (default
   `self()`): normalization runs inside the supervised task, never in the TUI
   process.
@@ -130,7 +133,18 @@ defmodule DashFloat.TUI.Suggest do
 
     Task.Supervisor.start_child(DashFloat.TaskSupervisor, fn ->
       # Normalize HERE, inside the supervised task — never in the TUI process.
-      send(send_to, {:suggestion, epoch, normalize(run(fetcher, config, tail))})
+      # The rescue covers normalize too: a fetcher returning something off
+      # its `{:ok, _} | :error` contract is just another failure (fail-open)
+      # — the message must land either way, or suggest_task would stay a
+      # dead pid with no result ever delivered.
+      text =
+        try do
+          normalize(run(fetcher, config, tail))
+        rescue
+          _reason -> nil
+        end
+
+      send(send_to, {:suggestion, epoch, text})
     end)
   end
 
@@ -149,27 +163,33 @@ defmodule DashFloat.TUI.Suggest do
   Display normalization: `:error` → nil; `{:ok, raw}` → the first non-blank
   line, trimmed, control/bidi characters scrubbed (an escape byte must never
   reach the terminal byte stream), ONE pair of surrounding quotes stripped,
-  hard-capped to `@display_cap` chars. Bounded by construction: the raw body
-  is capped to `@raw_cap` chars before any other work, and invalid UTF-8 is
-  repaired at the trust boundary (the wrap/markdown precedent). Blank at any
-  point → nil — no ghost at all.
+  hard-capped to `@display_cap` (80) graphemes. Bounded by construction: the
+  raw body is byte-prefixed to `@raw_cap` bytes before any other work, and
+  invalid UTF-8 is repaired at the trust boundary (the wrap/markdown
+  precedent). Blank at any point → nil — no ghost at all.
   """
   @spec normalize({:ok, term()} | :error) :: String.t() | nil
   def normalize(:error), do: nil
 
   def normalize({:ok, raw}) when is_binary(raw) do
-    # The cap is the bound (O(@raw_cap) graphemes): a misbehaving provider's
-    # multi-megabyte body must not stall the caller — max_tokens only bounds
-    # well-behaved ones.
-    capped = String.slice(raw, 0, @raw_cap)
+    # The cap is the bound — and it is a BYTE prefix, taken before any
+    # grapheme work: a grapheme cap would pass a single giant cluster (one
+    # base char + N combining marks) whole and the scan would be unbounded
+    # again. The prefix can split a codepoint; the repair below already
+    # handles that.
+    prefix = binary_part(raw, 0, min(byte_size(raw), @raw_cap))
 
     # Invalid UTF-8 repaired at the trust boundary (the wrap/markdown
     # precedent): a raw byte would hard-fail the drawn frame and freeze the
     # composer. Empty replacement — a pure-invalid body is no ghost at all.
-    raw = if String.valid?(capped), do: capped, else: String.replace_invalid(capped, "")
+    repaired = if String.valid?(prefix), do: prefix, else: String.replace_invalid(prefix, "")
+
+    # Grapheme work happens only here, on the repaired ≤ @raw_cap-byte
+    # prefix; the ghost itself is capped to @display_cap (80) graphemes.
+    body = String.slice(repaired, 0, @raw_cap)
 
     line =
-      raw
+      body
       |> String.split("\n")
       |> Enum.find(&(String.trim(&1) != ""))
 

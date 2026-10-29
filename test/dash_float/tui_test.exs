@@ -1093,6 +1093,9 @@ defmodule DashFloat.TUITest do
     # Burst coalescing with a big log: hundreds of messages, few frames.
     burst = Enum.map(1..300, &"b#{&1} ")
     burst_text = IO.iodata_to_binary(burst)
+    # Tokens ride a live turn per the stream contract — a stray token at
+    # idle is ignored (ADR 0015 §3's once-per-turn arm).
+    send(pid, {:phase, :streaming})
     before = Runtime.snapshot(pid).render_count
     Enum.each(burst, &send(pid, {:token, &1}))
     eventually(pid, &(&1.in_flight == burst_text))
@@ -2434,6 +2437,16 @@ defmodule DashFloat.TUITest do
 
       assert {:noreply, ^state, %{render?: false}} =
                TUI.handle_info({:suggestion, 1, "stale"}, state)
+    end
+
+    # The transport seam's accept predicate trusts nothing: "" is a truthy
+    # binary, so a blank ghost would land and blank the composer's
+    # placeholder.
+    test "an empty-string ghost is refused: no suggestion, render-suppressed" do
+      state = %{State.new(provider: provider()) | suggest_epoch: 5}
+
+      assert {:noreply, ^state, %{render?: false}} =
+               TUI.handle_info({:suggestion, 5, ""}, state)
     end
   end
 end
