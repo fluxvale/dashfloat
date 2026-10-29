@@ -17,9 +17,13 @@ defmodule DashFloat.Mode do
 
   @doc "The next mode in cycle order, wrapping `:unchained` back to `:plan`."
   @spec cycle(mode()) :: mode()
-  def cycle(mode) do
-    Enum.fetch!(@modes, rem(Enum.find_index(@modes, &(&1 == mode)) + 1, length(@modes)))
-  end
+  def cycle(mode) when mode in @modes,
+    do: Enum.fetch!(@modes, rem(Enum.find_index(@modes, &(&1 == mode)) + 1, length(@modes)))
+
+  # An unknown mode is a programming error (hostile-review m3: an unguarded
+  # cycle would raise an ArithmeticError inside route_key and take the TUI
+  # down) — fail loud, but with a named reason.
+  def cycle(other), do: raise(ArgumentError, "unknown mode: #{inspect(other)}")
 
   @doc "True iff `term` is one of the four mode atoms."
   @spec valid?(term()) :: boolean()

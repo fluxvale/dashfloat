@@ -2,7 +2,9 @@
 
 - **Status:** Accepted (revised at the plan gate, Oct 29: the owner's AUTO correction and
   PreToolUse addendum are folded in; renumbered from a draft "0014" by PA arbitration —
-  0014 is session persistence, 0015 is LSP)
+  0014 is session persistence, 0015 is reserved for the parked LSP lane and appears in
+  the index when that lane merges; amended post-hostile-review Oct 29: gate re-read at
+  check resolution, fence-free byte-capped vet payload)
 - **Date:** 2026-10-29
 - **Implements:** [issue #68](https://github.com/fluxvale/dashfloat/issues/68) — the owner's
   v0.1.1 test-drive feedback.
@@ -87,8 +89,13 @@ default mode). `:vet` resolves dynamically (§6): **allow → run; ask, or any c
 failure → confirm.** `:plan` still runs safe tools — a planning model that cannot read
 cannot plan.
 
-The gate is read **per call at dispatch time**. A switch mid-batch affects calls not yet
-dispatched. A pending confirmation is never retroactively converted — and while one is
+The gate is read **per call at dispatch time** — and re-read when a deferred
+check resolves. A switch mid-batch affects calls not yet dispatched; a switch
+mid-check re-resolves the call under the new mode at `vet_done`/DOWN (the
+verdict applies only if the gate is still `:vet`: a switch to plan proposes,
+to build arms the confirm, to unchained dispatches) — no deferred resolution
+may execute what the current mode forbids. A pending confirmation is never
+retroactively converted — and while one is
 pending it owns every key (ADR 0007 §4's swallow rule), so the cycle surface simply does
 not fire mid-decision: answer it or Esc it.
 
@@ -153,10 +160,16 @@ the project, lockfile-driven installs); **confirm** = destructive, irreversible,
 the project, touching credentials or secrets, network mutation (push, deploy),
 installing from the network, privilege escalation, force operations.
 
-**The payload.** Tool name, risk class, normalized arguments (JSON-encoded, capped at
-8 KiB with a disclosed marker), and **the same preview lines a human would confirm in
-BUILD** — bounded by construction (50 preview lines). The symmetry is the design: in
-AUTO a model plays the human's role on exactly the evidence the human sees in BUILD.
+**The payload.** One JSON object — instruction prose first, then the call as
+pure JSON data; **no markdown fence** (a fence is deterministically breakable
+by model-authored bytes containing its own closer, hostile-review finding):
+every tool-authored byte rides inside a JSON string, structurally incapable of
+becoming instruction. Fields: tool name, risk class, normalized arguments
+(encoded, capped at 8 KiB with a disclosed marker), and **the same preview
+lines a human would confirm in BUILD** — capped at 50 lines *and* 8 KiB total
+(line-byte-truncated with the same marker) so a single unbounded content line
+cannot balloon the check. The symmetry is the design: in AUTO a model plays
+the human's role on exactly the evidence the human sees in BUILD.
 
 **Latency.** The check sits on the tool-dispatch path (synchronous at the seam) and is
 visible, not hidden: the phase becomes `:checking` (§8) so the user sees why the pause

@@ -73,4 +73,10 @@ defmodule DashFloat.ModeTest do
       assert Mode.label(:unchained) == "Unchained"
     end
   end
+
+  describe "cycle/1 guard (hostile-review m3)" do
+    test "raises ArgumentError on an unknown mode instead of an arithmetic error" do
+      assert_raise ArgumentError, "unknown mode: :yolo", fn -> Mode.cycle(:yolo) end
+    end
+  end
 end

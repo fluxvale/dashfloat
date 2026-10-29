@@ -79,6 +79,7 @@ Rules, each driven by a test:
 {"ok":true,"path":"lib/foo.ex","content":"...","lines":120,"truncated":false}
 {"ok":false,"error":"path escapes the working directory: ../../etc/passwd"}
 {"ok":false,"rejected":true}                    # user pressed Esc on the confirmation
+{"ok":false,"blocked":"plan"}                   # plan mode refused the call (ADR 0016)
 {"ok":false,"cancelled":true}                   # user interrupted a running command
 {"ok":false,"error":"timed out after 30s","output":"...partial..."}
 ```
