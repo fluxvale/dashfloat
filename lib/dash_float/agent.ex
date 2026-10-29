@@ -421,19 +421,50 @@ defmodule DashFloat.Agent do
   # Id uniqueness is owned at the batch boundary (ADR 0014 §4): persistence
   # makes ids load-bearing across processes, and `state.results` is keyed by
   # call id, so a repeated id would serve one call's answer to two calls.
-  # Each repeat after its first use renames in place (id, id-2, id-3, …)
-  # BEFORE the assistant message is built, so the assistant `tool_calls`, the
-  # dispatch, the results map, and the flushed tool messages all carry the
-  # renamed ids consistently.
+  # Renames are decided against a used-id set — the original ids and every
+  # rename so far — so a colliding original can never re-create a rename:
+  # [a, a, a-2] becomes [a, a-2, a-3], not [a, a-2, a-2]. Applied BEFORE the
+  # assistant message is built, so the assistant `tool_calls`, the dispatch,
+  # the results map, and the flushed tool messages all carry the renamed ids
+  # consistently.
   defp dedup_ids(calls) do
-    {renamed, _counts} =
-      Enum.map_reduce(calls, %{}, fn %{id: id} = call, counts ->
-        n = Map.get(counts, id, 0) + 1
-        call = if n == 1, do: call, else: %{call | id: "#{id}-#{n}"}
-        {call, Map.put(counts, id, n)}
+    {renamed, _used} =
+      Enum.map_reduce(calls, MapSet.new(), fn %{id: id} = call, used ->
+        id = if MapSet.member?(used, id), do: next_free_id(id, used), else: id
+        {%{call | id: id}, MapSet.put(used, id)}
       end)
 
     renamed
+  end
+
+  # The first unused "#{id}-#{n}", n >= 2 — except when `id` itself is a
+  # taken "<base>-<n>" rename of an also-used base, where the sequence
+  # continues on the base (a-2 taken beside a → a-3, not a-2-2).
+  defp next_free_id(id, used) do
+    case renamed_form(id) do
+      {base, n} when is_integer(n) ->
+        if MapSet.member?(used, base) do
+          free_suffix(base, n + 1, used)
+        else
+          free_suffix(id, 2, used)
+        end
+
+      _not_a_rename ->
+        free_suffix(id, 2, used)
+    end
+  end
+
+  defp free_suffix(base, n, used) do
+    candidate = "#{base}-#{n}"
+
+    if MapSet.member?(used, candidate), do: free_suffix(base, n + 1, used), else: candidate
+  end
+
+  defp renamed_form(id) do
+    case Regex.run(~r/\A(.*)-(\d+)\z/, id) do
+      [_, base, n] -> {base, String.to_integer(n)}
+      _no_match -> :error
+    end
   end
 
   defp next_call(%__MODULE__{call_index: index, calls: calls} = state)

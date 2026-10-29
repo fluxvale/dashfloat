@@ -52,6 +52,19 @@ defmodule DashFloat.AgentTest do
     [opening | rest]
   end
 
+  # A third parallel call on index 2.
+  defp tool_frames_2(id, name, arg_fragments) do
+    opening =
+      ~s(data: {"choices":[{"index":2,"delta":{"tool_calls":[{"index":2,"id":"#{id}","type":"function","function":{"name":"#{name}","arguments":""}}]}}]}\n\n)
+
+    rest =
+      for frag <- arg_fragments do
+        ~s(data: {"choices":[{"index":2,"delta":{"tool_calls":[{"index":2,"function":{"arguments":#{Jason.encode!(frag)}}}]}}]}\n\n)
+      end
+
+    [opening | rest]
+  end
+
   defp call_tool_episode(id, name, args, opts \\ []) do
     frames = tool_frames(id, name, [Jason.encode!(args)])
     prefix = Keyword.get(opts, :prefix, [])
@@ -1059,6 +1072,61 @@ defmodule DashFloat.AgentTest do
 
     result_b = Jason.decode!(tool_b["content"])
     assert Map.has_key?(result_b, "entries")
+  end
+
+  @tag :tmp_dir
+  test "a batch of call_1/call_1/call_1-2 renames to distinct ids that load", ctx do
+    # The third call's ORIGINAL id is exactly the second call's rename: a
+    # counter-only rename would produce [call_1, call_1-2, call_1-2] — a
+    # file load refuses and the model gets two answers under one id. The
+    # used-id-set rename continues the sequence instead: [call_1, call_1-2,
+    # call_1-3].
+    write_sandbox(ctx, "notes.md", "seed\n")
+
+    frames =
+      tool_frames("call_1", "read_file", [~s({"path":"notes.md"})]) ++
+        tool_frames_1("call_1", "list_directory", [~s({"path":"."})]) ++
+        tool_frames_2("call_1-2", "read_file", [~s({"path":"notes.md"})])
+
+    server =
+      start_server([
+        [{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close],
+        final_episode("three done")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "run all three"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:tool_result, %{id: "call_1", ok: true}}, 2_000
+    assert_receive {:tool_result, %{id: "call_1-2", ok: true}}, 2_000
+    assert_receive {:tool_result, %{id: "call_1-3", ok: true}}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    id = session_id(sessions)
+
+    # The persisted file carries the three distinct ids and LOADS — a
+    # duplicate would refuse at load (ADR 0014 §4).
+    assert {:ok, session} = Session.load(sessions, id)
+
+    assert [
+             %{"role" => "user"},
+             %{"role" => "assistant", "content" => nil, "tool_calls" => calls},
+             tool_a,
+             tool_b,
+             tool_c,
+             %{"role" => "assistant", "content" => "three done"}
+           ] = session.messages
+
+    assert Enum.map(calls, & &1["id"]) == ["call_1", "call_1-2", "call_1-3"]
+
+    assert Enum.map([tool_a, tool_b, tool_c], & &1["tool_call_id"]) == [
+             "call_1",
+             "call_1-2",
+             "call_1-3"
+           ]
   end
 
   @tag :tmp_dir
