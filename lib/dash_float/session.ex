@@ -259,6 +259,9 @@ defmodule DashFloat.Session do
     end
   end
 
+  defp check_tool_calls(path, index, _other),
+    do: {:error, "#{path}: message #{index} field \"tool_calls\" must be a list"}
+
   defp check_call_shapes(path, index, calls) do
     Enum.reduce_while(calls, :ok, fn call, :ok ->
       case check_call(path, index, call) do
@@ -291,9 +294,6 @@ defmodule DashFloat.Session do
       %MapSet{} -> :ok
     end
   end
-
-  defp check_tool_calls(path, index, _other),
-    do: {:error, "#{path}: message #{index} field \"tool_calls\" must be a list"}
 
   defp check_call(_path, _index, %{
          "id" => id,
