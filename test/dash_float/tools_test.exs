@@ -45,7 +45,7 @@ defmodule DashFloat.ToolsTest do
                  "function" => %{
                    "name" => "write_file",
                    "description" =>
-                     "Create or overwrite a file with the given full content. Parent directories are created automatically. The user confirms before it runs.",
+                     "Create or overwrite a file with the given full content. Parent directories are created automatically. The user may confirm before it runs, depending on the session mode.",
                    "parameters" => %{
                      "type" => "object",
                      "properties" => %{
@@ -68,7 +68,7 @@ defmodule DashFloat.ToolsTest do
                  "function" => %{
                    "name" => "edit_file",
                    "description" =>
-                     "Replace an exact block of text in a file. search_block must match the file exactly once — include surrounding lines to make it unique. The user confirms before it runs.",
+                     "Replace an exact block of text in a file. search_block must match the file exactly once — include surrounding lines to make it unique. The user may confirm before it runs, depending on the session mode.",
                    "parameters" => %{
                      "type" => "object",
                      "properties" => %{
@@ -96,7 +96,7 @@ defmodule DashFloat.ToolsTest do
                  "function" => %{
                    "name" => "execute_command",
                    "description" =>
-                     "Run a shell command line and return its combined output (stdout and stderr, capped). Prefer it for builds, tests, and searches. The user confirms before it runs.",
+                     "Run a shell command line and return its combined output (stdout and stderr, capped). Prefer it for builds, tests, and searches. The user may confirm before it runs, depending on the session mode.",
                    "parameters" => %{
                      "type" => "object",
                      "properties" => %{
@@ -260,6 +260,20 @@ defmodule DashFloat.ToolsTest do
                  "replace_block" => "b"
                }) == {:error, "#{tool}: path must name a file, not end in \"/\""}
       end
+    end
+  end
+
+  describe "class/1" do
+    test "declares the risk class per ADR 0016 §2" do
+      assert Tools.class("read_file") == :safe
+      assert Tools.class("list_directory") == :safe
+      assert Tools.class("write_file") == :mutating
+      assert Tools.class("edit_file") == :mutating
+      assert Tools.class("execute_command") == :risky
+    end
+
+    test "unknown names fail closed to :risky" do
+      assert Tools.class("rm_rf") == :risky
     end
   end
 

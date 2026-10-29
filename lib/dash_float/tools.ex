@@ -130,19 +130,31 @@ defmodule DashFloat.Tools do
     "read_file" =>
       "Read a window of lines from a text file. Lines are 1-based; without offset or limit the first 2000 lines are returned. Output is byte-capped, so very long files come back truncated — re-read with offset/limit for the rest.",
     "write_file" =>
-      "Create or overwrite a file with the given full content. Parent directories are created automatically. The user confirms before it runs.",
+      "Create or overwrite a file with the given full content. Parent directories are created automatically. The user may confirm before it runs, depending on the session mode.",
     "edit_file" =>
-      "Replace an exact block of text in a file. search_block must match the file exactly once — include surrounding lines to make it unique. The user confirms before it runs.",
+      "Replace an exact block of text in a file. search_block must match the file exactly once — include surrounding lines to make it unique. The user may confirm before it runs, depending on the session mode.",
     "execute_command" =>
-      "Run a shell command line and return its combined output (stdout and stderr, capped). Prefer it for builds, tests, and searches. The user confirms before it runs.",
+      "Run a shell command line and return its combined output (stdout and stderr, capped). Prefer it for builds, tests, and searches. The user may confirm before it runs, depending on the session mode.",
     "list_directory" =>
       "List a directory's entries: directories first, then files, each alphabetical."
   }
 
   @order ["read_file", "write_file", "edit_file", "execute_command", "list_directory"]
 
+  @classes %{
+    "read_file" => :safe,
+    "list_directory" => :safe,
+    "write_file" => :mutating,
+    "edit_file" => :mutating,
+    "execute_command" => :risky
+  }
+
   # Display excerpt for tool-result rows; the model gets the bounded full result.
   @display_lines 30
+
+  @doc "Risk class per ADR 0016 §2. Unknown names are :risky (fail closed)."
+  @spec class(String.t()) :: :safe | :mutating | :risky
+  def class(name), do: Map.get(@classes, name, :risky)
 
   @doc "The OpenAI `tools` array advertising the catalogue."
   @spec schema() :: [map()]
@@ -278,12 +290,14 @@ defmodule DashFloat.Tools do
   def cancelled_result, do: %{ok: false, cancelled: true}
 
   @doc """
-  The tool-result row's status word: `"rejected"`, `"cancelled"`, `"ok"`, or
-  `"error: …"` with the message capped at 160 characters.
+  The tool-result row's status word: `"rejected"`, `"cancelled"`,
+  `"proposed (plan)"`, `"ok"`, or `"error: …"` with the message capped at 160
+  characters.
   """
   @spec display_status(map()) :: String.t()
   def display_status(%{rejected: true}), do: "rejected"
   def display_status(%{cancelled: true}), do: "cancelled"
+  def display_status(%{blocked: "plan"}), do: "proposed (plan)"
   def display_status(%{ok: true}), do: "ok"
 
   def display_status(%{error: error}) when is_binary(error),

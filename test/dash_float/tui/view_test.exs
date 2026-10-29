@@ -106,12 +106,13 @@ defmodule DashFloat.TUI.ViewTest do
       assert text =~ "● Idle"
     end
 
-    # Nothing has streamed and the phase cluster is the bar's first group:
-    # a fresh session never opens with a dangling leading separator.
-    test "a fresh session's status opens with the phase dot, no leading separator" do
+    # Nothing has streamed and the phase cluster follows the mode span (the
+    # mode is always the bar's first group, ADR 0016 §7): a fresh session
+    # never opens with a dangling leading separator.
+    test "a fresh session's status opens with the mode, no leading separator" do
       text = status_text(new_state())
 
-      assert String.starts_with?(text, "● ")
+      assert String.starts_with?(text, "Build · ● ")
       refute String.starts_with?(text, " · ")
     end
 
@@ -130,25 +131,50 @@ defmodule DashFloat.TUI.ViewTest do
         |> State.stream_message({:phase, :idle}, 2_000)
 
       # ctx keeps its slot on the status bar, before the phase cluster (the
-      # rate assertion lives with the footer describe now).
-      assert status_text(state) =~ ~r/ctx 4\.1k\/128k · ● Idle · /
+      # rate and model assertions live with the footer describe now). The
+      # mode span leads every group (ADR 0016 §7).
+      assert status_text(state) =~ ~r/Build · ctx 4\.1k\/128k · ● Idle · /
     end
 
     test "the status bar is one line of styled spans, dim separators between" do
       [line] = status_line(new_state())
 
-      # Exact fresh-session truth — phase cluster, one separator, the log
-      # position: a wrong separator layout must fail here, not pass on count.
-      assert Enum.map(line.spans, & &1.content) == ["● ", "Idle", " · ", "log empty"]
+      # Exact fresh-session truth — the mode label, phase cluster, one
+      # separator between each group, the log position: a wrong separator
+      # layout must fail here, not pass on count (mode first, ADR 0016 §7).
+      assert Enum.map(line.spans, & &1.content) == [
+               "Build",
+               " · ",
+               "● ",
+               "Idle",
+               " · ",
+               "log empty"
+             ]
 
       separators = Enum.filter(line.spans, &(&1.content == " · "))
       assert Enum.all?(separators, &(&1.style.fg == :dark_gray))
+    end
+
+    test "the status bar always carries the mode span (ADR 0016)" do
+      for {mode, label} <- [plan: "Plan", build: "Build", auto: "Auto", unchained: "Unchained"] do
+        assert status_text(%{new_state() | mode: mode}) =~ label
+      end
+    end
+
+    test "the unchained mode label is error-styled" do
+      [line] = status_line(%{new_state() | mode: :unchained})
+
+      assert %ExRatatui.Text.Span{style: style} =
+               Enum.find(line.spans, &(&1.content == "Unchained"))
+
+      assert style == Theme.style(:error)
     end
 
     test "each phase maps to its status label" do
       for {phase, label} <- [
             streaming: "Streaming",
             executing_tool: "Running tool",
+            checking: "Checking",
             confirming: "Confirm",
             idle: "Idle"
           ] do
@@ -502,6 +528,10 @@ defmodule DashFloat.TUI.ViewTest do
 
     test "says Running tool… while executing a tool" do
       assert activity_text(%{new_state() | phase: :executing_tool}) =~ "Running tool…"
+    end
+
+    test "says Checking… while a safety check is in flight (ADR 0016 §8)" do
+      assert activity_text(%{new_state() | phase: :checking}) =~ "Checking…"
     end
 
     test "says Approve this change? while confirming, with the decision hint" do

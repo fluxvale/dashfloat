@@ -7,20 +7,22 @@ defmodule DashFloat.TUI.State do
   at mount so the monitor lives there). The input draft lives in the
   textarea's Rust-side state, reached through its synchronous in-memory API.
   Transitions return `{state, action}` where `action` is `:quit`,
-  `{:submit, prompt}`, `{:confirm, decision}`, `:cancel`, or `nil`; the TUI
-  interprets actions. The one clock is injectable (`now` arguments, defaulting
+  `{:submit, prompt}`, `{:confirm, decision}`, `:cancel`, `{:set_mode, mode}`,
+  `nil`, or one of the setup actions; the TUI interprets actions. The one
+  clock is injectable (`now` arguments, defaulting
   to the monotonic clock) so the animation tick and rate math stay pure.
   See ADRs 0002, 0006, and 0007.
   """
 
   alias DashFloat.Config.Onboarding
+  alias DashFloat.Mode
   alias DashFloat.Tools
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.View
   alias DashFloat.TUI.Wrap
 
-  @type phase :: :idle | :streaming | :executing_tool | :confirming
+  @type phase :: :idle | :streaming | :executing_tool | :checking | :confirming
   @type entry_kind :: :user | :assistant | :tool | :system
 
   @type entry :: %{
@@ -32,17 +34,18 @@ defmodule DashFloat.TUI.State do
   @type confirm :: %{ref: term(), id: term(), name: String.t()}
 
   @typedoc """
-  One keypress's outcome. The chat actions are ADR 0002/0006/0007; the
-  setup actions (ADR 0009) carry the wizard's side-effecting steps to the
-  TUI runner: a profile picked in the forced-selection modal, the wizard's
-  finish handoff, an immediate keys.json5 write, the `/models` fetch, and
-  the final settings.json5 write.
+  One keypress's outcome. The chat actions are ADR 0002/0006/0007; the mode
+  cycle's `{:set_mode, _}` is ADR 0016; the setup actions (ADR 0009) carry
+  the wizard's side-effecting steps to the TUI runner: a profile picked in
+  the forced-selection modal, the wizard's finish handoff, an immediate
+  keys.json5 write, the `/models` fetch, and the final settings.json5 write.
   """
   @type action ::
           :quit
           | {:submit, String.t()}
           | {:confirm, :approved | :rejected}
           | :cancel
+          | {:set_mode, Mode.mode()}
           | nil
           | {:select_profile, String.t()}
           | :setup_finish
@@ -88,6 +91,9 @@ defmodule DashFloat.TUI.State do
     :config_dir,
     :resolve,
     :catalog_fetcher,
+    # The interaction mode (ADR 0016): defaulted here, no mount opt — the
+    # agent's {:mode, _} echo is the single writer after boot.
+    mode: :build,
     phase: :idle,
     entries: [],
     in_flight: nil,
@@ -141,6 +147,7 @@ defmodule DashFloat.TUI.State do
           provider: {:ok, DashFloat.Config.t()} | {:error, String.t()} | nil,
           cwd: String.t(),
           agent: pid() | atom(),
+          mode: Mode.mode(),
           phase: phase(),
           entries: [entry()],
           in_flight: String.t() | nil,
@@ -190,7 +197,8 @@ defmodule DashFloat.TUI.State do
 
   @typedoc """
   One message of the stream contract (see `stream_message/2` and ADR 0002 /
-  0006 / 0007). The agent is the single voice; the tool messages are ADR 0007.
+  0006 / 0007). The agent is the single voice; the tool messages are ADR 0007,
+  the mode messages ADR 0016.
   """
   @type stream_msg ::
           {:token, String.t()}
@@ -201,11 +209,13 @@ defmodule DashFloat.TUI.State do
                total_tokens: non_neg_integer()
              }}
           | {:phase, :streaming}
-          | {:phase, :executing_tool | :idle}
+          | {:phase, :executing_tool | :checking | :idle}
           | {:tool_call, tool_call_msg()}
           | {:tool_result, tool_result_msg()}
           | {:confirm, term(), confirm_msg()}
           | {:entry, :tool | :system, String.t()}
+          | {:mode, Mode.mode()}
+          | {:tool_preview, confirm_msg()}
 
   @typep tool_call_msg :: %{id: term(), name: String.t(), args: map()}
 
@@ -338,6 +348,7 @@ defmodule DashFloat.TUI.State do
           ok: result["ok"],
           rejected: result["rejected"],
           cancelled: result["cancelled"],
+          blocked: result["blocked"],
           error: result["error"],
           output: result["output"],
           content: result["content"]
@@ -639,15 +650,27 @@ defmodule DashFloat.TUI.State do
   defp route_key(%{confirm: pending} = state, _code, _modifiers, _now) when pending != nil,
     do: {state, nil}
 
+  # Shift+Tab cycles the interaction mode (ADR 0016 §7): the action carries
+  # it to the agent, whose echo applies it — no local change. Real terminals
+  # emit BackTab (CSI Z), which the native layer maps to "back_tab" with an
+  # arbitrary modifier list — never "tab"+shift — so back_tab cycles in any
+  # shape; the tab+shift clause stays for the synthetic shape it tests.
+  defp route_key(state, "tab", ["shift"], _now),
+    do: {state, {:set_mode, Mode.cycle(state.mode)}}
+
+  defp route_key(state, "back_tab", _modifiers, _now),
+    do: {state, {:set_mode, Mode.cycle(state.mode)}}
+
   # Enter / Ctrl+Enter submit; Shift+Enter / Alt+Enter insert a newline.
   defp route_key(state, "enter", mods, _now) when mods in [[], ["ctrl"]], do: submit(state)
   defp route_key(state, "enter", ["shift"], _now), do: forward(state, "enter", [])
   defp route_key(state, "enter", ["alt"], _now), do: forward(state, "enter", [])
 
-  # Esc interrupts a streaming reply or a running tool (ADR 0005/0007); a
-  # no-op otherwise (including the post-decision confirming gap).
+  # Esc interrupts a streaming reply, a running tool, or a safety check
+  # (ADR 0005/0007; ADR 0016 §6); a no-op otherwise (including the
+  # post-decision confirming gap).
   defp route_key(%{phase: phase} = state, "esc", _modifiers, _now)
-       when phase in [:streaming, :executing_tool],
+       when phase in [:streaming, :executing_tool, :checking],
        do: {state, :cancel}
 
   defp route_key(state, "esc", _modifiers, _now), do: {state, nil}
@@ -797,14 +820,18 @@ defmodule DashFloat.TUI.State do
     * `{:phase, :streaming}` — set the phase only; re-announcing streaming
       never finalizes (a producer resuming after a tool interlude must not
       fragment its reply)
-    * `{:phase, :executing_tool | :idle}` — set the phase and finalize the
-      in-flight entry, freezing the rate
+    * `{:phase, :executing_tool | :checking | :idle}` — set the phase and
+      finalize the in-flight entry, freezing the rate
     * `{:tool_call, call}` — append the gear row built by `Render.tool_call/2`
     * `{:tool_result, result}` — append the status row and dim output built by
       `Render.tool_result/3`
     * `{:confirm, ref, request}` — append the preview entry built by
       `Render.confirm_preview/1`, then arm `state.confirm` and flip to the
       `:confirming` phase (ADR 0007)
+    * `{:mode, mode}` — the single-voice echo: set the mode; no entry, no
+      phase change (ADR 0016)
+    * `{:tool_preview, request}` — append the preview entry built by
+      `Render.confirm_preview/1` without arming `state.confirm` (ADR 0016)
     * `{:entry, kind, text}` — append a complete entry
 
   `now` is monotonic milliseconds (injectable so the rate math is testable).
@@ -884,13 +911,31 @@ defmodule DashFloat.TUI.State do
     |> maybe_arm_suggestion(finalized?)
   end
 
-  # Tool interludes are mid-turn: the phase changes and any in-flight
-  # partial reply finalizes, but the turn is not complete — never an arm
-  # (and every new phase still sets the reap intent, ADR 0015 §3).
-  def stream_message(state, {:phase, :executing_tool}, now) do
+  # Tool interludes are mid-turn — a safety check (ADR 0016 §7) no less than
+  # an execution: the phase changes and any in-flight partial reply
+  # finalizes, but the turn is not complete — never an arm (and every new
+  # phase still sets the reap intent, ADR 0015 §3).
+  def stream_message(state, {:phase, phase}, now)
+      when phase in [:executing_tool, :checking] do
     state
-    |> finalize_phase(:executing_tool, now)
+    |> finalize_phase(phase, now)
     |> dismiss_suggestion()
+  end
+
+  # The single-voice echo (ADR 0016 §7): the announcing system entry arrives
+  # separately as {:entry, :system, _}. The agent validates the mode at its
+  # seam, so the echo — like every stream message — is trusted agent voice.
+  def stream_message(state, {:mode, mode}, _now), do: %{state | mode: mode}
+
+  # A proposal or execution receipt (ADR 0016 §4): the preview rows a human
+  # would confirm, landed without arming the decision.
+  def stream_message(
+        state,
+        {:tool_preview, %{id: _id, name: _name, args: _args, lines: lines}},
+        _now
+      ) do
+    {text, entry_lines} = Render.confirm_preview(lines)
+    put_entry(state, :tool, text, entry_lines)
   end
 
   def stream_message(state, {:entry, kind, text}, _now)

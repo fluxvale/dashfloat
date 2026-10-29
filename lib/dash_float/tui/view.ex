@@ -7,6 +7,7 @@ defmodule DashFloat.TUI.View do
   """
 
   alias DashFloat.Config.Onboarding
+  alias DashFloat.Mode
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Theme
@@ -23,7 +24,17 @@ defmodule DashFloat.TUI.View do
     idle: {"Idle", :status_idle},
     streaming: {"Streaming", :status_busy},
     executing_tool: {"Running tool", :status_tool},
+    checking: {"Checking", :status_tool},
     confirming: {"Confirm", :status_tool}
+  }
+
+  # The mode span's role (ADR 0016 §8) — display truth, kept local to the
+  # view; the label text comes from Mode.label/1.
+  @mode_roles %{
+    plan: :status_idle,
+    build: :assistant,
+    auto: :status_tool,
+    unchained: :error
   }
 
   # One cell of padding on every side of the chrome (issue #28; ADR 0006
@@ -401,15 +412,17 @@ defmodule DashFloat.TUI.View do
 
   ## Status bar
 
-  # One left-flowing line: context, phase, log position — non-empty groups
-  # joined with a separator BETWEEN them, so a fresh session opens with the
-  # phase dot, never a dangling leading separator. cwd, model, and rate
-  # moved to the stats footer (ADR 0015 §2) — moved, not duplicated.
+  # One left-flowing line: mode, context, phase, log position — non-empty
+  # groups joined with a separator BETWEEN them, so a fresh session opens
+  # with the phase dot, never a dangling leading separator. cwd, model, and
+  # rate moved to the stats footer (ADR 0015 §2) — moved, not duplicated.
+  # The mode span leads (ADR 0016 §7): it is session state, always shown.
   defp status_widget(state, log_height) do
     {label, role} = Map.fetch!(@phases, state.phase)
 
     spans =
       [
+        mode_spans(state),
         context_spans(state),
         phase_spans(label, role),
         position_spans(state, log_height)
@@ -443,6 +456,15 @@ defmodule DashFloat.TUI.View do
         )
       ]
     }
+  end
+
+  # The mode group is bare — the bar intersperses separators between groups
+  # (ADR 0016 §7): always present, so the bar opens with the mode label.
+  defp mode_spans(state) do
+    role = Map.fetch!(@mode_roles, state.mode)
+    label = Mode.label(state.mode)
+
+    [Span.new(label, style: Theme.style(role))]
   end
 
   defp context_spans(%{stats: %{context_total: 0}}), do: []
@@ -603,6 +625,7 @@ defmodule DashFloat.TUI.View do
 
   defp activity_label(%{phase: :confirming}), do: "Approve this change?"
   defp activity_label(%{phase: :executing_tool}), do: "Running tool…"
+  defp activity_label(%{phase: :checking}), do: "Checking…"
   defp activity_label(%{stats: %{tokens: 0}}), do: "Thinking…"
   defp activity_label(_state), do: "Streaming…"
 

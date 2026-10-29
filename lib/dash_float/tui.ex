@@ -3,8 +3,9 @@ defmodule DashFloat.TUI do
   The DashFloat terminal UI: a thin `ExRatatui.App` whose state logic lives in
   `DashFloat.TUI.State` and rendering in `DashFloat.TUI.View`. Process shape,
   key bindings, and teardown guarantees are settled in ADR 0002. Submits,
-  cancels, and confirmation decisions are plain sends to the agent (ADR 0007)
-  — the agent is the single voice streaming back into the UI, and this
+  cancels, confirmation decisions, and mode switches (ADR 0016) are plain
+  sends to the agent (ADR 0007) — the agent is the single voice streaming
+  back into the UI, and this
   process starts no tasks. The activity tick (ADR 0006) is the one timer this
   process owns — scheduled only while work is in flight.
 
@@ -101,6 +102,7 @@ defmodule DashFloat.TUI do
     case action do
       :quit -> {:stop, state}
       nil -> schedule(state)
+      {:set_mode, mode} -> schedule(set_mode(mode, state))
       _setup_action -> setup_action(action, state)
     end
   end
@@ -261,7 +263,7 @@ defmodule DashFloat.TUI do
     do: schedule(State.stream_message(state, msg))
 
   def handle_info({kind, _payload} = msg, state)
-      when kind in [:token, :phase, :usage, :tool_call, :tool_result],
+      when kind in [:token, :phase, :usage, :tool_call, :tool_result, :mode, :tool_preview],
       do: schedule(State.stream_message(state, msg))
 
   def handle_info({:confirm, _ref, _payload} = msg, state),
@@ -467,6 +469,13 @@ defmodule DashFloat.TUI do
   # tests are plain processes receiving these.
   defp prompt_agent(prompt, state) do
     send(state.agent, {:prompt, self(), prompt})
+    state
+  end
+
+  # The mode switch (ADR 0016 §7) rides the same seam: a plain send, no local
+  # change — the agent's {:mode, _} echo updates the chrome.
+  defp set_mode(mode, state) do
+    send(state.agent, {:set_mode, self(), mode})
     state
   end
 
