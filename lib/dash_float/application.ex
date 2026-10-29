@@ -253,7 +253,8 @@ defmodule DashFloat.Application do
   # delivers the resolved provider via {:set_provider, _} (ADR 0009).
   # Persistence is always on outside test (ADR 0014 §5); a resume additionally
   # carries the loaded id/pin/messages/created_at, so the next save rewrites
-  # the same file under the same id (ADR 0014 §6).
+  # the same file under the same id (ADR 0014 §6), plus the ADR 0022 §6
+  # diagnostics (the persisted context anchor and the eviction history).
   defp engine_children(classification, resume, sessions_dir) do
     resume_opts =
       case resume do
@@ -266,7 +267,9 @@ defmodule DashFloat.Application do
               id: session.id,
               pin: session.pin,
               messages: session.messages,
-              created_at: session.created_at
+              created_at: session.created_at,
+              context: session.context,
+              compactions: session.compactions
             }
           ]
       end

@@ -10,6 +10,7 @@ defmodule DashFloat.AgentTest do
 
   use ExUnit.Case, async: false
 
+  alias DashFloat.Accounting
   alias DashFloat.Agent
   alias DashFloat.Config
   alias DashFloat.Session
@@ -22,8 +23,12 @@ defmodule DashFloat.AgentTest do
     ~s(data: {"choices":[{"index":0,"delta":{"content":"#{content}"}}]}\n\n)
   end
 
-  defp usage_frame(total) do
-    ~s(data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":#{total}}}\n\n)
+  defp usage_frame(total) when is_integer(total), do: usage_frame(10, 5, total)
+
+  defp usage_frame({prompt, completion, total}), do: usage_frame(prompt, completion, total)
+
+  defp usage_frame(prompt, completion, total) do
+    ~s(data: {"choices":[],"usage":{"prompt_tokens":#{prompt},"completion_tokens":#{completion},"total_tokens":#{total}}}\n\n)
   end
 
   # A streamed tool call: the id/name frame first, then argument fragments.
@@ -91,6 +96,18 @@ defmodule DashFloat.AgentTest do
      %Config{base_url: SSEServer.base_url(server), model: "test-model", api_key: "test-key-123"}}
   end
 
+  # A provider carrying an explicit context window (ADR 0022 §2); the arity-1
+  # helper keeps `context_tokens` nil — no window, nothing compacts.
+  defp provider(server, context_tokens) do
+    {:ok,
+     %Config{
+       base_url: SSEServer.base_url(server),
+       model: "test-model",
+       api_key: "test-key-123",
+       context_tokens: context_tokens
+     }}
+  end
+
   defp start_agent(server, cwd, opts \\ []) do
     # A per-test supervisor: the agent's stream/runner tasks land here, so
     # tests can enumerate them without leftovers from other tests.
@@ -98,7 +115,7 @@ defmodule DashFloat.AgentTest do
 
     {:ok, agent} =
       Agent.start_link(
-        provider: provider(server),
+        provider: Keyword.get(opts, :provider, provider(server)),
         cwd: cwd,
         exec_timeout: Keyword.get(opts, :exec_timeout, 500),
         supervisor: sup,
@@ -1552,6 +1569,589 @@ defmodule DashFloat.AgentTest do
              "role" => "user",
              "content" => "after setup"
            }
+  end
+
+  ## Context accounting and compaction (ADR 0022)
+
+  # The test's mirror of Accounting's weights (ADR 0022 §1) over the
+  # string-keyed message maps a request body carries: bytes/4 over the
+  # content plus each tool call's function name and argument JSON.
+  defp weight_of(message) do
+    content_weight =
+      case message["content"] do
+        content when is_binary(content) -> div(byte_size(content), 4)
+        _other -> 0
+      end
+
+    calls_weight =
+      case message["tool_calls"] do
+        calls when is_list(calls) ->
+          Enum.sum(
+            for call <- calls do
+              div(byte_size(call["function"]["name"]), 4) +
+                div(byte_size(call["function"]["arguments"]), 4)
+            end
+          )
+
+        _other ->
+          0
+      end
+
+    content_weight + calls_weight
+  end
+
+  defp weight_sum(messages) do
+    messages
+    |> Enum.map(&weight_of/1)
+    |> Enum.sum()
+  end
+
+  # The fixture tokenizer (ADR 0022 test plan 7): Accounting's weights plus 8
+  # tokens of per-message scaffolding the heuristic cannot see.
+  defp f_of(messages), do: 8 * length(messages) + weight_sum(messages)
+
+  defp user_message(text), do: %{"role" => "user", "content" => text}
+
+  defp assistant_message(text), do: %{"role" => "assistant", "content" => text}
+
+  defp tool_assistant_message(id, args) do
+    %{
+      "role" => "assistant",
+      "content" => nil,
+      "tool_calls" => [
+        %{
+          "id" => id,
+          "type" => "function",
+          "function" => %{"name" => "read_file", "arguments" => Jason.encode!(args)}
+        }
+      ]
+    }
+  end
+
+  defp tool_message(id, content),
+    do: %{"role" => "tool", "tool_call_id" => id, "content" => content}
+
+  # read_file's result for a single-line file, byte-for-byte: the same map
+  # literal, in the same key order, DashFloat.Tools.Runner.read_window/3's
+  # whole-file clause builds.
+  defp read_result_json(path, content) do
+    Jason.encode!(%{
+      ok: true,
+      path: path,
+      content: content,
+      lines: 1,
+      total_lines: 1,
+      total_bytes: byte_size(content),
+      truncated: false
+    })
+  end
+
+  # The file payload whose read_file result JSON weighs exactly `target`
+  # heuristic tokens (div(bytes, 4) over the encoded result, ADR 0022 §1).
+  defp payload_for_result_weight(path, target) do
+    4 * target - byte_size(read_result_json(path, ""))
+  end
+
+  # One scripted automatic read_file turn: prompt, tool batch, reply, and the
+  # request-body shapes they must produce. The payload is sized so the tool
+  # result weighs `result_weight` tokens.
+  defp read_turn(k, result_weight) do
+    path = "big_#{k}.txt"
+    args = %{"path" => path}
+    content = String.duplicate("a", payload_for_result_weight(path, result_weight))
+
+    %{
+      k: k,
+      prompt: "turn #{k}",
+      final: "done #{k}",
+      args: args,
+      content: content,
+      expected: [
+        user_message("turn #{k}"),
+        tool_assistant_message("call_#{k}", args),
+        tool_message("call_#{k}", read_result_json(path, content)),
+        assistant_message("done #{k}")
+      ]
+    }
+  end
+
+  # The SSE scripts for a list of read turns. Every usage frame reports the
+  # fixture tokenizer's F of the request list the agent is expected to send
+  # (deterministic — every response is scripted), so the agent's anchored
+  # estimate tracks the transcript's true weight exactly. `first_overrides`
+  # maps a turn number to the compacted first-request list expected in place
+  # of the full history.
+  defp read_scripts(specs, first_overrides \\ %{}) do
+    {scripts, _transcript} =
+      Enum.map_reduce(specs, [], fn spec, transcript ->
+        first = Map.get(first_overrides, spec.k, transcript ++ [user_message(spec.prompt)])
+
+        # The second episode's request: the batch flushed, the final reply not
+        # yet appended (expected is [user, batch_assistant, tool, final]).
+        mid = first ++ Enum.slice(spec.expected, 1, 2)
+
+        scripts = [
+          call_tool_episode("call_#{spec.k}", "read_file", spec.args,
+            usage: {f_of(first), 5, f_of(first) + 5}
+          ),
+          final_episode(spec.final, usage: {f_of(mid), 5, f_of(mid) + 5})
+        ]
+
+        {scripts, transcript ++ spec.expected}
+      end)
+
+    # One level only: every episode stays its own list of steps — one
+    # connection per episode.
+    Enum.concat(scripts)
+  end
+
+  defp start_read_server(ctx, specs, first_overrides \\ %{}) do
+    for spec <- specs, do: write_sandbox(ctx, spec.args["path"], spec.content)
+    start_server(read_scripts(specs, first_overrides))
+  end
+
+  # Drives each prompt to idle, collecting both forwarded request bodies of
+  # every read turn in order.
+  defp drive_read_turns(agent, prompts) do
+    for prompt <- prompts do
+      send(agent, {:prompt, self(), prompt})
+      assert_receive {:sse_request, "POST", _, _, first_body}, 2_000
+      assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
+      assert_receive {:phase, :idle}, 4_000
+      {first_body, second_body}
+    end
+  end
+
+  @tag :tmp_dir
+  test "compaction drops the oldest whole turns when the estimate crosses 80%", ctx do
+    window = 2000
+    threshold = div(window * 4, 5)
+    specs = [read_turn(1, 800), read_turn(2, 800), read_turn(3, 800)]
+    full = Enum.flat_map(specs, & &1.expected)
+
+    # The anchored estimate sits under the trigger at the second prompt and
+    # crosses it at the third; the pure contract then drops exactly one turn.
+    anchor_after = fn k -> %{tokens: f_of(Enum.take(full, 4 * k - 1)), index: 4 * k - 1} end
+
+    estimate_at_prompt = fn k ->
+      Accounting.estimate(
+        Enum.take(full, 4 * (k - 1)) ++ [user_message("turn #{k}")],
+        anchor_after.(k - 1)
+      )
+    end
+
+    assert estimate_at_prompt.(2) <= threshold
+    assert estimate_at_prompt.(3) > threshold
+
+    messages_at_3 = Enum.take(full, 8) ++ [user_message("turn 3")]
+    plan = Accounting.compact(messages_at_3, anchor_after.(2), window)
+    assert plan.dropped == 1
+    refute plan.oversize
+
+    server = start_read_server(ctx, specs, %{3 => plan.kept})
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir, session_dir: sessions, provider: provider(server, window))
+
+    [_first, _second, {third_first, _request}] =
+      drive_read_turns(agent, Enum.map(specs, & &1.prompt))
+
+    # The eviction is announced with the estimate bracket.
+    before = Accounting.estimate(messages_at_3, anchor_after.(2))
+    after_estimate = Accounting.estimate(plan.kept, plan.anchor)
+
+    assert_receive {:entry, :system, context_entry}, 2_000
+
+    assert context_entry ==
+             "[context: dropped 1 oldest turn(s) — est #{before}→#{after_estimate} of #{window}]"
+
+    # The next request carries exactly the retained turns: the first turn's
+    # user text and its tool batch are absent, the newest turn is present.
+    messages = request_messages(third_first)
+    assert messages == plan.kept
+    assert [%{"role" => "user", "content" => "turn 2"} | _rest] = messages
+    refute Enum.any?(messages, &(&1["content"] == "turn 1"))
+    refute Enum.any?(messages, &match?(%{"tool_call_id" => "call_1"}, &1))
+
+    # The file agrees with the request and records the eviction; load
+    # succeeding is itself the no-dangling invariant. By load time turn 3 has
+    # also completed, so the transcript is the retained turns plus its batch.
+    [turn_3] = Enum.drop(specs, 2)
+
+    id = session_id(sessions)
+    {:ok, session} = Session.load(sessions, id)
+
+    assert session.messages == plan.kept ++ Enum.drop(turn_3.expected, 1)
+    assert hd(plan.kept)["role"] == "user"
+
+    assert [
+             %{
+               "at" => at,
+               "turns" => 1,
+               "window" => ^window,
+               "estimate_before" => ^before,
+               "estimate_after" => ^after_estimate
+             }
+           ] = session.compactions
+
+    assert is_binary(at)
+  end
+
+  @tag :tmp_dir
+  test "a transcript under 80% is untouched", ctx do
+    window = 2000
+    threshold = div(window * 4, 5)
+
+    # Sized so the third prompt's anchored estimate sits just under the
+    # trigger (~79%) — one more turn would cross it.
+    specs = [read_turn(1, 752), read_turn(2, 752), read_turn(3, 752)]
+    full = Enum.flat_map(specs, & &1.expected)
+    anchor_2 = %{tokens: f_of(Enum.take(full, 7)), index: 7}
+    messages_at_3 = Enum.take(full, 8) ++ [user_message("turn 3")]
+
+    estimate = Accounting.estimate(messages_at_3, anchor_2)
+    assert estimate in (threshold - 100)..threshold
+
+    server = start_read_server(ctx, specs)
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir, session_dir: sessions, provider: provider(server, window))
+
+    [_first, _second, {third_first, _request}] =
+      drive_read_turns(agent, Enum.map(specs, & &1.prompt))
+
+    # No context entry, no eviction: the third request carries the full history.
+    assert request_messages(third_first) == messages_at_3
+    refute_received {:entry, :system, "[context: " <> _}
+
+    # No eviction record anywhere — not in the loaded shape, not in the bytes.
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+    assert session.compactions == []
+    assert session.messages == full
+    refute read_session(sessions) =~ "compactions"
+  end
+
+  @tag :tmp_dir
+  test "a nil window never compacts", ctx do
+    # The same oversized transcript the dropping test uses, but the provider
+    # carries no context_tokens (the default helper): nothing compacts,
+    # nothing is guessed (ADR 0022 §2).
+    specs = [read_turn(1, 800), read_turn(2, 800), read_turn(3, 800)]
+    full = Enum.flat_map(specs, & &1.expected)
+    messages_at_3 = Enum.take(full, 8) ++ [user_message("turn 3")]
+
+    server = start_read_server(ctx, specs)
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    [_first, _second, {third_first, _request}] =
+      drive_read_turns(agent, Enum.map(specs, & &1.prompt))
+
+    assert request_messages(third_first) == messages_at_3
+    refute_received {:entry, :system, "[context: " <> _}
+
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+    assert session.compactions == []
+    assert session.messages == full
+  end
+
+  @tag :tmp_dir
+  test "an oversize single turn is kept whole with a warning", ctx do
+    window = 2000
+    threshold = div(window * 4, 5)
+
+    # One turn whose weight alone exceeds the whole budget: it cannot be
+    # split (whole-turn rule) and cannot be dropped (the newest question), so
+    # it is kept and warned.
+    huge = String.duplicate("a", 4 * threshold + 64)
+
+    server = start_server([final_episode("noted", usage: 100)])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir, session_dir: sessions, provider: provider(server, window))
+
+    send(agent, {:prompt, self(), huge})
+
+    assert_receive {:entry, :system,
+                    "[context: the remaining turn alone exceeds the 80% window budget — kept whole]"},
+                   2_000
+
+    refute_received {:entry, :system, "[context: dropped" <> _}
+
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+    assert request_messages(body) == [%{"role" => "user", "content" => huge}]
+
+    assert_receive {:token, "noted"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # Nothing dropped — no eviction record exists.
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+    assert session.compactions == []
+  end
+
+  @tag :tmp_dir
+  test "the anchor persists and is adopted on resume", ctx do
+    window = 2000
+    threshold = div(window * 4, 5)
+
+    # Sized so the pure heuristic over the whole transcript stays under the
+    # trigger while the anchored estimate crosses it: only an adopted anchor
+    # can produce the eviction asserted below.
+    specs = [read_turn(1, 780), read_turn(2, 780)]
+    full = Enum.flat_map(specs, & &1.expected)
+    u3 = user_message("turn 3")
+
+    # The resumed agent's anchor: the last scripted frame of turn 2 — F of its
+    # 7-message request — covering those 7 messages.
+    anchor = %{tokens: f_of(Enum.take(full, 7)), index: 7}
+    messages_at_resume = full ++ [u3]
+
+    assert Accounting.estimate(messages_at_resume, anchor) > threshold
+    assert Accounting.estimate(messages_at_resume, nil) <= threshold
+
+    plan = Accounting.compact(messages_at_resume, anchor, window)
+    assert plan.dropped == 1
+
+    for spec <- specs, do: write_sandbox(ctx, spec.args["path"], spec.content)
+
+    server =
+      start_server(
+        read_scripts(specs) ++
+          [
+            final_episode("ack", usage: {f_of(plan.kept ++ [u3]), 5, f_of(plan.kept ++ [u3]) + 5})
+          ]
+      )
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir, session_dir: sessions, provider: provider(server, window))
+
+    [_first, _second] = drive_read_turns(agent, Enum.map(specs, & &1.prompt))
+    id = session_id(sessions)
+
+    # The file persists the anchor: the last scripted frame's prompt_tokens
+    # over that episode's request message count. No evictions yet.
+    prompt_tokens = anchor.tokens
+
+    decoded =
+      sessions
+      |> read_session()
+      |> Jason.decode!()
+
+    assert %{"context" => %{"prompt_tokens" => ^prompt_tokens, "messages" => 7}} = decoded
+
+    {:ok, saved} = Session.load(sessions, id)
+    assert saved.context == %{prompt_tokens: anchor.tokens, messages: 7}
+    assert saved.compactions == []
+
+    # A fresh agent adopts both diagnostics — threaded exactly as
+    # application.ex threads them — and evicts on the ANCHORED estimate.
+    {resumed, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: provider(server, window),
+        resume: %{
+          id: saved.id,
+          pin: saved.pin,
+          messages: saved.messages,
+          created_at: saved.created_at,
+          context: saved.context,
+          compactions: saved.compactions
+        }
+      )
+
+    send(resumed, {:prompt, self(), "turn 3"})
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+
+    # plan.kept already carries the prompting user message — the eviction
+    # never touches the newest turn.
+    assert request_messages(body) == plan.kept
+    assert hd(request_messages(body))["content"] == "turn 2"
+    assert_receive {:phase, :idle}, 2_000
+
+    # The file gains its first eviction record.
+    {:ok, next} = Session.load(sessions, id)
+
+    assert [%{"at" => at, "turns" => 1, "window" => ^window}] = next.compactions
+    assert is_binary(at)
+    assert next.messages == plan.kept ++ [assistant_message("ack")]
+  end
+
+  @tag :tmp_dir
+  test "a malformed resume anchor or compactions never crashes a prompt (B1)", ctx do
+    window = 2000
+    spec = read_turn(1, 40)
+    u1 = user_message("turn 1")
+    u2 = user_message("turn 2")
+    full = spec.expected
+
+    # Both arms of the hostile-review B1 finding: a hand-built resume map can
+    # carry a context of any shape (the loader tolerates one, ADR 0022 §6)
+    # and a compactions value that is not a list. Neither may raise.
+    resume = %{
+      id: "20261029-000000-abcdef",
+      pin: %{profile: nil, model: nil, base_url: nil},
+      messages: full ++ [u1],
+      context: %{prompt_tokens: "412", messages: 6},
+      compactions: nil
+    }
+
+    server = start_server([final_episode("ack", usage: {10, 5, 15})])
+    write_sandbox(ctx, spec.args["path"], spec.content)
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: Path.join(ctx.tmp_dir, "sessions"),
+        provider: provider(server, window),
+        resume: resume
+      )
+
+    send(agent, {:prompt, self(), "turn 2"})
+    assert_receive {:sse_request, "POST", _, _, _body}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+    assert Process.alive?(agent)
+
+    # A well-shaped anchor whose index claims more messages than exist (M1)
+    # is no anchor at all: the trigger keeps working on the heuristic.
+    resume2 = %{resume | context: %{prompt_tokens: 10, messages: 999_999}}
+
+    {agent2, _sup2} =
+      start_agent(server, ctx.tmp_dir, provider: provider(server, window), resume: resume2)
+
+    send(agent2, {:prompt, self(), "turn 2"})
+    assert_receive {:sse_request, "POST", _, _, _body}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+    assert Process.alive?(agent2)
+
+    # And an integer anchor past the end must not disable the trigger: this
+    # transcript alone is far over a tiny window, so the prompt-time hook
+    # still evicts (asserted through the request body).
+    big =
+      Enum.map(1..8, fn i -> %{role: "user", content: String.duplicate("x", 400) <> "#{i}"} end)
+
+    resume3 = %{resume2 | messages: big, context: %{prompt_tokens: 10, messages: 999_999}}
+
+    {agent3, _sup3} =
+      start_agent(server, ctx.tmp_dir, provider: provider(server, 100), resume: resume3)
+
+    send(agent3, {:prompt, self(), "last"})
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+    messages = request_messages(body)
+    refute hd(messages)["content"] == "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1"
+    assert Process.alive?(agent3)
+  end
+
+  @tag :tmp_dir
+  test "a resumed-agent save keeps the pre-compaction file shape (m3)", ctx do
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    # A session file that predates compaction: valid messages, no diagnostics.
+    id = "20261029-000000-abcdef"
+
+    body = %{
+      "version" => 1,
+      "id" => id,
+      "created_at" => "2026-10-29T00:00:00Z",
+      "pin" => %{"profile" => nil, "model" => nil, "base_url" => nil},
+      "messages" => [%{"role" => "user", "content" => "hello"}]
+    }
+
+    File.mkdir_p!(sessions)
+    file = Path.join(sessions, id <> ".json")
+    File.write!(file, Jason.encode!(body))
+    {:ok, loaded} = Session.load(sessions, id)
+
+    # The loader fills context: nil / compactions: [] in — but a save of that
+    # same map must not write the keys back (ADR 0022 §6: written only once
+    # they exist), so the file keeps its pre-compaction shape.
+    assert :ok = Session.save(sessions, loaded)
+
+    decoded =
+      sessions
+      |> Path.join(id <> ".json")
+      |> File.read!()
+      |> Jason.decode!()
+
+    refute Map.has_key?(decoded, "context")
+    refute Map.has_key?(decoded, "compactions")
+  end
+
+  @tag :tmp_dir
+  test "the estimate tracks the fixture provider within the stated band", ctx do
+    # Turn 1 is a read_file batch, turns 2 and 3 plain replies. Every usage
+    # frame reports the fixture tokenizer's F of the request list the agent is
+    # expected to send — deterministic, because every response is scripted.
+    turn1 = read_turn(1, 40)
+    [u1, tc1, tool1, af1] = turn1.expected
+    u2 = user_message("turn 2")
+    af2 = assistant_message("done 2")
+    u3 = user_message("turn 3")
+    af3 = assistant_message("done 3")
+    u4 = user_message("turn 4")
+
+    request_1a = [u1]
+    request_1b = [u1, tc1, tool1]
+    request_2 = request_1b ++ [af1, u2]
+    request_3 = request_2 ++ [af2, u3]
+
+    server =
+      start_server([
+        call_tool_episode("call_1", "read_file", turn1.args,
+          usage: {f_of(request_1a), 5, f_of(request_1a) + 5}
+        ),
+        final_episode("done 1", usage: {f_of(request_1b), 5, f_of(request_1b) + 5}),
+        final_episode("done 2", usage: {f_of(request_2), 5, f_of(request_2) + 5}),
+        final_episode("done 3", usage: {f_of(request_3), 5, f_of(request_3) + 5})
+      ])
+
+    write_sandbox(ctx, turn1.args["path"], turn1.content)
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    # After each turn: the anchored estimate must track the fixture
+    # tokenizer's next request within the stated band — 8 tokens of
+    # scaffolding per message appended since the frame, plus slack.
+    assert_band = fn anchor, after_turn, next_request, appended ->
+      estimate = Accounting.estimate(after_turn, anchor)
+      assert abs(estimate - f_of(next_request)) <= 8 * length(appended) + 24
+    end
+
+    send(agent, {:prompt, self(), "turn 1"})
+    assert_receive {:sse_request, "POST", _, _, body_1a}, 2_000
+    assert request_messages(body_1a) == request_1a
+    assert_receive {:sse_request, "POST", _, _, body_1b}, 4_000
+    assert request_messages(body_1b) == request_1b
+    assert_receive {:phase, :idle}, 4_000
+
+    assert_band.(%{tokens: f_of(request_1b), index: 3}, [u1, tc1, tool1, af1], request_2, [
+      af1,
+      u2
+    ])
+
+    send(agent, {:prompt, self(), "turn 2"})
+    assert_receive {:sse_request, "POST", _, _, body_2}, 2_000
+    assert request_messages(body_2) == request_2
+    assert_receive {:phase, :idle}, 4_000
+
+    assert_band.(%{tokens: f_of(request_2), index: 5}, request_2 ++ [af2], request_3, [af2, u3])
+
+    send(agent, {:prompt, self(), "turn 3"})
+    assert_receive {:sse_request, "POST", _, _, body_3}, 2_000
+    assert request_messages(body_3) == request_3
+    assert_receive {:phase, :idle}, 4_000
+
+    assert_band.(
+      %{tokens: f_of(request_3), index: 7},
+      request_3 ++ [af3],
+      request_3 ++ [af3, u4],
+      [
+        af3,
+        u4
+      ]
+    )
   end
 
   defp free_port do

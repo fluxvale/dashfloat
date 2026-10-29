@@ -606,7 +606,9 @@ defmodule DashFloat.ApplicationTest do
                id: id,
                pin: session.pin,
                messages: messages,
-               created_at: session.created_at
+               created_at: session.created_at,
+               context: session.context,
+               compactions: session.compactions
              }
 
       assert agent_opts[:name] == DashFloat.Agent

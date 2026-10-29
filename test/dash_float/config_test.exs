@@ -769,6 +769,74 @@ defmodule DashFloat.ConfigTest do
     end
   end
 
+  describe "compaction settings key (inert stage-2 seam, ADR 0022)" do
+    test "a profile compaction block loads without the unknown-settings warning" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
+            settings: { compaction: { instructions: 'keep the design decisions' } },
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      logs =
+        capture_log(fn -> assert {:ok, %Config{model: "m1"}} = Config.load(dir, %{}, []) end)
+
+      refute logs =~ "unknown profile settings ignored"
+    end
+
+    test "the compaction key changes nothing: the struct is identical with and without settings" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
+            settings: { compaction: { instructions: 'keep the design decisions' } },
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      plain = tmp_dir()
+
+      write!(plain, """
+      {
+        configVersion: 3,
+        defaultProfile: 'work',
+        profiles: [{
+          name: 'work',
+          providers: [{ baseUrl: '#{@base_url}', models: [{ model: 'm1' }] }],
+        }],
+      }
+      """)
+
+      write_keys!(plain, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      assert {:ok, with_key} = Config.load(dir, %{}, [])
+      assert {:ok, without} = Config.load(plain, %{}, [])
+      assert with_key == without
+    end
+  end
+
   describe "Presets.suggest_model/1 (ADR 0015)" do
     test "the preset cheap models keyed by base URL; nil for custom providers" do
       assert Presets.suggest_model("https://api.z.ai/api/coding/paas/v4") == "glm-5.3-flash"

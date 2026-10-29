@@ -23,12 +23,19 @@ defmodule DashFloat.Session do
           base_url: String.t() | nil
         }
 
+  @type context :: %{prompt_tokens: non_neg_integer(), messages: non_neg_integer()}
+
+  # The two compaction diagnostics are optional (ADR 0022 §6): a saved map
+  # without them writes the pre-compaction shape byte-identically, and load
+  # always fills them in (nil / []).
   @type t :: %{
-          version: 1,
-          id: String.t(),
-          created_at: String.t(),
-          pin: pin(),
-          messages: [map()]
+          required(:version) => 1,
+          required(:id) => String.t(),
+          required(:created_at) => String.t(),
+          required(:pin) => pin(),
+          required(:messages) => [map()],
+          optional(:context) => context() | nil,
+          optional(:compactions) => [map()]
         }
 
   @doc "The sessions directory: `.../dashfloat/sessions` under the XDG data dir."
@@ -60,7 +67,26 @@ defmodule DashFloat.Session do
     # The id names the file (ADR 0014 §2): only the minted shape ever
     # reaches the filesystem, so no hand-supplied id can carry a path.
     with :ok <- check_save_id(session.id) do
-      do_save(dir, session)
+      do_save(dir, normalize(session))
+    end
+  end
+
+  # The additive diagnostics are written only once they exist (ADR 0022 §6),
+  # so a loaded map — which always carries `context: nil, compactions: []` —
+  # re-saves byte-identically to a pre-compaction file (hostile review m3).
+  defp normalize(session) do
+    session
+    |> drop_empty(:context, &is_nil/1)
+    |> drop_empty(:compactions, &(&1 == []))
+  end
+
+  defp drop_empty(session, key, empty?) do
+    value = Map.get(session, key)
+
+    if Map.has_key?(session, key) and empty?.(value) do
+      Map.delete(session, key)
+    else
+      session
     end
   end
 
@@ -92,7 +118,10 @@ defmodule DashFloat.Session do
   field; dangling tool calls gain synthesized cancelled results in memory.
   The requested id may carry the `.json` suffix `ls` prints; the strict id
   shape applies either way. The messages come back string-keyed as decoded
-  (plus repairs).
+  (plus repairs). The compaction diagnostics come back tolerant (ADR 0022
+  §6, the pin precedent): `context` is the atom-keyed anchor when well-shaped
+  and nil otherwise; `compactions` is the eviction history verbatim when a
+  list and [] otherwise.
   """
   @spec load(Path.t(), String.t()) :: {:ok, t()} | {:error, String.t()}
   def load(dir, requested) do
@@ -118,7 +147,9 @@ defmodule DashFloat.Session do
          id: id,
          created_at: created_at,
          pin: build_pin(decoded),
-         messages: repair(messages)
+         messages: repair(messages),
+         context: build_context(decoded),
+         compactions: build_compactions(decoded)
        }}
     end
   end
@@ -424,4 +455,22 @@ defmodule DashFloat.Session do
 
   defp string_or_nil(value) when is_binary(value), do: value
   defp string_or_nil(_other), do: nil
+
+  # The context anchor rides along as diagnostics for a resumed estimate
+  # (ADR 0022 §6); absent, or not a map of two non-negative integers, it
+  # estimates from nothing — never a refusal, the `pin` precedent.
+  defp build_context(%{"context" => %{"prompt_tokens" => prompt_tokens, "messages" => messages}})
+       when is_integer(prompt_tokens) and prompt_tokens >= 0 and is_integer(messages) and
+              messages >= 0 do
+    %{prompt_tokens: prompt_tokens, messages: messages}
+  end
+
+  defp build_context(_decoded), do: nil
+
+  # The eviction history is carried verbatim, string-keyed as decoded —
+  # diagnostics, not conversation truth; only list-ness is checked.
+  defp build_compactions(%{"compactions" => compactions}) when is_list(compactions),
+    do: compactions
+
+  defp build_compactions(_decoded), do: []
 end
