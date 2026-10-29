@@ -179,8 +179,10 @@ becoming instruction. Fields: tool name, risk class, normalized arguments
 lines *and* 8 KiB of raw content total (line-byte-truncated with the same
 marker) so a single unbounded content line cannot balloon the check. The caps
 are on content, not wire size: JSON escaping inflates the encoded prompt
-worst-case ~7x (pathological control characters), a bounded ceiling of ~60 KB
-for a maximal pathological call — accepted. The symmetry is the design: in
+worst-case ~7x (pathological control characters) — measured through the real
+preview builder, a maximal pathological `edit_file` reaches ~66 KB, a bounded
+ceiling accepted (the suite pins the escaping budget at 34 KB for pure
+backslashes and the cap's absence fails it by ~10 KB). The symmetry is the design: in
 AUTO a model plays the human's role on exactly the evidence the human sees in
 BUILD.
 
@@ -238,9 +240,11 @@ The surfaces that drive the seam:
 
 ### 8. Chrome
 
-One new status-bar span, always present, between the model and ctx spans:
-`❯ ~/dir | glm (flux) | Auto | ctx 4.1k/128k | …` — the mode is session-wide standing
-truth like the model label; hiding the default would imply "sometimes there is a mode".
+One new status-bar span, always present, leading the top status bar's groups:
+`Build · ctx 4.1k/128k · ● Idle · L12/40` — cwd, model, and live tok/s moved to
+the stats footer under the composer (ADR 0015 §2), so the mode heads the
+session-state bar instead of sitting beside the model. The mode is session-wide
+standing truth; hiding the default would imply "sometimes there is a mode".
 
 | Mode | Label | Role |
 | --- | --- | --- |
