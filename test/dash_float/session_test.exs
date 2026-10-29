@@ -547,6 +547,31 @@ defmodule DashFloat.SessionTest do
     end
   end
 
+  describe "session id shape" do
+    test "save refuses an id outside the minted shape, writing nothing" do
+      dir = Path.join("/tmp/opencode", "dashfloat-id-shape-#{System.unique_integer([:positive])}")
+
+      assert {:error, msg} = Session.save(dir, session([], id: "../escape"))
+      assert msg == "session ids look like 20261027-143052-a1b2c3"
+      refute File.exists?(dir)
+    end
+
+    @tag :tmp_dir
+    test "load refuses an id outside the shape, including a traversal attempt", ctx do
+      assert {:error, msg} = Session.load(ctx.tmp_dir, "../escape")
+      assert msg == "session ids look like 20261027-143052-a1b2c3"
+      assert File.ls!(ctx.tmp_dir) == []
+    end
+
+    @tag :tmp_dir
+    test "a requested id with the trailing .json `ls` prints still loads", ctx do
+      save_ok(ctx, [%{role: "user", content: "hi"}])
+      assert {:ok, loaded} = Session.load(ctx.tmp_dir, @id <> ".json")
+      assert loaded.id == @id
+      assert loaded.messages == [%{"role" => "user", "content" => "hi"}]
+    end
+  end
+
   describe "orphan tool results" do
     @tag :tmp_dir
     test "a tool message with no assistant batch before it refuses naming the index", ctx do

@@ -13,6 +13,8 @@ defmodule DashFloat.Session do
 
   @version 1
 
+  @id_shape ~r/\A[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\z/
+
   @type pin :: %{
           profile: String.t() | nil,
           model: String.t() | nil,
@@ -53,14 +55,18 @@ defmodule DashFloat.Session do
   """
   @spec save(Path.t(), t()) :: :ok | {:error, String.t()}
   def save(dir, session) do
-    case ensure_dir(dir) do
-      :ok ->
-        path = path_for(dir, session.id)
-        contents = Jason.encode!(session)
-        Posture.write_private(path, contents <> "\n")
+    # The id names the file (ADR 0014 §2): only the minted shape ever
+    # reaches the filesystem, so no hand-supplied id can carry a path.
+    with :ok <- check_id_shape(session.id) do
+      case ensure_dir(dir) do
+        :ok ->
+          path = path_for(dir, session.id)
+          contents = Jason.encode!(session)
+          Posture.write_private(path, contents <> "\n")
 
-      {:error, _reason} = error ->
-        error
+        {:error, _reason} = error ->
+          error
+      end
     end
   end
 
@@ -69,10 +75,20 @@ defmodule DashFloat.Session do
   name the directory; unreadable or undecodable files, schema violations, and
   orphaned tool results refuse naming the path, the message index, and the
   field; dangling tool calls gain synthesized cancelled results in memory.
-  The messages come back string-keyed as decoded (plus repairs).
+  The requested id may carry the `.json` suffix `ls` prints; the strict id
+  shape applies either way. The messages come back string-keyed as decoded
+  (plus repairs).
   """
   @spec load(Path.t(), String.t()) :: {:ok, t()} | {:error, String.t()}
-  def load(dir, id) do
+  def load(dir, requested) do
+    id = String.replace_suffix(requested, ".json", "")
+
+    with :ok <- check_id_shape(id) do
+      do_load(dir, id)
+    end
+  end
+
+  defp do_load(dir, id) do
     path = path_for(dir, id)
 
     with {:ok, body} <- read_file(path, dir, id),
@@ -92,6 +108,13 @@ defmodule DashFloat.Session do
          messages: repair(messages)
        }}
     end
+  end
+
+  # The error names the expected shape, never the offending id (ADR 0014 §4).
+  defp check_id_shape(id) do
+    if Regex.match?(@id_shape, id),
+      do: :ok,
+      else: {:error, "session ids look like 20261027-143052-a1b2c3"}
   end
 
   defp path_for(dir, id), do: Path.join(dir, id <> ".json")

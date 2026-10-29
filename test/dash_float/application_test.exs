@@ -640,7 +640,7 @@ defmodule DashFloat.ApplicationTest do
 
     test "a setup classification skips the pin compare but still hands the session off" do
       sessions = tmp_dir()
-      id = "20261027-144500-fg5678"
+      id = "20261027-144500-ab5678"
       pin = %{profile: "personal", model: "glm-5.3", base_url: nil}
 
       write_session_file(
@@ -660,7 +660,7 @@ defmodule DashFloat.ApplicationTest do
     test "a hand-written dangling session hands off synthesized cancelled results" do
       config_dir = v3_dir()
       sessions = tmp_dir()
-      id = "20261027-150000-gh6789"
+      id = "20261027-150000-be6789"
 
       dangling =
         Jason.encode!(%{
