@@ -2,7 +2,7 @@
 
 - **Status:** Accepted; **amended 2026-10-29** (`StructFieldAmount`
   parameterized to `max_fields: 40` for the TUI's whole-state struct; see
-  [Amendment: StructFieldAmount at 40](#amendment-structfieldamount-at-40-tuistate)
+  [Amendment (2026-10-29): StructFieldAmount at 40](#amendment-2026-10-29-structfieldamount-at-40-tuistate)
   below)
 - **Date:** 2026-10-23
 - **Implements:** [issue #10](https://github.com/fluxvale/dashfloat/issues/10).
@@ -70,8 +70,9 @@ future credo stays off until it is enumerated in both.
 single-app adaptations" rule above, recorded so the ruleset and the ADR
 cannot drift.
 
-`StructFieldAmount` is parameterized to `max_fields: 40` globally (the fleet
-default is 15): after the ghost-text plumbing ([ADR
+`StructFieldAmount` is parameterized to `max_fields: 40` globally (credo's
+default is 31 — the fleet config passes no parameter, i.e. 31): after the
+ghost-text plumbing ([ADR
 0015](0015-input-surface-cursor-stats-ghost.md) §3), `TUI.State` carries 38
 fields. That size is deliberate — the TUI state is one flat pure struct
 whose transitions read it whole (ADRs 0002, 0006, 0015; the ADR 0002

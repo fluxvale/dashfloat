@@ -233,19 +233,20 @@ defmodule DashFloat.TUI do
     end
   end
 
-  # A suggestion landed (ADR 0015 §3): accepted only while its epoch is
-  # current, the UI is idle, the draft is empty, and suggestions are on.
-  # A stale epoch is dropped with the state UNTOUCHED — a newer request may
-  # still be in flight, and clearing its task here would orphan it.
-  def handle_info({:suggestion, epoch, _result}, state) when epoch != state.suggest_epoch,
+  # A suggestion landed (ADR 0015 §3): the text arrives ALREADY normalized —
+  # fetch_async/3 normalizes inside the supervised task, so the UI process
+  # never touches the raw body. Accepted only while its epoch is current, the
+  # UI is idle, the draft is empty, and suggestions are on. A stale epoch is
+  # dropped with the state UNTOUCHED — a newer request may still be in
+  # flight, and clearing its task here would orphan it.
+  def handle_info({:suggestion, epoch, _text}, state) when epoch != state.suggest_epoch,
     do: {:noreply, state, %{render?: false}}
 
-  def handle_info({:suggestion, epoch, result}, state) do
-    text = if accept_suggestion?(state, epoch), do: Suggest.normalize(result), else: nil
-
-    case text do
-      nil -> {:noreply, %{state | suggest_task: nil}, %{render?: false}}
-      text -> {:noreply, %{state | suggestion: text, suggest_task: nil}}
+  def handle_info({:suggestion, epoch, text}, state) do
+    if accept_suggestion?(state, epoch) and is_binary(text) do
+      {:noreply, %{state | suggestion: text, suggest_task: nil}}
+    else
+      {:noreply, %{state | suggest_task: nil}, %{render?: false}}
     end
   end
 
@@ -408,20 +409,14 @@ defmodule DashFloat.TUI do
 
   defp suggest_arm(state) do
     if state.live? or state.suggest_fetcher do
-      state
-      |> kill_pending_suggest()
-      |> arm_suggest_debounce()
+      # No orphan-kill at the arm: a pending debounce/task was already reaped
+      # by suggest_reap/1 earlier in this pipeline; the ordering is the
+      # guarantee.
+      arm_suggest_debounce(state)
     else
       %{state | suggest_arm: false}
     end
   end
-
-  # A re-arm must never orphan a pending debounce or an in-flight task (the
-  # dismiss path's cancel rule, ADR 0015 §3): the existing reap runs first —
-  # kill, clear, epoch bump — so the old request is dead on arrival before
-  # the new one schedules.
-  defp kill_pending_suggest(%{suggest_ref: nil, suggest_task: nil} = state), do: state
-  defp kill_pending_suggest(state), do: suggest_reap(%{state | suggest_reap: true})
 
   defp arm_suggest_debounce(state) do
     %{

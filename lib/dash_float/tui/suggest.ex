@@ -19,7 +19,18 @@ defmodule DashFloat.TUI.Suggest do
   @max_tokens 48
   @timeout_ms 5_000
   @display_cap 80
+  # The raw-body cap: everything downstream of normalize/1 runs on ≤ 4 KiB —
+  # max_tokens only bounds well-behaved providers (ADR 0015 §3's bounds).
+  @raw_cap 4096
   @quote_chars ["\"", "'", "`"]
+
+  # Control bytes (ESC, BEL, NUL, DEL), the C1 range U+0080–U+009F (the 8-bit
+  # CSI introducer on UTF-8 terminals), and bidi/format characters
+  # (zero-width, directional overrides, BOM) never reach the composer: the
+  # ghost is drawn as placeholder text, so a smuggled escape or direction
+  # override would be interpreted by the terminal byte stream. The printable
+  # remainder is inert text.
+  @scrub ~r/[\x00-\x1f\x7f\x80-\x9f\x{200b}-\x{200f}\x{202a}-\x{202e}\x{2066}-\x{2069}\x{feff}]/u
 
   @instruction "Suggest the user's next message: one short line, at most 8 words, plain text only — no quotes, no explanation."
 
@@ -106,8 +117,10 @@ defmodule DashFloat.TUI.Suggest do
   Starts the supervised side-request (the `Catalog.refresh_async` shape):
   under `DashFloat.TaskSupervisor`, the fetcher (an `{m, f}` MFA or fun/2;
   default the real HTTP path) runs rescued to `:error` — a raising fetcher
-  is just another failure — and the result lands as
-  `{:suggestion, epoch, result}` on `send_to` (default `self()`).
+  is just another failure — and the ALREADY-NORMALIZED ghost lands as
+  `{:suggestion, epoch, text}` (`String.t() | nil`) on `send_to` (default
+  `self()`): normalization runs inside the supervised task, never in the TUI
+  process.
   """
   @spec fetch_async(Config.t(), String.t(), keyword()) :: {:ok, pid()} | {:error, term()}
   def fetch_async(%Config{} = config, tail, opts \\ []) do
@@ -116,7 +129,8 @@ defmodule DashFloat.TUI.Suggest do
     fetcher = Keyword.get(opts, :fetcher) || {__MODULE__, :request}
 
     Task.Supervisor.start_child(DashFloat.TaskSupervisor, fn ->
-      send(send_to, {:suggestion, epoch, run(fetcher, config, tail)})
+      # Normalize HERE, inside the supervised task — never in the TUI process.
+      send(send_to, {:suggestion, epoch, normalize(run(fetcher, config, tail))})
     end)
   end
 
@@ -133,15 +147,27 @@ defmodule DashFloat.TUI.Suggest do
 
   @doc """
   Display normalization: `:error` → nil; `{:ok, raw}` → the first non-blank
-  line, trimmed, control bytes scrubbed (an escape byte must never reach
-  the terminal byte stream), ONE pair of surrounding quotes stripped,
-  hard-capped to `@display_cap` chars. Blank at any point → nil — no ghost
-  at all.
+  line, trimmed, control/bidi characters scrubbed (an escape byte must never
+  reach the terminal byte stream), ONE pair of surrounding quotes stripped,
+  hard-capped to `@display_cap` chars. Bounded by construction: the raw body
+  is capped to `@raw_cap` chars before any other work, and invalid UTF-8 is
+  repaired at the trust boundary (the wrap/markdown precedent). Blank at any
+  point → nil — no ghost at all.
   """
   @spec normalize({:ok, term()} | :error) :: String.t() | nil
   def normalize(:error), do: nil
 
   def normalize({:ok, raw}) when is_binary(raw) do
+    # The cap is the bound (O(@raw_cap) graphemes): a misbehaving provider's
+    # multi-megabyte body must not stall the caller — max_tokens only bounds
+    # well-behaved ones.
+    capped = String.slice(raw, 0, @raw_cap)
+
+    # Invalid UTF-8 repaired at the trust boundary (the wrap/markdown
+    # precedent): a raw byte would hard-fail the drawn frame and freeze the
+    # composer. Empty replacement — a pure-invalid body is no ghost at all.
+    raw = if String.valid?(capped), do: capped, else: String.replace_invalid(capped, "")
+
     line =
       raw
       |> String.split("\n")
@@ -155,7 +181,7 @@ defmodule DashFloat.TUI.Suggest do
         ghost =
           line
           |> String.trim()
-          |> scrub_control_bytes()
+          |> scrub()
           |> strip_quotes()
           |> String.slice(0, @display_cap)
 
@@ -165,10 +191,7 @@ defmodule DashFloat.TUI.Suggest do
 
   def normalize({:ok, _other}), do: nil
 
-  # Control bytes (ESC, BEL, NUL, DEL...) never reach the composer: the
-  # ghost is drawn as placeholder text, so a smuggled escape byte would be
-  # interpreted by the terminal. The printable remainder is inert text.
-  defp scrub_control_bytes(line), do: String.replace(line, ~r/[\x00-\x1f\x7f]/, "")
+  defp scrub(line), do: String.replace(line, @scrub, "")
 
   defp strip_quotes(line) do
     cond do

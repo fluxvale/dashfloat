@@ -151,6 +151,43 @@ defmodule DashFloat.TUI.SuggestTest do
       assert Suggest.normalize({:ok, "\e\a\b\x7f"}) == nil
     end
 
+    # The 8-bit CSI introducer (U+009B) and the bidi/format set: the same
+    # threat as C0 control bytes — placeholder text is interpreted by the
+    # terminal byte stream.
+    test "C1 CSI and bidi/format characters are scrubbed too" do
+      assert Suggest.normalize({:ok, "\u{009B}2Jpwn"}) == "2Jpwn"
+      assert Suggest.normalize({:ok, "\u{202E}evil\u{200B}"}) == "evil"
+    end
+
+    # Invalid UTF-8 from a provider used to hard-fail the whole drawn frame
+    # (ExRatatui.draw → {:error, "textarea.placeholder: unexpected value"} —
+    # the composer froze until the ghost cleared). Repaired at the trust
+    # boundary (the wrap/markdown precedent); a body that is nothing but
+    # invalid bytes is no ghost.
+    test "invalid UTF-8 is repaired; a pure-invalid body is nil" do
+      ghost = Suggest.normalize({:ok, <<0xFF, ?a>>})
+
+      assert String.valid?(ghost)
+      assert ghost =~ "a"
+
+      assert Suggest.normalize({:ok, <<0xFF, 0xFE>>}) == nil
+    end
+
+    # The unbounded-scan regression: the raw body is capped to @raw_cap
+    # chars before any other work, so a misbehaving provider cannot stall
+    # the composer (max_tokens only bounds well-behaved ones). 100 ms is a
+    # generous wall-clock ceiling (the input round-trip backstop precedent);
+    # the capped call measures ~2 ms at 5 MB.
+    test "a 5 MB body stays bounded: ≤80-char ghost, under a 100 ms ceiling" do
+      {micros, ghost} =
+        :timer.tc(fn -> Suggest.normalize({:ok, String.duplicate("a", 5_000_000)}) end)
+
+      assert String.length(ghost) == 80
+
+      assert div(micros, 1000) < 100,
+             "normalize took #{div(micros, 1000)}ms on 5 MB — the unbounded scan is back"
+    end
+
     test "a raise inside the HTTP path is rescued to :error (fail-open)" do
       c = config(base_url: "not-a-url")
       assert Suggest.request(c, "tail") == :error
@@ -186,7 +223,7 @@ defmodule DashFloat.TUI.SuggestTest do
   end
 
   describe "fetch_async/3" do
-    test "the fetcher's result lands as {:suggestion, epoch, result} on send_to" do
+    test "the normalized ghost lands as {:suggestion, epoch, text} on send_to" do
       assert {:ok, _pid} =
                Suggest.fetch_async(config(), "tail",
                  send_to: self(),
@@ -194,10 +231,10 @@ defmodule DashFloat.TUI.SuggestTest do
                  fetcher: fn _config, tail -> {:ok, "for " <> tail} end
                )
 
-      assert_receive {:suggestion, 7, {:ok, "for tail"}}, 1_000
+      assert_receive {:suggestion, 7, "for tail"}, 1_000
     end
 
-    test "a raising fetcher is just another failure (rescued to :error)" do
+    test "a raising fetcher is just another failure (rescued to :error → nil)" do
       assert {:ok, _pid} =
                Suggest.fetch_async(config(), "tail",
                  send_to: self(),
@@ -205,7 +242,7 @@ defmodule DashFloat.TUI.SuggestTest do
                  fetcher: fn _config, _tail -> raise "boom" end
                )
 
-      assert_receive {:suggestion, 1, :error}, 1_000
+      assert_receive {:suggestion, 1, nil}, 1_000
     end
   end
 end

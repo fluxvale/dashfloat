@@ -2433,7 +2433,7 @@ defmodule DashFloat.TUITest do
       state = %{State.new(provider: provider()) | suggest_task: task, suggest_epoch: 2}
 
       assert {:noreply, ^state, %{render?: false}} =
-               TUI.handle_info({:suggestion, 1, {:ok, "stale"}}, state)
+               TUI.handle_info({:suggestion, 1, "stale"}, state)
     end
   end
 end
