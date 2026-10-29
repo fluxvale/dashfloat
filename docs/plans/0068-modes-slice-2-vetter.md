@@ -2,8 +2,11 @@
 
 Issue [#68](https://github.com/fluxvale/dashfloat/issues/68). Design:
 [ADR 0016](../decisions/0016-interaction-modes.md) — read §5 (the seam) and all
-of §6 (the check) before starting. Independent of slice 1 (no `DashFloat.Mode`
-dependency). Do not touch the agent or the TUI — slice 3 wires this in.
+of §6 (the check) before starting. Depends on slice 1's `Tools.class/1` (the
+prompt payload embeds the risk class) — write against its frozen contract
+(`class(name) :: :safe | :mutating | :risky`, unknown → `:risky`) and rebase
+onto `feat/modes` once slice 1 lands. Do not touch the agent or the TUI —
+slice 3 wires this in.
 
 Files you will touch: new `lib/dash_float/tools/vetter.ex`, new
 `test/dash_float/tools/vetter_test.exs`. Study `lib/dash_float/llm/chat_stream.ex`
@@ -126,4 +129,5 @@ mix ci
 ```
 
 exits 0. Paste both transcripts. `git diff --stat main -- lib test` shows
-exactly the two new files.
+your two new files plus slice 1's already-merged output (`lib/dash_float/mode.ex`,
+`lib/dash_float/tools.ex`, and their tests) — nothing else.
