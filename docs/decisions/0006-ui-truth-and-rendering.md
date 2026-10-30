@@ -21,7 +21,13 @@
   [issue #67](https://github.com/fluxvale/dashfloat/issues/67) /
   [issue #70](https://github.com/fluxvale/dashfloat/issues/70) —
   composer cursor, stats footer under the input, ghost-text suggestion;
-  see [ADR 0015](0015-input-surface-cursor-stats-ghost.md))
+  see [ADR 0015](0015-input-surface-cursor-stats-ghost.md)); **amended
+  2026-10-31** ([issue #107](https://github.com/fluxvale/dashfloat/issues/107) /
+  [issue #108](https://github.com/fluxvale/dashfloat/issues/108) — user
+  entries bold with an accent `❯` prefix, the chrome margin widened to two
+  cells; see
+  [Amendment (2026-10-31, issues #107 + #108)](#amendment-2026-10-31-issues-107--108-user-entry-style-margin-2)
+  below)
 - **Date:** 2026-10-24
 - **Implements:** [issue #16](https://github.com/fluxvale/dashfloat/issues/16) — Phase 2.5 of the
   [ADR 0001](0001-founding-stack-and-architecture.md) roadmap.
@@ -98,6 +104,8 @@ exists only while work is in flight:
 - **Message rows** — user input echoed dim with a bold `❯ ` prefix on its
   first line, continuation lines indented; assistant output rendered as
   markdown in default foreground; tool and system rows dim (system italic).
+  *(The user row's style is superseded — 2026-10-31, #107: bold default fg,
+  accent `❯` prefix; see the amendment below.)*
   Every entry's rendered lines begin with one blank separator line — no
   special-casing of the first entry; the top padding reads as warmth.
 
@@ -111,7 +119,7 @@ Phase 3 extends the vocabulary by adding roles, not code:
 | `:accent` | `{:rgb, 217, 119, 87}` — terracotta (`#d97757`) |
 | `:dim` | `:dark_gray` |
 | `:dim_italic` | `:dark_gray` + italic (system rows) |
-| `:user` | `:dark_gray` |
+| `:user` | bold, default foreground *(amended 2026-10-31, #107 — was `:dark_gray`)* |
 | `:assistant` | default foreground |
 | `:tool` | `:dark_gray` (accent prefix glyph is Phase 3's to add) |
 | `:heading1` | accent + bold |
@@ -411,6 +419,9 @@ amendment below already reversed. Live smoke testing (Oct 25) drove all three.
 
 ### Margin geometry — the padded width is the only width
 
+*(The numbers here are superseded — 2026-10-31, #108: two cells per side;
+see the amendment below. The single-source-of-truth rule stands.)*
+
 One cell of padding on every side of the chrome: `View.regions/3` splits an
 inner area inset by one from the frame, so no text hugs a screen edge.
 
@@ -642,3 +653,31 @@ genuine arrows are the same bytes at every layer the app can observe.
   delivers at most a couple of events per 16 ms poll, and bracketed paste
   of any size arrives as one event (probed at 4 KiB). Worth an upstream
   report; explicitly out of scope here.
+
+## Amendment (2026-10-31, issues #107 + #108): user-entry style, margin 2
+
+**Status:** Accepted. One owner smoke test (Oct 31) drove both changes: the
+owner could not tell their own messages from the assistant's (#107), and the
+transcript hugged the screen edges (#108). Supersedes exactly the numbers in
+the [2026-10-25 margin section](#margin-geometry--the-padded-width-is-the-only-width)
+and the user-row styling in the [theme table](#theme-as-data) and
+[message rows](#visual-language); everything else stands.
+
+- **User entries read distinct (#107):** `:user` was `:dark_gray` — the same
+  gray as half the chrome, vanishing into default-fg assistant text on light
+  palettes. It is now **bold on the default foreground**: a pure weight
+  change, legible on every palette, no wash, no new color (the palette stays
+  warm-dim). The first line's `❯ ` prefix rides `:accent` + bold, tying the
+  log's user entries to the composer's accent `❯` title — same glyph, same
+  role, so "your input" reads as one system. Tool and system rows are
+  unchanged, and resume replay already routes through the one styler
+  (`Render.entry_lines/2`), so the distinction survives `--resume` by
+  construction.
+- **Margin two (#108):** one cell per side was not enough air at realistic
+  widths. The chrome now insets **two cells on every side** — top, bottom,
+  left, right; wrap width = frame − 4. The 2026-10-25 rule is untouched: one
+  `@margin` drives `View.regions/3`'s inset area (status, log, activity,
+  input, footer, and the palette/setup screens alike) and `content_width/1`,
+  so the whole chrome moves together and the log rect is still the wrap
+  width, by construction. At 80×24 the idle log keeps 15 rows — the
+  top/bottom air is what makes the window read as framed.
