@@ -86,8 +86,7 @@ Two slots render today as nothing and are tested as no-ops:
 
 `DashFloat.ProjectInstructions.load(cwd)` walks cwd upward, collecting each
 directory's readable, non-empty `AGENTS.md`, and stops after examining the
-nearest
-ancestor whose `.git` exists — inclusive of that root, `.git` tested with
+nearest ancestor whose `.git` exists — inclusive of that root, `.git` tested with
 `File.lstat/1` because linked worktrees make it a file and a dangling `.git`
 symlink is still a placed marker. No git root means walk to the filesystem
 root. The return is most-general-first (root first, cwd last); unreadable

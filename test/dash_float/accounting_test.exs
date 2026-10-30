@@ -362,6 +362,17 @@ defmodule DashFloat.AccountingTest do
                Accounting.compact([system | turns], %{tokens: 1_500, index: 2}, 10_000)
     end
 
+    test "an anchor covering exactly the system message round-trips too" do
+      # Hostile review R1: the predicate reads the INPUT anchor's coverage,
+      # so index 1 (the system message alone) comes back as index 1 — the
+      # clamped shift must not eat it.
+      system = %{role: "system", content: pad(400)}
+      turns = [user(400), assistant(400)]
+
+      assert %{kept: [system | ^turns], anchor: %{tokens: 1_500, index: 1}, dropped: 0} =
+               Accounting.compact([system | turns], %{tokens: 1_500, index: 1}, 10_000)
+    end
+
     test "an index-0 anchor round-trips symmetrically through a no-drop compact" do
       # Hostile review F5: shift clamped but unshift added — the round trip
       # must be the identity for an anchor that covers nothing.

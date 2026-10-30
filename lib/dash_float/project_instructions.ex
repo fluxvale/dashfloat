@@ -1,7 +1,7 @@
 defmodule DashFloat.ProjectInstructions do
   @moduledoc """
   Discovers the project's AGENTS.md files for a session (ADR 0019): from `cwd`
-  upward, every readable AGENTS.md is collected until the nearest ancestor
+  upward, every readable, non-empty AGENTS.md is collected until the nearest ancestor
   carrying a `.git` marker — inclusive, so the repo root's own file counts.
   The marker may be a file (linked worktrees), so it is tested with
   `File.lstat/1` — which, unlike `File.exists?/1`, also treats a dangling
