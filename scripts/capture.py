@@ -41,6 +41,19 @@ Reading-surface captures (issues #107 + #108):
     scripts/capture.py still --scenario slash-autocomplete --margin 2 \
         --out FILE.png                     # popup alignment at 80 cols
 
+Provider-span captures (issue #109): point the scratch settings
+at any endpoint (a REAL preset URL boots fine — the footer resolves
+its label at render time, zero network), drop the provider's label,
+drive a /model switch, and ASSERT the footer span before the still
+is written — a capture whose claim is unverified fails, never ships.
+
+    scripts/capture.py still --scenario first-run --base-url https://api.z.ai/api/coding/paas/v4 \
+        --expect-label "zai - Sol" --out FILE.png
+    scripts/capture.py still --scenario mid-session --no-ghost --unlabeled \
+        --expect-label "127.0.0.1 - Sol" --out FILE.png
+    scripts/capture.py still --scenario model-switch \
+        --expect-label "mock - glm-5.3-flash" --out FILE.png
+
 Scenarios:
     first-run   fresh session: composer empty, no exchanges yet
     mid-session after one completed exchange: composer empty again
@@ -80,6 +93,10 @@ Scenarios:
                 boots from a fixture session (user+assistant turns) via
                 --resume and asserts the replayed log keeps the SAME
                 style claim — replay rides the one styler
+    model-switch
+                /model → the catalog picker opens, ↓ picks the other
+                entry, ⏎ swaps — the footer's model part follows the pick
+                (issue #109); pair with --expect-label to assert it
     probe       idle byte-rate: 0 bytes over the window == 0 renders/s
 
 The scratch root is hermetic: XDG_CONFIG_HOME and XDG_DATA_HOME both point
@@ -486,7 +503,7 @@ class App:
 
     def __init__(self, mix_args=("run", "--no-halt"), no_ghost=False,
                  context=524288, resume=None, images=False, cols=COLS,
-                 rows=ROWS):
+                 rows=ROWS, base_url=None, unlabeled=False):
         self.cols, self.rows = cols, rows
         self.sink = None  # callable(bytes) set during read loop
         self.screen = pyte.Screen(cols, rows)
@@ -506,7 +523,17 @@ class App:
 
         scratch = scratch_dir()
         os.makedirs(f"{scratch}/dashfloat", exist_ok=True)
-        base = f"http://127.0.0.1:{port}/v1"
+        # --base-url (issue #109): point the scratch settings at any
+        # endpoint — a REAL preset URL boots fine, nothing is sent until a
+        # prompt is submitted and the footer resolves its label at render
+        # time with zero network (the mount-time catalog refresh fails
+        # open, silently).
+        base = base_url or f"http://127.0.0.1:{port}/v1"
+        # --unlabeled (issue #109): drop the settings label AND the
+        # defaultProvider that names it — the provider entry degrades to
+        # its URL host (ADR 0015 §2's amendment, rung c).
+        label_field = "" if unlabeled else "      label: 'mock',\n"
+        default_field = "" if unlabeled else "    defaultProvider: 'mock',\n"
         # The images flag rides the models entry (ADR 0018 §1): the attach
         # scenarios pin it true (capable) or leave it off (incapable).
         images_field = ", images: true" if images else ""
@@ -518,9 +545,9 @@ class App:
                 "  yourName: 'demo',\n"
                 "  profiles: [{\n"
                 "    name: 'demo',\n"
-                "    defaultProvider: 'mock',\n"
+                f"{default_field}"
                 "    providers: [{\n"
-                "      label: 'mock',\n"
+                f"{label_field}"
                 f"      baseUrl: '{base}',\n"
                 f"      models: [{{ nickname: 'Sol', model: 'glm-5.3', "
                 f"context: {context}{images_field} }}],\n"
@@ -870,6 +897,36 @@ class App:
                 return row.rstrip()
         return ""
 
+    # Issue #109: /model → pick the other catalog entry → the footer's
+    # model part follows the pick (the label is a render-time read of the
+    # swapped provider). wait_footer_label at the shoot site is the
+    # assertion — a pick that never lands fails the capture.
+    def scenario_model_switch(self):
+        self.type("/model")
+        self.send(b"\r")               # the command runs; the picker opens
+        self.wait_for("Models", timeout=10)
+        time.sleep(0.6)                # a readable beat on the open picker
+        self.send(b"\x1b[B")           # ↓ — the second catalog entry
+        time.sleep(0.4)
+        self.send(b"\r")               # ⏎ — pick it; the footer follows
+
+    def wait_footer_label(self, expected: str, timeout=10):
+        """Assert-then-shoot for the provider span (issue #109): the footer
+        must read `expected` before any still is written — a capture whose
+        claim is unverified fails here, never ships."""
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            if expected in self.footer_span():
+                print(f"label  footer={self.footer_span()!r}")
+                return
+
+            time.sleep(0.1)
+
+        raise AssertionError(
+            f"the footer's provider span never read {expected!r}: "
+            f"{self.footer_span()!r}")
+
     def scenario_ghost(self):
         self.scenario_mid_session()
         self.wait_for(GHOST_TEXT, timeout=10)
@@ -967,7 +1024,7 @@ def main():
                              "growing-session", "compact-session",
                              "slash-autocomplete", "attach",
                              "attach-refusal", "reading-session",
-                             "resume-session"])
+                             "resume-session", "model-switch"])
     ap.add_argument("--out", default=None)
     # The compact-session flow shoots TWO stills: --out after the drop,
     # --out2 after the follow-up no-op command (its below-trigger entry).
@@ -999,9 +1056,25 @@ def main():
     # The #108 margin claim: every rendered row starts at column N and ends
     # N clear of the right edge. Skipped when omitted.
     ap.add_argument("--margin", type=int, default=None)
+    # Issue #109: point the scratch settings' provider at any endpoint
+    # (and write the matching keys entry), drop its label, and assert the
+    # footer's provider span before the still is written.
+    ap.add_argument("--base-url", default=None,
+                    help="override the scratch settings' provider baseUrl")
+    ap.add_argument("--unlabeled", action="store_true",
+                    help="drop the provider's settings label — the host degrades in")
+    ap.add_argument("--expect-label", default=None,
+                    help="assert the footer's provider span reads this before shooting")
     args = ap.parse_args()
     if args.mode in ("still", "gif") and not args.out:
         ap.error(f"{args.mode} requires --out FILE")
+    # The assert-then-shoot guarantee holds only where ONE still is written
+    # at the end (compact-session writes both stills inside its scenario;
+    # gif/probe write no still) — reject the combos rather than silently
+    # weakening the guarantee (issue #109).
+    if args.expect_label and (args.mode != "still" or args.scenario == "compact-session"):
+        ap.error("--expect-label needs still mode and a scenario that shoots "
+                 "once, at the end")
 
     set_palette(args.palette)
 
@@ -1019,7 +1092,8 @@ def main():
         20000 if args.scenario == "compact-session" else 524288)
     images = args.scenario == "attach"
     app = App(no_ghost=args.no_ghost, context=context, resume=resume,
-              images=images, cols=args.cols, rows=args.rows)
+              images=images, cols=args.cols, rows=args.rows,
+              base_url=args.base_url, unlabeled=args.unlabeled)
 
     def assert_claims():
         if args.style_claim:
@@ -1071,6 +1145,10 @@ def main():
                 app.scenario_attach()
             elif args.scenario == "attach-refusal":
                 app.scenario_attach_refusal()
+            elif args.scenario == "model-switch":
+                app.scenario_model_switch()
+            if args.expect_label:
+                app.wait_footer_label(args.expect_label)
             if args.scenario != "compact-session":
                 app.screenshot(args.out)
         elif args.scenario == "slash-autocomplete":

@@ -270,6 +270,12 @@ status-bar field (ADR 0006's model slot): `"nickname (profile)"` — e.g.
 then the model id, then `—` (view fallback unchanged). The context-usage
 denominator still reads `context_tokens` off the provider.
 
+**Superseded:** the field moved to the footer in
+[ADR 0015](0015-input-surface-cursor-stats-ghost.md) §2 (issue #67) and its
+shape became `provider - model` in
+[ADR 0015](0015-input-surface-cursor-stats-ghost.md)'s 2026-10-31 amendment
+(issue #109).
+
 ## Alternatives considered
 
 - **Amend ADR 0005 in place** — the config contract change (layout, profiles,

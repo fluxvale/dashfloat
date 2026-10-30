@@ -32,8 +32,8 @@ defmodule DashFloat.Config do
   `DashFloat.Application` and rides into the TUI as a mount opt; the UI
   process performs no file I/O (ADR 0005's contract, unchanged — the
   startup wizard/modal is the sanctioned exception, ADR 0009). The status
-  bar shows the selected entry's nickname and profile via
-  `DashFloat.TUI.State.provider_label/1`.
+  footer names the provider and model via
+  `DashFloat.TUI.State.provider_label/1` (ADR 0015 §2's amendment).
 
   Malformed config degrades to the least-surprising working state with a
   warning naming the field or profile — never a crash, never silent
@@ -1013,7 +1013,13 @@ defmodule DashFloat.Config do
     nil
   end
 
-  defp host_label(base_url) do
+  @doc """
+  The URL's host as a label — `URI.parse`'s host, else the raw string. The
+  settings label default (ADR 0009) and the footer's host degrade (ADR 0015
+  §2's amendment, issue #109) share this one rule.
+  """
+  @spec host_label(String.t()) :: String.t()
+  def host_label(base_url) do
     case URI.parse(base_url) do
       %URI{host: nil} -> base_url
       %URI{host: host} -> host

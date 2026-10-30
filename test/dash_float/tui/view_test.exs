@@ -469,18 +469,19 @@ defmodule DashFloat.TUI.ViewTest do
       assert footer_text(new_state(provider: provider)) =~ "gpt-test"
     end
 
-    test "the label shows nickname and profile when configured (ADR 0008)" do
+    test "the label names provider and model; the profile suffix is gone (issue #109)" do
       provider =
         {:ok,
          %DashFloat.Config{
-           base_url: "http://x",
+           base_url: "https://api.z.ai/api/coding/paas/v4",
            model: "glm-5.3",
            api_key: "k",
            nickname: "Sol",
            profile: "work"
          }}
 
-      assert footer_text(new_state(provider: provider)) =~ "Sol (work)"
+      assert footer_text(new_state(provider: provider)) =~ "zai - Sol"
+      refute footer_text(new_state(provider: provider)) =~ "(work)"
     end
 
     # The capability glyph (ADR 0018 §1): visible before any attach attempt.
@@ -542,7 +543,7 @@ defmodule DashFloat.TUI.ViewTest do
 
       [line] = footer_line(state)
       [_cwd, _sep, model, sep, ctx | _rest] = line.spans
-      assert model.content == "test-model"
+      assert model.content == "x - test-model"
       assert sep.content == " · "
       assert ctx.content == "4.1k/128k · 3.2%"
       assert ctx.style == Theme.style(:dim)
