@@ -312,10 +312,9 @@ owning normalization, uniqueness, and persistence exactly as recorded in
    `{:set_title, ui, title}` seam and the dialog stays open until the
    agent's reply closes or errors it; Esc cancels. `/title <name>` inline
    is unchanged. On the `--resume --title` combination (§6's boot-time
-   rename), the agent boots with the override while the dialog pre-fills
-   from the loaded file's own title — the mount value is deliberately the
-   session's persisted title, and retitling through the dialog remains an
-   explicit act.
+   rename) the mount value follows the agent's own precedence — the
+   override wins, because the session's live title after that boot IS the
+   override; the loaded file's old title never pre-fills.
 2. **The TUI learns titles** two ways: a `:title` mount opt (the boot
    `--title`'s normalized form, or a resumed session's own file title),
    which pre-fills the dialog, plus two display-only pushes from the

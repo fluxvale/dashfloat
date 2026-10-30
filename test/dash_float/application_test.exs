@@ -824,9 +824,10 @@ defmodule DashFloat.ApplicationTest do
 
       assert agent_opts[:title] == "New Name"
       assert agent_opts[:resume][:title] == "Old Name"
-      # The TUI pre-fills from the file's own title, never the override
+      # The TUI pre-fills the LIVE title — the override already renamed the
+      # session at boot, so it wins exactly as it does at the agent
       # (issue #106).
-      assert tui_opts[:title] == "Old Name"
+      assert tui_opts[:title] == "New Name"
     end
 
     test "a title another session holds refuses, naming that other session" do

@@ -428,7 +428,14 @@ defmodule DashFloat.Application do
           [title: boot_title(cli)]
 
         %{session: session, note: note} ->
-          [transcript: session.messages, resume_note: note, title: Map.get(session, :title)]
+          [
+            transcript: session.messages,
+            resume_note: note,
+            # The agent's own precedence (boot_title || session title): a
+            # --resume + --title boot has ALREADY renamed the session — the
+            # dialog pre-fills the live title, not the loaded file's old one.
+            title: boot_title(cli) || Map.get(session, :title)
+          ]
       end
 
     [
