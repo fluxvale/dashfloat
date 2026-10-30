@@ -267,38 +267,52 @@ jobs:
 
           ## What's new in $VERSION
 
-          Four features since 0.1.1:
+          Nine features since 0.2.0:
 
-          - **Sessions persist and resume.** Every turn is saved as you go.
-            Close the terminal and pick the conversation back up later:
-            \`dashfloat --resume <id>\` replays the transcript and your next
-            message continues it. List the ids with
-            \`ls ~/.local/share/dashfloat/sessions/\` on Linux
-            (\`~/Library/Application Support/dashfloat/sessions/\` on macOS).
-            A crash mid-task leaves a repairable session, not a lost one.
-          - **A sharper composer.** The input shows a cursor that blinks
-            while the agent works and disappears when its pane loses focus,
-            a dim footer under the input carries the working directory, the
-            active model, and live tok/s while streaming, and after a
-            completed turn a greyed next-input suggestion can appear — Tab
-            accepts it, typing ignores it. The suggestion targets a cheap
-            model by default; set \`suggest\` under a profile's \`settings\`
-            in settings.json5 to a model id to change it, or \`false\` to
-            turn it off.
-          - **Context accounting and compaction.** DashFloat tracks how full
-            the model's context window is and, once a session passes roughly
-            80%, drops the oldest complete turns to stay inside it — a
-            visible notice names the count. Long sessions keep working
-            instead of failing on their own length. (Needs the model's
-            context window configured — \`context\` on the model in
-            settings, or \`DASHFLOAT_CONTEXT_TOKENS\`.)
-          - **Interaction modes.** Shift+Tab cycles Plan → Build → Auto →
-            Unchained. Plan is read-only research: changes are proposed in
-            the log, never executed. Build — the default — confirms before
-            anything writes files or runs a command. Auto lets a model-based
-            safety check decide per call whether a tool runs without asking.
-            Unchained runs everything. Modes bind what the agent may do
-            unattended; your explicit answers always outrank them.
+          - **Sessions have titles.** Name a session as you start it with
+            \`dashfloat --title "My session"\`, and pick it back up later
+            with \`dashfloat --resume <id-or-title>\` — every session is
+            identified by a time-sorting UUID id. Leave the title off and
+            the model proposes one once the conversation is underway;
+            \`/title\` renames at runtime. Titles are unique, so a title
+            resolves to one session.
+          - **A wizard that knows your models.** First-run setup now
+            fetches the provider's model list and offers it as a
+            keyboard-navigable picker; manual entry is the explicit last
+            option, and a failed fetch falls back to it with the reason on
+            screen. ESC returns to the previous step with your answers
+            preserved.
+          - **Slash commands and a palette.** \`/model\`, \`/profile\`,
+            \`/mode\`, and \`/title\` switch at runtime. Typing \`/\`
+            lists every command, autocomplete narrows as you type, and
+            Ctrl+P opens the same list as a palette.
+          - **A system prompt with your project's instructions.** Every
+            session now runs on an assembled system prompt, and DashFloat
+            discovers \`AGENTS.md\` files — from the working directory up
+            to the git root (or the filesystem root outside a repo) — and
+            includes them, most general first.
+          - **Tool-call repair and web search.** When the model emits a
+            malformed tool call, DashFloat routes it through Synthetic's
+            fix-json repair instead of failing the call, and a
+            \`web_search\` tool joins the toolbox — both need a Synthetic
+            key in your configuration.
+          - **A composer that reads alive.** The idle cursor renders bright
+            on every terminal palette, and the placeholder hint shows only
+            before your first exchange.
+          - **Manual compaction.** \`/compact\` runs the same drop-oldest
+            compaction the ~80% threshold triggers, on demand and with
+            visible feedback; at or under the trigger it reports where the
+            context stands instead of compacting.
+          - **Live context stats.** The footer shows tokens used and the
+            percent of the context window, kept current as turns complete
+            (the percent appears once a context window is known for the
+            model — \`context\` in settings, \`DASHFLOAT_CONTEXT_TOKENS\`,
+            or the provider's fetched model list).
+          - **Image attachments.** Ctrl+O opens the attach prompt: type an
+            image's path (PNG, JPEG, GIF, or WebP, up to 10 MiB —
+            validated before it sits in the composer). The attach goes
+            through when the selected model can take images; otherwise it
+            is refused with a visible message, never silently dropped.
 
           Upgrading: re-run the install command below — it replaces the
           previous version and keeps your sessions. On macOS,
