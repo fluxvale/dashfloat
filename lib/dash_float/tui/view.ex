@@ -630,22 +630,23 @@ defmodule DashFloat.TUI.View do
 
   # The open attach prompt (ADR 0018 §5) replaces the phase labels — one
   # line like the exit guard: accent label, the draft with the composer's
-  # block cursor, and the dim key hints, the draft truncated to the row.
+  # block cursor, and the dim key hints. The DRAFT owns the row (§4's
+  # "fix the path and retry" UX — the path being edited is the payload):
+  # the hints show only when everything fits beside them, and when they
+  # drop the draft's TAIL extends into the freed space, `…` marking the
+  # clipped head (completion and editing work at the end).
   defp activity_widget(%State{attach: %{draft: draft}} = state) do
-    budget =
-      max(
-        content_width(elem(state.size, 0)) - String.length(@attach_label) -
-          String.length(@attach_hint) - 1,
-        0
-      )
+    width = content_width(elem(state.size, 0))
+    {draft_shown, hint} = attach_layout(draft, width, String.length(@attach_label))
 
     %Paragraph{
       text: [
-        Line.new([
-          Span.new(@attach_label, style: Theme.style(:accent)),
-          Span.new(String.slice(draft, 0, budget) <> "█", style: Theme.style(:assistant)),
-          Span.new(@attach_hint, style: Theme.style(:hint))
-        ])
+        Line.new(
+          [
+            Span.new(@attach_label, style: Theme.style(:accent)),
+            Span.new(draft_shown <> "█", style: Theme.style(:assistant))
+          ] ++ hint_spans(hint)
+        )
       ],
       scroll: {0, 0}
     }
@@ -668,6 +669,28 @@ defmodule DashFloat.TUI.View do
       scroll: {0, 0}
     }
   end
+
+  # Everything fits — the full draft plus the hints. Anything else drops
+  # the hints and tail-shows the draft into the whole remaining row.
+  defp attach_layout(draft, width, label_len) do
+    if label_len + String.length(draft) + 1 + String.length(@attach_hint) <= width do
+      {draft, @attach_hint}
+    else
+      budget = max(width - label_len - 1, 1)
+
+      shown =
+        if String.length(draft) >= budget,
+          do: "…" <> String.slice(draft, String.length(draft) - budget + 1, budget),
+          else: draft
+
+      {shown, ""}
+    end
+  end
+
+  defp hint_spans(""), do: []
+
+  defp hint_spans(hint),
+    do: [Span.new(hint, style: Theme.style(:hint))]
 
   defp spinner_frame(state) do
     frames = Theme.spinner_frames()

@@ -638,9 +638,10 @@ defmodule DashFloat.TUI.ViewTest do
 
     # The attach prompt (ADR 0018 §5) claims the transient row while open:
     # accent label, the draft with the composer's block cursor, and the dim
-    # key hints — all on the one line. The hints eat most of an 80-column
-    # row (label 14 + cursor 1 + hints 58), so a full draft shows at 5
-    # characters there.
+    # key hints — all on the one line WHEN THEY ALL FIT. The draft owns the
+    # row (§4's "fix the path and retry" UX): once it no longer fits beside
+    # the hints, the hints drop and the draft's TAIL fills the freed space
+    # — the path being edited stays readable, `…` marks the clipped head.
     test "the attach prompt replaces the idle row with label, draft, cursor, and hints" do
       state = %{new_state() | attach: %{draft: "c.png"}}
 
@@ -649,7 +650,7 @@ defmodule DashFloat.TUI.ViewTest do
       assert text =~ "⏎ attach · tab complete · esc keep · ^o close · ^d clear"
     end
 
-    test "a wide attach draft truncates to keep the prompt one row" do
+    test "a wide attach draft drops the hints and tail-shows into the row" do
       long = String.duplicate("p", 80) <> ".png"
       state = %{new_state() | attach: %{draft: long}}
 
@@ -658,6 +659,10 @@ defmodule DashFloat.TUI.ViewTest do
       assert String.length(line) <= 78
       refute line =~ long
       assert line =~ "Attach image: "
+      # the hints yielded, the tail survived, the head is a marked clip
+      refute line =~ "tab complete"
+      assert line =~ "…"
+      assert line =~ ".png█"
     end
 
     # Issue #28: the armed exit-guard prompt claims the transient row —

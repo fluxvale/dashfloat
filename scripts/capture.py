@@ -105,6 +105,13 @@ FONT_CANDIDATES_BOLD = [
     "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
 ]
+# Emoji coverage (U+1F4CE 📎 et al.) the mono fonts lack: the first of
+# these that exists draws any glyph the primary font cannot — a rig-side
+# rendering fallback, the app's bytes are unchanged.
+FONT_CANDIDATES_EMOJI = [
+    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+]
 
 # A conventional dark-terminal palette; pyte names -> hex.
 PALETTE = {
@@ -156,14 +163,79 @@ def cell_colors(ch) -> tuple[str, str]:
 
 
 def paint(draw, metrics, ch, px, py):
-    """One terminal cell: background block first, then the glyph."""
+    """One terminal cell: background block first, then the glyph — from the
+    emoji font, scaled into the cell, when the primary mono font cannot
+    draw it (coverage probe via getmask; an empty mask is the tofu the app
+    never sent)."""
     cell_w, cell_h, font = metrics
     fg, bg = cell_colors(ch)
     if bg != DEFAULT_BG:
         draw.rectangle([px, py, px + cell_w, py + cell_h], fill=bg)
     if ch.data and ch.data != " ":
-        draw.text((px, py), ch.data, font=font,
-                  fill=fg if not ch.bold else _brighten(fg))
+        emoji = emoji_font()
+        if emoji is not None and not glyph_covered(font, ch.data):
+            draw_emoji(draw, emoji, ch.data, px, py, cell_w, cell_h)
+        else:
+            draw.text((px, py), ch.data, font=font,
+                      fill=fg if not ch.bold else _brighten(fg))
+
+
+# Coverage probe: a missing glyph renders the font's .notdef — the same
+# mask as U+0378, a permanently unassigned codepoint no font maps. Byte-
+# equal masks (or an empty mask) mean "not covered — try the emoji font".
+_NOTDEF_MASKS: dict[int, bytes | None] = {}
+
+
+def glyph_covered(font, text: str) -> bool:
+    raw = mask_bytes(font.getmask(text))
+    if id(font) not in _NOTDEF_MASKS:
+        _NOTDEF_MASKS[id(font)] = mask_bytes(font.getmask("\u0378"))
+    notdef = _NOTDEF_MASKS[id(font)]
+    return raw is not None and raw != notdef
+
+
+def mask_bytes(mask) -> bytes | None:
+    """An ImagingCore mask as bytes — None for the empty mask."""
+    return bytes(mask) if mask.size else None
+
+
+# The emoji fallback font, resolved once per process (the None memo means
+# "no emoji font on this machine — render exactly as before").
+_EMOJI_FONT = None
+_EMOJI_RESOLVED = False
+
+
+def emoji_font():
+    global _EMOJI_FONT, _EMOJI_RESOLVED
+    if not _EMOJI_RESOLVED:
+        _EMOJI_RESOLVED = True
+        for path in FONT_CANDIDATES_EMOJI:
+            if os.path.exists(path):
+                try:
+                    # CBDT bitmap strikes: 109 is the size Pillow accepts
+                    # for NotoColorEmoji; the draw scales it into the cell.
+                    _EMOJI_FONT = ImageFont.truetype(path, 109)
+                except OSError:
+                    _EMOJI_FONT = None
+                break
+    return _EMOJI_FONT
+
+
+def draw_emoji(draw, font, glyph, px, py, cell_w, cell_h):
+    """Render the emoji at its fixed strike onto a scratch image, thumbnail
+    to the cell, paste — the only way a CBDT color font fits a cell."""
+    scratch = Image.new("RGBA", (160, 160), (0, 0, 0, 0))
+    sdraw = ImageDraw.Draw(scratch)
+    try:
+        sdraw.text((8, 8), glyph, font=font, embedded_color=True)
+        box = scratch.getbbox()
+        if not box:
+            return  # nothing rendered — leave the cell as-is
+        crop = scratch.crop(box)
+        crop.thumbnail((cell_w, cell_h))
+        draw._image.paste(crop, (px, py), crop)
+    except (ValueError, OSError):
+        pass
 
 
 def _brighten(hexcolor: str) -> str:
@@ -636,7 +708,9 @@ class App:
             "the image-capable model's footer never showed the 📎 glyph"
         self.send(b"\x0f")             # Ctrl+O — the attach prompt opens
         self.wait_for("attach", timeout=10)
-        self.type(path, per_key=0.01)
+        time.sleep(1.0)                # a readable beat on the open prompt
+        # per_key slow enough to read in the GIF — the path is the payload
+        self.type(path, per_key=0.06)
         self.send(b"\r")               # Enter — attach
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -794,12 +868,12 @@ def main():
             # path types in, Enter attaches (chip lands), the question
             # submits, the reply streams. The scenario asserts the chip
             # and the indicator BEFORE the render — a lost keystroke
-            # fails the capture. 14 rows keep the log tail, composer
-            # title chip, draft, and footer legible.
+            # fails the capture. FULL frame (24 rows): the log indicator
+            # and reply sit near the top, above any bottom-row crop.
             app._mark = time.monotonic()
             app.scenario_attach()
             time.sleep(0.5)            # a settled beat on the final state
-            app.gif(args.out, crop_rows=14, min_span=1.0)
+            app.gif(args.out, crop_rows=24, min_span=1.0)
         elif args.scenario == "growing-session":
             # Mark BEFORE the first send: the GIF covers both turns — the
             # span appears with the first turn's persist and grows with the
