@@ -36,3 +36,7 @@ dash_float-*.tar
 /.lexical/
 /.vscode/
 
+
+# Python rig bytecode (scripts/capture.py)
+__pycache__/
+*.pyc
