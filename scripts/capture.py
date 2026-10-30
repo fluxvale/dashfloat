@@ -26,6 +26,21 @@ Usage (from a worktree root, against the CURRENT tree's code):
     scripts/capture.py gif   --scenario slash-autocomplete --out FILE.gif
     scripts/capture.py gif   --scenario growing-session --context 4096 --out FILE.gif
 
+Reading-surface captures (issues #107 + #108):
+
+    scripts/capture.py still --scenario reading-session --style-claim user-bold \
+        --margin 2 --out FILE.png          # AFTER: user rows bold, 2-cell margin
+    scripts/capture.py still --scenario reading-session --style-claim all-plain \
+        --margin 1 --out FILE.png          # BEFORE: nothing bold, 1-cell margin
+    scripts/capture.py still --scenario reading-session --style-claim user-bold \
+        --palette light --margin 2 --out FILE.png   # bold reads on light too
+    scripts/capture.py still --scenario resume-session --style-claim user-bold \
+        --margin 2 --out FILE.png          # replayed turns keep the distinction
+    scripts/capture.py still --scenario reading-session --cols 120 --margin 2 \
+        --out FILE.png                     # wide terminal, same margin
+    scripts/capture.py still --scenario slash-autocomplete --margin 2 \
+        --out FILE.png                     # popup alignment at 80 cols
+
 Scenarios:
     first-run   fresh session: composer empty, no exchanges yet
     mid-session after one completed exchange: composer empty again
@@ -53,6 +68,18 @@ Scenarios:
     attach-refusal
                 the same attach attempt on a NON-capable model: the
                 visible [images: …] refusal entry in the log (nothing sent)
+    reading-session
+                two completed exchanges so user/assistant alternate in the
+                log (issues #107/#108 stills). Asserts, before the still:
+                the style claim (--style-claim: `user-bold` — user row text
+                bold + accent ❯ prefix, assistant rows plain — or
+                `all-plain`, the #107 bug shape) and, when --margin N is
+                passed, that every rendered row starts at column N and ends
+                N clear of the right edge.
+    resume-session
+                boots from a fixture session (user+assistant turns) via
+                --resume and asserts the replayed log keeps the SAME
+                style claim — replay rides the one styler
     probe       idle byte-rate: 0 bytes over the window == 0 renders/s
 
 The scratch root is hermetic: XDG_CONFIG_HOME and XDG_DATA_HOME both point
@@ -136,6 +163,44 @@ PALETTE = {
 DEFAULT_FG = "#c5c8c6"
 DEFAULT_BG = "#1d1f21"
 
+# A conventional light-terminal palette (#107): light bg, dark fg — the
+# bold-default-fg user rows must read legible here too.
+LIGHT_PALETTE = {
+    "default": "#383a42",
+    "black": "#383a42",
+    "red": "#ca1243",
+    "green": "#50a14f",
+    "yellow": "#c18401",
+    "blue": "#4078f2",
+    "magenta": "#a626a4",
+    "cyan": "#0184bc",
+    "white": "#383a42",
+    "bright-black": "#a0a1a7",
+    "bright-red": "#ca1243",
+    "bright-green": "#50a14f",
+    "bright-yellow": "#c18401",
+    "bright-blue": "#4078f2",
+    "bright-magenta": "#a626a4",
+    "bright-cyan": "#0184bc",
+    "bright-white": "#090a0f",
+}
+LIGHT_DEFAULT_FG = "#383a42"
+LIGHT_DEFAULT_BG = "#fafafa"
+
+# Which family is active (set_palette): bold text approximates the way a
+# terminal brightens bold glyphs — on a light palette the honest direction
+# is darker, or bold would LOSE contrast and the capture would lie.
+_LIGHT = False
+_DARK_SCHEME = (PALETTE, DEFAULT_FG, DEFAULT_BG)
+_LIGHT_SCHEME = (LIGHT_PALETTE, LIGHT_DEFAULT_FG, LIGHT_DEFAULT_BG)
+
+
+def set_palette(name: str):
+    global PALETTE, DEFAULT_FG, DEFAULT_BG, _LIGHT
+    PALETTE, DEFAULT_FG, DEFAULT_BG = (
+        _LIGHT_SCHEME if name == "light" else _DARK_SCHEME)
+    _LIGHT = name == "light"
+
 
 def color(value: str | None, fallback: str) -> str:
     if value in (None, "default"):
@@ -177,7 +242,7 @@ def paint(draw, metrics, ch, px, py):
             draw_emoji(draw, emoji, ch.data, px, py, cell_w, cell_h)
         else:
             draw.text((px, py), ch.data, font=font,
-                      fill=fg if not ch.bold else _brighten(fg))
+                      fill=fg if not ch.bold else _bold_fg(fg))
 
 
 # Coverage probe: a missing glyph renders the font's .notdef — the same
@@ -243,6 +308,17 @@ def _brighten(hexcolor: str) -> str:
     return "#%02x%02x%02x" % (min(255, r + 48), min(255, g + 48), min(255, b + 48))
 
 
+def _darken(hexcolor: str) -> str:
+    r, g, b = (int(hexcolor[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % (max(0, r - 48), max(0, g - 48), max(0, b - 48))
+
+
+def _bold_fg(hexcolor: str) -> str:
+    """Bold glyphs read as a pushed-toward-the-extreme fg: brighter on a
+    dark palette, darker on a light one (_LIGHT)."""
+    return _darken(hexcolor) if _LIGHT else _brighten(hexcolor)
+
+
 def scratch_dir() -> str:
     """The per-run scratch root: config and data (XDG_CONFIG_HOME and
     XDG_DATA_HOME) both live here, so captures never touch the user's
@@ -283,6 +359,30 @@ def write_image_fixture(scratch: str) -> str:
     with open(path, "wb") as f:
         f.write(b"\x89PNG\r\n\x1a\n" + b"\x11" * 300)
     return path
+
+
+def write_reading_fixture(scratch: str) -> str:
+    """The resume-session fixture (#107): two short user/assistant turns.
+    Resumed with --resume, the log is rebuilt by replay — the capture
+    proves the replayed user rows keep the bold/accent styling."""
+    session_id = str(uuid.uuid4())
+    messages = [
+        {"role": "user", "content": "what is elixir?"},
+        {"role": "assistant",
+         "content": "Elixir processes run independently, supervised by the VM."},
+        {"role": "user", "content": "and the supervision tree?"},
+        {"role": "assistant", "content": "A crash in one never touches the rest."},
+    ]
+    sessions = f"{scratch}/dashfloat/sessions"
+    os.makedirs(sessions, exist_ok=True)
+    with open(f"{sessions}/{session_id}.json", "w") as f:
+        json.dump({
+            "version": 1,
+            "id": session_id,
+            "created_at": "2026-10-31T00:00:00Z",
+            "messages": messages,
+        }, f)
+    return session_id
 
 
 def content_text(content) -> str:
@@ -385,9 +485,11 @@ class App:
     """The real TUI under a real pty, plus the capture operations."""
 
     def __init__(self, mix_args=("run", "--no-halt"), no_ghost=False,
-                 context=524288, resume=None, images=False):
+                 context=524288, resume=None, images=False, cols=COLS,
+                 rows=ROWS):
+        self.cols, self.rows = cols, rows
         self.sink = None  # callable(bytes) set during read loop
-        self.screen = pyte.Screen(COLS, ROWS)
+        self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         # The FULL byte history from boot (t, chunk): a GIF replay must
         # start at boot so static chrome (borders, labels, footer, log)
@@ -449,7 +551,8 @@ class App:
             os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             os.execvpe("mix", ["mix", *mix_args], env)
 
-        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", self.rows, self.cols, 0, 0))
         self._alive = True
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._reader.start()
@@ -494,7 +597,11 @@ class App:
                 self.sink(chunk)
 
     def wait_boot(self, timeout=120):
-        """Boot + first frame + quiet: >= 600 ms of silence after >= 800 B."""
+        """Boot + first frame + quiet: >= 600 ms of silence after >= 800 B,
+        with the alternate screen entered (compile noise lands BEFORE the
+        alt screen and can silence for a beat mid-build — without the alt
+        gate a cold first run "boots" mid-compile and the first exchange
+        times out)."""
         deadline = time.monotonic() + timeout
         last = self._total
         quiet_since = None
@@ -504,7 +611,7 @@ class App:
                 last = self._total
                 quiet_since = None
                 continue
-            if self._total > 800:
+            if self._total > 800 and self._alt:
                 quiet_since = quiet_since or time.monotonic()
                 if time.monotonic() - quiet_since >= 0.6:
                     if "first run" in self.text():
@@ -571,11 +678,11 @@ class App:
     def render(self, scale=2, crop_rows=None) -> Image.Image:
         metrics = self._metrics(scale)
         cell_w, cell_h, _ = metrics
-        rows = crop_rows or ROWS
-        img = Image.new("RGB", (COLS * cell_w, rows * cell_h), DEFAULT_BG)
+        rows = crop_rows or self.rows
+        img = Image.new("RGB", (self.cols * cell_w, rows * cell_h), DEFAULT_BG)
         draw = ImageDraw.Draw(img)
         for y in range(rows):
-            for x in range(COLS):
+            for x in range(self.cols):
                 paint(draw, metrics, self.screen.buffer[y][x],
                       x * cell_w, y * cell_h)
         return img
@@ -598,7 +705,7 @@ class App:
         cell_w, cell_h, _ = metrics
         frames = []
         step = 1000 / fps
-        replay = pyte.Screen(COLS, ROWS)
+        replay = pyte.Screen(self.cols, self.rows)
         saved = (self.screen, self.stream, self._alt)
         self.screen, self.stream, self._alt = replay, pyte.ByteStream(replay), False
         events = list(self._chunks)
@@ -617,11 +724,11 @@ class App:
             while events and events[0][0] <= horizon:
                 _, chunk = events.pop(0)
                 self.feed(chunk)
-            img = Image.new("RGB", (COLS * cell_w, crop_rows * cell_h), DEFAULT_BG)
+            img = Image.new("RGB", (self.cols * cell_w, crop_rows * cell_h), DEFAULT_BG)
             draw = ImageDraw.Draw(img)
-            top = ROWS - crop_rows
-            for y in range(top, ROWS):
-                for x in range(COLS):
+            top = self.rows - crop_rows
+            for y in range(top, self.rows):
+                for x in range(self.cols):
                     paint(draw, metrics, replay.buffer[y][x],
                           x * cell_w, (y - top) * cell_h)
             frames.append(img.quantize(colors=128))
@@ -632,6 +739,88 @@ class App:
         self.screen, self.stream, self._alt = saved
 
     # -- scenarios --------------------------------------------------------
+
+    # -- reading-surface claims (issues #107 + #108) ----------------------
+
+    def find_row(self, needle: str):
+        """The screen row containing `needle`, or None."""
+        for y, row in enumerate(self.screen.display):
+            if needle in row:
+                return y
+        return None
+
+    def row_cells(self, y: int, x0: int, x1: int):
+        return [self.screen.buffer[y][x] for x in range(x0, x1)]
+
+    # The style claim under test (#107): `user-bold` — the user row's text
+    # rides the bold :user role behind an accent ❯ prefix whose fg differs
+    # from the body's default fg; `all-plain` — the #107 bug shape, nothing
+    # in either row bold. Assistant rows are plain in both.
+    def assert_style_claim(self, claim: str):
+        user_y = self.find_row("❯ what is elixir?")
+        assert user_y is not None, "the user turn never rendered"
+
+        row = self.screen.display[user_y]
+        gx = row.index("❯")            # the log's left inset, wherever it is
+        body = "what is elixir?"
+        prefix = self.row_cells(user_y, gx, gx + 2)
+        text = self.row_cells(user_y, gx + 2, gx + 2 + len(body))
+
+        reply_y = self.find_row("supervised by")
+        assert reply_y is not None, "the assistant reply never rendered"
+        reply = self.row_cells(reply_y, 0, self.cols)
+
+        if claim == "user-bold":
+            assert all(c.bold for c in text), "the user row's text is not bold"
+            assert all(c.bold for c in prefix), "the ❯ prefix is not bold"
+            assert prefix[0].fg != text[0].fg, \
+                "the ❯ prefix does not contrast with the default-fg body"
+            assert not any(c.bold for c in reply), \
+                "the assistant reply row picked up bold"
+            print(f"claim  user-bold: prefix fg={prefix[0].fg!r} bold, "
+                  f"body fg={text[0].fg!r} bold, reply plain")
+        else:
+            assert not any(c.bold for c in text), \
+                "unexpected: the user row's text is bold"
+            assert not any(c.bold for c in reply), \
+                "unexpected: the assistant reply row is bold"
+            print("claim  all-plain: user and assistant rows carry the same "
+                "plain weight (the #107 bug shape)")
+
+    # The margin claim (#108): every rendered row starts at column N and
+    # ends N clear of the right edge — the whole chrome, popup included.
+    def assert_margin(self, margin: int):
+        for y, row in enumerate(self.screen.display):
+            stripped = row.rstrip()
+            if not stripped.strip():
+                continue
+            first = len(row) - len(row.lstrip())
+            last = len(stripped) - 1
+            assert first >= margin, \
+                f"row {y} starts at column {first} (< {margin}): {row!r}"
+            assert last <= self.cols - 1 - margin, \
+                f"row {y} ends at column {last} (> {self.cols - 1 - margin}): {row!r}"
+        print(f"claim  margin {margin}: rows within columns "
+              f"[{margin}, {self.cols - 1 - margin}] on a {self.cols}x{self.rows} pty")
+
+    # Two completed exchanges so user and assistant rows alternate (#107).
+    def scenario_reading_session(self):
+        for question in ("what is elixir?",
+                         "and how do supervisors keep it reliable?"):
+            self.type(question)
+            self.send(b"\r")
+            self.wait_for("rest")      # the scripted reply's last word
+            self.wait_quiet()          # the turn finalized
+
+    # The replay claim (#107): the fixture session booted with --resume;
+    # the replayed log must show both roles before the styling is asserted.
+    def scenario_resume_session(self):
+        assert self.find_row("❯ what is elixir?") is not None, \
+            "the replayed user turn never rendered"
+        assert self.find_row("supervised by") is not None, \
+            "the replayed assistant turn never rendered"
+        assert self.find_row("A crash in") is not None, \
+            "the replayed log is incomplete (the second turn is missing)"
 
     def scenario_mid_session(self):
         self.type("what is elixir?")
@@ -777,7 +966,8 @@ def main():
                     choices=["first-run", "mid-session", "ghost",
                              "growing-session", "compact-session",
                              "slash-autocomplete", "attach",
-                             "attach-refusal"])
+                             "attach-refusal", "reading-session",
+                             "resume-session"])
     ap.add_argument("--out", default=None)
     # The compact-session flow shoots TWO stills: --out after the drop,
     # --out2 after the follow-up no-op command (its below-trigger entry).
@@ -793,22 +983,50 @@ def main():
     # pass --no-ghost to pin the blank state (the ghost state is its own
     # scenario).
     ap.add_argument("--no-ghost", action="store_true")
+    # The pty size (#108): a wide capture is a real 120-column pty
+    # (TIOCSWINSZ + pyte Screen), not a crop of an 80-column one.
+    ap.add_argument("--cols", type=int, default=COLS)
+    ap.add_argument("--rows", type=int, default=ROWS)
+    # The terminal palette the still is painted with (#107): `light` swaps
+    # the rig's PALETTE/DEFAULT_FG/DEFAULT_BG to a light scheme — the app's
+    # bytes are unchanged, only the rendering.
+    ap.add_argument("--palette", choices=["dark", "light"], default="dark")
+    # The #107 style claim the still must prove: `user-bold` (user rows bold
+    # behind an accent ❯ prefix, assistant rows plain) or `all-plain` (the
+    # bug shape a BEFORE capture is expected to show).
+    ap.add_argument("--style-claim", choices=["user-bold", "all-plain"],
+                    default=None)
+    # The #108 margin claim: every rendered row starts at column N and ends
+    # N clear of the right edge. Skipped when omitted.
+    ap.add_argument("--margin", type=int, default=None)
     args = ap.parse_args()
     if args.mode in ("still", "gif") and not args.out:
         ap.error(f"{args.mode} requires --out FILE")
 
+    set_palette(args.palette)
+
     # The compact-session scenario boots from a fixture session file written
     # BEFORE the app starts: a 20000-token window whose trigger the resumed
-    # transcript (two ~20 KB turns, no anchor) sits over.
+    # transcript (two ~20 KB turns, no anchor) sits over. The resume-session
+    # fixture (#107) is the same trick: two short user/assistant turns.
     resume = None
     if args.scenario == "compact-session":
         resume = write_compact_fixture(scratch_dir())
+    elif args.scenario == "resume-session":
+        resume = write_reading_fixture(scratch_dir())
 
     context = args.context or (
         20000 if args.scenario == "compact-session" else 524288)
     images = args.scenario == "attach"
     app = App(no_ghost=args.no_ghost, context=context, resume=resume,
-              images=images)
+              images=images, cols=args.cols, rows=args.rows)
+
+    def assert_claims():
+        if args.style_claim:
+            app.assert_style_claim(args.style_claim)
+        if args.margin is not None:
+            app.assert_margin(args.margin)
+
     try:
         if args.mode == "probe":
             if args.after_exchange:
@@ -838,6 +1056,17 @@ def main():
             elif args.scenario == "slash-autocomplete":
                 app.type("/")
                 time.sleep(0.4)        # the popup renders
+                assert "/compact" in app.text(), \
+                    "the command popup never rendered"
+                assert_claims()
+            elif args.scenario == "reading-session":
+                app.scenario_reading_session()
+                time.sleep(0.3)        # a settled beat on the final state
+                assert_claims()
+            elif args.scenario == "resume-session":
+                app.scenario_resume_session()
+                time.sleep(0.3)        # a settled beat on the replayed log
+                assert_claims()
             elif args.scenario == "attach":
                 app.scenario_attach()
             elif args.scenario == "attach-refusal":
