@@ -20,7 +20,15 @@ defmodule DashFloat.LLM.ToolCalls do
   @typep entry :: %{id: String.t() | nil, name: String.t() | nil, args: binary()}
   @type t :: %__MODULE__{calls: %{optional(non_neg_integer()) => entry()}}
 
-  @type call :: %{id: String.t(), name: String.t(), args: map() | nil, error: nil | String.t()}
+  # `raw_args` is the accumulated argument binary before any parse — the
+  # fix-json repair's input for malformed calls (ADR 0021 §2).
+  @type call :: %{
+          id: String.t(),
+          name: String.t(),
+          args: map() | nil,
+          raw_args: binary(),
+          error: nil | String.t()
+        }
 
   @doc "A fresh accumulator."
   @spec new() :: t()
@@ -101,6 +109,7 @@ defmodule DashFloat.LLM.ToolCalls do
       id: if(entry.id in [nil, ""], do: "call_#{index}", else: entry.id),
       name: entry.name || "",
       args: args,
+      raw_args: entry.args,
       error: error
     }
   end

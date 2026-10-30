@@ -4,8 +4,13 @@ defmodule DashFloat.Tools do
   validation with defaults. String keys throughout — arguments arrive as
   decoded JSON objects and results go back as JSON.
 
-  One internal parameter table drives both `schema/0` and `validate/2`, so the
+  One internal parameter table drives both `schema/1` and `validate/2`, so the
   advertised contract and the enforced one cannot drift.
+
+  web_search rides the same table but is advertised only when the session
+  carries a Synthetic context (ADR 0021 §6); `validate/2` stays total over the
+  table on purpose — a model hallucinating web_search without a key gets a
+  normal validation pass, then the runner errors honestly at run time.
   """
 
   @params %{
@@ -123,6 +128,18 @@ defmodule DashFloat.Tools do
         maximum: nil,
         default: "."
       }
+    ],
+    "web_search" => [
+      %{
+        name: "query",
+        type: :string,
+        required: true,
+        nonempty: true,
+        description: "The search query.",
+        minimum: nil,
+        maximum: nil,
+        default: :none
+      }
     ]
   }
 
@@ -136,17 +153,27 @@ defmodule DashFloat.Tools do
     "execute_command" =>
       "Run a shell command line and return its combined output (stdout and stderr, capped). Prefer it for builds, tests, and searches. The user may confirm before it runs, depending on the session mode.",
     "list_directory" =>
-      "List a directory's entries: directories first, then files, each alphabetical."
+      "List a directory's entries: directories first, then files, each alphabetical.",
+    "web_search" =>
+      "Search the web. Use this to find information you are not sure about, to look up documentation, or to find data created after your training knowledge cutoff. Returns a list of results with url, title, and highlights."
   }
 
-  @order ["read_file", "write_file", "edit_file", "execute_command", "list_directory"]
+  @order [
+    "read_file",
+    "write_file",
+    "edit_file",
+    "execute_command",
+    "list_directory",
+    "web_search"
+  ]
 
   @classes %{
     "read_file" => :safe,
     "list_directory" => :safe,
     "write_file" => :mutating,
     "edit_file" => :mutating,
-    "execute_command" => :risky
+    "execute_command" => :risky,
+    "web_search" => :safe
   }
 
   # Display excerpt for tool-result rows; the model gets the bounded full result.
@@ -156,10 +183,16 @@ defmodule DashFloat.Tools do
   @spec class(String.t()) :: :safe | :mutating | :risky
   def class(name), do: Map.get(@classes, name, :risky)
 
-  @doc "The OpenAI `tools` array advertising the catalogue."
-  @spec schema() :: [map()]
-  def schema do
-    Enum.map(@order, fn name ->
+  @doc """
+  The OpenAI `tools` array advertising the catalogue. web_search is
+  advertised only when `synthetic` — the session's Synthetic context — is
+  present (ADR 0021 §6); without one the array is the base five-tool list.
+  """
+  @spec schema(term()) :: [map()]
+  def schema(synthetic \\ nil) do
+    order = if synthetic, do: @order, else: List.delete(@order, "web_search")
+
+    Enum.map(order, fn name ->
       params = @params[name]
 
       %{

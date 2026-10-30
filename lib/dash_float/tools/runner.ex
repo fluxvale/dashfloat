@@ -14,6 +14,7 @@ defmodule DashFloat.Tools.Runner do
   alias DashFloat.Tools.Edit
   alias DashFloat.Tools.Exec
   alias DashFloat.Tools.PathPolicy
+  alias DashFloat.Tools.WebSearch
 
   @exec_output_cap 32 * 1024
   @read_byte_cap 64 * 1024
@@ -23,7 +24,8 @@ defmodule DashFloat.Tools.Runner do
 
   @doc """
   Runs tool `name` with already-validated `args` (see `DashFloat.Tools.validate/2`)
-  sandboxed at `cwd`. Options: `:exec_timeout` (default #{@default_exec_timeout} ms).
+  sandboxed at `cwd`. Options: `:exec_timeout` (default #{@default_exec_timeout} ms);
+  web_search reads `:search` and `:search_timeout` instead (ADR 0021 §6).
   """
   @spec run(String.t(), map(), Path.t(), keyword()) :: map()
   def run(name, args, cwd, opts \\ []) do
@@ -42,6 +44,9 @@ defmodule DashFloat.Tools.Runner do
 
       "list_directory" ->
         list_directory(args, cwd)
+
+      "web_search" ->
+        WebSearch.run(args, opts)
     end
   rescue
     exception -> %{ok: false, error: "tool crashed: " <> Exception.message(exception)}

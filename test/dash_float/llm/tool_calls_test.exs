@@ -25,6 +25,7 @@ defmodule DashFloat.LLM.ToolCallsTest do
                id: "call_abc",
                name: "read_file",
                args: %{"path" => "lib/éléphant.ex", "note" => "你好"},
+               raw_args: @args_json,
                error: nil
              }
            ]
@@ -42,6 +43,7 @@ defmodule DashFloat.LLM.ToolCallsTest do
                id: "call_1",
                name: "write_file",
                args: %{"path" => "a.txt", "content" => "x"},
+               raw_args: ~s({"path": "a.txt", "content": "x"}),
                error: nil
              }
            ]
@@ -87,7 +89,13 @@ defmodule DashFloat.LLM.ToolCallsTest do
       |> ToolCalls.feed([%{"index" => 0, "function" => %{"arguments" => ~s(})}}])
 
     assert ToolCalls.finish(acc) == [
-             %{id: "call_bad", name: "edit_file", args: nil, error: "invalid JSON arguments"}
+             %{
+               id: "call_bad",
+               name: "edit_file",
+               args: nil,
+               raw_args: ~s({"path": }),
+               error: "invalid JSON arguments"
+             }
            ]
   end
 
@@ -95,7 +103,13 @@ defmodule DashFloat.LLM.ToolCallsTest do
     acc = ToolCalls.feed(ToolCalls.new(), [call("call_1", "read_file", "[1, 2]")])
 
     assert ToolCalls.finish(acc) == [
-             %{id: "call_1", name: "read_file", args: nil, error: "invalid JSON arguments"}
+             %{
+               id: "call_1",
+               name: "read_file",
+               args: nil,
+               raw_args: "[1, 2]",
+               error: "invalid JSON arguments"
+             }
            ]
   end
 
@@ -110,7 +124,7 @@ defmodule DashFloat.LLM.ToolCallsTest do
       ])
 
     assert ToolCalls.finish(acc) == [
-             %{id: "call_0", name: "list_directory", args: %{}, error: nil}
+             %{id: "call_0", name: "list_directory", args: %{}, raw_args: "{}", error: nil}
            ]
   end
 
@@ -126,7 +140,7 @@ defmodule DashFloat.LLM.ToolCallsTest do
       ])
 
     assert ToolCalls.finish(acc) == [
-             %{id: "call_0", name: "list_directory", args: %{}, error: nil}
+             %{id: "call_0", name: "list_directory", args: %{}, raw_args: "{}", error: nil}
            ]
   end
 
@@ -137,7 +151,13 @@ defmodule DashFloat.LLM.ToolCallsTest do
       ])
 
     assert ToolCalls.finish(acc) == [
-             %{id: "call_2", name: "", args: %{}, error: "missing function name"}
+             %{
+               id: "call_2",
+               name: "",
+               args: %{},
+               raw_args: "{}",
+               error: "missing function name"
+             }
            ]
   end
 
@@ -153,7 +173,7 @@ defmodule DashFloat.LLM.ToolCallsTest do
       ])
 
     assert ToolCalls.finish(acc) == [
-             %{id: "call_9", name: "list_directory", args: %{}, error: nil}
+             %{id: "call_9", name: "list_directory", args: %{}, raw_args: "", error: nil}
            ]
   end
 
@@ -204,7 +224,7 @@ defmodule DashFloat.LLM.ToolCallsTest do
       ])
 
     assert ToolCalls.finish(acc) == [
-             %{id: "call_n", name: "read_file", args: %{}, error: nil}
+             %{id: "call_n", name: "read_file", args: %{}, raw_args: "{}", error: nil}
            ]
   end
 
