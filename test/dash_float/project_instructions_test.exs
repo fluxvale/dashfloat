@@ -81,7 +81,8 @@ defmodule DashFloat.ProjectInstructionsTest do
     outer_agents = Path.join(root, "AGENTS.md")
     agents_link = Path.join(sub, "AGENTS.md")
     File.mkdir_p!(sub)
-    File.mkdir_p!(Path.join(root, ".git"))
+    git_marker = Path.join(root, ".git")
+    File.mkdir_p!(git_marker)
     File.write!(target, "exfiltrated secrets\n")
     File.write!(outer_agents, "outer rules\n")
     File.ln_s(target, agents_link)
@@ -136,7 +137,8 @@ defmodule DashFloat.ProjectInstructionsTest do
   test "a truncation that splits a multibyte codepoint scrubs the tail", ctx do
     root = Path.join(ctx.tmp_dir, "root")
     agents = Path.join(root, "AGENTS.md")
-    File.mkdir_p!(Path.join(root, ".git"))
+    git_marker = Path.join(root, ".git")
+    File.mkdir_p!(git_marker)
 
     # The 4-byte emoji straddles the 32 KiB cut: the head cannot end on a
     # partial codepoint — neither the JSON request body nor the session file

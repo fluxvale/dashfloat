@@ -2575,7 +2575,7 @@ defmodule DashFloat.AgentTest do
 
     assert_receive {:sse_request, "POST", _, _, body}, 2_000
 
-    assert [%{"role" => "system"}, %{"role" => "user", "content" => ^huge} | _] =
+    assert [%{"role" => "system"}, %{"role" => "user", "content" => ^huge} | _rest] =
              request_messages(body)
 
     assert_receive {:token, "noted"}, 2_000
@@ -2669,7 +2669,8 @@ defmodule DashFloat.AgentTest do
     # plan.kept already carries the pinned system message and the prompting
     # user message — the eviction never touches either.
     assert request_messages(body) == plan.kept
-    assert Enum.at(request_messages(body), 1)["content"] == "turn 2"
+    messages = request_messages(body)
+    assert Enum.at(messages, 1)["content"] == "turn 2"
     assert_receive {:phase, :idle}, 2_000
 
     # The file gains its first eviction record.

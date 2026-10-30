@@ -1,6 +1,4 @@
 defmodule DashFloat.ProjectInstructions do
-  alias DashFloat.Tools.Edit
-
   @moduledoc """
   Discovers the project's AGENTS.md files for a session (ADR 0019): from `cwd`
   upward, every readable AGENTS.md is collected until the nearest ancestor
@@ -16,6 +14,8 @@ defmodule DashFloat.ProjectInstructions do
   of the file, read bounded) with a truncation marker — the whole budget
   policy. Pure reads only; nothing here raises.
   """
+
+  alias DashFloat.Tools.Edit
 
   # The per-file budget (ADR 0019): 32 KiB of the file's head — the whole
   # policy, no total cap, no file-count cap.
@@ -55,7 +55,12 @@ defmodule DashFloat.ProjectInstructions do
 
     with {:ok, %{type: :regular, size: size}} <- File.lstat(path),
          {:ok, content} <- read_bounded(path) do
-      [{path, content |> truncate(size) |> Edit.sanitize()} | acc]
+      content =
+        content
+        |> truncate(size)
+        |> Edit.sanitize()
+
+      [{path, content} | acc]
     else
       _other -> acc
     end
