@@ -558,6 +558,28 @@ defmodule DashFloat.TUI.ViewTest do
       refute footer_text(state) =~ "4.1k/"
       refute footer_text(state) =~ "· 3"
     end
+
+    test "an assumed denominator carries the ~ marker — the visible note (issue #111)" do
+      snapshot =
+        {:context,
+         %{messages: [%{role: "user", content: String.duplicate("a", 16_400)}], anchor: nil}}
+
+      # A resolved provider whose model no source knows: 128k assumed.
+      assumed =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "https://api.z.ai/api/coding/paas/v4",
+           model: "glm-4.5",
+           api_key: "k"
+         }}
+
+      assumed_state = new_state(provider: assumed)
+      state = State.stream_message(assumed_state, snapshot, 1_000)
+
+      [line] = footer_line(state)
+      ctx = List.last(line.spans)
+      assert ctx.content == "4.1k/~131.1k · 3.1%"
+    end
   end
 
   describe "activity line" do
@@ -770,7 +792,8 @@ defmodule DashFloat.TUI.ViewTest do
         {%Onboarding{step: :label, draft: "zai"}, "Label this provider"},
         {%Onboarding{step: :key, draft: "k"}, "API key"},
         {%Onboarding{step: :fetching}, "Fetching"},
-        {%Onboarding{step: :model_pick, fetched: ["m-a", "m-b"], choice: 1}, "m-b"},
+        {%Onboarding{step: :model_pick, fetched: [%{model: "m-a"}, %{model: "m-b"}], choice: 1},
+         "m-b"},
         {%Onboarding{step: :model_manual, draft: "glm"}, "model id"},
         {%Onboarding{
            step: :model_manual,

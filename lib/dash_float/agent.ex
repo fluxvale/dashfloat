@@ -12,6 +12,7 @@ defmodule DashFloat.Agent do
 
   alias DashFloat.Accounting
   alias DashFloat.Config
+  alias DashFloat.Config.Presets
   alias DashFloat.Images
   alias DashFloat.LLM.ChatStream
   alias DashFloat.Mode
@@ -249,21 +250,22 @@ defmodule DashFloat.Agent do
   # prompt-time hook runs, on demand — never a second implementation. The
   # same ~80% trigger governs: below it the command is a no-op that reports
   # where the estimate stands, because drop-oldest below the trigger
-  # discards context nothing is at risk to reclaim.
+  # discards context nothing is at risk to reclaim. The window is the
+  # resolved chain (issue #111: configured, else seeded, else the
+  # documented default WITH the note naming the remedy — never a bare
+  # refusal and never silent).
   def handle_info(
         {:compact, ui},
-        %__MODULE__{status: :idle, provider: {:ok, %Config{context_tokens: window}}} = state
+        %__MODULE__{status: :idle, provider: {:ok, %Config{} = config}} = state
       )
-      when is_pid(ui) and is_integer(window) and window > 0 do
+      when is_pid(ui) do
+    {window, source} = Config.context_window(config)
+
     case eviction_pass(%{state | ui: ui}, window) do
       {state, nil} ->
         usage = Accounting.usage(state.messages, state.anchor, window)
 
-        display(
-          ui,
-          {:entry, :system,
-           "[context: at or under the 80% trigger — nothing to compact (est #{usage.used} of #{usage.window}, #{usage.percent}%)]"}
-        )
+        display(ui, {:entry, :system, below_trigger_text(usage, source)})
 
         {:noreply, state}
 
@@ -272,10 +274,16 @@ defmodule DashFloat.Agent do
     end
   end
 
-  # No configured window (or no resolved provider): nothing compacts and
-  # nothing is guessed (ADR 0022 §2) — the command says so, never silence.
+  # No resolved provider: nothing compacts and nothing is guessed (ADR 0022
+  # §2) — the command says so, naming the remedy (issue #111), never silence.
   def handle_info({:compact, ui}, %__MODULE__{status: :idle} = state) when is_pid(ui) do
-    display(ui, {:entry, :system, "[context: no context window configured — nothing to compact]"})
+    display(
+      ui,
+      {:entry, :system,
+       "[context: no context window resolved — nothing to compact; " <>
+         "set context on the model's entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS]"}
+    )
+
     {:noreply, state}
   end
 
@@ -1142,20 +1150,35 @@ defmodule DashFloat.Agent do
   ## Context accounting (ADR 0022)
 
   # The compaction hook (ADR 0022 §5): prompt time, after the user message is
-  # appended, before the episode starts. Only a configured window compacts —
-  # nil (or non-positive) persists the question and returns (§2, nothing is
-  # guessed). One persist per prompt either way, so a failed save shows one
-  # notice (m4): the pass persists when it dropped turns, this hook when it
-  # did not — the just-appended question must land, oversize warning or not.
-  defp maybe_compact(%__MODULE__{provider: {:ok, %Config{context_tokens: window}}} = state)
-       when is_integer(window) and window > 0 do
+  # appended, before the episode starts. The window is the resolved chain
+  # (issue #111: configured, else seeded, else the documented default) —
+  # only an unresolved provider skips the pass. One persist per prompt
+  # either way, so a failed save shows one notice (m4): the pass persists
+  # when it dropped turns, this hook when it did not — the just-appended
+  # question must land, oversize warning or not.
+  defp maybe_compact(%__MODULE__{provider: {:ok, %Config{} = config}} = state) do
+    {window, _source} = Config.context_window(config)
+
     case eviction_pass(state, window) do
       {state, %{dropped: dropped}} when dropped > 0 -> state
       {state, _no_drop} -> persist(state)
     end
   end
 
-  defp maybe_compact(state), do: persist(state)
+  # The below-trigger no-op's reply (issue #92's amendment): where the
+  # estimate stands, with the window's origin (issue #111) — a window no
+  # source knows is the documented default, and the note names the remedy
+  # instead of refusing.
+  defp below_trigger_text(usage, :default) do
+    "[context: at or under the 80% trigger — nothing to compact " <>
+      "(est #{usage.used} of #{usage.window}, #{usage.percent}%) — window assumed: no source " <>
+      "knows this model, using the #{Presets.default_window()}-token default; set context on " <>
+      "its models entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS to override]"
+  end
+
+  defp below_trigger_text(usage, _known_window) do
+    "[context: at or under the 80% trigger — nothing to compact (est #{usage.used} of #{usage.window}, #{usage.percent}%)]"
+  end
 
   # The eviction both entry points run (ADR 0022 §4-§6; the /compact
   # amendment, issue #92): plan the drop; when something changes, mutate,

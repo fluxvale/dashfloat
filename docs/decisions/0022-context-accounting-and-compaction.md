@@ -6,6 +6,9 @@
   **amended 2026-10-30** ([issue #92](https://github.com/fluxvale/dashfloat/issues/92) —
   manual `/compact`; see
   [Amendment (2026-10-30, issue #92): manual /compact](#amendment-2026-10-30-issue-92-manual-compact)
+  below); **amended again 2026-10-30** ([issue #111](https://github.com/fluxvale/dashfloat/issues/111) —
+  the window resolution chain; see
+  [Amendment (2026-10-30, issue #111): the window resolution chain](#amendment-2026-10-30-issue-111-the-window-resolution-chain)
   below).
 - **Date:** 2026-10-29
 - **Implements:** [issue #43](https://github.com/fluxvale/dashfloat/issues/43) —
@@ -96,6 +99,14 @@ the absolute total alone in that case, unchanged. The TUI catalog fallback
 stays display-only: evicting against an unconfigured window on the strength
 of an async model-list refresh would be exactly the guessing the issue
 forbids.
+
+*(Superseded 2026-10-30 by the
+[window resolution chain amendment](#amendment-2026-10-30-issue-111-the-window-resolution-chain)
+— issue #111: the window now resolves configured → observed → seeded →
+documented-default-with-note, and a stock config is never windowless. The
+"nothing is guessed" spirit stands: nothing is guessed SILENTLY — every
+assumption is visible, and the async-catalog rule survives for eviction
+thresholds.)*
 
 ### 3. The trigger: strictly past 80%
 
@@ -367,4 +378,74 @@ implementation exists; the automatic path behaves identically.
    unprompted launch must leave nothing behind (ADR 0014 §5). With no
    configured window (or no resolved provider) the command says so —
    `[context: no context window configured — nothing to compact]` — §2's
-   "nothing is guessed" governs the manual path too.
+   "nothing is guessed" governs the manual path too. *(The no-window arm
+   of this text was superseded later the same day by the
+   [window resolution chain amendment](#amendment-2026-10-30-issue-111-the-window-resolution-chain):
+   the window always resolves now, and the refusal survives only for an
+   unresolved provider, reworded to name the remedy.)*
+
+## Amendment (2026-10-30, issue #111): the window resolution chain
+
+**Status:** Accepted. The owner's v0.3.0 smoke test: on a stock config
+(fresh wizard, Z.AI key, default GLM model) **both** `/compact` and the
+footer's tokens/percent span were dead — the wizard writes models entries
+with no `context` ([ADR 0009](0009-config-v3-persona-profiles.md)'s
+document), so `Config.context_tokens` was nil, the ~80% trigger had no
+denominator, and the footer degraded to tokens-only. §2's "configured or
+never" made the feature work only where a window was hand-set. This
+amendment replaces that clause with a resolution chain — in the issue's
+stated order of preference:
+
+1. **Configured** — the selected entry's `context` (or
+   `DASHFLOAT_CONTEXT_TOKENS`). Always wins; unchanged from §2.
+2. **Observed** — the provider's own `/models` metadata per model:
+   `context_length` (the field real OpenAI-compatible catalogs carry —
+   probed 2026-10-30: Synthetic's endpoint reports it per model, Z.AI's
+   coding endpoint reports none; the plain `context` spelling stays
+   supported). Observed beats every assumption, never an explicit
+   setting.
+3. **Seeded** — `DashFloat.Config.Presets.context_window/2`: the standard
+   presets' real per-model windows, so stock configs work out of the box.
+   Z.AI's current GLM generation (glm-5.2/5.3/5.3-flash/5.3-flashx) is the
+   officially documented 1M-token window (docs.z.ai); Synthetic's
+   first-party ids carry their live catalog's values. Older Z.AI ids are
+   deliberately absent — unverified numbers are guesses, and layer 4 is the
+   honest floor for them.
+4. **Default** — 131 072 (128 Ki), documented (README), and **visible**:
+   the footer marks an assumed denominator (`4.1k/~131.1k · 3.1%`) and
+   `/compact`'s reply carries the note naming the remedy — `set context on
+   its models entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS to
+   override`. Never silent, never a bare refusal.
+
+**Where each layer lives, and why the split:**
+
+- `Config.context_window/1` resolves **configured > seeded > default** —
+  the load-time-stable chain the agent compacts against and the footer
+  floors to. The agent still never sees the async catalog: an eviction
+  threshold must not move mid-session under an async refresh (§2's
+  reasoning, kept), and §5's stable-list invariant is untouched.
+- The TUI's footer resolution (`State.provider_context_tokens/1`)
+  interleaves the observed layer: **configured > observed > seeded >
+  default** — display only, exactly the old catalog-fallback position,
+  now ranking provider truth above the static seed.
+- Observed windows reach settings.json5 **once, at creation**: the
+  onboarding wizard's picker keeps the fetched entries' windows and
+  `settings_doc/1` writes a picked model's observed value as its entry's
+  `context` (no key written when the provider carried none — pre-#111
+  files stay byte-compatible). That is the one path observed metadata
+  becomes eviction-relevant, and it is user-confirmed.
+
+**The refusal texts.** With the default, `/compact` never refuses for a
+missing window — it answers the estimate and percent (the below-trigger
+no-op of the #92 amendment), appending the layer-4 note when the window is
+the default. "No context window configured" survives only for an
+**unresolved provider**, reworded to name the remedy. §2's "nothing is
+guessed" becomes: *nothing is guessed silently* — every assumption is
+visible in both surfaces the issue names (the footer span and the
+`/compact` reply).
+
+**Testing:** the seed table is asserted per model (the Done-when's demand);
+the chain is asserted end-to-end — explicit-beats-observed,
+observed-beats-seed, seeded 1M on a stock Z.AI load, default+note for a
+model absent from every source, the wizard's write of observed context,
+and both `/compact` reply shapes.

@@ -211,6 +211,74 @@ defmodule DashFloat.TUI.StateTest do
       assert State.context_label(windowed) == "4.1k/128k · 3.2%"
     end
 
+    test "a stock config's window resolves without a configured context (issue #111)" do
+      messages = [%{role: "user", content: String.duplicate("a", 16_400)}]
+
+      # Seeded (Z.AI GLM stock shape): the real 1M window, stated plain.
+      seeded =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "https://api.z.ai/api/coding/paas/v4",
+           model: "glm-5.3-flash",
+           api_key: "k"
+         }}
+
+      state = context_state(new_state(provider: seeded), messages, nil)
+      assert State.provider_context_tokens(state) == 1_048_576
+      assert State.context_label(state) == "4.1k/1m · 0.4%"
+
+      # A model absent from every source: the documented default, marked.
+      assumed =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "https://api.z.ai/api/coding/paas/v4",
+           model: "glm-4.5",
+           api_key: "k"
+         }}
+
+      assumed_state = context_state(new_state(provider: assumed), messages, nil)
+      assert State.provider_context_tokens(assumed_state) == 131_072
+      assert State.context_label(assumed_state) == "4.1k/~131.1k · 3.1%"
+    end
+
+    test "observed catalog metadata beats the seed, never an explicit config (issue #111)" do
+      messages = [%{role: "user", content: String.duplicate("a", 16_400)}]
+      base = "https://api.synthetic.new/openai/v1"
+
+      seeded =
+        {:ok, %DashFloat.Config{base_url: base, model: "syn:small:text", api_key: "k"}}
+
+      # Before the sweep lands: the seed's 196_608.
+      state = context_state(new_state(provider: seeded), messages, nil)
+      assert State.provider_context_tokens(state) == 196_608
+
+      # The sweep lands with a fresher truth: observed wins, unmarked.
+      landed =
+        State.catalog_arrived(state, %{base => [%{model: "syn:small:text", context: 262_144}]})
+
+      assert State.provider_context_tokens(landed) == 262_144
+      assert State.context_label(landed) == "4.1k/262.1k · 1.6%"
+
+      # An explicit context always beats the catalog.
+      explicit =
+        {:ok,
+         %DashFloat.Config{
+           base_url: base,
+           model: "syn:small:text",
+           api_key: "k",
+           context_tokens: 64_000
+         }}
+
+      explicit_state = context_state(new_state(provider: explicit), messages, nil)
+
+      configured =
+        State.catalog_arrived(explicit_state, %{
+          base => [%{model: "syn:small:text", context: 262_144}]
+        })
+
+      assert State.provider_context_tokens(configured) == 64_000
+    end
+
     test "an anchored snapshot reads the measurement, not the heuristic" do
       messages = [
         %{role: "user", content: String.duplicate("a", 400)},
@@ -2100,10 +2168,14 @@ defmodule DashFloat.TUI.StateTest do
       }
 
       state = setup_state(provider: {:ok, config})
-      assert State.provider_context_tokens(state) == nil
+      # No catalog yet and the model is absent from the seed table: the
+      # documented default stands in (issue #111) — the footer always has a
+      # denominator on a resolved provider.
+      assert State.provider_context_tokens(state) == 131_072
 
       landed = State.catalog_arrived(state, %{base => [%{model: "glm-5.3", context: 128_000}]})
 
+      # Observed metadata beats the default assumption (issue #111).
       assert State.provider_context_tokens(landed) == 128_000
       assert landed.catalog == %{base => [%{model: "glm-5.3", context: 128_000}]}
 
@@ -2115,7 +2187,8 @@ defmodule DashFloat.TUI.StateTest do
 
       assert State.provider_context_tokens(filled) == 64_000
 
-      # A catalog entry without usable context leaves the fallback nil.
+      # A catalog entry without usable context falls to the documented
+      # default (issue #111) — an unusable observed value assumes nothing.
       bare = setup_state(provider: {:ok, config})
 
       contextless =
@@ -2123,7 +2196,7 @@ defmodule DashFloat.TUI.StateTest do
           base => [%{model: "glm-5.3", context: nil}]
         })
 
-      assert State.provider_context_tokens(contextless) == nil
+      assert State.provider_context_tokens(contextless) == 131_072
     end
   end
 

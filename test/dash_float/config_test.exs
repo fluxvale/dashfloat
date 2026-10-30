@@ -658,6 +658,85 @@ defmodule DashFloat.ConfigTest do
     end
   end
 
+  describe "context_window/1 — the resolution chain (issue #111)" do
+    test "an explicit context (entry or env) is :configured" do
+      assert {:ok, config} = Config.load(fleet_dir(), %{}, [])
+      assert Config.context_window(config) == {196_608, :configured}
+
+      assert {:ok, env_pinned} =
+               Config.load(fleet_dir(), %{"DASHFLOAT_CONTEXT_TOKENS" => "64000"}, [])
+
+      assert Config.context_window(env_pinned) == {64_000, :configured}
+    end
+
+    test "a stock Z.AI config (no context anywhere) resolves the seeded 1M window" do
+      dir = tmp_dir()
+
+      write!(dir, """
+      {
+        configVersion: 3,
+        defaultProfile: 'stock',
+        profiles: [
+          {
+            name: 'stock',
+            providers: [
+              {
+                baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+                models: [{ model: 'glm-5.3-flash' }],
+              },
+            ],
+          },
+        ],
+      }
+      """)
+
+      write_keys!(dir, """
+      {
+        stock: { 'https://api.z.ai/api/coding/paas/v4': 'PLACEHOLDER-stock-key' },
+      }
+      """)
+
+      assert {:ok, %Config{context_tokens: nil} = config} = Config.load(dir, %{}, [])
+      assert Config.context_window(config) == {1_048_576, :seeded}
+    end
+
+    test "a model no source knows degrades to the documented default, visibly" do
+      # A hand-built config with no model at all (the nameless shapes tests
+      # build): nothing is knowable — the documented default, visibly.
+      assert Config.context_window(%Config{base_url: @base_url, api_key: "k"}) ==
+               {131_072, :default}
+
+      dir = tmp_dir()
+
+      write!(dir, """
+      {
+        configVersion: 3,
+        defaultProfile: 'custom',
+        profiles: [
+          {
+            name: 'custom',
+            providers: [
+              {
+                baseUrl: '#{@base_url}',
+                models: [{ model: 'mystery-model' }],
+              },
+            ],
+          },
+        ],
+      }
+      """)
+
+      write_keys!(dir, """
+      {
+        custom: { '#{@base_url}': 'PLACEHOLDER-custom-key' },
+      }
+      """)
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert Config.context_window(config) == {131_072, :default}
+    end
+  end
+
   # A minimal one-profile layout whose settings map the test varies.
   defp settings_dir(settings) do
     dir = tmp_dir()

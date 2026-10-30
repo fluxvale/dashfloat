@@ -203,7 +203,11 @@ defmodule DashFloat.TUITest do
         s.setup != nil and s.setup.step == :model_pick
       end)
 
-    assert picker.setup.fetched == ["glm-loopback", "other-one"]
+    assert picker.setup.fetched == [
+             %{model: "glm-loopback", context: nil},
+             %{model: "other-one", context: nil}
+           ]
+
     press(pid, "down")
     press(pid, "enter")
 
@@ -541,7 +545,10 @@ defmodule DashFloat.TUITest do
     popped =
       eventually(pid, fn s ->
         s.setup.step == :model_pick and s.setup.providers == [] and
-          s.setup.fetched == ["glm-loopback", "other-one"]
+          s.setup.fetched == [
+            %{model: "glm-loopback", context: nil},
+            %{model: "other-one", context: nil}
+          ]
       end)
 
     assert popped.setup.pending.models == []
@@ -991,7 +998,7 @@ defmodule DashFloat.TUITest do
         s.setup != nil and s.setup.step == :model_pick
       end)
 
-    assert picker.setup.fetched == ["glm-env"]
+    assert picker.setup.fetched == [%{model: "glm-env", context: nil}]
 
     keys_file = Path.join(dir, "keys.json5")
     assert {:ok, keys} = JSON5.read_map(keys_file)
