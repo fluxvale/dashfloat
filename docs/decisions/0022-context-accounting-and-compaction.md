@@ -397,7 +397,15 @@ amendment replaces that clause with a resolution chain — in the issue's
 stated order of preference:
 
 1. **Configured** — the selected entry's `context` (or
-   `DASHFLOAT_CONTEXT_TOKENS`). Always wins; unchanged from §2.
+   `DASHFLOAT_CONTEXT_TOKENS`). Always wins at load; never displaced by
+   observed or seeded values. *(One interaction, recorded: a runtime
+   `/model` switch ([ADR 0020](0020-command-surface.md)) re-resolves the
+   window for the PICKED id — its own settings-menu entry's `context`
+   survives the switch, and with no entry the chain (observed → seeded →
+   default, marked) takes over. `DASHFLOAT_CONTEXT_TOKENS` is boot-scoped
+   like every env overlay: ADR 0020's switch-nil rule always applied to it,
+   and the pre-#111 visible degradation (tokens-only footer) becomes the
+   marked chain — never silent either way.)*
 2. **Observed** — the provider's own `/models` metadata per model:
    `context_length` (the field real OpenAI-compatible catalogs carry —
    probed 2026-10-30: Synthetic's endpoint reports it per model, Z.AI's
@@ -413,9 +421,11 @@ stated order of preference:
    honest floor for them.
 4. **Default** — 131 072 (128 Ki), documented (README), and **visible**:
    the footer marks an assumed denominator (`4.1k/~131.1k · 3.1%`) and
-   `/compact`'s reply carries the note naming the remedy — `set context on
-   its models entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS to
-   override`. Never silent, never a bare refusal.
+   `/compact`'s replies carry the note naming the remedy — `set context on
+   the model's entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS to
+   override` — on BOTH reply shapes, the below-trigger no-op AND the drop
+   entry (the most destructive action discloses the most; review F1).
+   Never silent, never a bare refusal.
 
 **Where each layer lives, and why the split:**
 

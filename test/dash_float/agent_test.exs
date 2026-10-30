@@ -3362,7 +3362,7 @@ defmodule DashFloat.AgentTest do
 
     assert entry =~
              " — window assumed: no source knows this model, using the 131072-token default; " <>
-               "set context on its models entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS to override]"
+               "set context on the model's entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS to override]"
   end
 
   test "manual /compact with no resolved provider names the remedy (issue #111)" do
@@ -3405,6 +3405,64 @@ defmodule DashFloat.AgentTest do
     assert entry =~ "[context: at or under the 80% trigger — nothing to compact (est "
     assert entry =~ " of 1048576, "
     refute entry =~ "window assumed"
+  end
+
+  @tag :tmp_dir
+  test "a drop against the documented default window carries the assumption note (issue #111, review F1)",
+       ctx do
+    # Two turns whose estimate sits over the DEFAULT window's trigger (an
+    # unknown model at an unseeded provider): the most destructive action
+    # discloses the most — the drop entry names the assumed window and the
+    # remedy, exactly like the below-trigger reply.
+    id = "0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b44"
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    File.mkdir_p!(sessions)
+
+    fixture =
+      Jason.encode!(%{
+        version: 1,
+        id: id,
+        created_at: "2026-10-30T00:00:00Z",
+        pin: %{},
+        messages:
+          for turn <- ["a", "b"] do
+            [
+              %{"role" => "user", "content" => String.duplicate(turn, 120_000)},
+              %{"role" => "assistant", "content" => String.duplicate(turn, 120_000)}
+            ]
+          end
+          |> List.flatten()
+      })
+
+    path = Path.join(sessions, "#{id}.json")
+    File.write!(path, fixture)
+
+    {:ok, saved} = Session.load(sessions, id)
+    server = start_server([])
+    # provider/1: the mock's URL and an unknown model — the documented
+    # 131072 default, :default source.
+    resumed = %{
+      id: saved.id,
+      pin: saved.pin,
+      messages: saved.messages,
+      created_at: saved.created_at
+    }
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: provider(server),
+        resume: resumed
+      )
+
+    send(agent, {:compact, self()})
+
+    assert_receive {:entry, :system, entry}, 2_000
+
+    assert entry =~ "[context: dropped 1 oldest turn(s) — est "
+
+    assert entry =~
+             " of 131072 — window assumed, set context on the model's entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS]"
   end
 
   @tag :tmp_dir

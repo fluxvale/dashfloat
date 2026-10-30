@@ -242,6 +242,12 @@ value.
   failure — auth, network, timeout — falls back to manual model-id entry with
   a gentle note, never an error screen. **Nickname defaults to the model id.**
   Skippable (empty menu is legal). One entry; menu breadth is a hand-edit.
+  *(Superseded 2026-10-30 by
+  [ADR 0022](0022-context-accounting-and-compaction.md)'s issue-#111
+  amendment: `/models` entries that carry `context_length` keep it, and a
+  picked model's observed window is written as its entry's `context`;
+  providers without the metadata still land context-less and ride the
+  runtime seed/default.)*
   The fetch is the same standing fetch defined below — onboarding reuses the
   catalog machinery, not a second HTTP path.
 - **W5 Optional loops** — "add another provider?" (W2 again under the same

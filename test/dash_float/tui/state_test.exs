@@ -2931,10 +2931,51 @@ defmodule DashFloat.TUI.StateTest do
 
       assert config.model == "m3"
       assert config.nickname == nil
+      # m3 is catalog-only (no settings menu entry): no explicit window —
+      # the observed/seeded/default chain takes over, never the outgoing
+      # model's 1_000.
       assert config.context_tokens == nil
       assert config.base_url == "http://x"
       assert picked.provider == {:ok, config}
       assert picked.palette == nil
+    end
+
+    # Issue #111 (hostile review F2): a settings-menu entry's explicit
+    # context survives the switch to its own id — the window re-resolves
+    # for the PICKED model, and the user's number is never silently
+    # displaced by observed/seed/default.
+    test "the picker's Enter re-resolves the window from the picked id's menu entry" do
+      menu = [
+        %{nickname: "Seer", model: "m9", context: 262_144, images: false},
+        %{nickname: "Plain", model: "m2", context: nil, images: false}
+      ]
+
+      base =
+        new_state(
+          provider:
+            {:ok,
+             %DashFloat.Config{
+               base_url: "http://x",
+               model: "m2",
+               api_key: "k",
+               context_tokens: 1_000,
+               model_menu: menu
+             }}
+        )
+
+      with_catalog =
+        State.catalog_arrived(base, %{
+          "http://x" => [%{model: "m2", context: nil}, %{model: "m9", context: 128_000}]
+        })
+
+      {opened, nil} = enter_typed(with_catalog, "/model")
+      moved = press(opened, "down", [])
+      {_picked, {:switch_model, {:ok, switched}}} = State.handle_key(moved, "enter", [])
+
+      assert switched.model == "m9"
+      # The menu entry's 262_144 — NOT the outgoing 1_000, NOT the
+      # catalog's observed 128_000 (which loses to an explicit entry).
+      assert switched.context_tokens == 262_144
     end
 
     # ADR 0018 §1 (hostile review finding 2): the images flag never carries

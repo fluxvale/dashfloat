@@ -261,7 +261,7 @@ defmodule DashFloat.Agent do
       when is_pid(ui) do
     {window, source} = Config.context_window(config)
 
-    case eviction_pass(%{state | ui: ui}, window) do
+    case eviction_pass(%{state | ui: ui}, window, source) do
       {state, nil} ->
         usage = Accounting.usage(state.messages, state.anchor, window)
 
@@ -1157,9 +1157,9 @@ defmodule DashFloat.Agent do
   # when it dropped turns, this hook when it did not — the just-appended
   # question must land, oversize warning or not.
   defp maybe_compact(%__MODULE__{provider: {:ok, %Config{} = config}} = state) do
-    {window, _source} = Config.context_window(config)
+    {window, source} = Config.context_window(config)
 
-    case eviction_pass(state, window) do
+    case eviction_pass(state, window, source) do
       {state, %{dropped: dropped}} when dropped > 0 -> state
       {state, _no_drop} -> persist(state)
     end
@@ -1173,12 +1173,21 @@ defmodule DashFloat.Agent do
     "[context: at or under the 80% trigger — nothing to compact " <>
       "(est #{usage.used} of #{usage.window}, #{usage.percent}%) — window assumed: no source " <>
       "knows this model, using the #{Presets.default_window()}-token default; set context on " <>
-      "its models entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS to override]"
+      "the model's entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS to override]"
   end
 
   defp below_trigger_text(usage, _known_window) do
     "[context: at or under the 80% trigger — nothing to compact (est #{usage.used} of #{usage.window}, #{usage.percent}%)]"
   end
+
+  # The drop entry's assumption suffix (issue #111, hostile review F1): the
+  # most destructive action must disclose the most — dropping turns against
+  # the documented default names the assumption like every other surface.
+  defp assumed_suffix(:default),
+    do:
+      " — window assumed, set context on the model's entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS"
+
+  defp assumed_suffix(_known_window), do: ""
 
   # The eviction both entry points run (ADR 0022 §4-§6; the /compact
   # amendment, issue #92): plan the drop; when something changes, mutate,
@@ -1188,7 +1197,7 @@ defmodule DashFloat.Agent do
   # the question; /compact saves nothing (the amendment's §3, no phantom
   # mint). Returns {state, plan}; a nil plan means the estimate sat at or
   # under the trigger with no oversize survivor — nothing changed.
-  defp eviction_pass(state, window) do
+  defp eviction_pass(state, window, source) do
     plan = Accounting.compact(state.messages, state.anchor, window)
 
     if plan.dropped == 0 and not plan.oversize do
@@ -1212,7 +1221,7 @@ defmodule DashFloat.Agent do
         display(
           state.ui,
           {:entry, :system,
-           "[context: dropped #{plan.dropped} oldest turn(s) — est #{before}→#{after_estimate} of #{window}]"}
+           "[context: dropped #{plan.dropped} oldest turn(s) — est #{before}→#{after_estimate} of #{window}#{assumed_suffix(source)}]"}
         )
       end
 

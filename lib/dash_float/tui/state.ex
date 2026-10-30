@@ -1378,12 +1378,16 @@ defmodule DashFloat.TUI.State do
 
   defp run_command(state, "profile", _rest), do: {state, :list_profiles}
 
-  # The model picker's Enter: a catalog id has no nickname or configured
-  # context — both nil out and the label/context denominator fall back to the
-  # catalog (ADR 0020). The images flag is NOT carried from the outgoing
-  # model: it re-resolves against the settings-side menu by id — a marked
-  # entry keeps its capability, a catalog-only id is not capable
-  # (ADR 0018 §1). The switch lands on the NEXT request.
+  # The model picker's Enter: a catalog id has no nickname — it nils out and
+  # the label falls back to the catalog (ADR 0020). The context window
+  # re-resolves for the PICKED id (issue #111, hostile review F2): its own
+  # settings-menu entry's `context` when one exists (an explicit user
+  # setting survives the switch), else nothing explicit and the
+  # seed/default chain takes over — never the outgoing model's number. The
+  # images flag is NOT carried from the outgoing model: it re-resolves
+  # against the settings-side menu by id — a marked entry keeps its
+  # capability, a catalog-only id is not capable (ADR 0018 §1). The switch
+  # lands on the NEXT request.
   defp pick_model(
          %{provider: {:ok, %DashFloat.Config{} = config}} = state,
          %Palette{items: entries, selected: selected}
@@ -1395,11 +1399,20 @@ defmodule DashFloat.TUI.State do
         config
         | model: picked,
           nickname: nil,
-          context_tokens: nil,
+          context_tokens: menu_context(config.model_menu, picked),
           images: menu_images(config.model_menu, picked)
       }
 
     {%{state | provider: {:ok, switched}, palette: nil}, {:switch_model, {:ok, switched}}}
+  end
+
+  # The menu entry for `id` decides (ADR 0018 §1's pattern, the context
+  # twin): no entry — a catalog-only id — carries no explicit window.
+  defp menu_context(menu, id) do
+    case Enum.find(menu, fn entry -> entry.model == id end) do
+      %{context: context} when is_integer(context) and context > 0 -> context
+      _no_entry -> nil
+    end
   end
 
   # The menu entry for `id` decides (ADR 0018 §1); no entry — a catalog-only

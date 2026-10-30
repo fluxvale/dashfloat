@@ -452,6 +452,14 @@ class App:
             # Dev may recompile on entry; keep that noise out of the boot.
             "MIX_ENV": "dev",
         })
+        # The scenarios' premises (a stock config with NO context anywhere,
+        # a specific model id) are env-sensitive: an ambient DASHFLOAT_*
+        # pin in the operator's shell would silently reconfigure the
+        # capture (issue #111 review F4). Scrub the lot — the scratch
+        # settings and keys are the whole config.
+        for var in list(env):
+            if var.startswith("DASHFLOAT_"):
+                del env[var]
         if no_ghost:
             env["DASHFLOAT_SUGGEST"] = "false"
         if resume:
