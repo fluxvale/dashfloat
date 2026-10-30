@@ -10,7 +10,7 @@ version bump — the release-notes template in `.github/workflows/release.yml`
 and this changelog must never drift. The date of a pending section is filled in
 when its tag is cut.
 
-## [0.4.0] - unreleased
+## [0.4.0] - 2026-10-31
 
 ### Added
 
