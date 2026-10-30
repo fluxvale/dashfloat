@@ -2021,6 +2021,26 @@ defmodule DashFloat.TUITest do
     assert Runtime.snapshot(pid).render_count == settled
   end
 
+  # The placeholder rule (#91, owner-set): "ask anything" only until the
+  # session's first exchange; mid-session an empty composer shows nothing.
+  test "the hint disappears with the session's first exchange" do
+    {:ok, pid} = start_tui()
+    assert screen_text(get_state(pid)) =~ "ask anything"
+
+    submit(pid, "first prompt")
+    assert_receive {:prompt, ui_pid, "first prompt"}, 1_000
+
+    # The turn finalizes (the in-flight tokens land as the assistant
+    # entry); the draft is empty again — no placeholder now.
+    send(ui_pid, {:token, "an answer"})
+    send(ui_pid, {:phase, :idle})
+    eventually(pid, fn s -> s.phase == :idle and s.entries != [] end)
+
+    text = screen_text(get_state(pid))
+    refute text =~ "ask anything"
+    refute text =~ "Enter send"
+  end
+
   # Samples the input widget's cursor_style over `window_ms` of wall clock
   # (a pure View.render in this process — no frames drawn), returning the
   # observed shapes: :reversed (the cursor artifact) or :empty (absent).

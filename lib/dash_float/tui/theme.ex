@@ -11,7 +11,10 @@ defmodule DashFloat.TUI.Theme do
 
   @styles %{
     accent: @accent,
-    cursor: %Style{modifiers: [:reversed]},
+    # ADR 0015 §1 (amended, #91): reversed alone inherits the terminal's
+    # default fg and reads dim-family next to the dark-gray placeholder —
+    # an explicit white-on-black pair makes the block bright everywhere.
+    cursor: %Style{fg: :white, bg: :black, modifiers: [:reversed]},
     dim: @dim,
     dim_italic: %Style{fg: :dark_gray, modifiers: [:italic]},
     user: @dim,

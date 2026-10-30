@@ -1,6 +1,11 @@
 # 0015 — Input surface: blinking cursor, stats footer, model-driven ghost text
 
-- **Status:** Accepted
+- **Status:** Accepted; **amended 2026-10-30**
+  ([issue #91](https://github.com/fluxvale/dashfloat/issues/91) — the idle
+  cursor carries an explicit bright fg+bg pair, and the placeholder rule is
+  tightened; see
+  [Amendment (2026-10-30, issue #91)](#amendment-2026-10-30-issue-91-cursor-prominence-placeholder-rule)
+  below).
 - **Date:** 2026-10-29
 - **Implements:** [issue #66](https://github.com/fluxvale/dashfloat/issues/66),
   [issue #67](https://github.com/fluxvale/dashfloat/issues/67) **stage 1**,
@@ -53,8 +58,10 @@ status quo ante). The composer's `cursor_style`:
 
 - **unfocused** — the empty style: the cursor artifact is absent, so a
   glance at a multiplexer shows which pane holds focus;
-- **focused + idle** — static reversed: visible, and costing **zero new
-  timers** (ADR 0006's idle ⇒ no timers ⇒ no renders stands untouched);
+- **focused + idle** — static bright reversed (an explicit `fg: :white,
+  bg: :black` pair — see the 2026-10-30 amendment): visible on every
+  terminal, and costing **zero new timers** (ADR 0006's idle ⇒ no timers ⇒
+  no renders stands untouched);
 - **focused + active phase** — reversed on
   `rem(div(anim_step, 4), 2) == 0`: a 500 ms half-period blink riding the
   existing 125 ms activity tick, within the 8 fps budget by construction —
@@ -124,9 +131,11 @@ interprets intents (the submit-action pattern — side effects never in
   non-blank line, trimmed, surrounding quotes stripped, ≤ 80 chars; blank →
   none) and shown **only while the draft is empty**, replacing the
   composer's placeholder text in the existing placeholder styling; the
-  static key-hint placeholder shows otherwise. **No deterministic
-  fallback**: before any assistant turn there is no suggestion at all —
-  zero side-channel spend until real context exists.
+  placeholder otherwise follows the 2026-10-30 amendment (the short
+  `"ask anything"` hint, only before the session's first exchange; nothing
+  mid-session). **No deterministic fallback**: before any assistant turn
+  there is no suggestion at all — zero side-channel spend until real
+  context exists.
 - **Tab** — accepts: the draft becomes the suggestion (editable, cursor at
   end) and Enter sends it through the unchanged submit path.
 - **Test gating** — the side-request runs on live sessions or when a
@@ -145,6 +154,11 @@ interprets intents (the submit-action pattern — side effects never in
   `ExRatatui.App` render contract (a widget list). Not available.
 - **Blink while idle** — needs a recurring idle timer; violates ADR 0006's
   zero-idle-tick guarantee. Static-when-idle chosen instead.
+- **Colorless reversed cursor (this ADR's first cut)** — a bare
+  `modifiers: [:reversed]` inherits the terminal's default foreground, which
+  reads dim-family next to the dark-gray placeholder (the v0.2.0 smoke
+  test: "the same color as the placeholder"). An explicit bright fg+bg pair
+  chosen (#91).
 - **Keystroke-reset blink phase** — nicer feel, extra state, no budget
   benefit. Deferred.
 - **Duplicating cwd/model/rate in both bars** — visual noise; the fields
@@ -175,3 +189,30 @@ interprets intents (the submit-action pattern — side effects never in
   frames are event-driven (focus change, a landed suggestion).
 - Terminals without focus reporting never hide the cursor (degradation is
   the previous behavior plus a static cursor, never a blank composer).
+
+## Amendment (2026-10-30, issue #91): cursor prominence, placeholder rule
+
+The owner's v0.2.0 smoke test (Oct 30) found the composer reading as dead:
+the idle cursor does not blink (by design — ADR 0006's idle budget) and its
+colorless reversed block inherits the terminal's default foreground, the
+same dim family as the placeholder. Two changes, both style/data only —
+**no new timers, no new renders**:
+
+1. **Idle cursor prominence.** `Theme`'s `:cursor` role carries an explicit
+   `fg: :white, bg: :black` pair under `modifiers: [:reversed]`: the
+   reversed block renders bright on every terminal palette instead of
+   inheriting the default foreground. Still static at idle; the active-phase
+   blink mechanism is untouched. An idle blink remains rejected — it would
+   force periodic renders and break ADR 0006's 0-renders-while-idle budget.
+2. **Placeholder rule (owner-set).** The instruction tail
+   ("Enter send · Shift+Enter newline · …") is gone from the composer —
+   the key map lives in `/help` ([ADR 0020](0020-command-surface.md)).
+   The placeholder is now, in precedence order:
+   - the ghost suggestion, whenever one has landed (unchanged — #70's
+     contract; when a suggestion exists it IS the placeholder);
+   - else `"ask anything"` — short and neutral — **only while the session
+     has no entries yet**;
+   - else nothing at all: the first prompt, a command's output, or a
+     resume note all make the session underway, and a mid-session hint
+     ("feels patronizing" — the owner's refinement, Oct 30) renders no
+     placeholder.

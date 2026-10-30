@@ -1,0 +1,24 @@
+Idle-render probe for issue #91 — bytes the app pushes to the terminal over a
+1500 ms window with NO input (0 bytes == 0 renders/s at the terminal
+boundary). Rig: scripts/capture.py (real pty, real `mix run --no-halt`).
+
+== BEFORE (main @ b547ae5) ======================================
+
+$ scripts/capture.py probe --window-ms 1500
+probe  window=1500ms fresh-session bytes=0
+
+$ scripts/capture.py probe --window-ms 1500 --after-exchange
+probe  window=1500ms after-exchange bytes=0
+
+== AFTER (this branch) ==========================================
+
+$ scripts/capture.py probe --window-ms 1500
+probe  window=1500ms fresh-session bytes=0
+
+$ scripts/capture.py probe --window-ms 1500 --after-exchange
+probe  window=1500ms after-exchange bytes=0
+
+In-suite (mix test) the render-count metric of record agrees:
+"an idle app renders nothing on a timer" and "the blink toggles over ticks
+while a turn is live and stops at idle" both assert Runtime.snapshot/1
+render_count is unchanged across a quiet window — no new timers exist.

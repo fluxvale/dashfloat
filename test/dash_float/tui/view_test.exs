@@ -888,8 +888,23 @@ defmodule DashFloat.TUI.ViewTest do
       assert buffer =~ "❯"
       assert buffer =~ "Idle"
       assert buffer =~ "hello log"
+      # Mid-session (#91): the session is underway (a system entry), so an
+      # empty composer shows NO placeholder — and the instruction tail is
+      # gone everywhere (the key map lives in /help).
+      refute buffer =~ "ask anything"
+      refute buffer =~ "Enter send"
+    end
+
+    test "a fresh session shows the short hint, and never the instruction tail" do
+      term = ExRatatui.init_test_terminal(80, 24)
+      widgets = View.render(new_state(), %ExRatatui.Frame{width: 80, height: 24})
+      assert :ok = ExRatatui.draw(term, widgets)
+
+      buffer = ExRatatui.get_buffer_content(term)
       assert buffer =~ "ask anything"
-      assert buffer =~ "Enter send"
+      refute buffer =~ "Enter send"
+      refute buffer =~ "Shift+Enter"
+      refute buffer =~ "Ctrl+Q"
     end
 
     # Issue #20 repro: at a narrow width every word of a long entry must still
@@ -994,9 +1009,8 @@ defmodule DashFloat.TUI.ViewTest do
       {widget, _rect} = input(new_state())
       assert widget.wrap_mode == :word_or_glyph
 
-      assert widget.placeholder ==
-               "ask anything — Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit"
-
+      # The hint is short and neutral — the key map lives in /help (#91).
+      assert widget.placeholder == "ask anything"
       assert widget.placeholder_style == Theme.style(:dim)
       assert widget.block.border_type == :rounded
       assert widget.block.borders == [:all]
@@ -1004,6 +1018,26 @@ defmodule DashFloat.TUI.ViewTest do
       assert %ExRatatui.Text.Span{content: "❯ ", style: style} = widget.block.title
       assert style == Theme.style(:accent)
     end
+
+    # The placeholder rule (#91, owner-set): the ghost keeps precedence
+    # wherever the session stands; otherwise the hint shows ONLY until the
+    # session's first entry — then an empty composer shows nothing at all.
+    test "placeholder: the ghost wins, the hint waits for an empty session, else nothing" do
+      # A command's output makes the session underway (ADR 0015 amendment)
+      # — as does the first prompt or a resume note.
+      underway = State.stream_message(new_state(), {:entry, :system, "hello log"})
+
+      assert placeholder(input(new_state())) == "ask anything"
+      assert placeholder(input(underway)) == nil
+
+      ghosted = %{underway | suggestion: "what happened next?"}
+      assert placeholder(input(ghosted)) == "what happened next?"
+
+      fresh_ghost = %{new_state() | suggestion: "try asking about elixir"}
+      assert placeholder(input(fresh_ghost)) == "try asking about elixir"
+    end
+
+    defp placeholder({widget, _rect}), do: widget.placeholder
   end
 
   # The composer's cursor artifact (ADR 0015 §1): focus-gated, static at
@@ -1026,6 +1060,17 @@ defmodule DashFloat.TUI.ViewTest do
         state = %{new_state() | phase: :idle, anim_step: step}
         assert cursor_style(state) == Theme.style(:cursor), "step #{step}"
       end
+    end
+
+    # Prominence regression (#91): reversed alone inherits the terminal's
+    # default fg — dim-family next to the dark-gray placeholder. The role
+    # must carry its own bright pair so the block pops on every palette.
+    test "the cursor role is a bright reversed pair, not a bare reversal" do
+      assert Theme.style(:cursor) == %ExRatatui.Style{
+               fg: :white,
+               bg: :black,
+               modifiers: [:reversed]
+             }
     end
 
     test "focused and streaming: the blink alternates 4 ticks on / 4 ticks off" do
