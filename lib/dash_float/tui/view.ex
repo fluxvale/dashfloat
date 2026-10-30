@@ -40,10 +40,10 @@ defmodule DashFloat.TUI.View do
     unchained: :error
   }
 
-  # One cell of padding on every side of the chrome (issue #28; ADR 0006
-  # amendment): text never hugs a screen edge, and the log rect's width —
-  # which IS the wrap width — shrinks with it.
-  @margin 1
+  # Two cells of padding on every side of the chrome (issues #28 and #108;
+  # ADR 0006 amendment): text never hugs a screen edge, and the log rect's
+  # width — which IS the wrap width — shrinks with it.
+  @margin 2
 
   # The composer's placeholder, shown ONLY before the session's first
   # exchange (ADR 0015 §3, amended #91). The key map lives in /help.
@@ -59,7 +59,7 @@ defmodule DashFloat.TUI.View do
   (1 row while an overlay exists — an active phase, the exit prompt, or the
   open attach prompt — else 0), input (`2 + input_lines` rows, clamped to a
   third of the frame), and the permanent stats footer (1 row, ADR 0015) —
-  the whole chrome inset by one cell per side.
+  the whole chrome inset by two cells per side.
   """
   @spec regions({integer(), integer()}, integer(), boolean()) :: %{
           status: Rect.t(),
@@ -401,7 +401,7 @@ defmodule DashFloat.TUI.View do
   # is silently clipped mid-token (issue #42).
   defp error_lines(message, width) do
     message
-    |> wrap_remedy(max(width - 4, 1))
+    |> wrap_remedy(max(width - 2 * @margin - 2, 1))
     |> Enum.map(&{&1, :error})
   end
 
@@ -410,7 +410,7 @@ defmodule DashFloat.TUI.View do
   # error.
   defp note_lines(message, width) do
     message
-    |> wrap_remedy(max(width - 4, 1))
+    |> wrap_remedy(max(width - 2 * @margin - 2, 1))
     |> Enum.map(&{&1, :dim})
   end
 

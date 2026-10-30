@@ -2560,15 +2560,17 @@ defmodule DashFloat.TUITest do
     assert bare.selection == nil
 
     # down at log row 1 ("selectable line 1"), drag to row 3, release.
-    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 3, y: 3})
+    # (16 lines in the 15-row idle viewport: follow pins the bottom, so the
+    # view sits at scroll 1 — screen row 3 is display row 1.)
+    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 4, y: 3})
     drag = eventually(pid, &(&1.selection != nil))
     assert drag.selection.anchor == {1, 2}
 
-    inject(pid, %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 5, y: 5})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 6, y: 5})
     extended = get_state(pid)
     assert extended.selection.head == {3, 4}
 
-    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 5, y: 5})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 6, y: 5})
     released = get_state(pid)
 
     # The highlight stays after the copy (terminal convention)…
@@ -2580,8 +2582,8 @@ defmodule DashFloat.TUITest do
     assert State.selection_text(released) == "lectable line 1\n\nselec"
 
     # Click-to-clear: a press+release without extension clears it.
-    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 3, y: 3})
-    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 3, y: 3})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 4, y: 3})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 4, y: 3})
     cleared = get_state(pid)
     assert cleared.selection == nil
   end
@@ -2602,9 +2604,9 @@ defmodule DashFloat.TUITest do
              threaded =
                Enum.reduce(
                  [
-                   %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3},
-                   %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 12, y: 3},
-                   %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 12, y: 3}
+                   %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 4},
+                   %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 13, y: 4},
+                   %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 13, y: 4}
                  ],
                  test_state,
                  fn event, acc ->
@@ -2627,8 +2629,8 @@ defmodule DashFloat.TUITest do
     dragging =
       Enum.reduce(
         [
-          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3},
-          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 12, y: 3}
+          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 4},
+          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 13, y: 4}
         ],
         live,
         fn event, acc ->
@@ -2637,7 +2639,7 @@ defmodule DashFloat.TUITest do
         end
       )
 
-    up = %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 12, y: 3}
+    up = %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 13, y: 4}
 
     output =
       ExUnit.CaptureIO.capture_io(fn ->

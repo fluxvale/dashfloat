@@ -17,7 +17,10 @@ defmodule DashFloat.TUI.Theme do
     cursor: %Style{fg: :white, bg: :black, modifiers: [:reversed]},
     dim: @dim,
     dim_italic: %Style{fg: :dark_gray, modifiers: [:italic]},
-    user: @dim,
+    # ADR 0006 (amended, #107): bold default fg — a weight, not a color —
+    # so the owner's turns read distinct from the assistant's on every
+    # palette, light or dark, without a wash.
+    user: %Style{modifiers: [:bold]},
     assistant: %Style{},
     tool: @dim,
     heading1: %Style{fg: {:rgb, 217, 119, 87}, modifiers: [:bold]},
