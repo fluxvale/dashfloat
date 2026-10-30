@@ -156,7 +156,10 @@ page-scroll arithmetic — one source of truth.
   protocol, modifyOtherKeys) distinguish Shift+Enter from plain Enter; on
   legacy terminals it arrives as Enter and submits. Alt+Enter is the
   portable fallback. All other printable keys and unbound Emacs shortcuts go
-  to the textarea.
+  to the textarea. (Amended by [ADR 0018](0018-image-attachments.md):
+  `Ctrl+O` while idle opens a one-line image-attach prompt — a key mode that
+  owns keys until it closes — with `Tab` path completion; the composer's
+  textarea itself is untouched.)
 - **Up/Down are history-aware**: `Up` navigates history only when the cursor
   is on the textarea's first row, `Down` only on its last row; otherwise they
   move the cursor (multi-line editing). History navigation overwrites the
