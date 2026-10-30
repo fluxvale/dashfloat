@@ -45,8 +45,9 @@ defmodule DashFloat.TUI.View do
   # which IS the wrap width — shrinks with it.
   @margin 1
 
-  # The composer's static key hint (the placeholder when no ghost shows).
-  @input_hint "ask anything — Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit"
+  # The composer's placeholder, shown ONLY before the session's first
+  # exchange (ADR 0015 §3, amended #91). The key map lives in /help.
+  @input_hint "ask anything"
 
   @doc """
   Splits `width` x `height` into status (1 row), log (rest), activity
@@ -658,17 +659,27 @@ defmodule DashFloat.TUI.View do
       },
       # The ghost (ADR 0015 §3) rides the placeholder slot in the existing
       # placeholder styling; the textarea only shows a placeholder while the
-      # draft is empty, which is the display gate.
-      placeholder: state.suggestion || @input_hint,
+      # draft is empty, which is the display gate. Past the session's first
+      # exchange an empty composer shows NOTHING (#91: a mid-session hint
+      # reads as patronizing) — until then, the short neutral hint.
+      placeholder: placeholder(state),
       placeholder_style: Theme.style(:dim),
       wrap_mode: :word_or_glyph,
       cursor_style: cursor_style(state)
     }
   end
 
+  # The placeholder precedence (#91): a landed ghost IS the placeholder,
+  # wherever the session stands; otherwise the short hint shows only while
+  # the session has no entries yet — the first prompt, a command's output,
+  # or a resume note all make it underway, and then: no placeholder at all.
+  defp placeholder(%State{suggestion: suggestion}) when suggestion != nil, do: suggestion
+  defp placeholder(%State{entries: []}), do: @input_hint
+  defp placeholder(%State{}), do: nil
+
   # The composer's cursor artifact (ADR 0015 §1): absent while the pane is
-  # unfocused, static reversed while idle (zero timers — ADR 0006's idle
-  # discipline stands), and a 500 ms on/off blink in active phases riding
+  # unfocused, static bright reversed while idle (zero timers — ADR 0006's
+  # idle discipline stands), and a 500 ms on/off blink in active phases riding
   # the existing 125 ms tick — 4 anim_steps on, 4 off at the 8 Hz budget.
   defp cursor_style(%State{focused?: false}), do: %Style{}
   defp cursor_style(%State{phase: :idle}), do: Theme.style(:cursor)
