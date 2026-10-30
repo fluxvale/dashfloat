@@ -240,13 +240,15 @@ deleted with the field. The footer reads, left to right:
    flush, finalize, cancel fill), persistence on or off — and at each
    **usage frame** (the anchor's own refresh, mid-episode). The span itself
    recomputes at render time: `footer_widget/1` reads
-   `Accounting.usage(messages, anchor, window)` per frame — the accounting
-   read costs one O(messages) pass of O(1) `byte_size` sums inside a frame
-   that already wraps the log viewport, and it happens exactly when frames
-   happen: **never while idle** (no new timers; the idle 0-render
-   discipline is untouched by construction), at most the 8 fps budget
-   while active. In-flight deltas are deliberately not counted — the usage
-   frame is the only ground truth ([ADR 0022](0022-context-accounting-and-compaction.md)
+   `Accounting.usage(messages, anchor, window)` per frame. The read walks
+   the whole message list (the viewport only renders visible rows — this
+   is O(messages), not O(viewport)) but each step is an O(1) `byte_size`
+   or map read, so it is microseconds against a frame's milliseconds — and
+   it happens exactly when frames happen: **never while idle** (no new
+   timers; the idle 0-render discipline is untouched by construction), at
+   most the 8 fps budget while active. In-flight deltas are deliberately
+   not counted — the usage frame is the only ground truth ([ADR
+   0022](0022-context-accounting-and-compaction.md)
    §1); the span moves at frames and mutation pushes, not per stream tick.
 2. **Window.** The denominator is the TUI's **display window** —
    `provider_context_tokens/1`: the configured per-model `context` (env

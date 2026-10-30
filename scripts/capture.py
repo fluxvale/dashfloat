@@ -72,6 +72,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pyte
+import re
 from PIL import Image, ImageDraw, ImageFont
 
 COLS, ROWS = 80, 24
@@ -502,10 +503,12 @@ class App:
         self.wait_quiet()              # the turn finalized; composer empty
 
     # Two completed exchanges over a small window: the footer's tokens-used
-    # span grows across turns (issue #67 stage 2). Asserted, not assumed —
-    # a mock that stopped reporting usage must fail the capture, not ship a
-    # GIF where the count stands still. The second question is longer so
-    # the growth moves the used label, not just the percent's decimal.
+    # span grows across turns (issue #67 stage 2). Asserted on the CONTEXT
+    # SPAN itself — the whole row would let cwd slashes and rate jitter
+    # satisfy a guard that proves nothing — so a mock that stopped reporting
+    # usage fails the capture, never a GIF where the count stands still.
+    # The second question is longer so the growth moves the used label, not
+    # just the percent's decimal.
     def scenario_growing_session(self) -> list[str]:
         seen = []
         for question in (
@@ -518,12 +521,20 @@ class App:
             self.send(b"\r")
             self.wait_for("rest")      # the scripted reply's last word
             self.wait_quiet()
-            seen.append(self.footer_span())
-        assert "/" in seen[0] and "/" in seen[1], \
+            seen.append(self.context_value())
+        assert all(seen), \
             f"the footer's context span never populated: {seen}"
         assert seen[0] != seen[1], \
             f"the footer's context span never grew: {seen}"
         return seen
+
+    # The `used/window · percent` portion of the footer row — the cwd's
+    # slashes and the rate's decimals must not be able to satisfy a guard.
+    CONTEXT_SPAN = re.compile(r"[\d.]+[kmb]?/[\d.]+[kmb]? · [\d.]+%")
+
+    def context_value(self) -> str:
+        match = self.CONTEXT_SPAN.search(self.footer_span())
+        return match.group(0) if match else ""
 
     def footer_span(self) -> str:
         """The footer row — the LAST row whose first glyph is ❯ (user log

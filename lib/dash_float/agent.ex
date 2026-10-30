@@ -1363,9 +1363,10 @@ defmodule DashFloat.Agent do
   # :session_dir — the nil default keeps tests and embedded starters off the
   # user's XDG dir. A failed save degrades to a warning plus one system
   # entry; the turn continues — persistence never joins the episode loop
-  # (ADR 0014 §5). The context push rides the same seam: every caller is a
-  # transcript mutation, and the footer's span re-reads off the snapshot
-  # even with persistence off (ADR 0015 §2 amendment).
+  # (ADR 0014 §5). The context push rides the same seam: every transcript
+  # mutation passes through here (title adoptions ride along too — one
+  # idempotent push on a user-paced rename), and the footer's span re-reads
+  # off the snapshot even with persistence off (ADR 0015 §2 amendment).
   defp persist(state), do: write_session(push_context(state))
 
   defp write_session(%__MODULE__{session_dir: nil} = state), do: state

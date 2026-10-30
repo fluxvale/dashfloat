@@ -604,8 +604,8 @@ defmodule DashFloat.TUI.State do
   end
 
   # One decimal, trailing `.0` trimmed — humanize/1's number rule, stated
-  # once (ADR 0015 §2 amendment).
-  defp percent_label(nil), do: ""
+  # once (ADR 0015 §2 amendment). The window arm guarantees a percent:
+  # Accounting.usage/3 returns nil only with no window.
   defp percent_label(percent), do: trim_zero(percent) <> "%"
 
   @doc "Token counts for humans: 999 reads 999, 1_500 1.5k, 1_048_576 1m."

@@ -3074,6 +3074,15 @@ defmodule DashFloat.AgentTest do
     messages = request_messages(body)
     refute hd(messages)["content"] == "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1"
     assert Process.alive?(agent3)
+
+    # The compacting prompt's snapshot is the POST-EVICTION list — the
+    # footer's estimate drops with the dropped turns, exactly the list the
+    # request carries (here: every big turn evicted, the question kept).
+    assert_receive {:context, %{messages: [%{role: "user", content: "last"}] = pushed}},
+                   2_000
+
+    assert length(pushed) == length(messages)
+    assert Enum.at(messages, 0)["content"] == "last"
   end
 
   # The stage-2 footer seam (ADR 0015 §2 amendment): the {messages, anchor}
