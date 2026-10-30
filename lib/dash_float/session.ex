@@ -527,10 +527,19 @@ defmodule DashFloat.Session do
         [message | repair(rest)]
 
       calls ->
-        {block, tail} = Enum.split_while(rest, &tool_message?/1)
+        {block, tail} = Enum.split_while(rest, &block_member?/1)
         [message | block] ++ cancelled_for_missing(block, calls) ++ repair(tail)
     end
   end
+
+  # A tool result is a batch member; so is a system message interleaved in
+  # the block (ADR 0019: the validator's system clause passes batch state
+  # through). Splitting the block AT one would synthesize a duplicate
+  # answer for a call the file actually answers — and the rewritten
+  # transcript would refuse its own next load.
+  defp block_member?(%{"role" => "tool"}), do: true
+  defp block_member?(%{"role" => "system"}), do: true
+  defp block_member?(_other), do: false
 
   defp batch_calls(%{"role" => "assistant", "tool_calls" => calls}) when is_list(calls),
     do: Enum.map(calls, & &1["id"])
@@ -552,9 +561,6 @@ defmodule DashFloat.Session do
       "content" => Jason.encode!(Tools.cancelled_result())
     }
   end
-
-  defp tool_message?(%{"role" => "tool"}), do: true
-  defp tool_message?(_other), do: false
 
   # The title rides along tolerantly (the pin precedent, #80): absent or not
   # a string it loads as nil — never a refusal.

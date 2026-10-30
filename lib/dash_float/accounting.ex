@@ -59,35 +59,47 @@ defmodule DashFloat.Accounting do
   remains, so `kept` is always a suffix of `messages` and no `tool_calls`
   batch can be split from its results (ADR 0022 §4). A leading non-user
   prelude is its own first group. A leading `system` message is session
-  context, not a turn (ADR 0019): it stays pinned — never evicted. The
+  context, not a turn (ADR 0019): it stays pinned — never evicted — and its
+  weight rides the estimate as a heuristic floor whenever the anchor is nil
+  or spent, so the trigger always sees the full list the wire carries. The
   anchor sheds the weights of the messages a drop takes, and `oversize`
   flags a surviving turn that is itself above the budget.
   """
   @spec compact([map()], anchor(), pos_integer()) ::
           %{kept: [map()], anchor: anchor(), dropped: non_neg_integer(), oversize: boolean()}
-  def compact(messages, anchor, window) do
-    threshold = div(window * 4, 5)
+  def compact(messages, anchor, window), do: compact_at(messages, anchor, div(window * 4, 5), 0)
 
+  # The pinned split (ADR 0019): the anchor threads down (shift) and back
+  # (unshift — only when a drop re-indexed it, so an index-0 anchor stays
+  # index-0 and nil stays nil), and the pinned weight threads down as a
+  # floor for nil/spent-anchor estimates. A real anchor's tokens already
+  # measured everything the floor stands for — the two never add.
+  defp compact_at(messages, anchor, threshold, floor) do
     case split_system(messages) do
       {[system], rest} ->
-        plan = compact(rest, shift(anchor), window)
+        shifted = shift(anchor)
+        plan = compact_at(rest, shifted, threshold, floor + weight(system))
 
-        %{
-          plan
-          | kept: [system | plan.kept],
-            anchor: unshift(plan.anchor),
-            oversize: estimate([system | plan.kept], unshift(plan.anchor)) > threshold
-        }
+        anchor =
+          if plan.anchor == shifted do
+            plan.anchor
+          else
+            unshift(plan.anchor)
+          end
+
+        %{plan | kept: [system | plan.kept], anchor: anchor}
 
       :none ->
-        {groups, anchor, dropped} = evict(turns(messages), trust(anchor, messages), threshold, 0)
+        {groups, anchor, dropped} =
+          evict(turns(messages), trust(anchor, messages), threshold, 0, floor)
+
         kept = Enum.concat(groups)
 
         %{
           kept: kept,
           anchor: anchor,
           dropped: dropped,
-          oversize: estimate(kept, anchor) > threshold
+          oversize: evict_estimate(groups, anchor, floor) > threshold
         }
     end
   end
@@ -153,9 +165,10 @@ defmodule DashFloat.Accounting do
   defp user?(message), do: field(message, :role) == "user"
 
   # The pinned leading system message (ADR 0019): the anchor shifts with the
-  # split so its coverage boundary stays on the same message, and shifts
-  # back so callers holding the full list stay consistent. An anchor that
-  # covers nothing covers nothing either way.
+  # split so its coverage boundary stays on the same message. The shift back
+  # is applied by compact_at only when a drop re-indexed the anchor, so an
+  # index-0 anchor stays index-0 and a nil anchor stays nil — the round trip
+  # is symmetric for every shape the loader tolerates.
   defp split_system([first | rest]) do
     if system?(first), do: {[first], rest}, else: :none
   end
@@ -175,16 +188,24 @@ defmodule DashFloat.Accounting do
 
   # Oldest turns leave whole, one at a time, while the estimate sits above
   # the trigger and more than one turn remains (ADR 0022 §4).
-  defp evict([last], anchor, _threshold, dropped), do: {[last], anchor, dropped}
+  defp evict([last], anchor, _threshold, dropped, _floor), do: {[last], anchor, dropped}
 
-  defp evict(groups, anchor, threshold, dropped) do
-    if estimate(Enum.concat(groups), anchor) > threshold do
+  defp evict(groups, anchor, threshold, dropped, floor) do
+    if evict_estimate(groups, anchor, floor) > threshold do
       [group | rest] = groups
-      evict(rest, shed(anchor, group), threshold, dropped + 1)
+      evict(rest, shed(anchor, group), threshold, dropped + 1, floor)
     else
       {groups, anchor, dropped}
     end
   end
+
+  # A nil anchor (no frame yet, a provider that never emits usable usage, a
+  # spent anchor) estimates the heuristic over the groups PLUS the pinned
+  # floor — the full list the wire carries; an anchored estimate already
+  # measured the floor's weight and must not double-count it.
+  defp evict_estimate(groups, nil, floor), do: floor + sum_weights(Enum.concat(groups))
+
+  defp evict_estimate(groups, anchor, _floor), do: estimate(Enum.concat(groups), anchor)
 
   # The anchor sheds the weights of the covered messages a drop takes away
   # (ADR 0022 §4); once it covers nothing it is spent.

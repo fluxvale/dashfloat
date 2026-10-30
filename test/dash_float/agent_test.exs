@@ -234,7 +234,10 @@ defmodule DashFloat.AgentTest do
   # assert its presence and shape, never its bytes — the accounting-driven
   # ones measure its weight where the window tuning matters. The discovery
   # rides along: the sandboxes live inside this repo, so the live prompt
-  # picks up the repo's own AGENTS.md and the mirror must too.
+  # picks up the repo's own AGENTS.md and the mirror must too. Load-bearing:
+  # the sandbox writes stay under /tmp/, which .gitignore excludes — tracked
+  # writes would flip the git line between this mirror's probe and the
+  # agent's and break the byte-equality asserts below.
   defp system_message(cwd) do
     %{
       "role" => "system",

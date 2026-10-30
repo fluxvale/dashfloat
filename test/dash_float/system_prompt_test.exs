@@ -3,7 +3,7 @@ defmodule DashFloat.SystemPromptTest do
   # Pure renderer tests — no servers; the only process spawned is the git
   # probe (one real `git status`, plus one `git init` in the probe test).
   #
-  # See ADR 0014.
+  # See ADR 0019.
 
   use ExUnit.Case, async: true
 

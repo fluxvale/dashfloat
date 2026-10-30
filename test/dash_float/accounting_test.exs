@@ -324,6 +324,46 @@ defmodule DashFloat.AccountingTest do
 
       assert kept == Enum.drop(messages, 2)
     end
+
+    test "a nil anchor still evicts on the full-list estimate (the floor)" do
+      # Hostile review F1: the pinned weight must ride the heuristic when no
+      # anchor vouches for it, or the trigger fires late and the oversize
+      # warning lies — three droppable turns would stay "kept whole".
+      system = %{role: "system", content: pad(16_000)}
+      turns = for _i <- 1..4, do: user(3_200)
+
+      assert %{kept: kept, dropped: 3, oversize: false} =
+               Accounting.compact([system | turns], nil, 6_000)
+
+      assert kept == [system, List.last(turns)]
+    end
+
+    test "an anchor spent mid-eviction falls back to the floor, not to rest alone" do
+      system = %{role: "system", content: pad(16_000)}
+      turns = for _i <- 1..4, do: user(3_200)
+
+      # The anchor covers the system message and the first turn; shedding
+      # the first turn spends it, and the remaining drops must continue on
+      # the floored heuristic.
+      assert %{kept: kept, dropped: 3, anchor: nil, oversize: false} =
+               Accounting.compact([system | turns], %{tokens: 4_900, index: 2}, 6_000)
+
+      assert kept == [system, List.last(turns)]
+    end
+
+    test "an index-0 anchor round-trips symmetrically through a no-drop compact" do
+      # Hostile review F5: shift clamped but unshift added — the round trip
+      # must be the identity for an anchor that covers nothing.
+      system = %{role: "system", content: pad(400)}
+      turns = [user(400), assistant(400)]
+
+      assert %{
+               kept: [system | ^turns],
+               anchor: %{tokens: 5_000, index: 0},
+               dropped: 0,
+               oversize: true
+             } = Accounting.compact([system | turns], %{tokens: 5_000, index: 0}, 2_000)
+    end
   end
 
   describe "compact/3 randomized" do

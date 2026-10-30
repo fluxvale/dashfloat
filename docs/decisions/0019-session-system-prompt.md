@@ -87,15 +87,24 @@ Two slots render today as nothing and are tested as no-ops:
 `DashFloat.ProjectInstructions.load(cwd)` walks cwd upward, collecting each
 directory's readable `AGENTS.md`, and stops after examining the nearest
 ancestor whose `.git` exists — inclusive of that root, `.git` tested with
-`File.exists?/1` because linked worktrees make it a file. No git root means
-walk to the filesystem root. The return is most-general-first (root first,
-cwd last); unreadable files are skipped, never raised. `build/2`'s
-`project_instructions:` slot renders the chain with an absolute-path
-provenance line per file and the precedence rule stated in the section
-header: when files conflict, the later (closer) file wins. The budget is a
-per-file 32 KiB head-truncation with a trailing marker naming the original
-byte size — no total cap, no file-count cap. Only `AGENTS.md` (no CLAUDE.md /
-OCTO.md chain — out of scope, lazy).
+`File.lstat/1` because linked worktrees make it a file and a dangling `.git`
+symlink is still a placed marker. No git root means walk to the filesystem
+root. The return is most-general-first (root first, cwd last); unreadable
+files are skipped, never raised. **Only regular files are collected** (an
+lstat, not a stat): a cloned repo must not be able to aim the discovery at
+files outside itself — the tool layer's sandbox rejects the same class
+(ADR 0007) — and a FIFO or device must not be able to hang or slurp the
+boot; the cost is that a dotfile-style symlinked AGENTS.md is silently
+rejected. The read is bounded to one byte past the budget, so a multi-GiB
+AGENTS.md costs 32 KiB + 1, not memory. `build/2`'s `project_instructions:`
+slot renders the chain with an absolute-path provenance line per file and
+the precedence rule stated in the section header: when files conflict, the
+later (closer) file wins. The budget is a per-file 32 KiB head-truncation
+with a trailing marker naming the original byte size — no total cap, no
+file-count cap. Only `AGENTS.md` (no CLAUDE.md / OCTO.md chain — out of
+scope, lazy). The env-facts git probe carries no timeout — accepted: a hung
+`git status` means a hung repository, where every exec tool call would hang
+equally; discovery hangs are the bounded-read/lstat case handled above.
 
 ### 5. The transcript carries it: persistence and compaction
 
@@ -105,16 +114,24 @@ extend rather than fork:
 - **Persistence (ADR 0014):** the system message persists with the
   transcript. The loader's role gate accepts `"system"` with binary
   `content`; it neither opens nor closes a tool-call batch, so the batch
-  state passes through.
+  state passes through — and `repair/1` agrees: a system message interleaved
+  in a tool batch rides the block (splitting the block at one would
+  synthesize a duplicate answer and brick the file on its next load).
 - **Accounting (ADR 0022):** the anchor's `index` counts the full list, so
   provider-measured `prompt_tokens` and the heuristic stay aligned with what
   the wire actually carries.
 - **Compaction (ADR 0022 §4):** a leading `system` message is session
-  context, not a turn — it is pinned, never evicted. The carve-out is
-  exactly one message, exactly leading: the prelude rule ("leading non-user
-  messages form their own first group, dropped first") stands for everything
-  else, and a `system` message that lands mid-transcript (hand-built resume
-  maps can carry anything) groups into its turn like any other message.
+  context, not a turn — it is pinned, never evicted, and its weight rides
+  the estimate as a **heuristic floor** whenever the anchor is nil or spent:
+  the eviction trigger always sees the full list the wire carries, system
+  message included (a real anchor already measured that weight — the two
+  never add). The anchor shifts with the pin and shifts back only when a
+  drop re-indexed it, so the round trip is symmetric for every anchor shape
+  the loader tolerates. The carve-out is exactly one message, exactly
+  leading: the prelude rule ("leading non-user messages form their own first
+  group, dropped first") stands for everything else, and a `system` message
+  that lands mid-transcript (hand-built resume maps can carry anything)
+  groups into its turn like any other message.
 
 ## Alternatives considered
 

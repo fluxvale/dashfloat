@@ -57,6 +57,40 @@ defmodule DashFloat.ProjectInstructionsTest do
            ]
   end
 
+  @tag :tmp_dir
+  test "a dangling .git symlink still stops the walk", ctx do
+    outer = Path.join(ctx.tmp_dir, "outer")
+    repo = Path.join(outer, "repo")
+    above = Path.join(outer, "AGENTS.md")
+    git_link = Path.join(repo, ".git")
+    File.mkdir_p!(repo)
+    File.write!(above, "above the repo\n")
+    File.ln_s("/nonexistent/gitdir", git_link)
+
+    assert ProjectInstructions.load(repo) == []
+  end
+
+  @tag :tmp_dir
+  test "a symlinked AGENTS.md is rejected outright", ctx do
+    # A cloned repo must not be able to aim the discovery at files outside
+    # itself (the tool sandbox rejects the same class, ADR 0007) — so only
+    # regular files count, dotfile-style symlinked AGENTS.md included.
+    root = Path.join(ctx.tmp_dir, "root")
+    sub = Path.join(root, "sub")
+    target = Path.join(ctx.tmp_dir, "real-agents.md")
+    outer_agents = Path.join(root, "AGENTS.md")
+    agents_link = Path.join(sub, "AGENTS.md")
+    File.mkdir_p!(sub)
+    File.mkdir_p!(Path.join(root, ".git"))
+    File.write!(target, "exfiltrated secrets\n")
+    File.write!(outer_agents, "outer rules\n")
+    File.ln_s(target, agents_link)
+
+    assert ProjectInstructions.load(sub) == [
+             %{path: outer_agents, content: "outer rules\n"}
+           ]
+  end
+
   test "with no .git anywhere the walk reaches the filesystem root" do
     base = Path.join(System.tmp_dir!(), "agents-discovery-#{System.unique_integer()}")
     inner = Path.join(base, "sub")
@@ -131,9 +165,14 @@ defmodule DashFloat.ProjectInstructionsTest do
     File.chmod!(agents, 0)
     on_exit(fn -> File.chmod!(agents, 0o644) end)
 
-    # A privileged user (e.g. root) reads a 000-mode file anyway; the skip
-    # cannot be exercised there.
-    unless match?({:ok, _}, File.read(agents)) do
+    # A privileged user (e.g. root) reads a 000-mode file anyway; both arms
+    # assert, so neither runner loses the coverage.
+    if match?({:ok, _}, File.read(agents)) do
+      assert ProjectInstructions.load(sub) == [
+               %{path: agents, content: "locked\n"},
+               %{path: inner_agents, content: "readable\n"}
+             ]
+    else
       assert ProjectInstructions.load(sub) == [
                %{path: inner_agents, content: "readable\n"}
              ]

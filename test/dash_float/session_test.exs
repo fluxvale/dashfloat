@@ -629,6 +629,39 @@ defmodule DashFloat.SessionTest do
     end
 
     @tag :tmp_dir
+    test "a system message interleaved in a tool batch rides the block through repair", ctx do
+      # Hostile review F4: the validator tolerates a mid-batch system message
+      # (batch state passes through, ADR 0019) — repair must agree, or it
+      # synthesizes a duplicate answer and the next save bricks the file.
+      calls = [
+        %{
+          "id" => "call_x",
+          "type" => "function",
+          "function" => %{"name" => "read_file", "arguments" => "{\"path\":\"a\"}"}
+        }
+      ]
+
+      messages = [
+        %{"role" => "system", "content" => "session start"},
+        %{"role" => "user", "content" => "go"},
+        %{"role" => "assistant", "content" => nil, "tool_calls" => calls},
+        %{"role" => "system", "content" => "mid-batch"},
+        %{"role" => "tool", "tool_call_id" => "call_x", "content" => "{\"ok\":true}"}
+      ]
+
+      write_body(ctx, body_with(messages))
+
+      assert {:ok, session} = load(ctx)
+      assert session.messages == messages
+
+      # The repaired transcript re-saves and re-loads — no synthesized
+      # duplicate, no refusal.
+      assert :ok = Session.save(ctx.tmp_dir, session)
+      assert {:ok, reloaded} = load(ctx)
+      assert reloaded.messages == messages
+    end
+
+    @tag :tmp_dir
     test "a system message with non-binary content refuses naming the field", ctx do
       write_body(ctx, body_with([%{"role" => "system", "content" => 42}]))
 
