@@ -14,6 +14,7 @@ defmodule DashFloat.Agent do
   alias DashFloat.Config
   alias DashFloat.LLM.ChatStream
   alias DashFloat.Mode
+  alias DashFloat.ProjectInstructions
   alias DashFloat.Session
   alias DashFloat.Session.Title
   alias DashFloat.SystemPrompt
@@ -1090,7 +1091,12 @@ defmodule DashFloat.Agent do
   # persisted messages already carry the system message the original
   # session start built.
   defp initial_messages(cwd, nil, []),
-    do: [%{role: "system", content: SystemPrompt.build(cwd)}]
+    do: [
+      %{
+        role: "system",
+        content: SystemPrompt.build(cwd, project_instructions: ProjectInstructions.load(cwd))
+      }
+    ]
 
   defp initial_messages(_cwd, _resume, messages), do: messages
 

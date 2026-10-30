@@ -232,9 +232,17 @@ defmodule DashFloat.AgentTest do
   # The session-start system message (ADR 0019) rides every request and
   # every persisted transcript. Its content is cwd/git dependent, so tests
   # assert its presence and shape, never its bytes — the accounting-driven
-  # ones measure its weight where the window tuning matters.
+  # ones measure its weight where the window tuning matters. The discovery
+  # rides along: the sandboxes live inside this repo, so the live prompt
+  # picks up the repo's own AGENTS.md and the mirror must too.
   defp system_message(cwd) do
-    %{"role" => "system", "content" => DashFloat.SystemPrompt.build(cwd)}
+    %{
+      "role" => "system",
+      "content" =>
+        DashFloat.SystemPrompt.build(cwd,
+          project_instructions: DashFloat.ProjectInstructions.load(cwd)
+        )
+    }
   end
 
   defp tool_result_of(body, id) do
@@ -338,6 +346,30 @@ defmodule DashFloat.AgentTest do
     assert [%{"role" => "system", "content" => content} | _rest] = request_messages(body)
     assert content =~ "You are DashFloat"
     assert content =~ "Working directory:"
+  end
+
+  @tag :tmp_dir
+  test "a fresh session's system prompt carries the discovered AGENTS.md files", ctx do
+    # A .git marker one level up stops the walk; the repo's own AGENTS.md,
+    # further above, must NOT ride along (ADR 0019).
+    root = Path.join(ctx.tmp_dir, "root")
+    proj = Path.join(root, "proj")
+    git_marker = Path.join(root, ".git")
+    File.mkdir_p!(proj)
+    File.mkdir_p!(git_marker)
+
+    agents = Path.join(proj, "AGENTS.md")
+    File.write!(agents, "always answer with a haiku\n")
+
+    server = start_server([final_episode()])
+    {agent, _sup} = start_agent(server, proj)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+
+    assert [%{"role" => "system", "content" => content} | _rest] = request_messages(body)
+    assert content =~ "always answer with a haiku"
+    assert content =~ "--- #{agents} ---"
   end
 
   @tag :tmp_dir
