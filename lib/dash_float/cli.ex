@@ -48,6 +48,11 @@ defmodule DashFloat.CLI do
   # a typo worth warning about.
   defp do_parse(["--version" | rest], acc), do: do_parse(rest, acc)
 
+  # The launcher's end-of-options separator (ADR 0010's amendment, issue
+  # #113): everything past it is pure user argv, and the marker itself is
+  # not an argument.
+  defp do_parse(["--" | rest], acc), do: do_parse(rest, acc)
+
   defp do_parse([flag, value | rest], acc) when flag in @flags do
     do_parse(rest, put_new(acc, Map.fetch!(@keys, flag), value))
   end

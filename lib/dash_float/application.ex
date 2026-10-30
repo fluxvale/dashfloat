@@ -123,7 +123,7 @@ defmodule DashFloat.Application do
         _no_argv -> plain
       end
 
-    Enum.reject(argv, &(&1 == "--no-halt"))
+    Enum.reject(argv, &(&1 in ["--no-halt", "--"]))
   end
 
   # A forced selection or onboarding state needs the terminal; a headless or
@@ -420,7 +420,10 @@ defmodule DashFloat.Application do
   # pre-fills the /title dialog (ADR 0023's 2026-10-31 amendment): a resume
   # mounts the file's own title (NOT the --title override, which lives only
   # at the agent), a fresh boot the normalized --title — `boot_title/1`'s
-  # output verbatim, no renormalizing.
+  # output verbatim, no renormalizing. The Herdr context is detected from
+  # the boot env here (ADR 0024) — nil outside Herdr — and the resumed
+  # session's id rides along so the reporter can attach the resume command
+  # from mount.
   defp tui_child(classification, config_dir, env, cli, resume) do
     resume_opts =
       case resume do
@@ -431,6 +434,7 @@ defmodule DashFloat.Application do
           [
             transcript: session.messages,
             resume_note: note,
+            session_id: session.id,
             # The agent's own precedence (boot_title || session title): a
             # --resume + --title boot has ALREADY renamed the session — the
             # dialog pre-fills the live title, not the loaded file's old one.
@@ -445,7 +449,8 @@ defmodule DashFloat.Application do
          agent: DashFloat.Agent,
          config_dir: config_dir,
          setup: setup_state(classification),
-         resolve: boot_resolver(config_dir, env, cli)
+         resolve: boot_resolver(config_dir, env, cli),
+         herdr: DashFloat.Herdr.detect(env)
        ] ++ resume_opts}
     ]
   end

@@ -1465,18 +1465,25 @@ defmodule DashFloat.Agent do
 
   defp write_session(%__MODULE__{session_dir: nil} = state), do: state
 
-  # Id, pin, and created_at are minted once, at the first save. An error
-  # provider never reaches a persist (the prompt arm guards it), so the pin
-  # always reads off an {:ok, config}.
   defp write_session(%__MODULE__{session_id: nil} = state) do
+    id = Session.new_id()
+
     # Recurse through write_session, not persist: the minted-id rewrite is
     # the same transcript mutation the outer persist already pushed for.
-    write_session(%{
-      state
-      | session_id: Session.new_id(),
-        session_created_at: now_iso8601_utc(),
-        session_pin: session_pin(state.provider)
-    })
+    # The id is announced to the UI only once the save attempt has run —
+    # the Herdr reporter publishes a resume command off it (ADR 0024 §5);
+    # a first save that fails leaves no file, and the announcement still
+    # fires because a later turn retries under the SAME in-memory id.
+    saved =
+      write_session(%{
+        state
+        | session_id: id,
+          session_created_at: now_iso8601_utc(),
+          session_pin: session_pin(state.provider)
+      })
+
+    display(state.ui, {:session_id, id})
+    saved
   end
 
   # A hand-built resume map may carry no created_at; the first save stamps it.

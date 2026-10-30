@@ -45,3 +45,4 @@ their replacement.
 | [0021](0021-synthetic-repair-and-web-search.md) | Synthetic repair and web search: fix-json at the stream terminal, the search endpoint seam | Accepted |
 | [0022](0022-context-accounting-and-compaction.md) | Context accounting and compaction: usage-frame anchor, chars/4 growth, 80% whole-turn eviction | Accepted |
 | [0023](0023-session-titles-and-uuid-ids.md) | Session titles and UUID session ids: title normalization, uniqueness, resume by title, the auto-title nudge | Accepted |
+| [0024](0024-herdr-integration.md) | Herdr integration: state reporting, resume command, pane release | Accepted |
