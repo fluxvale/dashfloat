@@ -2550,6 +2550,18 @@ defmodule DashFloat.TUI.StateTest do
       assert replayed.entries == live_state().entries
     end
 
+    test "the stored system message replays as nothing — the prompt is re-derived at boot (ADR 0019)" do
+      # A session saved since ADR 0019 always carries the system message
+      # first; a resume of one crashed at mount until the skip landed
+      # (issue #113's restore dance).
+      replayed =
+        new_state(
+          transcript: [%{"role" => "system", "content" => "You are DashFloat."} | transcript()]
+        )
+
+      assert pairs(replayed) == pairs(live_state())
+    end
+
     test "entries wrap at the construction width, exactly like live entries" do
       wide = new_state(transcript: transcript())
       narrow = new_state(test_mode: {20, 24}, transcript: transcript())

@@ -3422,4 +3422,174 @@ defmodule DashFloat.TUITest do
       assert state.phase == :idle
     end
   end
+
+  # The Herdr integration (ADR 0024): the reporter hooks are driven through
+  # the real TUI event loop — mount's first report, the phase transitions
+  # through the stream contract, the blocked prompts, the session-id
+  # landing, and release on quit. The injected runner is the test seam.
+  describe "herdr reporting (ADR 0024)" do
+    defp herdr_ctx do
+      test = self()
+
+      %DashFloat.Herdr{
+        pane: "wA:p1",
+        socket: "/tmp/opencode/herdr-tui.sock",
+        runner: fn request -> send(test, {:herdr, request}) end
+      }
+    end
+
+    defp herdr_state(%{params: params}), do: params.state
+
+    defp herdr_message(%{params: params}), do: params[:message]
+
+    test "mount holds the pane with the idle state" do
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
+
+      assert_receive {:herdr, %{method: "pane.report_agent", params: params}}, 1_000
+      seq = params.seq
+
+      assert params == %{
+               pane_id: "wA:p1",
+               source: "dashfloat",
+               agent: "dashfloat",
+               state: "idle",
+               seq: seq
+             }
+
+      assert seq > 0
+      assert get_state(pid).herdr.seq == seq
+    end
+
+    test "outside Herdr nothing reports and nothing breaks" do
+      {:ok, pid} = start_tui(provider: provider())
+
+      submit(pid, "hello")
+      assert_receive {:prompt, _ui, "hello", []}, 1_000
+      refute_receive {:herdr, _request}, 50
+      assert get_state(pid).herdr == nil
+    end
+
+    test "a turn reports working, then idle" do
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "idle"
+
+      submit(pid, "hello")
+      assert_receive {:prompt, ui, "hello", []}, 1_000
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "working"
+
+      send(ui, {:phase, :idle})
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "idle"
+    end
+
+    test "a confirm prompt reports blocked naming the decision" do
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
+      assert_receive {:herdr, _request}, 1_000
+
+      send(pid, {:confirm, make_ref(), %{id: "c1", name: "bash", args: %{}, lines: ["$ x"]}})
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "blocked"
+      assert herdr_message(request) == "approve bash"
+    end
+
+    test "the exit prompt reports blocked; its expiry returns to idle" do
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
+      assert_receive {:herdr, _request}, 1_000
+
+      press(pid, "c", ["ctrl"])
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "blocked"
+      assert herdr_message(request) == "exit? press Ctrl+C again"
+
+      # The guard's one-shot timer expiry (2 s) is the non-schedule return
+      # path that also carries the hook.
+      assert_receive {:herdr, request}, 3_000
+      assert herdr_state(request) == "idle"
+    end
+
+    test "the setup questions report blocked until the provider resolves" do
+      {:ok, pid} =
+        start_tui(
+          setup: {:select, ["work", "home"], 0},
+          resolve: fn "work" -> provider() end,
+          herdr: herdr_ctx()
+        )
+
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "blocked"
+      assert herdr_message(request) == "first-run setup: choose a provider"
+
+      press(pid, "enter")
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "idle"
+    end
+
+    test "the agent's session-id landing attaches the resume command" do
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
+      assert_receive {:herdr, _request}, 1_000
+
+      id = "01923f8e-6b1e-7abc-8def-123456789abc"
+      send(pid, {:session_id, id})
+
+      assert_receive {:herdr, %{method: "pane.report_agent_session", params: params}}, 1_000
+      assert params.agent_session_id == id
+      assert params.resume_argv == ["dashfloat", "--resume", id, "--model", "test-model"]
+      assert get_state(pid).session_id == id
+    end
+
+    test "a resumed boot reports the resume command from mount" do
+      id = "01923f8e-6b1e-7abc-8def-123456789abc"
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx(), session_id: id)
+
+      assert_receive {:herdr, %{method: "pane.report_agent_session", params: params}}, 1_000
+      assert params.resume_argv == ["dashfloat", "--resume", id, "--model", "test-model"]
+      assert get_state(pid).session_id == id
+    end
+
+    test "quit releases the pane on teardown" do
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
+      assert_receive {:herdr, _request}, 1_000
+      ref = Process.monitor(pid)
+
+      press(pid, "q", ["ctrl"])
+
+      assert_receive {:herdr, %{method: "pane.release_agent", params: params}}, 2_000
+      assert params.pane_id == "wA:p1"
+      assert params.source == "dashfloat"
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 2_000
+    end
+
+    test "a /model switch re-reports the resume command under the new model" do
+      provider =
+        {:ok,
+         %Config{
+           base_url: "https://active.example/v1",
+           model: "m1",
+           api_key: "k",
+           providers: [%{label: "a", base_url: "https://active.example/v1", api_key: "k"}]
+         }}
+
+      {:ok, pid} =
+        start_tui(
+          provider: provider,
+          catalog_fetcher: fn "https://active.example/v1", "k" ->
+            {:ok, [%{model: "m2", context: 128_000}]}
+          end,
+          herdr: herdr_ctx(),
+          session_id: "01923f8e-6b1e-7abc-8def-123456789abc"
+        )
+
+      assert_receive {:herdr, %{method: "pane.report_agent_session", params: params}}, 1_000
+      assert List.last(params.resume_argv) == "m1"
+      eventually(pid, fn s -> s.catalog != %{} end)
+
+      submit(pid, "/model")
+      press(pid, "enter")
+
+      assert_receive {:herdr, %{method: "pane.report_agent_session", params: params}}, 1_000
+      assert List.last(params.resume_argv) == "m2"
+    end
+  end
 end

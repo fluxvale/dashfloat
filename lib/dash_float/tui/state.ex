@@ -186,7 +186,13 @@ defmodule DashFloat.TUI.State do
     # by the agent's {:title, _} push (issue #106); pre-fills the dialog.
     title: nil,
     # The bare /title dialog (issue #106), nil closed.
-    title_dialog: nil
+    title_dialog: nil,
+    # The Herdr integration (ADR 0024): nil outside Herdr — every hook is a
+    # no-op then. `session_id` is the resume identity the reporter reports;
+    # set at mount for a resumed boot, or on the agent's `{:session_id, _}`
+    # when a fresh session's id is minted at first save.
+    herdr: nil,
+    session_id: nil
   ]
 
   @type t :: %__MODULE__{
@@ -238,8 +244,11 @@ defmodule DashFloat.TUI.State do
           palette: Palette.t() | nil,
           attachments: [attachment()],
           attach: attach_prompt() | nil,
+
           title: String.t() | nil,
-          title_dialog: title_dialog() | nil
+          title_dialog: title_dialog() | nil,
+          herdr: DashFloat.Herdr.t() | nil,
+          session_id: String.t() | nil
         }
 
   @typedoc """
@@ -323,7 +332,11 @@ defmodule DashFloat.TUI.State do
       suggest_debounce_ms: Keyword.get(opts, :suggest_debounce_ms, 600),
       # The session title (ADR 0023): the boot --title or the resumed file's
       # title — the dialog's prefill (issue #106).
-      title: Keyword.get(opts, :title)
+      title: Keyword.get(opts, :title),
+      # The Herdr reporter's seams (ADR 0024): the detected context (nil
+      # outside Herdr — inert) and the resumed boot's session id.
+      herdr: Keyword.get(opts, :herdr),
+      session_id: Keyword.get(opts, :session_id)
     }
 
     replay(state, Keyword.get(opts, :transcript, []), Keyword.get(opts, :resume_note))
@@ -347,6 +360,12 @@ defmodule DashFloat.TUI.State do
   # shape the live submit renders: the concatenated text parts as the
   # body, then one dim 📎 row per image part — the loaded part carries a
   # data URL, not the display metadata, so the row counts, not names.
+  # The transcript's system message (ADR 0019) is not chat-log content: the
+  # prompt is re-derived at every boot, so replay skips the role instead of
+  # rendering it. Without this clause a resume of any system-bearing session
+  # crashes at mount (found by the Herdr restore dance, issue #113).
+  defp replay_message(%{"role" => "system"}, acc), do: acc
+
   defp replay_message(%{"role" => "user", "content" => parts}, {state, names})
        when is_list(parts) do
     text =

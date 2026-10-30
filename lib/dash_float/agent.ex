@@ -1467,13 +1467,17 @@ defmodule DashFloat.Agent do
 
   # Id, pin, and created_at are minted once, at the first save. An error
   # provider never reaches a persist (the prompt arm guards it), so the pin
-  # always reads off an {:ok, config}.
+  # always reads off an {:ok, config}. The minted id is announced to the UI:
+  # the Herdr reporter needs it to report the resume command (ADR 0024 §5).
   defp write_session(%__MODULE__{session_id: nil} = state) do
+    id = Session.new_id()
+    display(state.ui, {:session_id, id})
+
     # Recurse through write_session, not persist: the minted-id rewrite is
     # the same transcript mutation the outer persist already pushed for.
     write_session(%{
       state
-      | session_id: Session.new_id(),
+      | session_id: id,
         session_created_at: now_iso8601_utc(),
         session_pin: session_pin(state.provider)
     })

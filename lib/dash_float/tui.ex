@@ -22,6 +22,7 @@ defmodule DashFloat.TUI do
   alias DashFloat.Config
   alias DashFloat.Config.Catalog
   alias DashFloat.Config.Onboarding
+  alias DashFloat.Herdr
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Suggest
@@ -72,6 +73,7 @@ defmodule DashFloat.TUI do
     |> State.new()
     |> State.claim_agent()
     |> maybe_start_catalog()
+    |> herdr_report()
     |> then(&{:ok, &1})
   end
 
@@ -278,7 +280,9 @@ defmodule DashFloat.TUI do
     if stale_guard?(state) do
       {:noreply, state, %{render?: false}}
     else
-      {:noreply, %{state | exit_guard_at: nil, exit_guard_ref: nil}}
+      # The Herdr hook rides here too (ADR 0024): the prompt's expiry is a
+      # blocked→idle transition this path returns without passing schedule/1.
+      {:noreply, herdr_report(%{state | exit_guard_at: nil, exit_guard_ref: nil})}
     end
   end
 
@@ -338,6 +342,12 @@ defmodule DashFloat.TUI do
 
   def handle_info({:confirm, _ref, _payload} = msg, state),
     do: schedule(State.stream_message(state, msg))
+
+  # A fresh session's id was minted at first save (ADR 0023/0024): the agent
+  # is the single voice; the reporter re-reports with the resume command
+  # attached once the id is known.
+  def handle_info({:session_id, id}, state) when is_binary(id),
+    do: schedule(%{state | session_id: id})
 
   # The standing catalog refresh landed (ADR 0009): in-memory merge, the
   # context denominator fills in, nothing else changes.
@@ -425,8 +435,35 @@ defmodule DashFloat.TUI do
       |> schedule_guard(System.monotonic_time(:millisecond))
       |> suggest_reap()
       |> suggest_arm()
+      |> herdr_report()
 
     {:noreply, state}
+  end
+
+  # The Herdr reporter's choke point (ADR 0024): every event return threads
+  # through schedule/1, so one change-detected report here covers phase
+  # flips, confirm arms/clears, exit-guard arming, setup completion, and
+  # provider switches. nil context — outside Herdr — is the cheap no-op.
+  defp herdr_report(%State{herdr: nil} = state), do: state
+
+  defp herdr_report(%State{} = state) do
+    {profile, model} =
+      case state.provider do
+        {:ok, %Config{profile: p, model: m}} -> {p, m}
+        _unresolved -> {nil, nil}
+      end
+
+    shot = %{
+      phase: state.phase,
+      confirm: if(state.confirm, do: state.confirm.name),
+      exit_prompt: state.exit_guard_at != nil,
+      setup: state.setup != nil,
+      session_id: state.session_id,
+      profile: profile,
+      model: model
+    }
+
+    %{state | herdr: Herdr.report(state.herdr, shot)}
   end
 
   defp schedule_tick(state) do
@@ -521,7 +558,12 @@ defmodule DashFloat.TUI do
     # the TUI quits so the shell prompt comes back. Only an explicit quit is a
     # success — a supervisor-driven or failing shutdown reports 1 (ADR 0002).
     # Test-mode instances own no real terminal and must not stop the test VM.
+    # The Herdr release is the one synchronous report (ADR 0024 §6): every
+    # deliberate exit funnels here, and the release must land before the VM
+    # stops — Herdr's idle-prompt self-clear is only the safety net.
+    _released = Herdr.release(state.herdr)
     code = exit_code(reason)
+
     if state.live?, do: System.stop(code)
 
     :ok
