@@ -4,7 +4,7 @@ defmodule DashFloat.ToolsTest do
 
   alias DashFloat.Tools
 
-  describe "schema/0" do
+  describe "schema/1" do
     test "returns the five tools in the exact OpenAI shape" do
       assert Tools.schema() == [
                %{
@@ -143,6 +143,51 @@ defmodule DashFloat.ToolsTest do
     test "the schema is JSON-encodable exactly as advertised" do
       assert {:ok, _encoded} = Jason.encode(Tools.schema())
     end
+
+    test "an explicit nil context is the same five-tool list" do
+      assert Tools.schema(nil) == Tools.schema()
+    end
+
+    test "a synthetic context advertises web_search last, with its required query" do
+      ctx = %{base_url: "https://api.synthetic.new/v1", api_key: "sk"}
+
+      names =
+        ctx
+        |> Tools.schema()
+        |> Enum.map(& &1["function"]["name"])
+
+      assert names == [
+               "read_file",
+               "write_file",
+               "edit_file",
+               "execute_command",
+               "list_directory",
+               "web_search"
+             ]
+
+      search = %{
+        "type" => "function",
+        "function" => %{
+          "name" => "web_search",
+          "description" =>
+            "Search the web. Use this to find information you are not sure about, to look up documentation, or to find data created after your training knowledge cutoff. Returns a list of results with url, title, and highlights.",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{
+              "query" => %{
+                "type" => "string",
+                "description" => "The search query.",
+                "minLength" => 1
+              }
+            },
+            "required" => ["query"]
+          }
+        }
+      }
+
+      advertised = Tools.schema(ctx)
+      assert List.last(advertised) == search
+    end
   end
 
   describe "validate/2" do
@@ -261,6 +306,19 @@ defmodule DashFloat.ToolsTest do
                }) == {:error, "#{tool}: path must name a file, not end in \"/\""}
       end
     end
+
+    test "web_search validates its query — total over the table, key or no key" do
+      assert Tools.validate("web_search", %{"query" => "x"}) == {:ok, %{"query" => "x"}}
+
+      assert Tools.validate("web_search", %{}) ==
+               {:error, ~s(web_search: missing required argument "query")}
+
+      assert Tools.validate("web_search", %{"query" => ""}) ==
+               {:error, "web_search: query must not be empty"}
+
+      assert Tools.validate("web_search", %{"query" => 3}) ==
+               {:error, "web_search: query must be a string"}
+    end
   end
 
   describe "class/1" do
@@ -270,6 +328,7 @@ defmodule DashFloat.ToolsTest do
       assert Tools.class("write_file") == :mutating
       assert Tools.class("edit_file") == :mutating
       assert Tools.class("execute_command") == :risky
+      assert Tools.class("web_search") == :safe
     end
 
     test "unknown names fail closed to :risky" do

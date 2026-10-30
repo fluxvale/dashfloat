@@ -2,6 +2,7 @@ defmodule DashFloat.Tools.RunnerTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  alias DashFloat.SSEServer
   alias DashFloat.Tools
 
   setup do
@@ -629,5 +630,38 @@ defmodule DashFloat.Tools.RunnerTest do
     unknown = Tools.Runner.run("not_a_tool", %{}, root)
     assert unknown.ok == false
     assert unknown.error =~ "tool crashed"
+  end
+
+  ## web_search (ADR 0021 §6)
+
+  test "web_search dispatches through the loopback search endpoint" do
+    entries = [%{"url" => "https://example.com/a", "title" => "A"}]
+    body = Jason.encode!(%{"results" => entries})
+
+    {:ok, server} =
+      SSEServer.start_link([
+        {:send,
+         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n" <>
+           "content-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n" <> body},
+        :close
+      ])
+
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+
+    search = %{url: SSEServer.base_url(server) <> "/v2/search", api_key: "test-key-123"}
+
+    assert run("web_search", %{"query" => "dashfloat"}, "unused-cwd",
+             search: search,
+             search_timeout: 2_000
+           ) == %{
+             ok: true,
+             query: "dashfloat",
+             content: Enum.map_join(entries, "\n", &Jason.encode!/1),
+             count: 1
+           }
+
+    assert_receive {:sse_request, "POST", "/v2/search", headers, request_body}, 2_000
+    assert headers["authorization"] == "Bearer test-key-123"
+    assert Jason.decode!(request_body) == %{"query" => "dashfloat"}
   end
 end

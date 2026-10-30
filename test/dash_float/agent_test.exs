@@ -769,6 +769,140 @@ defmodule DashFloat.AgentTest do
            }
   end
 
+  ## web_search: advertisement and the safe-class round trip (ADR 0021 §§6–8)
+
+  @tag :tmp_dir
+  test "web_search is advertised only with a synthetic context", ctx do
+    server = start_server([final_episode("with key"), final_episode("without key")])
+
+    {pinned, _sup} = start_agent(server, ctx.tmp_dir, synthetic: synthetic_ctx(server))
+
+    send(pinned, {:prompt, self(), "search enabled"})
+    assert_receive {:sse_request, "POST", _, _, with_body}, 2_000
+
+    names =
+      with_body
+      |> Jason.decode!()
+      |> Map.fetch!("tools")
+      |> Enum.map(& &1["function"]["name"])
+
+    assert names == [
+             "read_file",
+             "write_file",
+             "edit_file",
+             "execute_command",
+             "list_directory",
+             "web_search"
+           ]
+
+    # No :synthetic opt: discovery finds nothing on a loopback host — the
+    # advertised array stays the base five.
+    {plain, _sup} = start_agent(server, ctx.tmp_dir)
+
+    send(plain, {:prompt, self(), "search disabled"})
+    assert_receive {:sse_request, "POST", _, _, without_body}, 2_000
+
+    plain_names =
+      without_body
+      |> Jason.decode!()
+      |> Map.fetch!("tools")
+      |> Enum.map(& &1["function"]["name"])
+
+    assert plain_names == [
+             "read_file",
+             "write_file",
+             "edit_file",
+             "execute_command",
+             "list_directory"
+           ]
+
+    assert_receive {:phase, :idle}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "web_search runs with no confirmation and lands its results in context", ctx do
+    entries = [
+      %{"url" => "https://elixir-lang.org", "title" => "Elixir", "highlights" => ["a"]},
+      %{"url" => "https://hex.pm", "highlights" => ["dashfloat"]}
+    ]
+
+    body = Jason.encode!(%{"results" => entries})
+
+    search_ok =
+      "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n" <>
+        "content-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n" <> body
+
+    server =
+      start_server([
+        call_tool_episode("call_s", "web_search", %{"query" => "dashfloat elixir"}),
+        [{:send, search_ok}, :close],
+        final_episode("searched")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, synthetic: synthetic_ctx(server))
+    send(agent, {:prompt, self(), "search it"})
+
+    # conn 0: the episode announcing the search call.
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    # conn 1: the search POST — the derived endpoint, the Bearer key, the query.
+    assert_receive {:sse_request, "POST", "/v2/search", search_headers, search_body}, 2_000
+    assert search_headers["authorization"] == "Bearer test-key-123"
+    assert Jason.decode!(search_body) == %{"query" => "dashfloat elixir"}
+
+    # The :safe class: announced, dispatched, no keypress — default :build mode.
+    assert_receive {:tool_call,
+                    %{id: "call_s", name: "web_search", args: %{"query" => "dashfloat elixir"}}},
+                   2_000
+
+    rendered = Enum.map_join(entries, "\n", &Jason.encode!/1)
+    assert_receive {:tool_result, %{id: "call_s", ok: true, output: ^rendered}}, 2_000
+    refute_received {:confirm, _ref, _preview}
+
+    # conn 2: the next episode carries the rendered lines as the tool message.
+    assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
+
+    assert %{"content" => result_json} = tool_result_of(second_body, "call_s")
+
+    assert %{
+             "ok" => true,
+             "query" => "dashfloat elixir",
+             "content" => ^rendered,
+             "count" => 2
+           } = Jason.decode!(result_json)
+
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "a hallucinated web_search without a key errors honestly and the turn continues", ctx do
+    server =
+      start_server([
+        call_tool_episode("call_h", "web_search", %{"query" => "anything"}),
+        final_episode("noted")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+    send(agent, {:prompt, self(), "search anyway"})
+
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:tool_result, %{id: "call_h", ok: false, status: status}}, 2_000
+    assert status =~ "web search is not configured"
+
+    assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
+
+    assert %{"content" => result_json} = tool_result_of(second_body, "call_h")
+
+    assert Jason.decode!(result_json) == %{
+             "ok" => false,
+             "error" => "web search is not configured"
+           }
+
+    assert_receive {:phase, :idle}, 2_000
+  end
+
   ## Multiple calls and usage gating
 
   @tag :tmp_dir

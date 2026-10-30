@@ -578,7 +578,7 @@ defmodule DashFloat.Agent do
       Task.Supervisor.start_child(
         state.supervisor,
         fn ->
-          ChatStream.run(agent, state.provider, state.messages, Tools.schema(),
+          ChatStream.run(agent, state.provider, state.messages, Tools.schema(state.synthetic),
             synthetic: state.synthetic
           )
         end,
@@ -916,7 +916,7 @@ defmodule DashFloat.Agent do
     agent = self()
     args = call.args
     cwd = state.cwd
-    opts = [exec_timeout: state.exec_timeout]
+    opts = [exec_timeout: state.exec_timeout, search: search_opts(state.synthetic)]
 
     # A crash is reported by the dying process itself, as a result — the
     # monitor's DOWN reason carries no information about whether the body
@@ -949,6 +949,11 @@ defmodule DashFloat.Agent do
 
     {:noreply, %{state | tool_slot: {:running, Process.monitor(pid), pid, call}}}
   end
+
+  # The web_search seam (ADR 0021 §6): the tool's POST target and key derive
+  # from the Synthetic context; nil means WebSearch reports "not configured".
+  defp search_opts(nil), do: nil
+  defp search_opts(ctx), do: %{url: Synthetic.search_url(ctx), api_key: ctx.api_key}
 
   defp record_and_continue(state, call, result) do
     state = %{

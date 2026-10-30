@@ -3,16 +3,21 @@
 - **Status:** Accepted
 - **Date:** 2026-10-30
 - **Implements:** [issue #73](https://github.com/fluxvale/dashfloat/issues/73)
-  (the repair half; the web_search half appends the search sections when it
-  lands).
+  (the repair half) and
+  [issue #74](https://github.com/fluxvale/dashfloat/issues/74) (the
+  web_search half, §§6–8).
 - **Extends:** [ADR 0007](0007-tool-calls-and-execution.md) (the stream
   terminal's tool-call report and the error-result path it feeds),
   [ADR 0005](0005-llm-streaming-engine.md) (the streaming producer's
-  process shape). Reference implementation: Octofriend's
-  `source/compilers/autofix.ts` and `source/prompts/autofix-prompts.ts`.
+  process shape), [ADR 0016](0016-interaction-modes.md) (the
+  risk classes the search tool's `:safe` gating rides). Reference
+  implementation: Octofriend's `source/compilers/autofix.ts`,
+  `source/prompts/autofix-prompts.ts`, and
+  `source/tools/tool-defs/web-search.ts`.
 - **Governs:** `DashFloat.Synthetic` (new), `ToolCalls.build_call/1`'s
-  `raw_args`, the `ChatStream` [DONE] terminal, and the agent's `:synthetic`
-  opt.
+  `raw_args`, the `ChatStream` [DONE] terminal, the agent's `:synthetic`
+  opt, and `DashFloat.Tools`' advertisement of `web_search`
+  (`DashFloat.Tools.WebSearch`).
 
 ## Context
 
@@ -118,12 +123,43 @@ terminal is byte-identical.
 
 ### 6. The search endpoint seam — `DashFloat.Synthetic.search_url/1`
 
-Slice B's web_search POSTs `{root}/v2/search`; the root is the context's
+The web_search POST targets `{root}/v2/search`; the root is the context's
 base URL minus its trailing slash and its OpenAI-compat path suffix —
 `/openai/v1`, `/api/openai/v1`, `/api/v1`, `/v1`, tried longest-specific
 first. A suffix-less base URL (the loopback test server) derives
 `{base_url}/v2/search` unchanged, which is what makes the search round-trip
 loopback-testable.
+
+### 7. web_search — advertisement gated on the context
+
+The tool lives in the one `DashFloat.Tools` parameter table like every other,
+but `schema/1` advertises it only when the session carries a Synthetic
+context — discovered from the config or pinned by the `:synthetic` opt
+(§1). Without a context the advertised array is the base five-tool list,
+exactly as before. `validate/2` stays total over the table on purpose: a
+model hallucinating a web_search call without a key passes validation (the
+table is the single source of truth for argument shapes) and then the runner
+answers with a plain error result — "web search is not configured" — the
+turn continues, one honest error instead of a second advertisement channel
+to keep in sync.
+
+The tool's risk class is `:safe` (read-only, ADR 0016): the gate sends it
+straight to dispatch in every mode — no preview, no confirmation, no safety
+check. The agent derives the call's target per dispatch from its context
+(`search_url/1` plus the context's key) and threads it to the runner as the
+`:search` opt; a nil context threads nil.
+
+### 8. The search call and its rendering
+
+One non-streaming `POST {root}/v2/search` with `{"query": q}`, Bearer auth,
+`retry: false` (one attempt — a retry would double-bill the same query, the
+repair POST's §3 posture), and a `receive_timeout` defaulting to 15 000 ms.
+A 2xx body — pre-decoded by Req or a binary decoded with Jason — must carry
+`results` as a list; each entry renders as one JSON line (`Jason.encode!/1`)
+and the lines join with newlines into the result's `content`, Octofriend's
+rendering. Every other outcome — non-2xx (`HTTP <status>`), timeout,
+transport error, a shape miss — is a `%{ok: false, error: ...}` result map,
+never a raise: the agent's turn cannot die on a misbehaving search.
 
 ## Alternatives considered
 
@@ -155,5 +191,7 @@ loopback-testable.
 - Quota: repairs spend Synthetic quota only when a stream actually produces
   malformed arguments; every test drives the loopback server, never the real
   endpoint.
-- Slice B (web_search) builds on `context/1` and `search_url/1` as-is; its
-  gating and tool live in the Tools layer and will be recorded here.
+- web_search spends quota only when the model calls it, and only on a
+  session with a Synthetic context; a keyless session sees an unchanged tool
+  list, and the `:safe` class means a call needs no keypress — the search's
+  own timeout bounds how long the tool batch can pause on it.
