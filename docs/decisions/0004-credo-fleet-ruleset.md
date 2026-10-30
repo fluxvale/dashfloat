@@ -106,8 +106,10 @@ the creep gate stands.
 **Rider (2026-10-31, [issue #104](https://github.com/fluxvale/dashfloat/issues/104)):**
 the idle blink's phase/timer/cadence ([ADR
 0006](0006-ui-truth-and-rendering.md)'s 2026-10-31 blink amendment) are
-fields 46–48 — the blink timer lives in the TUI process but its display
-phase and injected cadence are pure state the router, view, and schedule
-choke point read whole (the tick's `anim_step`/`tick_ref` pair is the
-direct precedent). `max_fields` moves to 48, again the smallest whole
-number above the actual size, so the creep gate stands.
+three more flat fields — the blink timer lives in the TUI process but its
+display phase and injected cadence are pure state the router, view, and
+schedule choke point read whole (the tick's `anim_step`/`tick_ref` pair is
+the direct precedent). Numbered against the #113 Herdr rider's landing
+between design and rebase, they are fields 48–50. `max_fields` moves to
+50, again the smallest whole number above the actual size, so the creep
+gate stands.
