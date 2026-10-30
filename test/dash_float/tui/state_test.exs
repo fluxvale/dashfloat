@@ -2456,6 +2456,36 @@ defmodule DashFloat.TUI.StateTest do
       assert Enum.map_join(user.lines, "\n", &flatten/1) =~ "📎 image"
     end
 
+    # Issue #107: the resumed log keeps the user/assistant distinction —
+    # replay rides Render.entry_lines/2 (the one styler), so the replayed
+    # user rows carry the bold :user role and the accent ❯ prefix, while
+    # the assistant rows stay plain.
+    test "a replayed user turn keeps the bold :user style and the accent prefix" do
+      transcript = [
+        %{"role" => "user", "content" => "first question"},
+        %{"role" => "assistant", "content" => "an answer."}
+      ]
+
+      assert [%{kind: :user} = user, %{kind: :assistant} = assistant] =
+               new_state(transcript: transcript).entries
+
+      user_style = Theme.style(:user)
+      accent_bold = %{Theme.style(:accent) | modifiers: [:bold]}
+
+      [_sep, first | rest] = user.lines
+
+      assert [%ExRatatui.Text.Span{content: "❯ ", style: ^accent_bold}, %{style: ^user_style}] =
+               first.spans
+
+      assert Enum.all?(rest, fn line ->
+               Enum.all?(line.spans, &(&1.style == user_style))
+             end)
+
+      assert Enum.all?(assistant.lines, fn line ->
+               Enum.all?(line.spans, &(&1.style == %ExRatatui.Style{}))
+             end)
+    end
+
     test "arguments that do not decode render the (invalid arguments) arm" do
       transcript = [
         %{

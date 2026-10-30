@@ -93,8 +93,9 @@ defmodule DashFloat.TUI.Render do
 
   defp blank, do: Line.new([Span.new("")])
 
-  # The user's own words echo dim, with a bold prompt glyph on the first line
-  # and continuation lines indented under it.
+  # The user's own words ride the bold :user role; the first line's accent
+  # ❯ ties them to the composer's accent ❯ title (ADR 0006, #107) — "your
+  # input" reads as one system. Continuation lines indent under it.
   defp body_lines(:user, text) do
     text
     |> String.split("\n")
@@ -102,7 +103,7 @@ defmodule DashFloat.TUI.Render do
     |> Enum.map(fn
       {line, 1} ->
         Line.new([
-          Span.new("❯ ", style: bold(Theme.style(:user))),
+          Span.new("❯ ", style: bold(Theme.style(:accent))),
           Span.new(line, style: Theme.style(:user))
         ])
 
