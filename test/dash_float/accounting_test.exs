@@ -351,6 +351,17 @@ defmodule DashFloat.AccountingTest do
       assert kept == [system, List.last(turns)]
     end
 
+    test "a live anchor with no drops round-trips unchanged" do
+      # Hostile review N1: the shift back must not depend on whether a drop
+      # re-indexed the anchor — a no-drop plan with coverage still returns
+      # full-list coordinates.
+      system = %{role: "system", content: pad(400)}
+      turns = [user(400), assistant(400)]
+
+      assert %{kept: [system | ^turns], anchor: %{tokens: 1_500, index: 2}, dropped: 0} =
+               Accounting.compact([system | turns], %{tokens: 1_500, index: 2}, 10_000)
+    end
+
     test "an index-0 anchor round-trips symmetrically through a no-drop compact" do
       # Hostile review F5: shift clamped but unshift added — the round trip
       # must be the identity for an anchor that covers nothing.

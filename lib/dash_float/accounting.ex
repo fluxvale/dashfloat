@@ -70,10 +70,10 @@ defmodule DashFloat.Accounting do
   def compact(messages, anchor, window), do: compact_at(messages, anchor, div(window * 4, 5), 0)
 
   # The pinned split (ADR 0019): the anchor threads down (shift) and back
-  # (unshift — only when a drop re-indexed it, so an index-0 anchor stays
-  # index-0 and nil stays nil), and the pinned weight threads down as a
-  # floor for nil/spent-anchor estimates. A real anchor's tokens already
-  # measured everything the floor stands for — the two never add.
+  # (unshift — unless it covers nothing, where nil stays nil and index 0
+  # stays index 0), and the pinned weight threads down as a floor for
+  # nil/spent-anchor estimates. A real anchor's tokens already measured
+  # everything the floor stands for — the two never add.
   defp compact_at(messages, anchor, threshold, floor) do
     case split_system(messages) do
       {[system], rest} ->
@@ -81,11 +81,9 @@ defmodule DashFloat.Accounting do
         plan = compact_at(rest, shifted, threshold, floor + weight(system))
 
         anchor =
-          if plan.anchor == shifted do
-            plan.anchor
-          else
-            unshift(plan.anchor)
-          end
+          if is_nil(shifted) or shifted.index == 0,
+            do: plan.anchor,
+            else: unshift(plan.anchor)
 
         %{plan | kept: [system | plan.kept], anchor: anchor}
 

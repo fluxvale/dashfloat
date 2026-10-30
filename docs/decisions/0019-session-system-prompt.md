@@ -85,7 +85,8 @@ Two slots render today as nothing and are tested as no-ops:
 ### 4. AGENTS.md discovery, precedence, budget (#72)
 
 `DashFloat.ProjectInstructions.load(cwd)` walks cwd upward, collecting each
-directory's readable `AGENTS.md`, and stops after examining the nearest
+directory's readable, non-empty `AGENTS.md`, and stops after examining the
+nearest
 ancestor whose `.git` exists — inclusive of that root, `.git` tested with
 `File.lstat/1` because linked worktrees make it a file and a dangling `.git`
 symlink is still a placed marker. No git root means walk to the filesystem
@@ -125,9 +126,10 @@ extend rather than fork:
   the estimate as a **heuristic floor** whenever the anchor is nil or spent:
   the eviction trigger always sees the full list the wire carries, system
   message included (a real anchor already measured that weight — the two
-  never add). The anchor shifts with the pin and shifts back only when a
-  drop re-indexed it, so the round trip is symmetric for every anchor shape
-  the loader tolerates. The carve-out is exactly one message, exactly
+  never add). The anchor shifts with the pin and shifts back unless it
+  covers nothing — nil stays nil, index 0 stays index 0, and everything with
+  coverage returns full-list coordinates whether or not a drop re-indexed
+  it. The carve-out is exactly one message, exactly
   leading: the prelude rule ("leading non-user messages form their own first
   group, dropped first") stands for everything else, and a `system` message
   that lands mid-transcript (hand-built resume maps can carry anything)
