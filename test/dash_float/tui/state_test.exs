@@ -323,24 +323,24 @@ defmodule DashFloat.TUI.StateTest do
     test "down anchors, drag extends, up copies; click-to-clear" do
       state = selected_state()
 
-      {anchored, nil} = State.select_mouse(state, "down", 1, 3)
+      {anchored, nil} = State.select_mouse(state, "down", 1, 4)
       assert anchored.selection.anchor == {1, 0}
       # The gesture snapshots the entries' display-row count as its base —
       # the finalize boundary (review P1).
       assert anchored.selection.base_rows == 4
       assert anchored.selection.head == {1, 0}
 
-      {extended, nil} = State.select_mouse(anchored, "drag", 6, 5)
+      {extended, nil} = State.select_mouse(anchored, "drag", 7, 6)
       assert extended.selection.head == {3, 5}
 
-      {released, {:copy, text}} = State.select_mouse(extended, "up", 6, 5)
+      {released, {:copy, text}} = State.select_mouse(extended, "up", 7, 6)
       assert match?(%{head: _}, released.selection)
       # Last row slices through col 5's cell ("beta l" — the pointed cell
       # is included; review P2a).
       assert text == "alpha line\n\nbeta l"
 
       # Press+release without extension clears…
-      {cleared, nil} = State.select_mouse(anchored, "up", 1, 3)
+      {cleared, nil} = State.select_mouse(anchored, "up", 1, 4)
       assert cleared.selection == nil
       # …and an empty selection copies nothing (the nil clause's contract).
       assert State.selection_text(cleared) == ""
@@ -362,15 +362,15 @@ defmodule DashFloat.TUI.StateTest do
       # Below the log (over the input box): clamps to the last row, and the
       # column clamps to the padded width (one past the last column).
       {below, nil} = State.select_mouse(selected_state(), "down", 999, 23)
-      assert below.selection.anchor == {3, 78}
+      assert below.selection.anchor == {3, 76}
     end
 
     test "a blank-only selection copies nothing and clears" do
       # An empty entry renders as blank separator + empty line: rows 0-1.
       state = State.stream_message(new_state(), {:entry, :system, ""})
 
-      {anchored, nil} = State.select_mouse(state, "down", 1, 2)
-      {released, action} = State.select_mouse(anchored, "up", 1, 3)
+      {anchored, nil} = State.select_mouse(state, "down", 3, 3)
+      {released, action} = State.select_mouse(anchored, "up", 3, 4)
 
       assert action == nil
       assert released.selection == nil
@@ -409,7 +409,7 @@ defmodule DashFloat.TUI.StateTest do
 
       scrolled = State.wheel_scroll(state, :up)
       refute scrolled.follow?
-      top = State.effective_scroll(scrolled, 17)
+      top = State.effective_scroll(scrolled, 15)
       assert top > 0
 
       # Click on the status bar (screen row 0): anchors the viewport's
@@ -418,10 +418,10 @@ defmodule DashFloat.TUI.StateTest do
       assert above.selection.anchor == {top, 0}
 
       # Drag into the input pane (screen row 23): the viewport's last
-      # visible row (17-row idle viewport, ADR 0015's footer: rows
-      # top..top + 16).
+      # visible row (15-row idle viewport, issues #28 + #108: rows
+      # top..top + 14).
       {below, _nil} = State.select_mouse(scrolled, "down", 1, 23)
-      assert below.selection.anchor == {top + 16, 0}
+      assert below.selection.anchor == {top + 14, 0}
     end
 
     test "click jitter below the drag threshold clears instead of copying" do
@@ -430,20 +430,20 @@ defmodule DashFloat.TUI.StateTest do
       state = selected_state()
 
       # Same cell (1-cell extent): a plain click.
-      {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
-      {same, action} = State.select_mouse(anchored, "up", 1, 3)
+      {anchored, _nil} = State.select_mouse(state, "down", 2, 4)
+      {same, action} = State.select_mouse(anchored, "up", 2, 4)
       assert action == nil
       assert same.selection == nil
 
       # Adjacent cell (2-cell extent): still wobble.
-      {anchored2, _nil} = State.select_mouse(state, "down", 1, 3)
-      {wobbled, action2} = State.select_mouse(anchored2, "up", 2, 3)
+      {anchored2, _nil} = State.select_mouse(state, "down", 2, 4)
+      {wobbled, action2} = State.select_mouse(anchored2, "up", 3, 4)
       assert action2 == nil
       assert wobbled.selection == nil
 
       # Two cells away (3-cell extent): a deliberate selection — copies.
-      {anchored3, _nil} = State.select_mouse(state, "down", 1, 3)
-      {dragged3, {:copy, text}} = State.select_mouse(anchored3, "up", 3, 3)
+      {anchored3, _nil} = State.select_mouse(state, "down", 2, 4)
+      {dragged3, {:copy, text}} = State.select_mouse(anchored3, "up", 4, 4)
       assert match?(%{head: _}, dragged3.selection)
       assert text == "alp"
     end
@@ -541,8 +541,8 @@ defmodule DashFloat.TUI.StateTest do
 
       # Select into the live reply (rows 0-1; the base is 0 — no entries).
       {anchored, _nil} = State.select_mouse(ticked, "down", 1, 2)
-      {dragged, _nil} = State.select_mouse(anchored, "drag", 10, 3)
-      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 10, 3)
+      {dragged, _nil} = State.select_mouse(anchored, "drag", 10, 4)
+      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 10, 4)
       assert selected.selection.base_rows == 0
 
       cancelled =
@@ -580,7 +580,9 @@ defmodule DashFloat.TUI.StateTest do
       # after the last tick) and equal in count while differing in
       # content, so row counts cannot decide — the guard is positional.
       # Display rows: 0 blank, 1 "warm", then the reply's rows from 2.
-      warm = new_state(test_mode: {20, 24})
+      # 22 cols → content 18: "one two three" AND "one two three four"
+      # each fit one padded row (the equal-count premise below).
+      warm = new_state(test_mode: {22, 24})
 
       base = State.stream_message(warm, {:entry, :system, "warm"})
 
@@ -596,9 +598,9 @@ defmodule DashFloat.TUI.StateTest do
 
       # Above the reply (row 1): a real drag within "warm" that survives
       # the finalize untouched.
-      {anchored, _no_copy} = State.select_mouse(dirty, "down", 1, 3)
-      {dragged, _no_copy} = State.select_mouse(anchored, "drag", 4, 3)
-      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 4, 3)
+      {anchored, _no_copy} = State.select_mouse(dirty, "down", 1, 4)
+      {dragged, _no_copy} = State.select_mouse(anchored, "drag", 4, 4)
+      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 4, 4)
 
       finalized = State.stream_message(selected, {:phase, :idle}, 1_300)
       assert finalized.selection != nil
@@ -612,9 +614,9 @@ defmodule DashFloat.TUI.StateTest do
 
       # Reaching into the reply (row 2, the reply's blank separator row)
       # clears even at that equal count.
-      {into, _no_copy} = State.select_mouse(dirty, "down", 1, 4)
-      {into_drag, _no_copy} = State.select_mouse(into, "drag", 6, 5)
-      {into_selected, {:copy, _reply_text}} = State.select_mouse(into_drag, "up", 6, 5)
+      {into, _no_copy} = State.select_mouse(dirty, "down", 1, 5)
+      {into_drag, _no_copy} = State.select_mouse(into, "drag", 6, 6)
+      {into_selected, {:copy, _reply_text}} = State.select_mouse(into_drag, "up", 6, 6)
       assert match?(%{head: _}, into_selected.selection)
 
       replaced = State.stream_message(into_selected, {:phase, :idle}, 1_400)
@@ -1414,9 +1416,9 @@ defmodule DashFloat.TUI.StateTest do
       final = State.stream_message(over, {:phase, :idle}, 1_300)
       [entry] = final.entries
       assert entry.text == over_cap
-      # blank separator + 64 KiB + 1 of x's at 78 columns (the padded width)
-      # = 841 display rows
-      assert length(entry.lines) == 1 + div(64 * 1024, 78) + 1
+      # blank separator + 64 KiB + 1 of x's at 76 columns (the padded width)
+      # = 864 display rows
+      assert length(entry.lines) == 1 + div(64 * 1024, 76) + 1
     end
 
     test "needs_tick?/1 is true only while active and unscheduled" do
@@ -1501,15 +1503,15 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up on a viewport-fitting log is a no-op (stays pinned)" do
-      # The real idle viewport at 80x24 is 17 rows with the margin (issue
-      # #28; ADR 0015's footer took one more row); 8 entries = blank + line
-      # each fit inside one viewport.
-      base = full_state(8)
-      assert State.log_line_count(base) == 16
+      # The real idle viewport at 80x24 is 15 rows with the margin (issues
+      # #28 + #108; ADR 0015's footer took one more row); 7 entries = blank
+      # + line each fit inside one viewport.
+      base = full_state(7)
+      assert State.log_line_count(base) == 14
 
       {paged, nil} = State.handle_key(base, "page_up", [])
       assert paged.follow?
-      assert State.effective_scroll(paged, 17) == 0
+      assert State.effective_scroll(paged, 15) == 0
     end
 
     test "submit re-pins the log so the new reply is visible" do
@@ -1531,47 +1533,47 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up unfollows and pages back; page_down re-pins at the bottom" do
-      # 200 lines, 17-row viewport (the padded 80x24 layout with ADR 0015's
-      # footer) → bottom 183.
+      # 200 lines, 15-row viewport (the padded 80x24 layout with ADR 0015's
+      # footer) → bottom 185.
       base = full_state(100)
       {up_one, nil} = State.handle_key(base, "page_up", [])
       refute up_one.follow?
-      assert State.effective_scroll(up_one, 17) == 166
+      assert State.effective_scroll(up_one, 15) == 170
 
       {up_two, nil} = State.handle_key(up_one, "page_up", [])
-      assert State.effective_scroll(up_two, 17) == 149
+      assert State.effective_scroll(up_two, 15) == 155
 
       {down_one, nil} = State.handle_key(up_two, "page_down", [])
-      assert State.effective_scroll(down_one, 17) == 166
+      assert State.effective_scroll(down_one, 15) == 170
 
       {down_two, nil} = State.handle_key(down_one, "page_down", [])
       assert down_two.follow?
-      assert State.effective_scroll(down_two, 17) == 183
+      assert State.effective_scroll(down_two, 15) == 185
     end
 
     test "wheel_scroll: one notch is three lines; up unfollows, down re-pins at the bottom" do
       base = full_state(100)
-      assert State.effective_scroll(base, 17) == 183
+      assert State.effective_scroll(base, 15) == 185
 
       wheeled = State.wheel_scroll(base, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 17) == 180
+      assert State.effective_scroll(wheeled, 15) == 182
 
       again = State.wheel_scroll(wheeled, :up)
-      assert State.effective_scroll(again, 17) == 177
+      assert State.effective_scroll(again, 15) == 179
 
       down = State.wheel_scroll(again, :down)
       refute down.follow?
-      assert State.effective_scroll(down, 17) == 180
+      assert State.effective_scroll(down, 15) == 182
 
       pinned = State.wheel_scroll(down, :down)
       assert pinned.follow?
-      assert State.effective_scroll(pinned, 17) == 183
+      assert State.effective_scroll(pinned, 15) == 185
     end
 
     test "wheel up on a viewport-fitting log is a no-op (stays pinned)" do
-      base = full_state(8)
-      assert State.log_line_count(base) == 16
+      base = full_state(7)
+      assert State.log_line_count(base) == 14
       assert State.wheel_scroll(base, :up) == base
     end
 
@@ -1586,12 +1588,12 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.phase == :confirming
 
-      # The activity row is up while confirming: the viewport is 16 rows
+      # The activity row is up while confirming: the viewport is 14 rows
       # (ADR 0015's footer took one from the log).
-      bottom = State.effective_scroll(state, 16)
+      bottom = State.effective_scroll(state, 14)
       wheeled = State.wheel_scroll(state, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 16) == bottom - 3
+      assert State.effective_scroll(wheeled, 14) == bottom - 3
     end
 
     test "new content does not move an unfollowed view, but clamping still holds" do
