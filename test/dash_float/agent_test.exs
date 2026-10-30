@@ -3277,7 +3277,7 @@ defmodule DashFloat.AgentTest do
     assert_receive {:entry, :system, entry}, 2_000
 
     assert entry ==
-             "[context: below the 80% trigger — nothing to compact (est #{usage.used} of #{usage.window}, #{usage.percent}%)]"
+             "[context: at or under the 80% trigger — nothing to compact (est #{usage.used} of #{usage.window}, #{usage.percent}%)]"
 
     # The session file is untouched: no drop, no record.
     {:ok, session} = Session.load(sessions, session_id(sessions))
@@ -3294,6 +3294,74 @@ defmodule DashFloat.AgentTest do
     assert_receive {:entry, :system,
                     "[context: no context window configured — nothing to compact]"},
                    2_000
+  end
+
+  @tag :tmp_dir
+  test "manual /compact on an oversize-only transcript warns but writes nothing", ctx do
+    # One turn alone over the budget: nothing can drop, the survivor warns —
+    # and a pass that dropped nothing must not rewrite the session file (the
+    # ADR 0022 amendment's §3). The fixture file is resumed, not re-derived.
+    id = "0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c"
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    File.mkdir_p!(sessions)
+    path = Path.join(sessions, "#{id}.json")
+
+    fixture =
+      Jason.encode!(%{
+        version: 1,
+        id: id,
+        created_at: "2026-10-30T00:00:00Z",
+        pin: %{},
+        messages: [
+          %{"role" => "user", "content" => String.duplicate("a", 20_000)},
+          %{"role" => "assistant", "content" => String.duplicate("b", 20_000)}
+        ]
+      })
+
+    File.write!(path, fixture)
+
+    {:ok, saved} = Session.load(sessions, id)
+    server = start_server([])
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir,
+        session_dir: sessions,
+        provider: provider(server, 8_000),
+        resume: %{
+          id: saved.id,
+          pin: saved.pin,
+          messages: saved.messages,
+          created_at: saved.created_at
+        }
+      )
+
+    send(agent, {:compact, self()})
+
+    assert_receive {:entry, :system,
+                    "[context: the remaining turn alone exceeds the 80% window budget — kept whole]"},
+                   2_000
+
+    refute_received {:entry, :system, "[context: dropped" <> _}
+
+    # Byte-identical: no persist ran at all.
+    assert File.read!(path) == fixture
+  end
+
+  @tag :tmp_dir
+  test "manual /compact never mints a session file for an unprompted launch", ctx do
+    # A fresh agent's only message is the pinned system prompt (ADR 0019); a
+    # window smaller than it makes /compact oversize-only on a launch that
+    # never prompted — which must leave NOTHING behind (ADR 0014 §5).
+    server = start_server([])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir, session_dir: sessions, provider: provider(server, 10))
+
+    send(agent, {:compact, self()})
+
+    assert_receive {:entry, :system, "[context: the remaining turn alone" <> _}, 2_000
+    refute File.exists?(sessions)
   end
 
   test "a /compact while streaming is ignored" do

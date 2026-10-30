@@ -137,6 +137,9 @@ exactly one check. Consequences:
 - Compaction covers resumed sessions at their first prompt — ADR 0014 §6's
   "no truncation, no accounting" clause ends here, at the seam it reserved.
 - Mid-turn mutation is structurally impossible: there is no second hook.
+  *(Amended 2026-10-30: the [`/compact`
+  seam](#amendment-2026-10-30-issue-92-manual-compact) below adds an
+  idle-only entry point to this same pass — still never mid-turn.)*
 - Eviction rewrites the session file immediately (the compacted list plus its
   record, §6), so the persisted session and the next request agree — and the
   dropped turns are absent from both (issue #43's visibility clause).
@@ -329,8 +332,9 @@ implementation exists; the automatic path behaves identically.
 
 1. **The same ~80% trigger governs the manual path.** Below it, `/compact`
    is a no-op whose feedback entry reports where the estimate stands —
-   `[context: below the 80% trigger — nothing to compact (est 940 of 2000,
-   47.0%)]` (`Accounting.usage/3`, §7). Three reasons:
+   `[context: at or under the 80% trigger — nothing to compact (est 940 of
+   2000, 47.0%)]` (`Accounting.usage/3`, §7; "at or under" because the
+   trigger is *strictly past* 80%, §3). Three reasons:
    - Under drop-oldest, eviction is pure discard — stage-2 summarization
      (§8) does not exist yet — so compacting a mostly-empty window destroys
      context the next request could have carried, reclaiming nothing that
@@ -357,8 +361,10 @@ implementation exists; the automatic path behaves identically.
    (§1).
 3. **Persistence matches the mutation.** A dropping `/compact` rewrites the
    session file immediately (compacted list plus `compactions` record, §6).
-   A no-op writes nothing — there is nothing to save, and a failed-save
-   notice on an unchanged session would be noise. With no configured window
-   (or no resolved provider) the command says so — `[context: no context
-   window configured — nothing to compact]` — §2's "nothing is guessed"
-   governs the manual path too.
+   A pass that dropped nothing — the below-trigger no-op and the oversize
+   warning alike — writes nothing at all: there is nothing to save, a
+   failed-save notice on an unchanged session would be noise, and an
+   unprompted launch must leave nothing behind (ADR 0014 §5). With no
+   configured window (or no resolved provider) the command says so —
+   `[context: no context window configured — nothing to compact]` — §2's
+   "nothing is guessed" governs the manual path too.

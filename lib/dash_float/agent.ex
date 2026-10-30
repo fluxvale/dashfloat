@@ -251,7 +251,7 @@ defmodule DashFloat.Agent do
         display(
           ui,
           {:entry, :system,
-           "[context: below the 80% trigger — nothing to compact (est #{usage.used} of #{usage.window}, #{usage.percent}%)]"}
+           "[context: at or under the 80% trigger — nothing to compact (est #{usage.used} of #{usage.window}, #{usage.percent}%)]"}
         )
 
         {:noreply, state}
@@ -1094,12 +1094,13 @@ defmodule DashFloat.Agent do
   # appended, before the episode starts. Only a configured window compacts —
   # nil (or non-positive) persists the question and returns (§2, nothing is
   # guessed). One persist per prompt either way, so a failed save shows one
-  # notice (m4).
+  # notice (m4): the pass persists when it dropped turns, this hook when it
+  # did not — the just-appended question must land, oversize warning or not.
   defp maybe_compact(%__MODULE__{provider: {:ok, %Config{context_tokens: window}}} = state)
        when is_integer(window) and window > 0 do
     case eviction_pass(state, window) do
-      {state, nil} -> persist(state)
-      {state, _plan} -> state
+      {state, %{dropped: dropped}} when dropped > 0 -> state
+      {state, _no_drop} -> persist(state)
     end
   end
 
@@ -1107,9 +1108,12 @@ defmodule DashFloat.Agent do
 
   # The eviction both entry points run (ADR 0022 §4-§6; the /compact
   # amendment, issue #92): plan the drop; when something changes, mutate,
-  # record, persist once, and announce. Returns {state, plan}; a nil plan
-  # means the estimate sat at or under the trigger with no oversize
-  # survivor — nothing changed, nothing persisted.
+  # record, and announce. A drop persists immediately — the file and the
+  # announcement agree — while an oversize-only pass changed nothing
+  # file-worthy and leaves saving to the caller: the prompt hook saves for
+  # the question; /compact saves nothing (the amendment's §3, no phantom
+  # mint). Returns {state, plan}; a nil plan means the estimate sat at or
+  # under the trigger with no oversize survivor — nothing changed.
   defp eviction_pass(state, window) do
     plan = Accounting.compact(state.messages, state.anchor, window)
 
@@ -1120,9 +1124,15 @@ defmodule DashFloat.Agent do
       after_estimate = Accounting.estimate(plan.kept, plan.anchor)
 
       state =
-        %{state | messages: plan.kept, anchor: plan.anchor}
-        |> with_compaction_record(plan, window, before, after_estimate)
-        |> persist()
+        with_compaction_record(
+          %{state | messages: plan.kept, anchor: plan.anchor},
+          plan,
+          window,
+          before,
+          after_estimate
+        )
+
+      state = if plan.dropped > 0, do: persist(state), else: state
 
       if plan.dropped > 0 do
         display(

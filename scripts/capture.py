@@ -435,11 +435,14 @@ class App:
         self.render(crop_rows=crop_rows).save(path)
         print(f"still  {path} ({os.path.getsize(path)} bytes)")
 
-    def gif(self, path: str, fps=10, crop_rows=12):
+    def gif(self, path: str, fps=10, crop_rows=12, min_span=0.0):
         """Render the marked window as frames. The replay screen is fed the
         FULL byte history from boot up to each frame's horizon, so every
         frame carries the complete UI (static chrome included); the window
-        itself starts at the mark."""
+        itself starts at the mark. `min_span` (seconds) extends the frame
+        count past the last byte event — an idle app emits nothing, but the
+        final state must still fall inside a frame horizon (Pillow merges
+        pixel-identical frames, so trailing duplicates cost nothing)."""
         if self._mark is None:
             raise RuntimeError("no recording mark was set")
         metrics = self._metrics(scale=2)
@@ -455,7 +458,11 @@ class App:
             _, chunk = events.pop(0)
             self.feed(chunk)
         window = [e for e in events if e[0] >= self._mark]
-        n_frames = max(1, int((window[-1][0] - self._mark) * 1000 / step))
+        n_frames = max(
+            1,
+            int((window[-1][0] - self._mark) * 1000 / step),
+            int(min_span * 1000 / step),
+        )
         for i in range(n_frames):
             horizon = self._mark + (i + 1) * step / 1000
             while events and events[0][0] <= horizon:
@@ -563,7 +570,7 @@ def main():
                 if args.out2:
                     app.type("/compact")
                     app.send(b"\r")
-                    app.wait_for("below the 80% trigger")
+                    app.wait_for("at or under the 80% trigger")
                     app.wait_quiet()
                     app.screenshot(args.out2)
             elif args.scenario == "slash-autocomplete":
@@ -572,12 +579,24 @@ def main():
             if args.scenario != "compact-session":
                 app.screenshot(args.out)
         elif args.scenario == "slash-autocomplete":
-            # The popup mid-typing: "/" then "c" — the list narrows to
-            # /clear and /compact.
+            # The popup opening AND narrowing: "/" opens the full list, "c"
+            # narrows it to /clear + /compact. The narrowed state is ASSERTED
+            # before recording — a keystroke lost in flight must fail the
+            # capture, not ship a GIF where nothing happens (#92 review).
             app._mark = time.monotonic()
-            app.type("/c", per_key=0.3)
-            time.sleep(0.5)
-            app.gif(args.out)
+            app.type("/c", per_key=0.5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                screen = app.text()
+                if "compact" in screen and "/help" not in screen:
+                    break
+                time.sleep(0.1)
+            else:
+                raise TimeoutError("the narrowed command popup never rendered")
+            time.sleep(0.5)                # a settled beat on the narrowed list
+            # 16 rows: the narrowed popup rides higher than the full list,
+            # and /clear + /compact must be legible in the final frame.
+            app.gif(args.out, crop_rows=16, min_span=1.5)
         else:
             app.type("what is elixir?")
             app.send(b"\r")
