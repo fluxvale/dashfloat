@@ -293,7 +293,7 @@ jobs:
             includes them, most general first.
           - **Tool-call repair and web search.** When the model emits a
             malformed tool call, DashFloat routes it through Synthetic's
-            fix-json repair instead of stalling the turn, and a
+            fix-json repair instead of failing the call, and a
             \`web_search\` tool joins the toolbox — both need a Synthetic
             key in your configuration.
           - **A composer that reads alive.** The idle cursor renders bright
@@ -305,14 +305,14 @@ jobs:
             context stands instead of compacting.
           - **Live context stats.** The footer shows tokens used and the
             percent of the context window, kept current as turns complete
-            (the percent needs the model's context window configured —
-            \`context\` on the model in settings, or
-            \`DASHFLOAT_CONTEXT_TOKENS\`).
-          - **Image attachments.** On an image-capable model, Ctrl+O opens
-            the attach prompt: type an image's path (PNG, JPEG, GIF, or
-            WebP, up to 10 MiB — validated before it sits in the composer);
-            on a model without image support the attach is refused with a
-            visible message, never silently dropped.
+            (the percent appears once a context window is known for the
+            model — \`context\` in settings, \`DASHFLOAT_CONTEXT_TOKENS\`,
+            or the provider's fetched model list).
+          - **Image attachments.** Ctrl+O opens the attach prompt: type an
+            image's path (PNG, JPEG, GIF, or WebP, up to 10 MiB —
+            validated before it sits in the composer). The attach goes
+            through when the selected model can take images; otherwise it
+            is refused with a visible message, never silently dropped.
 
           Upgrading: re-run the install command below — it replaces the
           previous version and keeps your sessions. On macOS,
