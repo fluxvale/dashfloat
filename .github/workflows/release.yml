@@ -267,57 +267,22 @@ jobs:
 
           ## What's new in $VERSION
 
-          Nine features since 0.2.0:
+          Ten features since 0.3.0:
 
-          - **Sessions have titles.** Name a session as you start it with
-            \`dashfloat --title "My session"\`, and pick it back up later
-            with \`dashfloat --resume <id-or-title>\` — every session is
-            identified by a time-sorting UUID id. Leave the title off and
-            the model proposes one once the conversation is underway;
-            \`/title\` renames at runtime. Titles are unique, so a title
-            resolves to one session.
-          - **A wizard that knows your models.** First-run setup now
-            fetches the provider's model list and offers it as a
-            keyboard-navigable picker; manual entry is the explicit last
-            option, and a failed fetch falls back to it with the reason on
-            screen. ESC returns to the previous step with your answers
-            preserved.
-          - **Slash commands and a palette.** \`/model\`, \`/profile\`,
-            \`/mode\`, and \`/title\` switch at runtime. Typing \`/\`
-            lists every command, autocomplete narrows as you type, and
-            Ctrl+P opens the same list as a palette.
-          - **A system prompt with your project's instructions.** Every
-            session now runs on an assembled system prompt, and DashFloat
-            discovers \`AGENTS.md\` files — from the working directory up
-            to the git root (or the filesystem root outside a repo) — and
-            includes them, most general first.
-          - **Tool-call repair and web search.** When the model emits a
-            malformed tool call, DashFloat routes it through Synthetic's
-            fix-json repair instead of failing the call, and a
-            \`web_search\` tool joins the toolbox — both need a Synthetic
-            key in your configuration.
-          - **A composer that reads alive.** The idle cursor renders bright
-            on every terminal palette, and the placeholder hint shows only
-            before your first exchange.
-          - **Manual compaction.** \`/compact\` runs the same drop-oldest
-            compaction the ~80% threshold triggers, on demand and with
-            visible feedback; at or under the trigger it reports where the
-            context stands instead of compacting.
-          - **Live context stats.** The footer shows tokens used and the
-            percent of the context window, kept current as turns complete
-            (the percent appears once a context window is known for the
-            model — \`context\` in settings, \`DASHFLOAT_CONTEXT_TOKENS\`,
-            or the provider's fetched model list).
-          - **Image attachments.** Ctrl+O opens the attach prompt: type an
-            image's path (PNG, JPEG, GIF, or WebP, up to 10 MiB —
-            validated before it sits in the composer). The attach goes
-            through when the selected model can take images; otherwise it
-            is refused with a visible message, never silently dropped.
+          - **A transcript you can read.** Your messages render bold behind an accent \`❯\` marker — set apart from the model's replies on every terminal palette, light or dark — and the distinction survives session resume.
+          - **Room to breathe.** The whole interface keeps two cells of air from the screen edges — transcript, status line, composer, and popups alike — so text no longer hugs the borders.
+          - **The footer names provider and model.** The model span reads \`zai - glm-5.3\` (provider - model) instead of a profile label, and a \`/model\` pick updates it on the spot.
+          - **\`/title\` opens a dialog.** Bare \`/title\` opens a centered input pre-filled with the live title; a refused rename shows the reason in the dialog with your draft kept, and Esc cancels.
+          - **The idle cursor blinks.** The composer's cursor pulses on its own timer while the agent waits, so the input surface reads alive on every terminal palette.
+          - **Tab completes slash commands.** While the autocomplete popup shows matches, Tab completes the highlighted command into the composer — arrows move the pick, Enter runs it, Tab types it for you.
+          - **Typing snaps the transcript to the tail.** Scroll back to reread something; your first keystroke in the composer brings the view back to the live end of the conversation.
+          - **Drop an image to attach it.** Dragging an image file into the terminal becomes a numbered \`[Image #1]\` chip in the composer instead of pasted path text; Backspace on an empty draft pops the newest chip, and Ctrl+O still works.
+          - **Context stats work out of the box.** Stock presets carry seeded context windows and a provider's fetched model list is read for its real ones, so the footer's tokens/percent and \`/compact\` work on a fresh install; a model no source knows falls back to a documented default — visibly marked, never silent.
+          - **Herdr support.** Running inside a Herdr pane, DashFloat reports its state — idle, working, or blocked with the pending decision named — so the pane shows when input awaits you, and a restored Herdr session reopens DashFloat on the right \`--resume\` command.
 
-          Upgrading: re-run the install command below — it replaces the
-          previous version and keeps your sessions. On macOS,
-          \`brew upgrade dashfloat\` does the same once the tap catches up
-          with the release.
+          Also fixed: resuming a session saved by 0.3.0 crashed at startup (the stored system prompt now replays cleanly), and \`dashfloat --resume <id> --profile p\` no longer exits with \`No file named --resume\` (release-launcher user flags were being dropped into Elixir's CLI).
+
+          Upgrading: re-run the install command below — it replaces the previous version and keeps your sessions. On macOS, \`brew upgrade dashfloat\` does the same once the tap catches up with the release.
 
           ## Install
 
@@ -325,10 +290,7 @@ jobs:
           curl -fsSL https://github.com/fluxvale/dashfloat/releases/latest/download/install.sh | sh
           \`\`\`
 
-          Installs into \`~/.local/share/dashfloat\`, puts a shim in
-          \`~/.local/bin\`, verifies the sha256 before extracting, and prunes the
-          previous version on upgrade. Pin this version with
-          \`DASHFLOAT_VERSION=$VERSION\`.
+          Installs into \`~/.local/share/dashfloat\`, puts a shim in \`~/.local/bin\`, verifies the sha256 before extracting, and prunes the previous version on upgrade. Pin this version with \`DASHFLOAT_VERSION=$VERSION\`.
           EOF
 
           # Homebrew is the macOS-native path but lives in a separate repo, so
@@ -349,37 +311,20 @@ jobs:
 
           ## macOS: first launch of an unsigned build
 
-          These binaries are not notarized. A copy downloaded **with a browser**
-          carries the quarantine flag and macOS refuses it with "unidentified
-          developer". Clear it once, either way:
+          These binaries are not notarized. A copy downloaded **with a browser** carries the quarantine flag and macOS refuses it with "unidentified developer". Clear it once, either way:
 
-          - Finder: right-click (or Control-click) \`dashfloat\`, choose **Open**,
-            then **Open** again in the dialog.
+          - Finder: right-click (or Control-click) \`dashfloat\`, choose **Open**, then **Open** again in the dialog.
           - Terminal: \`xattr -d com.apple.quarantine "\$(command -v dashfloat)"\`.
 
-          Installing with \`curl\` or Homebrew sets no quarantine flag, so there is
-          nothing to clear. Notarization is not part of $VERSION.
+          Installing with \`curl\` or Homebrew sets no quarantine flag, so there is nothing to clear. Notarization is not part of $VERSION.
 
           ## Linux requirements
 
-          Built on Debian 12 and needs glibc 2.34+, so it runs on Debian 12+,
-          Ubuntu 22.04+, and current Fedora/RHEL; Debian 11 does not. It links the system
-          \`libtinfo.so.6\`, \`libstdc++.so.6\`, and OpenSSL 3
-          (\`libcrypto.so.3\`); those are present on the distributions above but
-          not necessarily in a minimal container — the installer checks first
-          and names the package. Debian 11 and Alpine/musl are not supported,
-          nor is Linux arm64.
+          Built on Debian 12 and needs glibc 2.34+, so it runs on Debian 12+, Ubuntu 22.04+, and current Fedora/RHEL; Debian 11 does not. It links the system \`libtinfo.so.6\`, \`libstdc++.so.6\`, and OpenSSL 3 (\`libcrypto.so.3\`); those are present on the distributions above but not necessarily in a minimal container — the installer checks first and names the package. Debian 11 and Alpine/musl are not supported, nor is Linux arm64.
 
           ## Bundled SCTP library (Linux)
 
-          The Linux tarball bundles an unmodified \`libsctp.so.1\` from Debian
-          12's \`libsctp1\` package
-          ([lksctp-tools](https://github.com/sctp/lksctp-tools/)),
-          redistributed under the LGPL-2.1-or-later. Corresponding source is
-          available upstream and as the Debian \`lksctp-tools\` source package;
-          the full licence text and a redistribution notice travel inside the
-          tarball (\`lib/sctp/\`), where the library sits as a separate,
-          replaceable file.
+          The Linux tarball bundles an unmodified \`libsctp.so.1\` from Debian 12's \`libsctp1\` package ([lksctp-tools](https://github.com/sctp/lksctp-tools/)), redistributed under the LGPL-2.1-or-later. Corresponding source is available upstream and as the Debian \`lksctp-tools\` source package; the full licence text and a redistribution notice travel inside the tarball (\`lib/sctp/\`), where the library sits as a separate, replaceable file.
 
           ## Verify
 
