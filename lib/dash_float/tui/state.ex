@@ -495,7 +495,9 @@ defmodule DashFloat.TUI.State do
     end
   end
 
-  defp trim_slash(nil), do: nil
+  # The caller (provider_name's ladder) guards base_url nil above; the
+  # settings entries always carry a base_url (parse_provider ignores the
+  # baseUrl-less).
   defp trim_slash(url), do: String.trim_trailing(url, "/")
 
   @doc "The selected model's image capability (ADR 0018 §1): true only for a resolved provider carrying `images: true`."
