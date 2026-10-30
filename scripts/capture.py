@@ -54,6 +54,15 @@ is written — a capture whose claim is unverified fails, never ships.
     scripts/capture.py still --scenario model-switch \
         --expect-label "mock - glm-5.3-flash" --out FILE.png
 
+Title-dialog captures (issue #106): one app run over a TITLED fixture
+session (resumed) plus a SECOND fixture session holding another title.
+Five stills, each asserted before it is written:
+
+    scripts/capture.py still --scenario title-dialog \
+        --out 01-dialog-open.png --out2 02-dialog-refusal.png \
+        --out3 03-dialog-success.png --out4 04-dialog-esc.png \
+        --out5 05-inline-unchanged.png
+
 Scenarios:
     first-run   fresh session: composer empty, no exchanges yet
     mid-session after one completed exchange: composer empty again
@@ -97,6 +106,13 @@ Scenarios:
                 /model → the catalog picker opens, ↓ picks the other
                 entry, ⏎ swaps — the footer's model part follows the pick
                 (issue #109); pair with --expect-label to assert it
+    title-dialog
+                a resumed TITLED fixture session (issue #106): bare /title
+                opens the dialog pre-filled, a held title refuses IN the
+                dialog naming the holder id, a free title renames and
+                closes, Esc cancels untouched, and /title <name> inline
+                still lands its entry with no dialog — five stills, every
+                act asserted before its still is written
     probe       idle byte-rate: 0 bytes over the window == 0 renders/s
 
 The scratch root is hermetic: XDG_CONFIG_HOME and XDG_DATA_HOME both point
@@ -139,6 +155,15 @@ REPLY_TOKENS = (
 
 GHOST_TEXT = "what happened next?"
 TITLE_TEXT = "composer demo"
+
+# The /title-dialog scenario's script (issue #106): the resumed fixture's
+# own title (the pre-fill proof), a title a SECOND fixture session holds
+# (the refusal names its holder id), a free title (the success), and the
+# inline rename (the unchanged form).
+TITLE_FIXTURE_TITLE = "Resume Me"
+TITLE_HOLDER_TITLE = "Held Name"
+TITLE_FREE_TITLE = "Fresh Name"
+TITLE_INLINE_TITLE = "Inline Name"
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
@@ -398,6 +423,31 @@ def write_reading_fixture(scratch: str) -> str:
             "id": session_id,
             "created_at": "2026-10-31T00:00:00Z",
             "messages": messages,
+        }, f)
+    return session_id
+
+
+TITLED_MESSAGES = [
+    {"role": "user", "content": "what is elixir?"},
+    {"role": "assistant",
+     "content": "Elixir processes run independently, supervised by the VM."},
+]
+
+
+def write_titled_fixture(scratch: str, title: str, messages=None) -> str:
+    """A titled session file (the /title dialog's fixture, issue #106): the
+    map carries a `title` (the ADR 0023 additive field), resumable like the
+    compact fixture. Returns the session id."""
+    session_id = str(uuid.uuid4())
+    sessions = f"{scratch}/dashfloat/sessions"
+    os.makedirs(sessions, exist_ok=True)
+    with open(f"{sessions}/{session_id}.json", "w") as f:
+        json.dump({
+            "version": 1,
+            "id": session_id,
+            "created_at": "2026-10-31T00:00:00Z",
+            "title": title,
+            "messages": messages if messages is not None else TITLED_MESSAGES,
         }, f)
     return session_id
 
@@ -998,6 +1048,123 @@ class App:
                 return row.rstrip()
         return ""
 
+    # -- the /title dialog (issue #106) ------------------------------------
+
+    def dialog_top(self):
+        """The screen row carrying the dialog box's title border, or None."""
+        for y, row in enumerate(self.screen.display):
+            if "Session title" in row:
+                return y
+        return None
+
+    def dialog_box_rows(self) -> list[str]:
+        """The dialog's rows from its top border down (the box is 7 rows at
+        the default 80x24 pty: border, five inner, border)."""
+        top = self.dialog_top()
+        assert top is not None, "the /title dialog never opened"
+        return self.screen.display[top:top + 7]
+
+    def dialog_draft_row(self) -> str:
+        """The box's first inner row — the ❯ draft line."""
+        return self.dialog_box_rows()[1]
+
+    def clear_dialog_draft(self):
+        """Backspace the draft empty (a pre-filled dialog starts here)."""
+        for _ in range(40):
+            self.send(b"\x7f")
+        time.sleep(0.5)
+        assert "❯ █" in self.dialog_draft_row(), \
+            f"the dialog draft never cleared: {self.dialog_draft_row()!r}"
+
+    def wait_dialog_contains(self, needle: str, timeout=10):
+        """Assert-then-shoot for the IN-dialog render: `needle` must appear
+        inside the box's rows — a log line beneath never satisfies this."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            box = "\n".join(self.dialog_box_rows())
+            if needle in box:
+                return
+            time.sleep(0.1)
+        raise TimeoutError(f"the dialog box never showed {needle!r}: "
+                           f"{self.dialog_box_rows()!r}")
+
+    def wait_dialog_gone(self, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.dialog_top() is None:
+                return
+            time.sleep(0.1)
+        raise TimeoutError("the /title dialog never closed")
+
+    def titled_entry_count(self) -> int:
+        return self.text().count("session titled")
+
+    def scenario_title_dialog(self, holder_id: str, stills: list[str]):
+        # The resumed titled session is on screen (the replayed log) before
+        # anything is typed.
+        self.wait_for("supervised by")
+        self.wait_quiet()
+
+        # Act 1 — bare /title opens the dialog PRE-FILLED with the fixture's
+        # title; asserted on the draft row before the still is taken.
+        self.type("/title")
+        self.send(b"\r")
+        self.wait_for("Session title")
+        time.sleep(0.5)                # a readable beat on the open dialog
+        assert f"❯ {TITLE_FIXTURE_TITLE}█" in self.dialog_draft_row(), \
+            f"the dialog never pre-filled with {TITLE_FIXTURE_TITLE!r}: " \
+            f"{self.dialog_draft_row()!r}"
+        print(f"claim  pre-fill: draft row {self.dialog_draft_row().strip()!r} "
+              f"carries the fixture title")
+        self.screenshot(stills[0])
+
+        # Act 2 — a title the SECOND fixture session holds refuses IN the
+        # dialog, naming the holder id (not as a log line only).
+        self.clear_dialog_draft()
+        self.type(TITLE_HOLDER_TITLE)
+        self.send(b"\r")
+        self.wait_dialog_contains("already taken")
+        self.wait_dialog_contains(holder_id)
+        assert TITLE_HOLDER_TITLE in self.dialog_draft_row(), \
+            "the refusal lost the draft"
+        print(f"claim  in-dialog refusal: box names the holder {holder_id}, "
+              f"draft kept")
+        self.screenshot(stills[1])
+
+        # Act 3 — a free title: the dialog closes and the entry lands.
+        self.clear_dialog_draft()
+        self.type(TITLE_FREE_TITLE)
+        self.send(b"\r")
+        self.wait_dialog_gone()
+        self.wait_for(f"[session titled: {TITLE_FREE_TITLE}]")
+        self.wait_quiet()
+        print(f"claim  success: dialog closed, "
+              f"[session titled: {TITLE_FREE_TITLE}] landed")
+        self.screenshot(stills[2])
+
+        # Act 4 — Esc cancels: dialog gone, nothing renamed.
+        titled_before = self.titled_entry_count()
+        self.type("/title")
+        self.send(b"\r")
+        self.wait_for("Session title")
+        time.sleep(0.4)
+        self.send(b"\x1b")             # Esc
+        self.wait_dialog_gone()
+        self.wait_quiet()
+        assert self.titled_entry_count() == titled_before, \
+            "Esc renamed something"
+        print("claim  esc: dialog closed, the titled-entry count unchanged")
+        self.screenshot(stills[3])
+
+        # Act 5 — the inline form is unchanged: the entry lands, no dialog.
+        self.type("/title " + TITLE_INLINE_TITLE)
+        self.send(b"\r")
+        self.wait_for(f"[session titled: {TITLE_INLINE_TITLE}]")
+        self.wait_quiet()
+        assert self.dialog_top() is None, "the inline form opened a dialog"
+        print("claim  inline: /title <name> entry landed, no dialog")
+        self.screenshot(stills[4])
+
     def close(self):
         self._alive = False
         try:
@@ -1024,11 +1191,17 @@ def main():
                              "growing-session", "compact-session",
                              "slash-autocomplete", "attach",
                              "attach-refusal", "reading-session",
-                             "resume-session", "model-switch"])
+                             "resume-session", "model-switch",
+                             "title-dialog"])
     ap.add_argument("--out", default=None)
     # The compact-session flow shoots TWO stills: --out after the drop,
     # --out2 after the follow-up no-op command (its below-trigger entry).
     ap.add_argument("--out2", default=None)
+    # The title-dialog flow (issue #106) shoots FIVE stills in one app run:
+    # --out open, --out2 refusal, --out3 success, --out4 esc, --out5 inline.
+    ap.add_argument("--out3", default=None)
+    ap.add_argument("--out4", default=None)
+    ap.add_argument("--out5", default=None)
     ap.add_argument("--window-ms", type=int, default=1500)
     ap.add_argument("--after-exchange", action="store_true")
     # Override the per-model context window the scratch settings carry
@@ -1072,7 +1245,7 @@ def main():
     # at the end (compact-session writes both stills inside its scenario;
     # gif/probe write no still) — reject the combos rather than silently
     # weakening the guarantee (issue #109).
-    if args.expect_label and (args.mode != "still" or args.scenario == "compact-session"):
+    if args.expect_label and (args.mode != "still" or args.scenario in ("compact-session", "title-dialog")):
         ap.error("--expect-label needs still mode and a scenario that shoots "
                  "once, at the end")
 
@@ -1083,10 +1256,16 @@ def main():
     # transcript (two ~20 KB turns, no anchor) sits over. The resume-session
     # fixture (#107) is the same trick: two short user/assistant turns.
     resume = None
+    holder_id = None
     if args.scenario == "compact-session":
         resume = write_compact_fixture(scratch_dir())
     elif args.scenario == "resume-session":
         resume = write_reading_fixture(scratch_dir())
+    elif args.scenario == "title-dialog":
+        # A holder session owns "Held Name"; the resumed fixture is titled
+        # "Resume Me" — the dialog must pre-fill from it (issue #106).
+        holder_id = write_titled_fixture(scratch_dir(), TITLE_HOLDER_TITLE)
+        resume = write_titled_fixture(scratch_dir(), TITLE_FIXTURE_TITLE)
 
     context = args.context or (
         20000 if args.scenario == "compact-session" else 524288)
@@ -1147,9 +1326,17 @@ def main():
                 app.scenario_attach_refusal()
             elif args.scenario == "model-switch":
                 app.scenario_model_switch()
+            elif args.scenario == "title-dialog":
+                # Five stills in one app run (issue #106): open, refusal,
+                # success, esc, inline — each act asserts before it shoots.
+                stills = [args.out, args.out2, args.out3, args.out4, args.out5]
+                if not all(stills):
+                    ap.error("title-dialog shoots five stills: "
+                             "--out .. --out5 are all required")
+                app.scenario_title_dialog(holder_id, stills)
             if args.expect_label:
                 app.wait_footer_label(args.expect_label)
-            if args.scenario != "compact-session":
+            if args.scenario not in ("compact-session", "title-dialog"):
                 app.screenshot(args.out)
         elif args.scenario == "slash-autocomplete":
             # The popup opening AND narrowing: "/" opens the full list, "c"
