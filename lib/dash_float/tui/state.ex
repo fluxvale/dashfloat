@@ -244,7 +244,6 @@ defmodule DashFloat.TUI.State do
           palette: Palette.t() | nil,
           attachments: [attachment()],
           attach: attach_prompt() | nil,
-
           title: String.t() | nil,
           title_dialog: title_dialog() | nil,
           herdr: DashFloat.Herdr.t() | nil,
