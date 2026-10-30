@@ -234,6 +234,45 @@ defmodule DashFloat.Agent do
   # A prompt while busy is a UI bug (the UI gates on phase): ignore, never crash.
   def handle_info({:prompt, _ui, _text}, state), do: {:noreply, state}
 
+  # /compact (issue #92; ADR 0022's amendment): the same eviction the
+  # prompt-time hook runs, on demand — never a second implementation. The
+  # same ~80% trigger governs: below it the command is a no-op that reports
+  # where the estimate stands, because drop-oldest below the trigger
+  # discards context nothing is at risk to reclaim.
+  def handle_info(
+        {:compact, ui},
+        %__MODULE__{status: :idle, provider: {:ok, %Config{context_tokens: window}}} = state
+      )
+      when is_pid(ui) and is_integer(window) and window > 0 do
+    case eviction_pass(%{state | ui: ui}, window) do
+      {state, nil} ->
+        usage = Accounting.usage(state.messages, state.anchor, window)
+
+        display(
+          ui,
+          {:entry, :system,
+           "[context: below the 80% trigger — nothing to compact (est #{usage.used} of #{usage.window}, #{usage.percent}%)]"}
+        )
+
+        {:noreply, state}
+
+      {state, _plan} ->
+        {:noreply, state}
+    end
+  end
+
+  # No configured window (or no resolved provider): nothing compacts and
+  # nothing is guessed (ADR 0022 §2) — the command says so, never silence.
+  def handle_info({:compact, ui}, %__MODULE__{status: :idle} = state) when is_pid(ui) do
+    display(ui, {:entry, :system, "[context: no context window configured — nothing to compact]"})
+    {:noreply, state}
+  end
+
+  # A /compact while a turn is open is a UI race (the TUI gates commands
+  # idle, like submit): ignore like a busy prompt — the message list is only
+  # mutated where it is stable (ADR 0022 §5).
+  def handle_info({:compact, _ui}, state), do: {:noreply, state}
+
   # The mode seam (ADR 0016 §7): the UI sends, the agent validates, the echo
   # updates the chrome. Accepted in any phase — the gate reads per call at
   # dispatch, and a pending confirmation is left standing untouched.
@@ -1054,15 +1093,28 @@ defmodule DashFloat.Agent do
   # The compaction hook (ADR 0022 §5): prompt time, after the user message is
   # appended, before the episode starts. Only a configured window compacts —
   # nil (or non-positive) persists the question and returns (§2, nothing is
-  # guessed). The compacting path mutates, persists once, and announces what
-  # happened (§6); one persist per prompt either way, so a failed save warns
-  # once (hostile review m4).
+  # guessed). One persist per prompt either way, so a failed save shows one
+  # notice (m4).
   defp maybe_compact(%__MODULE__{provider: {:ok, %Config{context_tokens: window}}} = state)
        when is_integer(window) and window > 0 do
+    case eviction_pass(state, window) do
+      {state, nil} -> persist(state)
+      {state, _plan} -> state
+    end
+  end
+
+  defp maybe_compact(state), do: persist(state)
+
+  # The eviction both entry points run (ADR 0022 §4-§6; the /compact
+  # amendment, issue #92): plan the drop; when something changes, mutate,
+  # record, persist once, and announce. Returns {state, plan}; a nil plan
+  # means the estimate sat at or under the trigger with no oversize
+  # survivor — nothing changed, nothing persisted.
+  defp eviction_pass(state, window) do
     plan = Accounting.compact(state.messages, state.anchor, window)
 
     if plan.dropped == 0 and not plan.oversize do
-      persist(state)
+      {state, nil}
     else
       before = Accounting.estimate(state.messages, state.anchor)
       after_estimate = Accounting.estimate(plan.kept, plan.anchor)
@@ -1088,11 +1140,9 @@ defmodule DashFloat.Agent do
         )
       end
 
-      state
+      {state, plan}
     end
   end
-
-  defp maybe_compact(state), do: persist(state)
 
   # One chronological record per dropping compact (ADR 0022 §6); an
   # oversize-only pass appends nothing.

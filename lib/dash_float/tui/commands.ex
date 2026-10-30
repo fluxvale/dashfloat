@@ -12,6 +12,7 @@ defmodule DashFloat.TUI.Commands do
 
   @commands [
     %Command{name: "clear", description: "clear the log (input history survives)"},
+    %Command{name: "compact", description: "compact the context now (respects the 80% trigger)"},
     %Command{name: "help", description: "list commands and keys"},
     %Command{name: "mode", description: "show or switch the interaction mode"},
     %Command{name: "model", description: "pick a model for the next request"},

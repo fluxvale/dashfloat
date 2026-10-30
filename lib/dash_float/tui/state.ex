@@ -9,7 +9,7 @@ defmodule DashFloat.TUI.State do
   Transitions return `{state, action}` where `action` is `:quit`,
   `{:submit, prompt}`, `{:confirm, decision}`, `:cancel`, `{:set_mode, mode}`,
   the command actions (`{:set_title, title}`, `{:switch_model, _}`,
-  `:list_profiles` — ADR 0020), `nil`, or one of the setup actions; the TUI
+  `:list_profiles`, `:compact` — ADR 0020), `nil`, or one of the setup actions; the TUI
   interprets actions. The one clock is injectable (`now` arguments,
   defaulting to the monotonic clock) so the animation tick and rate math stay
   pure. See ADRs 0002, 0006, and 0007.
@@ -55,6 +55,7 @@ defmodule DashFloat.TUI.State do
           | {:set_title, String.t()}
           | {:switch_model, DashFloat.Config.classification()}
           | :list_profiles
+          | :compact
           | nil
           | {:select_profile, String.t()}
           | :setup_finish
@@ -1010,7 +1011,7 @@ defmodule DashFloat.TUI.State do
   end
 
   # One clause per registry entry; the actions ride to the TUI ({:set_mode,
-  # _}, {:set_title, _}, {:switch_model, _}, :list_profiles, :quit).
+  # _}, {:set_title, _}, {:switch_model, _}, :list_profiles, :compact, :quit).
 
   # /clear resets the log; the input history survives (ADR 0020).
   defp run_command(state, "clear", _rest) do
@@ -1054,6 +1055,10 @@ defmodule DashFloat.TUI.State do
   # The agent owns title normalization, uniqueness, and validation — even ""
   # goes through (ADR 0023 §7's rename seam).
   defp run_command(state, "title", rest), do: {state, {:set_title, rest}}
+
+  # /compact rides ADR 0022's eviction on demand (issue #92): the agent
+  # owns the transcript, the anchor, and every feedback entry.
+  defp run_command(state, "compact", _rest), do: {state, :compact}
 
   # /model opens the picker over this provider's catalog entries (ADR 0009's
   # landed sweep), the current model preselected; an empty catalog warns.

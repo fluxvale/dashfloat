@@ -2514,11 +2514,11 @@ defmodule DashFloat.TUI.StateTest do
       typed = type(new_state(), "/")
       broad = press(typed, "down", [])
 
-      assert length(broad.palette.items) == 7
+      assert length(broad.palette.items) == 8
       assert broad.palette.selected == 1
 
       narrow = type(broad, "c")
-      assert Enum.map(narrow.palette.items, & &1.name) == ["clear"]
+      assert Enum.map(narrow.palette.items, & &1.name) == ["clear", "compact"]
       assert narrow.palette.selected == 0
     end
 
@@ -2747,6 +2747,11 @@ defmodule DashFloat.TUI.StateTest do
       assert {_state, {:set_title, ""}} = enter_typed(new_state(), "/title ")
     end
 
+    test "/compact returns the action; trailing text is ignored" do
+      assert {_state, :compact} = enter_typed(new_state(), "/compact")
+      assert {_state, :compact} = enter_typed(new_state(), "/compact now")
+    end
+
     test "/model opens the picker preselected on the current model" do
       base = cataloged()
       {opened, nil} = enter_typed(base, "/model")
@@ -2861,7 +2866,7 @@ defmodule DashFloat.TUI.StateTest do
       assert %{mode: :modal, kind: :commands, selected: 0} = state.palette
 
       assert Enum.map(state.palette.items, & &1.name) ==
-               ~w(clear help mode model profile quit title)
+               ~w(clear compact help mode model profile quit title)
     end
 
     test "ctrl+p is idle-gated like submit" do
@@ -2904,11 +2909,12 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.palette.selected == 1
 
-      {helped, nil} = State.handle_key(state, "enter", [])
+      # Selected 1 is now /compact (alphabetical under /clear): enter runs it —
+      # the action rides to the TUI, no entry, palette closed.
+      {ran, :compact} = State.handle_key(state, "enter", [])
 
-      assert helped.palette == nil
-      assert [{:system, text}] = pairs(helped)
-      assert text =~ "/help — "
+      assert ran.palette == nil
+      assert pairs(ran) == []
     end
 
     test "esc closes the modal" do

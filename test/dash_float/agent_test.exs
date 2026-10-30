@@ -3187,6 +3187,139 @@ defmodule DashFloat.AgentTest do
     )
   end
 
+  ## Manual /compact (issue #92; ADR 0022's amendment): the same eviction the
+  ## prompt-time hook runs, on demand — same trigger, same entries.
+
+  @tag :tmp_dir
+  test "manual /compact runs the same eviction immediately, idle, without a prompt", ctx do
+    # The estimate sits UNDER the trigger at the second prompt and OVER it
+    # once turn 2's reply lands, so the automatic path stays silent through
+    # both turns and the manual command does the dropping. The window is
+    # derived from the measured estimates — the system message's weight
+    # varies with the cwd and git state.
+    sys = system_message(ctx.tmp_dir)
+    specs = [read_turn(1, 800), read_turn(2, 800)]
+    full = [sys | Enum.flat_map(specs, & &1.expected)]
+    anchor_after = fn k -> %{tokens: f_of(Enum.take(full, 4 * k)), index: 4 * k} end
+
+    est_at_prompt_2 =
+      Accounting.estimate(Enum.take(full, 5) ++ [user_message("turn 2")], anchor_after.(1))
+
+    est_after_reply_2 = Accounting.estimate(full, anchor_after.(2))
+    window = div((est_at_prompt_2 + div(est_after_reply_2 - est_at_prompt_2, 2)) * 5, 4) + 1
+    threshold = div(window * 4, 5)
+
+    assert est_at_prompt_2 <= threshold
+    assert threshold < est_after_reply_2
+
+    plan = Accounting.compact(full, anchor_after.(2), window)
+    assert plan.dropped == 1
+    refute plan.oversize
+
+    server = start_read_server(ctx, specs, %{}, [sys])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir, session_dir: sessions, provider: provider(server, window))
+
+    drive_read_turns(agent, Enum.map(specs, & &1.prompt))
+
+    # The automatic path never fired; the manual one does the work.
+    refute_received {:entry, :system, "[context: " <> _}
+    send(agent, {:compact, self()})
+
+    before = est_after_reply_2
+    after_estimate = Accounting.estimate(plan.kept, plan.anchor)
+
+    assert_receive {:entry, :system, entry}, 2_000
+
+    assert entry ==
+             "[context: dropped 1 oldest turn(s) — est #{before}→#{after_estimate} of #{window}]"
+
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+    assert session.messages == plan.kept
+
+    assert [
+             %{
+               "at" => at,
+               "turns" => 1,
+               "window" => ^window,
+               "estimate_before" => ^before,
+               "estimate_after" => ^after_estimate
+             }
+           ] = session.compactions
+
+    assert is_binary(at)
+  end
+
+  @tag :tmp_dir
+  test "manual /compact below the trigger is a no-op that reports the estimate", ctx do
+    sys = system_message(ctx.tmp_dir)
+    specs = [read_turn(1, 800), read_turn(2, 800)]
+    full = [sys | Enum.flat_map(specs, & &1.expected)]
+    anchor_after = fn k -> %{tokens: f_of(Enum.take(full, 4 * k)), index: 4 * k} end
+
+    # A window whose trigger sits above the whole transcript: nothing to drop.
+    est_after_reply_2 = Accounting.estimate(full, anchor_after.(2))
+    window = est_after_reply_2 * 2
+
+    server = start_read_server(ctx, specs, %{}, [sys])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir, session_dir: sessions, provider: provider(server, window))
+
+    drive_read_turns(agent, Enum.map(specs, & &1.prompt))
+    send(agent, {:compact, self()})
+
+    usage = Accounting.usage(full, anchor_after.(2), window)
+
+    assert_receive {:entry, :system, entry}, 2_000
+
+    assert entry ==
+             "[context: below the 80% trigger — nothing to compact (est #{usage.used} of #{usage.window}, #{usage.percent}%)]"
+
+    # The session file is untouched: no drop, no record.
+    {:ok, session} = Session.load(sessions, session_id(sessions))
+    assert session.messages == full
+    assert session.compactions == []
+  end
+
+  test "manual /compact with no configured window says so" do
+    server = start_server([])
+    {agent, _sup} = start_agent(server, System.tmp_dir!())
+
+    send(agent, {:compact, self()})
+
+    assert_receive {:entry, :system,
+                    "[context: no context window configured — nothing to compact]"},
+                   2_000
+  end
+
+  test "a /compact while streaming is ignored" do
+    # The reply pauses mid-stream: the command lands while the turn is open.
+    server =
+      start_server([
+        [
+          {:send, [@headers, frame("half")]},
+          {:sleep, 300},
+          {:send, frame(" rest")},
+          {:send, "data: [DONE]\n\n"},
+          :close
+        ]
+      ])
+
+    {agent, _sup} = start_agent(server, System.tmp_dir!())
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:token, "half"}, 2_000
+
+    send(agent, {:compact, self()})
+
+    assert_receive {:phase, :idle}, 2_000
+    refute_received {:entry, :system, "[context:" <> _}
+  end
+
   ## Session title (#80): the auto-title side-request, the rename seam,
   ## resume adoption. The suite's default provider opts the trigger out;
   ## these tests opt in through `title_provider/2`.
