@@ -43,7 +43,7 @@ detect_target() {
 
       case "$arch" in
         x86_64 | amd64) printf '%s\n' "x86_64-unknown-linux-gnu" ;;
-        *) die "unsupported Linux architecture: $arch (v0.2.0 ships x86_64 only)" ;;
+        *) die "unsupported Linux architecture: $arch (v0.3.0 ships x86_64 only)" ;;
       esac
       ;;
     Darwin)
@@ -54,7 +54,7 @@ detect_target() {
       esac
       ;;
     *)
-      die "unsupported operating system: $os (v0.2.0 ships Linux x86_64 and macOS)"
+      die "unsupported operating system: $os (v0.3.0 ships Linux x86_64 and macOS)"
       ;;
   esac
 }
