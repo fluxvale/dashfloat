@@ -20,8 +20,10 @@ defmodule DashFloat.LLM.ChatStream do
 
   alias DashFloat.LLM.SSE
   alias DashFloat.LLM.ToolCalls
+  alias DashFloat.Synthetic
 
   @default_idle_timeout 60_000
+  @default_repair_timeout 15_000
   @drain_limit 64 * 1024
   # A single SSE frame that never completes would grow the parser buffer until
   # the node dies: cap it (the parser itself stays pure and unbounded).
@@ -47,11 +49,18 @@ defmodule DashFloat.LLM.ChatStream do
 
     * `:idle_timeout` — milliseconds without stream data before aborting
       (default #{@default_idle_timeout}).
+    * `:synthetic` — a `DashFloat.Synthetic.ctx()`; nil (the default) keeps
+      today's behavior exactly. Present, malformed argument JSON is repaired
+      at the [DONE] terminal (ADR 0021 §3)
+    * `:repair_timeout` — the repair request's timeout in ms
+      (default #{@default_repair_timeout}).
   """
   @spec run(pid(), DashFloat.Config.t() | {:error, String.t()}, [map()], [map()], keyword()) ::
           :ok
   def run(agent, provider, messages, tools, opts \\ []) when is_pid(agent) do
     idle_timeout = Keyword.get(opts, :idle_timeout, @default_idle_timeout)
+    synthetic = Keyword.get(opts, :synthetic)
+    repair_timeout = Keyword.get(opts, :repair_timeout, @default_repair_timeout)
 
     case request_url(provider) do
       {:error, message} ->
@@ -59,7 +68,7 @@ defmodule DashFloat.LLM.ChatStream do
 
       {:ok, url} ->
         response = post(url, provider, messages, tools, idle_timeout)
-        handle_response(response, agent, provider, idle_timeout)
+        handle_response(response, agent, provider, idle_timeout, synthetic, repair_timeout)
     end
   end
 
@@ -132,7 +141,14 @@ defmodule DashFloat.LLM.ChatStream do
     )
   end
 
-  defp handle_response({:error, exception}, agent, {:ok, provider}, _idle_timeout) do
+  defp handle_response(
+         {:error, exception},
+         agent,
+         {:ok, provider},
+         _idle_timeout,
+         _synthetic,
+         _repair_timeout
+       ) do
     if cancelled?() do
       terminal_cancel(agent, "")
     else
@@ -141,7 +157,14 @@ defmodule DashFloat.LLM.ChatStream do
     end
   end
 
-  defp handle_response({:ok, %Req.Response{status: status} = resp}, agent, provider, idle_timeout)
+  defp handle_response(
+         {:ok, %Req.Response{status: status} = resp},
+         agent,
+         provider,
+         idle_timeout,
+         synthetic,
+         repair_timeout
+       )
        when status in 200..299 do
     if cancelled?(),
       do: terminal_cancel(agent, ""),
@@ -150,7 +173,9 @@ defmodule DashFloat.LLM.ChatStream do
           parser: SSE.new(),
           tool_calls: ToolCalls.new(),
           content: "",
-          tool_bytes: 0
+          tool_bytes: 0,
+          synthetic: synthetic,
+          repair_timeout: repair_timeout
         })
   end
 
@@ -158,7 +183,9 @@ defmodule DashFloat.LLM.ChatStream do
          {:ok, %Req.Response{status: status} = resp},
          agent,
          provider,
-         _timeout
+         _timeout,
+         _synthetic,
+         _repair_timeout
        )
        when status not in 200..299 do
     drain(agent, provider, resp, status, "")
@@ -262,7 +289,7 @@ defmodule DashFloat.LLM.ChatStream do
 
   # [DONE] is the ONLY happy terminal — it closes the connection so no pool
   # slot lingers. Frames after it are ignored.
-  defp emit_frames(agent, _provider, resp, [%{data: "[DONE]"} | _rest], acc) do
+  defp emit_frames(agent, _provider, resp, [%{data: "[DONE]"} | _rest], %{synthetic: nil} = acc) do
     Req.cancel_async_response(resp)
 
     send(
@@ -272,6 +299,28 @@ defmodule DashFloat.LLM.ChatStream do
     )
 
     :done
+  end
+
+  # With a Synthetic ctx (ADR 0021 §3), calls that finished with malformed
+  # argument JSON get one fix-json repair attempt before the terminal report.
+  defp emit_frames(agent, _provider, resp, [%{data: "[DONE]"} | _rest], acc) do
+    Req.cancel_async_response(resp)
+    {calls, repaired?} = repair_calls(ToolCalls.finish(acc.tool_calls), acc)
+
+    # A cancel that landed while a repair POST was in flight wins — it was
+    # invisible to the stream loop's own checks. Without repairs, today's
+    # terminal (no re-check) is byte-identical.
+    if repaired? and cancelled?() do
+      terminal_cancel(agent, acc.content)
+      :done
+    else
+      send(
+        agent,
+        {:stream_done, %{content: acc.content, tool_calls: calls, cancelled: false}}
+      )
+
+      :done
+    end
   end
 
   defp emit_frames(agent, provider, resp, [%{data: data} | rest], acc) do
@@ -301,6 +350,22 @@ defmodule DashFloat.LLM.ChatStream do
   end
 
   defp emit_frames(_agent, _provider, _resp, [], acc), do: {:cont, acc}
+
+  # Sequential repairs, in call order: a repair that succeeds replaces the
+  # args (schema validation happens later, in the agent, as usual); a repair
+  # that fails leaves the call exactly as finish/1 built it.
+  defp repair_calls(calls, acc) do
+    Enum.map_reduce(calls, false, fn
+      %{error: "invalid JSON arguments", raw_args: raw_args} = call, _repaired? ->
+        case Synthetic.repair_json(raw_args, acc.synthetic, receive_timeout: acc.repair_timeout) do
+          {:ok, fixed} -> {%{call | args: fixed, error: nil}, true}
+          {:error, _reason} -> {call, true}
+        end
+
+      call, repaired? ->
+        {call, repaired?}
+    end)
+  end
 
   # Usage arrives in the stream's final chunk (often with empty choices):
   # forward it as data; a malformed usage object is ignored, never an error.

@@ -17,6 +17,7 @@ defmodule DashFloat.Agent do
   alias DashFloat.ProjectInstructions
   alias DashFloat.Session
   alias DashFloat.Session.Title
+  alias DashFloat.Synthetic
   alias DashFloat.SystemPrompt
   alias DashFloat.Tools
   alias DashFloat.Tools.Preview
@@ -83,7 +84,12 @@ defmodule DashFloat.Agent do
     # the gate; :vetter is the injectable check module.
     mode: :build,
     vetter: DashFloat.Tools.Vetter,
-    vet_timeout: @default_vet_timeout
+    vet_timeout: @default_vet_timeout,
+    # The Synthetic context (ADR 0021 §2) — discovered from the provider
+    # config, or pinned by the :synthetic opt (the loopback test seam);
+    # pinned means {:set_provider, _} must not re-resolve it.
+    synthetic: nil,
+    synthetic_pinned?: false
   ]
 
   @doc """
@@ -113,6 +119,11 @@ defmodule DashFloat.Agent do
       (default: `DashFloat.Tools.Vetter`; the injection seam for tests)
     * `:vet_timeout` — the safety check's hard timeout in ms
       (default: #{@default_vet_timeout})
+    * `:synthetic` — the Synthetic context (ADR 0021 §2): `:discover`
+      (the default) resolves it from the provider config (and again on every
+      `{:set_provider, _}`); a map pins that context verbatim and nil turns
+      the features off — both pinned forms survive a provider swap (the
+      loopback test seam)
     * `:name` — GenServer name (default: `__MODULE__`)
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -133,7 +144,8 @@ defmodule DashFloat.Agent do
       Keyword.get(opts, :vetter, DashFloat.Tools.Vetter),
       Keyword.get(opts, :vet_timeout, @default_vet_timeout),
       Keyword.get(opts, :title),
-      Keyword.get(opts, :title_fetcher)
+      Keyword.get(opts, :title_fetcher),
+      Keyword.get(opts, :synthetic, :discover)
     }
 
     GenServer.start_link(__MODULE__, init_args, name: Keyword.get(opts, :name, __MODULE__))
@@ -142,7 +154,7 @@ defmodule DashFloat.Agent do
   @impl GenServer
   def init(
         {provider, cwd, supervisor, exec_timeout, session_dir, resume, mode, vetter, vet_timeout,
-         title, title_fetcher}
+         title, title_fetcher, synthetic_opt}
       ) do
     # A resumed agent adopts the loaded session's id, pin, created_at, and
     # history in one move: the first prompt streams the restored transcript
@@ -162,6 +174,16 @@ defmodule DashFloat.Agent do
           {nil, nil, nil, [], nil, [], nil}
       end
 
+    # The Synthetic context (ADR 0021 §2): :discover reads the provider
+    # config once here; a map pins the injected context (the loopback test
+    # seam); an explicit nil (or anything else) is off, pinned.
+    {synthetic, synthetic_pinned?} =
+      case synthetic_opt do
+        :discover -> {Synthetic.context(provider), false}
+        %{} = ctx -> {ctx, true}
+        _other -> {nil, true}
+      end
+
     {:ok,
      %__MODULE__{
        provider: provider,
@@ -179,7 +201,9 @@ defmodule DashFloat.Agent do
        compactions: compactions,
        mode: mode,
        vetter: vetter,
-       vet_timeout: vet_timeout
+       vet_timeout: vet_timeout,
+       synthetic: synthetic,
+       synthetic_pinned?: synthetic_pinned?
      }}
   end
 
@@ -234,6 +258,12 @@ defmodule DashFloat.Agent do
   # completes, the UI delivers the resolved provider here — the agent is the
   # single voice, so the config it streams with must be this one message old
   # at most.
+  def handle_info({:set_provider, provider}, %__MODULE__{synthetic_pinned?: false} = state) do
+    # Post-wizard handoff: the config swapped, so the discoverable Synthetic
+    # context re-reads with it. A pinned context (ADR 0021 §2) never moves.
+    {:noreply, %{state | provider: provider, synthetic: Synthetic.context(provider)}}
+  end
+
   def handle_info({:set_provider, provider}, state) do
     {:noreply, %{state | provider: provider}}
   end
@@ -548,7 +578,9 @@ defmodule DashFloat.Agent do
       Task.Supervisor.start_child(
         state.supervisor,
         fn ->
-          ChatStream.run(agent, state.provider, state.messages, Tools.schema())
+          ChatStream.run(agent, state.provider, state.messages, Tools.schema(),
+            synthetic: state.synthetic
+          )
         end,
         restart: :temporary
       )

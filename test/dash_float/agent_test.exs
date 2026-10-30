@@ -145,6 +145,28 @@ defmodule DashFloat.AgentTest do
     server
   end
 
+  # A pinned Synthetic context aimed at the loopback server (the ADR 0021 §2
+  # test seam): repairs ride the same server's next scripted connection.
+  defp synthetic_ctx(server) do
+    %{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
+  end
+
+  # The repair endpoint's 200 responses (Req pre-decodes application/json).
+  defp repair_ok(fixed) do
+    content = Jason.encode!(%{"success" => true, "fixed" => fixed})
+    body = Jason.encode!(%{choices: [%{message: %{content: content}}]})
+
+    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n" <>
+      "content-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n" <> body
+  end
+
+  defp repair_failure do
+    body = Jason.encode!(%{choices: [%{message: %{content: ~s({"success": false})}}]})
+
+    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n" <>
+      "content-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n" <> body
+  end
+
   defp provider(server) do
     {:ok,
      %Config{
@@ -190,7 +212,7 @@ defmodule DashFloat.AgentTest do
 
     {:ok, agent} =
       base
-      |> Keyword.merge(Keyword.take(opts, [:mode, :vetter, :vet_timeout]))
+      |> Keyword.merge(Keyword.take(opts, [:mode, :vetter, :vet_timeout, :synthetic]))
       |> Agent.start_link()
 
     on_exit(fn ->
@@ -590,6 +612,161 @@ defmodule DashFloat.AgentTest do
     log = display_log()
     assert {:phase, :idle} in log
     assert contract_survives?(log)
+  end
+
+  ## Synthetic fix-json repair through the real agent (ADR 0021)
+
+  @tag :tmp_dir
+  test "a synthetic ctx repairs malformed arguments at the stream terminal and the turn proceeds",
+       ctx do
+    write_sandbox(ctx, "a.txt", "hello contents\n")
+
+    # The args fragment is truncated mid-JSON: finish/1 must see it raw.
+    broken = ~s({"path": "a.txt)
+    frames = tool_frames("call_1", "read_file", [broken])
+
+    server =
+      start_server([
+        [{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close],
+        [{:send, repair_ok(%{"path" => "a.txt"})}, :close],
+        final_episode()
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, synthetic: synthetic_ctx(server))
+    send(agent, {:prompt, self(), "read it"})
+
+    # conn 0: the episode with the broken call.
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    # conn 1: the repair POST — Octofriend's contract, the raw broken string.
+    assert_receive {:sse_request, "POST", "/chat/completions", repair_headers, repair_body},
+                   2_000
+
+    assert repair_headers["authorization"] == "Bearer test-key-123"
+
+    decoded = Jason.decode!(repair_body)
+    assert decoded["model"] == "hf:syntheticlab/fix-json"
+
+    assert [%{"role" => "user", "content" => prompt}] = decoded["messages"]
+    assert prompt =~ broken
+    assert prompt =~ "Here's the string:\n"
+
+    # The repair becomes a real read; the UI sees the successful tool result.
+    assert_receive {:tool_result, %{id: "call_1", name: "read_file", ok: true}}, 2_000
+
+    # conn 2: the next episode carries the REPAIRED arguments and the file.
+    assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
+    messages = request_messages(second_body)
+
+    assert %{"role" => "assistant", "tool_calls" => [call]} = Enum.at(messages, -2)
+    assert call["function"]["name"] == "read_file"
+    assert call["function"]["arguments"] == ~s({"path":"a.txt"})
+
+    assert %{"content" => result_json} = tool_result_message(messages, "call_1")
+    assert %{"ok" => true, "content" => "hello contents"} = Jason.decode!(result_json)
+
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "a failed repair degrades to exactly the no-key error result", ctx do
+    frames = tool_frames("call_bad", "read_file", ["{\"path\": "])
+
+    server =
+      start_server([
+        [{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close],
+        [{:send, repair_failure()}, :close],
+        final_episode()
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, synthetic: synthetic_ctx(server))
+    send(agent, {:prompt, self(), "call it"})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:tool_result, %{id: "call_bad", ok: false}}, 2_000
+
+    # conn 1 was the repair; conn 2 is the follow-up episode.
+    assert_receive {:sse_request, "POST", "/chat/completions", _, _repair_request}, 2_000
+
+    assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
+    messages = request_messages(second_body)
+
+    assert %{"role" => "assistant", "tool_calls" => [call]} = Enum.at(messages, -2)
+    assert call["function"]["arguments"] == "{}"
+
+    assert %{"content" => result_json} = tool_result_message(messages, "call_bad")
+    assert Jason.decode!(result_json) == %{"ok" => false, "error" => "invalid JSON arguments"}
+
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "Esc during a repair POST still cancels the turn", ctx do
+    frames = tool_frames("call_1", "read_file", ["{\"path\": "])
+
+    server =
+      start_server([
+        [{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close],
+        [{:sleep, 200}, {:send, repair_ok(%{"path" => "a.txt"})}, :close]
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, synthetic: synthetic_ctx(server))
+    send(agent, {:prompt, self(), "call it"})
+
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+    # The repair request is in flight; cancel lands inside it.
+    assert_receive {:sse_request, "POST", "/chat/completions", _, _repair_request}, 2_000
+    send(agent, {:cancel})
+
+    assert_receive {:entry, :system, "[cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  test "a pinned synthetic ctx survives a provider swap" do
+    server = start_server([final_episode()])
+    cwd = System.tmp_dir!()
+
+    {agent, _sup} =
+      start_agent(server, cwd,
+        synthetic: %{base_url: "https://api.synthetic.new/v1", api_key: "sk-pin"}
+      )
+
+    # A pinned context never moves (ADR 0021 §2) — even to a Synthetic host.
+    send(agent, {:set_provider, provider(server)})
+
+    assert :sys.get_state(agent).synthetic == %{
+             base_url: "https://api.synthetic.new/v1",
+             api_key: "sk-pin"
+           }
+
+    assert :sys.get_state(agent).synthetic_pinned? == true
+  end
+
+  test "an explicit nil synthetic opt is pinned off; :discover re-resolves on a swap" do
+    server = start_server([final_episode()])
+    cwd = System.tmp_dir!()
+
+    {agent, _sup} = start_agent(server, cwd, synthetic: nil)
+    assert :sys.get_state(agent).synthetic == nil
+    assert :sys.get_state(agent).synthetic_pinned? == true
+
+    # The default :discover arm: a loopback provider resolves to nil, and a
+    # swap to a Synthetic host re-resolves to a live context.
+    {discovering, _sup} = start_agent(server, cwd)
+
+    assert :sys.get_state(discovering).synthetic == nil
+    assert :sys.get_state(discovering).synthetic_pinned? == false
+
+    synthetic_provider =
+      {:ok,
+       %Config{base_url: "https://api.synthetic.new/v1", model: "m", api_key: "test-key-123"}}
+
+    send(discovering, {:set_provider, synthetic_provider})
+
+    assert :sys.get_state(discovering).synthetic == %{
+             base_url: "https://api.synthetic.new/v1",
+             api_key: "test-key-123"
+           }
   end
 
   ## Multiple calls and usage gating

@@ -41,5 +41,6 @@ their replacement.
 | [0016](0016-interaction-modes.md) | Interaction modes: the confirmation boundary becomes a mode setting (Plan / Build / Auto / Unchained) | Accepted |
 | [0019](0019-session-system-prompt.md) | Session system prompt: Octofriend-pattern assembly, AGENTS.md chain injection, pinned through compaction | Accepted |
 | [0020](0020-command-surface.md) | Command surface: slash commands, Ctrl+P palette, runtime model/profile/mode/title switching | Accepted |
+| [0021](0021-synthetic-repair-and-web-search.md) | Synthetic repair and web search: fix-json at the stream terminal, the search endpoint seam | Accepted |
 | [0022](0022-context-accounting-and-compaction.md) | Context accounting and compaction: usage-frame anchor, chars/4 growth, 80% whole-turn eviction | Accepted |
 | [0023](0023-session-titles-and-uuid-ids.md) | Session titles and UUID session ids: title normalization, uniqueness, resume by title, the auto-title nudge | Accepted |

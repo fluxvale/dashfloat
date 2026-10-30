@@ -51,7 +51,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
     messages = Keyword.get(opts, :messages, [%{role: "user", content: "hello"}])
     tools = Keyword.get(opts, :tools, [])
     key = Keyword.get(opts, :api_key, "test-key-123")
-    run_opts = Keyword.take(opts, [:idle_timeout])
+    run_opts = Keyword.take(opts, [:idle_timeout, :synthetic, :repair_timeout])
 
     {:ok, pid} =
       Task.start(fn ->
@@ -794,6 +794,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
                   id: "call_abc",
                   name: "read_file",
                   args: %{"path" => "lib/foo.ex", "offset" => 5, "limit" => 10},
+                  raw_args: ~s({"path": "lib/foo.ex", "offset": 5, "limit": 10}),
                   error: nil
                 }
               ]
@@ -921,6 +922,148 @@ defmodule DashFloat.LLM.ChatStreamTest do
     {_pid, ref} = start_stream(SSEServer.base_url(server))
 
     assert {:stream_done, %{tool_calls: []}} = done(collect())
+    await_exit(ref)
+  end
+
+  ## Synthetic fix-json repair at the [DONE] terminal (ADR 0021 §3)
+
+  defp start_per_connection(scripts) do
+    {:ok, server} = SSEServer.start_link(:per_connection, scripts)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    server
+  end
+
+  # The repair endpoint's responses (application/json: Req pre-decodes them).
+  defp repair_ok(fixed) do
+    content = Jason.encode!(%{"success" => true, "fixed" => fixed})
+    json_response(200, Jason.encode!(%{choices: [%{message: %{content: content}}]}))
+  end
+
+  defp repair_failure do
+    json_response(
+      200,
+      Jason.encode!(%{choices: [%{message: %{content: ~s({"success": false})}}]})
+    )
+  end
+
+  test "a synthetic ctx repairs malformed argument JSON at [DONE]" do
+    server =
+      start_per_connection([
+        [
+          {:send, [@headers, tool_frames("call_1", "read_file", ["{\"path\": "])]},
+          {:send, "data: [DONE]\n\n"},
+          :close
+        ],
+        [{:send, repair_ok(%{"path" => "a.txt"})}, :close]
+      ])
+
+    ctx = %{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
+    {_pid, ref} = start_stream(SSEServer.base_url(server), synthetic: ctx)
+
+    # conn 0 is the stream; the repair (conn 1) completes before stream_done.
+    assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 2_000
+
+    assert {:stream_done, %{content: "", tool_calls: [call], cancelled: false}} =
+             done(collect())
+
+    assert call.args == %{"path" => "a.txt"}
+    assert call.error == nil
+
+    assert_receive {:sse_request, "POST", "/chat/completions", repair_headers, repair_body},
+                   2_000
+
+    assert repair_headers["authorization"] == "Bearer test-key-123"
+
+    decoded = Jason.decode!(repair_body)
+    assert decoded["model"] == "hf:syntheticlab/fix-json"
+
+    assert [%{"role" => "user", "content" => prompt}] = decoded["messages"]
+    assert prompt =~ ~s({"path": )
+    assert prompt =~ "Here's the string:\n"
+
+    await_exit(ref)
+  end
+
+  test "a failed repair leaves the error call exactly as the no-key path built it" do
+    server =
+      start_per_connection([
+        [
+          {:send, [@headers, tool_frames("call_1", "read_file", ["{\"path\": "])]},
+          {:send, "data: [DONE]\n\n"},
+          :close
+        ],
+        [{:send, repair_failure()}, :close]
+      ])
+
+    ctx = %{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
+    {_pid, ref} = start_stream(SSEServer.base_url(server), synthetic: ctx)
+
+    assert {:stream_done,
+            %{
+              tool_calls: [
+                %{
+                  id: "call_1",
+                  name: "read_file",
+                  args: nil,
+                  raw_args: ~s({"path": ),
+                  error: "invalid JSON arguments"
+                }
+              ],
+              cancelled: false
+            }} = done(collect())
+
+    await_exit(ref)
+  end
+
+  test "a cancel landing during a repair POST wins the terminal" do
+    server =
+      start_per_connection([
+        [
+          {:send,
+           [@headers, frame("partial"), tool_frames("call_1", "read_file", ["{\"path\": "])]},
+          {:send, "data: [DONE]\n\n"},
+          :close
+        ],
+        [{:sleep, 150}, {:send, repair_ok(%{"path" => "a.txt"})}, :close]
+      ])
+
+    ctx = %{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
+    {pid, ref} = start_stream(SSEServer.base_url(server), synthetic: ctx)
+
+    # conn 0 (the stream), then conn 1 — the repair POST is in flight.
+    assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 2_000
+    assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 2_000
+    send(pid, :cancel)
+
+    assert {:stream_done, %{content: "partial", tool_calls: [], cancelled: true}} =
+             done(collect())
+
+    await_exit(ref)
+  end
+
+  test "calls fix-json cannot help are reported untouched, with no repair request" do
+    no_name =
+      ~s(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"arguments":"{}"}}]}}]}\n\n)
+
+    server =
+      start_per_connection([
+        [{:send, [@headers, no_name]}, {:send, "data: [DONE]\n\n"}, :close],
+        [:close]
+      ])
+
+    ctx = %{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
+    {_pid, ref} = start_stream(SSEServer.base_url(server), synthetic: ctx)
+
+    assert {:stream_done,
+            %{
+              tool_calls: [%{id: "call_x", name: "", args: %{}, error: "missing function name"}],
+              cancelled: false
+            }} = done(collect())
+
+    # Exactly one request: no repair POST for a missing function name.
+    assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 2_000
+    refute_receive {:sse_request, _, _, _, _}, 300
+
     await_exit(ref)
   end
 
