@@ -1826,6 +1826,36 @@ defmodule DashFloat.AgentTest do
   end
 
   @tag :tmp_dir
+  test "the minted id is announced to the UI exactly once, after the first save", ctx do
+    # The Herdr reporter publishes a resume command off the announced id
+    # (ADR 0024 §5): the send must fire with the first save and never again.
+    server = start_server([final_episode("saved")])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:prompt, self(), "hello", []})
+    assert_receive {:sse_request, "POST", _, _, _}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    ids =
+      for _drain <- 1..10 do
+        receive do
+          {:session_id, id} -> {:ok, id}
+        after
+          0 -> :none
+        end
+      end
+
+    minted = for {:ok, id} <- ids, do: id
+    assert length(minted) == 1
+    [id] = minted
+    saved = Path.join(sessions, id <> ".json")
+    assert File.exists?(saved)
+
+    DashFloat.TestTeardown.stop(agent)
+  end
+
+  @tag :tmp_dir
   test "a completed read_file turn persists the full transcript, untruncated", ctx do
     # 40 lines: the log row shows a 30-line excerpt, the transcript must hold
     # the whole result the model received.

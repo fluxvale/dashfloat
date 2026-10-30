@@ -74,8 +74,9 @@ reaches Herdr.
 State reports follow the suggester/auto-title discipline: one temporary task
 under `DashFloat.TaskSupervisor` per report, fire-and-forget — the spawn's
 `:exit` (dead supervisor) is caught, the body rescues everything, and each
-request is bounded (connect/send/read-reply-line, each at a short timeout —
-default 2 s) on its own connection. No result is read beyond the reply line.
+request is bounded (connect and reply-read each at a short timeout — default
+2 s; the send itself is kernel-buffered) on its own connection. No result is
+read beyond the reply line.
 A `runner` fun on the context is the test seam (the `suggest_fetcher`
 pattern). `release/1` is the one synchronous-bounded call: it runs during
 `terminate/2`, user-paced, and must land before the VM stops — Herdr's
@@ -97,6 +98,17 @@ Herdr. Consequence: platforms without a unix-domain socket path (Windows
 named pipes) would need the CLI fallback — DashFloat does not ship there
 today.
 
+Failure semantics: a report whose task cannot even start (a dead supervisor)
+leaves the change-detected signature **uncommitted**, so the next event
+re-fires the same state — transient spawn failure is retried, never
+swallowed. A failure that happens *after* the spawn (connect/send/recv
+timeout inside the task) is unobservable to the caller by design: Herdr
+holds the last accepted state until the next state change re-sends the whole
+report (state and session together). The worst window is a mount report
+losing a race at boot — the pane shows no agent until the first phase
+change. Accepted: the alternative (delivery acknowledgements back to the UI
+process) would couple report delivery to UI latency for a cosmetic sidebar.
+
 ### 5. Resume argv: what `--resume` alone does not restore
 
 Verified: `--resume <uuid>` restores **only the transcript**. The session file's
@@ -114,7 +126,9 @@ after a mid-session `/model` or `/profile` switch (the provider tag is part of
 the report signature, so the argv re-reports on switch). The session id reaches
 the TUI two ways: at mount for a resumed boot (Application opt), or as a
 `{:session_id, id}` send from the agent when a fresh session's id is minted at
-first save (ADR 0023). Args are sanitized per Herdr's rules: profile/model
+first save (ADR 0023) — announced after the save attempt; a persistently
+failing save leaves no file and the restore then refuses loudly (ADR 0014's
+named-request rule), never silently blank. Args are sanitized per Herdr's rules: profile/model
 values containing an apostrophe or control character are dropped (Herdr
 rejects the whole report otherwise); the UUIDv7 id is always clean; the total
 stays far under 64 args / 8 KiB. Env-derived `base_url` is not argv-restorable
@@ -146,8 +160,12 @@ slot while the agent still runs.
   report-agent` when spawned from inside a pane, while the socket API
   delivers. Revisit if Herdr fixes the CLI.
 - **A client-side queue that drops older reports while one is in flight** —
-  rejected: Herdr's seq guard already discards stale reports server-side;
-  duplicating it client-side adds state without changing outcomes.
+  rejected: Herdr's seq guard already discards stale reports server-side.
+  Reports fire as one task per change (state + session requests ordered
+  inside the task); two tasks may interleave *between* reports, at worst
+  briefly dropping an older task's session request to the newer one's seq —
+  self-healing at the next signature change, which re-sends the session
+  request every time.
 - **Attaching the resume argv to the state report** — rejected in favor of the
   dedicated `pane.report_agent_session` follow-up: the docs require the source
   to hold the pane first, and the pair (state, then session with the next

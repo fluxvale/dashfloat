@@ -179,6 +179,8 @@ defmodule DashFloat.HerdrTest do
     test "control characters are dropped the same way" do
       assert Herdr.resume_argv("id", "a\nb", nil) == ["dashfloat", "--resume", "id"]
       assert Herdr.resume_argv("id", "a\x7fb", nil) == ["dashfloat", "--resume", "id"]
+      # Non-binary values (a hand-broken config) drop, never crash.
+      assert Herdr.resume_argv("id", :atom, nil) == ["dashfloat", "--resume", "id"]
     end
   end
 
@@ -254,6 +256,35 @@ defmodule DashFloat.HerdrTest do
 
       assert seq2 > seq1
       assert next.seq == seq2
+    end
+
+    test "a spawn failure leaves the signature uncommitted — the next event retries", ctx do
+      # A supervisor name nothing answers to: the spawn exits, the caller
+      # hears :error, and the SAME state must fire again on the next event
+      # (ADR 0024 §4 — a transient failure is retried, not swallowed).
+      test = self()
+      dead = Herdr.TestDeadSupervisor
+      context = %Herdr{pane: "wA:p1", socket: "/tmp/opencode/herdr-test.sock", supervisor: dead}
+      streaming = shot(phase: :streaming)
+      failed = Herdr.report(context, streaming)
+      refute_receive {:herdr, _request}, 50
+      assert failed.sig == nil and failed.seq == 0
+
+      working = %Herdr{failed | runner: fn request -> send(test, {:herdr, request}) end}
+      _retried = Herdr.report(working, streaming)
+      assert_receive {:herdr, %{params: %{state: "working"}}}
+    end
+
+    test "a resume command Herdr would reject is dropped, not the state report" do
+      # Over Herdr's 8 KiB argv budget: the state report still fires, the
+      # session request is silently omitted.
+      huge = String.duplicate("m", 9_000)
+      ctx = report_once(session_id: "id", model: huge)
+
+      assert_receive {:herdr, %{method: "pane.report_agent", params: params}}
+      assert params.state == "idle"
+      refute_receive {:herdr, %{method: "pane.report_agent_session"}}, 50
+      assert ctx.seq > 0
     end
   end
 
@@ -352,7 +383,7 @@ defmodule DashFloat.HerdrTest do
       # async report task uses — so its deadline is observable directly.
       assert Herdr.release(ctx) == :ok
       elapsed = System.monotonic_time(:millisecond) - started
-      assert elapsed < 5_000
+      assert elapsed < 1_000
     end
 
     test "a missing socket fails open, silently" do

@@ -123,7 +123,7 @@ defmodule DashFloat.Application do
         _no_argv -> plain
       end
 
-    Enum.reject(argv, &(&1 == "--no-halt"))
+    Enum.reject(argv, &(&1 in ["--no-halt", "--"]))
   end
 
   # A forced selection or onboarding state needs the terminal; a headless or

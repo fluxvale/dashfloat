@@ -32,13 +32,22 @@ defmodule DashFloat.Herdr do
   @max_resume_bytes 8 * 1024
 
   @enforce_keys [:pane, :socket]
-  defstruct [:pane, :socket, :runner, timeout_ms: @command_timeout_ms, seq: 0, sig: nil]
+  defstruct [
+    :pane,
+    :socket,
+    :runner,
+    :supervisor,
+    timeout_ms: @command_timeout_ms,
+    seq: 0,
+    sig: nil
+  ]
 
   @typedoc "The detected Herdr pane context; `nil` outside Herdr (inert)."
   @type t :: %__MODULE__{
           pane: String.t(),
           socket: Path.t(),
           runner: (request() -> term()) | nil,
+          supervisor: module() | nil,
           timeout_ms: pos_integer(),
           seq: integer(),
           sig: term()
@@ -176,8 +185,16 @@ defmodule DashFloat.Herdr do
         state_request(herdr, seq, state, message) | session_requests(herdr, seq, snapshot)
       ]
 
-      seq = max(seq, fire(herdr, requests))
-      %{herdr | seq: seq, sig: sig}
+      case fire(herdr, requests) do
+        {:ok, sent} ->
+          %{herdr | seq: max(seq, sent), sig: sig}
+
+        # A spawn failure (a dead supervisor) leaves the signature
+        # UNCOMMITTED: the next event's report re-fires the same state — a
+        # transient failure is retried, not swallowed (ADR 0024 §4).
+        :error ->
+          herdr
+      end
     end
   end
 
@@ -253,28 +270,35 @@ defmodule DashFloat.Herdr do
        when is_function(runner, 1) do
     seq = Enum.reduce(requests, last, &max(&2, &1.params.seq))
     Enum.each(requests, runner)
-    seq
+    {:ok, seq}
   end
 
-  defp fire(%__MODULE__{seq: last} = herdr, requests) do
+  defp fire(%__MODULE__{seq: last, supervisor: sup} = herdr, requests) do
     seq = Enum.reduce(requests, last, &max(&2, &1.params.seq))
 
-    _result =
+    result =
       try do
-        Task.Supervisor.start_child(DashFloat.TaskSupervisor, fn -> run_now(herdr, requests) end)
+        Task.Supervisor.start_child(sup || DashFloat.TaskSupervisor, fn ->
+          run_now(herdr, requests)
+        end)
       catch
         # A dead supervisor EXITS the start call — the report is fail-open
-        # absolutely (the title/suggest rule).
+        # absolutely (the title/suggest rule), and the caller hears :error
+        # so the signature stays uncommitted for a retry.
         :exit, _reason -> :error
       end
 
-    seq
+    case result do
+      {:ok, _pid} -> {:ok, seq}
+      _no_task -> :error
+    end
   end
 
   # Bounded: each request gets `timeout_ms` to connect, send, and hear one
   # reply line, on its own connection — a hung server never accumulates.
   # Silenced: nothing is logged, nothing read beyond the reply line, and
-  # every death is swallowed — the report is silent, not just tolerated.
+  # every failure is an error tuple — the task is fire-and-forget and
+  # unmonitored, so even a crash changes nothing for the caller.
   defp run_now(%__MODULE__{runner: runner} = herdr, requests) when is_function(runner, 1) do
     Enum.each(requests, runner)
     herdr
@@ -283,32 +307,28 @@ defmodule DashFloat.Herdr do
   defp run_now(%__MODULE__{} = herdr, requests) do
     Enum.each(requests, &send_request(herdr, &1))
     :ok
-  rescue
-    _reason -> :ok
-  catch
-    _kind, _reason -> :ok
   end
 
   defp send_request(%__MODULE__{} = herdr, request) do
     line =
       Jason.encode_to_iodata!(%{id: "dashfloat", method: request.method, params: request.params})
 
-    with {:ok, sock} <-
-           :gen_tcp.connect(
-             {:local, herdr.socket},
-             0,
-             [:binary, active: false, packet: :line],
-             herdr.timeout_ms
-           ),
-         :ok <- :gen_tcp.send(sock, [line, ~c"\n"]),
-         {:ok, _line} <- :gen_tcp.recv(sock, 0, herdr.timeout_ms) do
-      :gen_tcp.close(sock)
-    else
-      _failed_or_timeout -> :ok
+    case :gen_tcp.connect(
+           {:local, herdr.socket},
+           0,
+           [:binary, active: false, packet: :line],
+           herdr.timeout_ms
+         ) do
+      {:ok, sock} ->
+        # Outcomes are unread by design (fail-open); the socket closes on
+        # every path that opened one — ownership stays explicit.
+        _sent = :gen_tcp.send(sock, [line, ~c"\n"])
+        _reply = :gen_tcp.recv(sock, 0, herdr.timeout_ms)
+        :gen_tcp.close(sock)
+        :ok
+
+      _connect_failed ->
+        :ok
     end
-  rescue
-    _reason -> :ok
-  catch
-    _kind, _reason -> :ok
   end
 end
