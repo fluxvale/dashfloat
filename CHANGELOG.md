@@ -30,7 +30,7 @@ when its tag is cut.
 
 ### Fixed
 
-- Resuming a session saved with 0.3.0's assembled system prompt crashed at startup, and the release launcher exited 1 when `--resume` carried `--profile`/`--model` flags — both found and fixed in #116's Herdr restore work.
+- Resuming a session saved with 0.3.0's assembled system prompt crashed at startup, and the release launcher exited 1 on any user flag (`--resume`, `--title`, … were dropped into Elixir's CLI) — both found and fixed in #116's Herdr restore work.
 
 ## [0.3.0] - 2026-10-30
 
@@ -66,7 +66,6 @@ when its tag is cut.
 - The first-run wizard was unreachable in the release; a headless boot now refuses cleanly (exit 1, no crash dump) instead of spewing.
 - The exec group-kill leak and the pre-monitor runner misreport.
 - The v1+v3 config interleave is refused before the split writes anything; refusal blame is honest, model-id enumeration works, and remedies are glyph-wrapped.
-- Wizard write refusals surface on the wizard, with `:done` gated on real writes.
 - Release smokes: bullseye's apt points at the Debian archive, binutils installs before the Linux artifact smoke, and `/etc/os-release` no longer clobbers the version.
 
 ## [0.1.0] - 2026-10-27

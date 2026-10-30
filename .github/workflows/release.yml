@@ -275,12 +275,12 @@ jobs:
           - **\`/title\` opens a dialog.** Bare \`/title\` opens a centered input pre-filled with the live title; a refused rename shows the reason in the dialog with your draft kept, and Esc cancels.
           - **The idle cursor blinks.** The composer's cursor pulses on its own timer while the agent waits, so the input surface reads alive on every terminal palette.
           - **Tab completes slash commands.** While the autocomplete popup shows matches, Tab completes the highlighted command into the composer — arrows move the pick, Enter runs it, Tab types it for you.
-          - **Typing snaps the transcript to the tail.** Scroll back to reread something; your first keystroke in the composer brings the view back to the live end of the conversation.
+          - **Typing snaps the transcript to the tail.** Scroll back to reread something; typing in the composer brings the view back to the live end of the conversation.
           - **Drop an image to attach it.** Dragging an image file into the terminal becomes a numbered \`[Image #1]\` chip in the composer instead of pasted path text; Backspace on an empty draft pops the newest chip, and Ctrl+O still works.
           - **Context stats work out of the box.** Stock presets carry seeded context windows and a provider's fetched model list is read for its real ones, so the footer's tokens/percent and \`/compact\` work on a fresh install; a model no source knows falls back to a documented default — visibly marked, never silent.
           - **Herdr support.** Running inside a Herdr pane, DashFloat reports its state — idle, working, or blocked with the pending decision named — so the pane shows when input awaits you, and a restored Herdr session reopens DashFloat on the right \`--resume\` command.
 
-          Also fixed: resuming a session saved by 0.3.0 crashed at startup (the stored system prompt now replays cleanly), and \`dashfloat --resume <id> --profile p\` no longer exits with \`No file named --resume\` (release-launcher user flags were being dropped into Elixir's CLI).
+          Also fixed: resuming a session saved by 0.3.0 crashed at startup (the system prompt is re-derived at boot and no longer breaks replay), and \`dashfloat --resume <id> --profile p\` no longer exits with \`No file named --resume\` (release-launcher user flags were being dropped into Elixir's CLI).
 
           Upgrading: re-run the install command below — it replaces the previous version and keeps your sessions. On macOS, \`brew upgrade dashfloat\` does the same once the tap catches up with the release.
 
