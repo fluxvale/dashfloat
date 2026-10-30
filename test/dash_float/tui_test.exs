@@ -1349,14 +1349,17 @@ defmodule DashFloat.TUITest do
   ## and the picker state; /model is proven END TO END with a real agent and
   ## the loopback server — the switch must reach the NEXT request.
 
-  test "/title delivers the rename seam: the typed title, then the bare empty one" do
+  test "/title delivers the rename seam: the typed title, then the dialog's submit" do
     {:ok, pid} = start_tui()
 
     submit(pid, "/title fix the login")
     assert_receive {:set_title, ^pid, "fix the login"}, 1_000
 
-    # A command submit never flips the phase, so the bare form follows directly.
+    # Bare /title opens the dialog; Enter submits its draft through the same
+    # seam — the agent owns validation either way.
     submit(pid, "/title")
+    eventually(pid, fn s -> s.title_dialog != nil end)
+    press(pid, "enter")
     assert_receive {:set_title, ^pid, ""}, 1_000
   end
 
@@ -1399,6 +1402,88 @@ defmodule DashFloat.TUITest do
 
     press(pid, "esc")
     eventually(pid, fn s -> s.palette == nil end)
+  end
+
+  ## The /title dialog (issue #106) driven through the app: the default fake
+  ## agent (this test process) answers with the title pushes.
+
+  describe "the /title dialog" do
+    defp open_dialog(pid) do
+      submit(pid, "/title")
+      eventually(pid, fn s -> s.title_dialog != nil end)
+    end
+
+    test "bare /title opens the dialog pre-filled from the mount title" do
+      {:ok, pid} = start_tui(title: "Booted Title")
+
+      state = open_dialog(pid)
+
+      assert state.title_dialog == %{draft: "Booted Title", error: nil}
+    end
+
+    test "enter sends the draft; the agent's {:title, _} closes the dialog and updates" do
+      {:ok, pid} = start_tui(title: "Old")
+
+      open_dialog(pid)
+      type(pid, "Name")
+      press(pid, "enter")
+
+      assert_receive {:set_title, ^pid, "OldName"}, 1_000
+
+      # The dialog is still open, error cleared, until the agent's reply.
+      assert get_state(pid).title_dialog == %{draft: "OldName", error: nil}
+
+      send(pid, {:title, "OldName"})
+      state = eventually(pid, fn s -> s.title_dialog == nil end)
+      assert state.title == "OldName"
+    end
+
+    test "the agent's {:title_refused, _} errors the open dialog, draft kept" do
+      {:ok, pid} = start_tui()
+      open_dialog(pid)
+      type(pid, "Taken")
+      press(pid, "enter")
+
+      assert_receive {:set_title, ^pid, "Taken"}, 1_000
+
+      reason = ~s("Taken" is already taken by session 0192aa10-b002-7c00-8000-00000000000c)
+      send(pid, {:title_refused, reason})
+
+      state = eventually(pid, fn s -> s.title_dialog.error != nil end)
+      assert state.title_dialog == %{draft: "Taken", error: reason}
+    end
+
+    test "esc closes the dialog and nothing is sent" do
+      {:ok, pid} = start_tui()
+
+      open_dialog(pid)
+      press(pid, "esc")
+
+      eventually(pid, fn s -> s.title_dialog == nil end)
+      refute_received {:set_title, _, _}
+    end
+
+    test "a paste feeds the open dialog's draft, not the composer" do
+      {:ok, pid} = start_tui()
+      open_dialog(pid)
+
+      inject(pid, %ExRatatui.Event.Paste{content: "pasted name\r\n"})
+
+      state = eventually(pid, fn s -> s.title_dialog == %{draft: "pasted name", error: nil} end)
+      assert State.input_text(state) == ""
+    end
+
+    test "the agent's pushes reach the state with no dialog open" do
+      {:ok, pid} = start_tui()
+
+      send(pid, {:title, "Inline Title"})
+      assert eventually(pid, &(&1.title == "Inline Title")).title_dialog == nil
+
+      send(pid, {:title_refused, "may not be empty"})
+      state = eventually(pid, &(&1.title == "Inline Title"))
+      assert state.title_dialog == nil
+      assert state.entries == []
+    end
   end
 
   # A final-only episode: one content frame, then DONE — the agent returns to

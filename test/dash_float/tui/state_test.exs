@@ -2934,8 +2934,11 @@ defmodule DashFloat.TUI.StateTest do
       assert State.input_text(state) == ""
     end
 
-    test "a bare /title sends the empty title — the agent owns validation" do
-      assert {_state, {:set_title, ""}} = enter_typed(new_state(), "/title ")
+    test "a bare /title opens the dialog pre-filled with the current title" do
+      titled = Map.put(new_state(), :title, "Fix the login")
+      {state, nil} = enter_typed(titled, "/title ")
+
+      assert state.title_dialog == %{draft: "Fix the login", error: nil}
     end
 
     test "/compact returns the action; trailing text is ignored" do
@@ -3621,6 +3624,126 @@ defmodule DashFloat.TUI.StateTest do
         |> State.stream_message({:phase, :idle}, 1_000)
 
       assert length(refused.attachments) == 1
+    end
+  end
+
+  ## The /title dialog (issue #106; ADR 0023's 2026-10-31 amendment)
+
+  describe "the /title dialog" do
+    # The dialog as bare /title opens it: idle, pre-filled, no error.
+    defp dialog_open(opts \\ []) do
+      opts
+      |> new_state()
+      |> enter_typed("/title ")
+      |> elem(0)
+    end
+
+    test "bare /title with no current title opens with an empty draft" do
+      assert dialog_open().title_dialog == %{draft: "", error: nil}
+    end
+
+    test "typing appends, a shifted printable uppercases, backspace slices the last grapheme" do
+      state =
+        dialog_open()
+        |> press("f", [])
+        |> press("i", [])
+        |> press("x", [])
+        |> press("I", ["shift"])
+        |> press("t", [])
+        |> press("backspace", [])
+
+      assert state.title_dialog.draft == "fixI"
+
+      # backspacing past the start is a no-op
+      emptied =
+        Enum.reduce(1..9, state, fn _n, acc -> press(acc, "backspace", []) end)
+
+      assert emptied.title_dialog.draft == ""
+    end
+
+    test "a paste appends newline-stripped; the composer stays untouched" do
+      state = State.title_paste(dialog_open(), "fix it\r\n")
+
+      assert state.title_dialog.draft == "fix it"
+      assert State.input_text(state) == ""
+    end
+
+    test "enter returns {:set_title, draft} and keeps the dialog open, error reset" do
+      state = %{dialog_open() | title_dialog: %{draft: "fix it", error: "stale refusal"}}
+
+      {submitted, {:set_title, "fix it"}} = State.handle_key(state, "enter", [])
+
+      # The dialog stays open: the agent's {:title, _} closes it or
+      # {:title_refused, _} errors it.
+      assert submitted.title_dialog == %{draft: "fix it", error: nil}
+    end
+
+    test "enter accepts the ctrl modifier; esc closes" do
+      state = dialog_open()
+      {sent, {:set_title, ""}} = State.handle_key(state, "enter", ["ctrl"])
+      assert sent.title_dialog != nil
+
+      {closed, nil} = State.handle_key(state, "esc", [])
+      assert closed.title_dialog == nil
+    end
+
+    test "{:title, t} sets the title and closes an open dialog" do
+      opened = dialog_open(title: "Old")
+      titled = State.stream_message(opened, {:title, "New"}, 1_000)
+
+      assert titled.title == "New"
+      assert titled.title_dialog == nil
+    end
+
+    test "{:title_refused, r} errors the open dialog, keeping the draft" do
+      reason = ~s("x" is already taken by session 0192aa10-b002-7c00-8000-00000000000c)
+      typed = press(dialog_open(title: "Old"), "x", [])
+
+      refused = State.stream_message(typed, {:title_refused, reason}, 1_000)
+
+      assert refused.title_dialog == %{draft: "Oldx", error: reason}
+    end
+
+    test "{:title_refused, r} with no dialog open is a no-op" do
+      state = State.stream_message(new_state(), {:title_refused, "may not be empty"}, 1_000)
+
+      assert state.title_dialog == nil
+      assert state.entries == []
+    end
+
+    test "the open dialog swallows up/down/tab/page keys — no history, no mode cycle, no palette" do
+      state =
+        dialog_open()
+        |> Map.put(:history, ["/old"])
+        |> Map.put(:suggestion, "ghost")
+        |> press("up", [])
+        |> press("down", [])
+        |> press("tab", [])
+        |> press("page_up", [])
+        |> press("back_tab", [])
+        |> press("p", ["ctrl"])
+        |> press("u", ["ctrl"])
+
+      assert state.title_dialog.draft == ""
+      assert state.history == ["/old"]
+      assert state.mode == :build
+      assert state.palette == nil
+      assert state.suggestion == "ghost"
+    end
+
+    test "the global quits still work while the dialog is open" do
+      state = dialog_open()
+      assert {^state, :quit} = State.handle_key(state, "q", ["ctrl"])
+
+      {armed, nil} = State.handle_key(state, "c", ["ctrl"], 1_000)
+      assert armed.exit_guard_at == 1_000
+    end
+
+    test "the inline form is unchanged: /title <name> returns {:set_title, name}" do
+      {state, {:set_title, "fix the login"}} = enter_typed(new_state(), "/title fix the login")
+
+      assert state.title_dialog == nil
+      assert State.input_text(state) == ""
     end
   end
 end

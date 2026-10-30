@@ -1307,6 +1307,65 @@ defmodule DashFloat.TUI.ViewTest do
     end
   end
 
+  describe "the title dialog (issue #106)" do
+    defp dialog_state(draft, error) do
+      %{new_state() | title_dialog: %{draft: draft, error: error}}
+    end
+
+    defp dialog_paragraph(state) do
+      [{%ExRatatui.Widgets.Popup{content: %ExRatatui.Widgets.Paragraph{} = paragraph}, _area}] =
+        state
+        |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+        |> Enum.take(-1)
+
+      paragraph
+    end
+
+    test "the dialog rides last, a Popup over the five chrome widgets" do
+      state = dialog_state("fix it", nil)
+
+      widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+      assert length(widgets) == 6
+
+      assert {%ExRatatui.Widgets.Popup{}, _area} = List.last(widgets)
+    end
+
+    test "the box carries the accent title, the draft row, and the dim hint" do
+      buffer = drawn_text(dialog_state("fix it", nil))
+
+      assert buffer =~ "Session title"
+      assert buffer =~ "❯ fix it█"
+      assert buffer =~ "⏎ rename · esc cancel"
+    end
+
+    test "the refusal renders in the error role, wrapped so the holder id never clips" do
+      holder = "0192aa10-b002-7c00-8000-00000000000c"
+      error = ~s("Taken Name" is already taken by session #{holder})
+
+      buffer = drawn_text(dialog_state("Taken Name", error))
+      assert buffer =~ "already taken"
+      assert buffer =~ holder
+
+      # Every refusal row carries the :error role, and the wrap keeps each
+      # row inside the box's inner width (60% of the 76-cell area, minus
+      # borders → 43 columns).
+      paragraph = dialog_paragraph(dialog_state("Taken Name", error))
+      [_draft, _hint | error_lines] = paragraph.text
+
+      assert error_lines != []
+
+      for %ExRatatui.Text.Line{spans: [span]} <- error_lines do
+        assert span.style == Theme.style(:error)
+        assert String.length(span.content) <= 43
+      end
+    end
+
+    test "a closed dialog renders no dialog widgets" do
+      widgets = View.render(new_state(), %ExRatatui.Frame{width: 80, height: 24})
+      assert length(widgets) == 5
+    end
+  end
+
   ## helpers
 
   # The error-styled rows of a rendered setup box (issue #42 probes): the

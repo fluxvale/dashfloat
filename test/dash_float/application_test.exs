@@ -629,6 +629,7 @@ defmodule DashFloat.ApplicationTest do
       assert agent_opts[:supervisor] == DashFloat.TaskSupervisor
       assert tui_opts[:transcript] == messages
       assert tui_opts[:resume_note] == nil
+      assert tui_opts[:title] == nil
     end
 
     test "a setup classification skips the pin compare but still hands the session off" do
@@ -810,7 +811,7 @@ defmodule DashFloat.ApplicationTest do
       {:ok, session} = Session.load(sessions, id)
       {:ok, config} = Config.load(config_dir, %{}, [])
 
-      assert [_task, {DashFloat.Agent, agent_opts}, _tui] =
+      assert [_task, {DashFloat.Agent, agent_opts}, {DashFloat.TUI, tui_opts}] =
                Application.boot_children(
                  false,
                  {:ok, config},
@@ -823,6 +824,9 @@ defmodule DashFloat.ApplicationTest do
 
       assert agent_opts[:title] == "New Name"
       assert agent_opts[:resume][:title] == "Old Name"
+      # The TUI pre-fills from the file's own title, never the override
+      # (issue #106).
+      assert tui_opts[:title] == "Old Name"
     end
 
     test "a title another session holds refuses, naming that other session" do
@@ -869,7 +873,7 @@ defmodule DashFloat.ApplicationTest do
 
       {:ok, config} = Config.load(config_dir, %{}, [])
 
-      assert [_task, {DashFloat.Agent, agent_opts}, _tui] =
+      assert [_task, {DashFloat.Agent, agent_opts}, {DashFloat.TUI, tui_opts}] =
                Application.boot_children(
                  false,
                  {:ok, config},
@@ -882,6 +886,8 @@ defmodule DashFloat.ApplicationTest do
 
       assert agent_opts[:title] == "Fresh Start"
       refute Keyword.has_key?(agent_opts, :resume)
+      # The TUI's dialog prefill reads the same source (issue #106).
+      assert tui_opts[:title] == "Fresh Start"
     end
 
     test "a titled resume file carries its title in both the resume map and the opt" do
@@ -894,7 +900,7 @@ defmodule DashFloat.ApplicationTest do
       {:ok, session} = Session.load(sessions, id)
       {:ok, config} = Config.load(config_dir, %{}, [])
 
-      assert [_task, {DashFloat.Agent, agent_opts}, _tui] =
+      assert [_task, {DashFloat.Agent, agent_opts}, {DashFloat.TUI, tui_opts}] =
                Application.boot_children(
                  false,
                  {:ok, config},
@@ -907,6 +913,8 @@ defmodule DashFloat.ApplicationTest do
 
       assert agent_opts[:title] == "The Title"
       assert agent_opts[:resume][:title] == "The Title"
+      # The TUI pre-fills from the file's own title (issue #106).
+      assert tui_opts[:title] == "The Title"
     end
 
     test "the storage form threads: a typed title arrives trimmed and collapsed" do
