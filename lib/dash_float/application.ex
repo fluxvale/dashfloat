@@ -416,15 +416,26 @@ defmodule DashFloat.Application do
   # I/O (ADR 0005); the agent name rides in as a mount opt (ADR 0007). Setup
   # states ride in as mount opts too (ADR 0009), with the resolver the setup
   # phase calls to deliver the completed selection. A resumed boot mounts the
-  # loaded transcript and the pin warning, if any (ADR 0014 §6).
+  # loaded transcript and the pin warning, if any (ADR 0014 §6). The title
+  # pre-fills the /title dialog (ADR 0023's 2026-10-31 amendment): a resume
+  # mounts the file's own title (NOT the --title override, which lives only
+  # at the agent), a fresh boot the normalized --title — `boot_title/1`'s
+  # output verbatim, no renormalizing.
   defp tui_child(classification, config_dir, env, cli, resume) do
     resume_opts =
       case resume do
         nil ->
-          []
+          [title: boot_title(cli)]
 
         %{session: session, note: note} ->
-          [transcript: session.messages, resume_note: note]
+          [
+            transcript: session.messages,
+            resume_note: note,
+            # The agent's own precedence (boot_title || session title): a
+            # --resume + --title boot has ALREADY renamed the session — the
+            # dialog pre-fills the live title, not the loaded file's old one.
+            title: boot_title(cli) || Map.get(session, :title)
+          ]
       end
 
     [

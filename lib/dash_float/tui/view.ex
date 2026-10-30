@@ -54,6 +54,9 @@ defmodule DashFloat.TUI.View do
   @attach_label "Attach image: "
   @attach_hint "  ⏎ attach · tab complete · esc keep · ^o close · ^d clear"
 
+  # The /title dialog's hint line (issue #106).
+  @title_dialog_hint "⏎ rename · esc cancel"
+
   @doc """
   Splits `width` x `height` into status (1 row), log (rest), activity
   (1 row while an overlay exists — an active phase, the exit prompt, or the
@@ -133,6 +136,7 @@ defmodule DashFloat.TUI.View do
     # The transient row exists for an active phase OR an armed exit guard
     # (issue #28; ADR 0006 amendment) — even while idle.
     regions = regions({width, height}, State.input_line_count(state), State.overlay?(state))
+    area = inset_area(width, height)
 
     [
       {status_widget(state, regions.log.height), regions.status},
@@ -140,7 +144,7 @@ defmodule DashFloat.TUI.View do
       {activity_widget(state), regions.activity},
       {input_widget(state), regions.input},
       {footer_widget(state), regions.footer}
-    ] ++ palette_widgets(state, inset_area(width, height))
+    ] ++ palette_widgets(state, area) ++ title_dialog_widgets(state, area)
   end
 
   ## Setup screens (ADR 0009: forced selection + onboarding wizard)
@@ -829,6 +833,55 @@ defmodule DashFloat.TUI.View do
        },
        percent_width: 50,
        percent_height: 40
+     }, area}
+  end
+
+  ## Title dialog (issue #106; ADR 0023's 2026-10-31 amendment)
+
+  # Rendered last — on top of every region (and any palette; the two are
+  # mutually exclusive, the dialog only opens from an idle bare /title).
+  defp title_dialog_widgets(%State{title_dialog: nil}, _area), do: []
+
+  defp title_dialog_widgets(%State{title_dialog: %{draft: draft, error: error}}, area) do
+    # The refusal wraps to the box's inner width (60% of the area, minus the
+    # borders) so the holder id never clips — wrap_remedy's semantics.
+    inner = max(div(area.width * 60, 100) - 2, 1)
+
+    lines =
+      [
+        # The attach prompt's row shape: accent prompt glyph, the draft with
+        # the block cursor (ADR 0018 §5).
+        Line.new([
+          Span.new("❯ ", style: Theme.style(:accent)),
+          Span.new(draft <> "█", style: Theme.style(:assistant))
+        ]),
+        Line.new([Span.new(@title_dialog_hint, style: Theme.style(:hint))])
+      ] ++ refusal_lines(error, inner)
+
+    [title_dialog_box(lines, area)]
+  end
+
+  defp refusal_lines(nil, _width), do: []
+
+  defp refusal_lines(error, width) do
+    for text <- wrap_remedy(error, width),
+        do: Line.new([Span.new(text, style: Theme.style(:error))])
+  end
+
+  defp title_dialog_box(lines, area) do
+    {%Popup{
+       content: %Paragraph{
+         text: lines,
+         block: %Block{
+           title: Span.new(" Session title ", style: Theme.style(:accent)),
+           borders: [:all],
+           border_type: :rounded,
+           border_style: Theme.style(:dim)
+         },
+         scroll: {0, 0}
+       },
+       percent_width: 60,
+       percent_height: 35
      }, area}
   end
 end

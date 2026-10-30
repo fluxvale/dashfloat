@@ -157,6 +157,11 @@ defmodule DashFloat.TUI do
       when setup != nil,
       do: schedule(State.setup_paste(state, content))
 
+  # The /title dialog (issue #106) takes pastes into its draft too — the
+  # attach prompt's rule (ADR 0018 §5); the composer stays untouched.
+  def handle_event(%ExRatatui.Event.Paste{content: content}, %State{title_dialog: %{}} = state),
+    do: schedule(State.title_paste(state, content))
+
   # The attach prompt (ADR 0018 §5) takes pastes into its path draft too —
   # a pasted path is the supported shape; the composer stays untouched.
   def handle_event(%ExRatatui.Event.Paste{content: content}, %State{attach: %{}} = state),
@@ -324,7 +329,10 @@ defmodule DashFloat.TUI do
              :tool_call,
              :tool_result,
              :mode,
-             :tool_preview
+             :tool_preview,
+             # The display-only title pushes (issue #106).
+             :title,
+             :title_refused
            ],
       do: schedule(State.stream_message(state, msg))
 
