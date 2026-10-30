@@ -528,17 +528,14 @@ defmodule DashFloat.TUI do
   end
 
   defp schedule_blink(%{blink_ref: ref} = state) when is_reference(ref) do
-    cond do
-      not blinkable?(state) ->
-        Process.cancel_timer(ref)
-        reset_blink(%{state | blink_ref: nil})
-
-      Process.read_timer(ref) == false ->
-        # Fired but not yet drained: the toggle is already queued.
-        state
-
-      true ->
-        state
+    if blinkable?(state) do
+      # Pending or fired-but-not-yet-drained: either way the tracked arm
+      # owns the next toggle (a fired one's message drains through the
+      # staleness check) — leave it exactly as it is.
+      state
+    else
+      Process.cancel_timer(ref)
+      reset_blink(%{state | blink_ref: nil})
     end
   end
 

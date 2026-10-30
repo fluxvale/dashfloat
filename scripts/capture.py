@@ -713,6 +713,10 @@ class App:
     # A real frame (full draw, redraw, streamed chunk) is comfortably over
     # this; the idle cursor blink's diff (issue #104) is a single reversed
     # cell plus cursor handling — a few dozen bytes, never this big.
+    # KNOWN CAVEAT (review F7): a mid-stream spinner-only tick frame could
+    # in principle land under this too — no scenario waits for quiet
+    # mid-stream today; if one ever does, wait_for a content needle
+    # instead of wait_quiet.
     QUIET_CHUNK_BYTES = 96
 
     def feed(self, chunk: bytes):
@@ -1201,40 +1205,37 @@ class App:
         with open(second, "wb") as f:
             f.write(b"\x89PNG\r\n\x1a\n" + b"\x22" * 120)
 
+        def wait_title(needle, pop=None, timeout=10):
+            # Waits until the composer title contains `needle` — and, when
+            # `pop` is given, does NOT contain it (the popped chip).
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                title = self.composer_title()
+                if pop is not None:
+                    if needle in title and pop not in title:
+                        return
+                elif needle in title:
+                    return
+                time.sleep(0.1)
+            raise TimeoutError(f"composer title never reached {needle!r}")
+
         self.paste(path + "\r\n")
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            if "[Image #1]" in self.composer_title():
-                break
-            time.sleep(0.1)
-        else:
-            raise TimeoutError("the dropped path never became a chip")
+        wait_title("[Image #1]")
         assert path not in self.text(), \
             "the dropped path typed into the composer as literal text"
 
         self.paste(second)
-        while time.monotonic() < deadline:
-            if "[Image #1] [Image #2]" in self.composer_title():
-                break
-            time.sleep(0.1)
-        else:
-            raise TimeoutError("the second drop never numbered as #2")
+        wait_title("[Image #1] [Image #2]")
 
-        # Backspace on the empty draft pops the newest chip (and renumbers)
+        # Backspace on the empty draft pops the newest chip (and
+        # renumbers); the settle beat holds the popped state long enough
+        # to be its own GIF frame (hostile review F5).
         self.send(b"\x7f")
-        while time.monotonic() < deadline:
-            title = self.composer_title()
-            if "[Image #1]" in title and "[Image #2]" not in title:
-                break
-            time.sleep(0.1)
-        else:
-            raise TimeoutError("Backspace never popped the chip")
+        wait_title("[Image #1]", pop="[Image #2]")
+        time.sleep(0.8)
         # ...and the re-drop restores two
         self.paste(second)
-        while time.monotonic() < deadline:
-            if "[Image #1] [Image #2]" in self.composer_title():
-                break
-            time.sleep(0.1)
+        wait_title("[Image #1] [Image #2]")
 
         self.type("what is this?")
         self.send(b"\r")
@@ -1325,6 +1326,9 @@ class App:
     def scenario_snap_scroll(self):
         assert "follow L" in self.text(), \
             "the resumed log never reached a follow state"
+        # Mark BEFORE the wheel-ups: the GIF must contain the scroll-back
+        # state itself, not only the snap back (hostile review F1).
+        self._mark = time.monotonic()
         self.wheel("up")
         self.wheel("up")
         deadline = time.monotonic() + 5
@@ -1339,7 +1343,6 @@ class App:
         assert "forty" not in self.text(), \
             "the tail's last line is still visible after scrolling away"
 
-        self._mark = time.monotonic()
         self.type("h", per_key=0.4)
         while time.monotonic() < deadline:
             if "follow L" in self.text():

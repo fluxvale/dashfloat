@@ -691,12 +691,16 @@ and the user-row styling in the [theme table](#theme-as-data) and
 
 **Status:** Accepted. The owner's v0.3.0 smoke test (Oct 31) decided the
 question [issue #91](https://github.com/fluxvale/dashfloat/issues/91)
-deferred to him: the idle cursor BLINKS. Supersedes exactly one clause of
-this ADR's animation model — "**Idle ⇒ no timers ⇒ no renders.**" — and the
-matching idle-cursor clause of
+deferred to him: the idle cursor BLINKS. Supersedes the animation model's
+"**Idle ⇒ no timers ⇒ no renders.**" clause and the sentence right below it
+("an idle DashFloat renders nothing on a timer, ever"), plus the matching
+idle-cursor clause of
 [ADR 0015](0015-input-surface-cursor-stats-ghost.md) §1 ("costing zero new
-timers"); every other idle discipline stands (no parse in `render/2`, no
+timers"; its "static bright reversed" wording — see that ADR's same-day
+amendment). Every other idle discipline stands (no parse in `render/2`, no
 timers beyond the ones enumerated here, render-suppressed stale messages).
+Restatements of the old discipline in other ADRs (e.g. ADR 0007's process
+notes) are read against this amendment, not independently.
 
 - **Sanctioned exception #5 — the first REPEATING idle timer.** A dedicated
   `:dashfloat_blink` timer at **500 ms** (the active-phase blink's own

@@ -327,9 +327,10 @@ Still one compact span — never the full base_url, never a second span.
 
 ## Amendment (2026-10-31, issue #104): the idle cursor blinks
 
-**Status:** Accepted. Supersedes exactly one clause of §1 above — the
-"focused + idle" bullet's "costing **zero new timers** (ADR 0006's idle ⇒
-no timers ⇒ no renders stands untouched)" — which the owner's smoke test
+**Status:** Accepted. Supersedes the "focused + idle" bullet of §1 above —
+its "costing **zero new timers** (ADR 0006's idle ⇒ no timers ⇒ no renders
+stands untouched)" parenthetical AND its "static bright reversed" wording —
+which the owner's smoke test
 ([issue #104](https://github.com/fluxvale/dashfloat/issues/104)) reversed.
 Everything else in §1 stands: the focus gate (unfocused shows no cursor,
 still zero extra renders), the explicit bright pair, and the active-phase

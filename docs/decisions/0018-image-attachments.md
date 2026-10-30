@@ -260,6 +260,11 @@ unchanged.
   draft; an empty cursor sits at its boundary) — the chip-row UX terminals
   teach. With draft text, Backspace keeps its ordinary edit. `Ctrl+D`
   inside the attach prompt still clears everything.
+- **Ctrl+O's own attach does not snap the log** (issue #110's rule is
+  composer EDITS — keystrokes and pastes; a prompt action is neither, and
+  the prompt is open precisely because the user is mid-task on the
+  composer's chrome). The drop path and the chip pop DO snap: they are
+  composer events.
 - **The submitted entry keeps §5's indicator rows** (`📎 name (n KB)` per
   image under the prompt text): the chips are the composer's pending
   display, the entry's rows are the transcript's record — different
