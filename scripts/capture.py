@@ -17,14 +17,17 @@ One-time setup (any venv; kept outside the repo):
 Usage (from a worktree root, against the CURRENT tree's code):
 
     scripts/capture.py still --scenario first-run  --out FILE.png
-    scripts/capture.py still --scenario mid-session --out FILE.png
+    scripts/capture.py still --scenario mid-session --no-ghost --out FILE.png
     scripts/capture.py still --scenario ghost       --out FILE.png
     scripts/capture.py probe [--window-ms 1500] [--after-exchange]
-    scripts/capture.py gif   --out FILE.gif [--duration-ms 2600]
+    scripts/capture.py gif   --out FILE.gif
 
 Scenarios:
     first-run   fresh session: composer empty, no exchanges yet
     mid-session after one completed exchange: composer empty again
+                (--no-ghost pins the BLANK composer: with suggestions on,
+                 the suggester's ghost lands there — the ghost is its own
+                 scenario)
     ghost       after a completed exchange + suggest side-request landed
     probe       idle byte-rate: 0 bytes over the window == 0 renders/s
 
@@ -189,12 +192,16 @@ class MockHandler(BaseHTTPRequestHandler):
 class App:
     """The real TUI under a real pty, plus the capture operations."""
 
-    def __init__(self, mix_args=("run", "--no-halt")):
+    def __init__(self, mix_args=("run", "--no-halt"), no_ghost=False):
         self.sink = None  # callable(bytes) set during read loop
         self.screen = pyte.Screen(COLS, ROWS)
         self.stream = pyte.ByteStream(self.screen)
+        # The FULL byte history from boot (t, chunk): a GIF replay must
+        # start at boot so static chrome (borders, labels, footer, log)
+        # exists in every frame — replaying only the recorded window's
+        # diffs would silently drop it (#91 review finding).
         self._chunks: list[tuple[float, bytes]] = []
-        self._recording = False
+        self._mark: float | None = None  # the GIF window's start time
         self._total = 0
         self._alt = False  # saw the app enter the alternate screen
 
@@ -210,7 +217,7 @@ class App:
                 "{\n"
                 "  configVersion: 3,\n"
                 "  defaultProfile: 'demo',\n"
-                f"  yourName: 'terry',\n"
+                "  yourName: 'demo',\n"
                 "  profiles: [{\n"
                 "    name: 'demo',\n"
                 "    defaultProvider: 'mock',\n"
@@ -232,7 +239,7 @@ class App:
             # Dev may recompile on entry; keep that noise out of the boot.
             "MIX_ENV": "dev",
         })
-        if os.environ.get("CAPTURE_NO_GHOST"):
+        if no_ghost:
             env["DASHFLOAT_SUGGEST"] = "false"
         self.pid, self.master = pty.fork()
         if self.pid == 0:
@@ -278,8 +285,7 @@ class App:
                 break
             now = time.monotonic()
             self._total += len(chunk)
-            if self._recording:
-                self._chunks.append((now, chunk))
+            self._chunks.append((now, chunk))
             self.feed(chunk)
             if self.sink:
                 self.sink(chunk)
@@ -375,23 +381,29 @@ class App:
         self.render(crop_rows=crop_rows).save(path)
         print(f"still  {path} ({os.path.getsize(path)} bytes)")
 
-    def gif(self, path: str, duration_ms=2600, fps=10, crop_rows=12):
-        """Replay the recorded stream, sampling the screen at fps, cropped."""
-        self._recording = False
+    def gif(self, path: str, fps=10, crop_rows=12):
+        """Render the marked window as frames. The replay screen is fed the
+        FULL byte history from boot up to each frame's horizon, so every
+        frame carries the complete UI (static chrome included); the window
+        itself starts at the mark."""
+        if self._mark is None:
+            raise RuntimeError("no recording mark was set")
         metrics = self._metrics(scale=2)
         cell_w, cell_h, _ = metrics
         frames = []
-        t0 = self._chunks[0][0]
         step = 1000 / fps
-        # A fresh screen: replay from scratch so frames are exact. feed()
-        # needs self.screen/self.stream pointing at the replay screen.
         replay = pyte.Screen(COLS, ROWS)
         saved = (self.screen, self.stream, self._alt)
         self.screen, self.stream, self._alt = replay, pyte.ByteStream(replay), False
         events = list(self._chunks)
-        n_frames = int(duration_ms / step)
+        # Catch the replay screen up to the window's start.
+        while events and events[0][0] < self._mark:
+            _, chunk = events.pop(0)
+            self.feed(chunk)
+        window = [e for e in events if e[0] >= self._mark]
+        n_frames = max(1, int((window[-1][0] - self._mark) * 1000 / step))
         for i in range(n_frames):
-            horizon = t0 + (i + 1) * step / 1000
+            horizon = self._mark + (i + 1) * step / 1000
             while events and events[0][0] <= horizon:
                 _, chunk = events.pop(0)
                 self.feed(chunk)
@@ -440,11 +452,6 @@ class App:
         self.server.shutdown()
 
 
-def _brighten(hexcolor: str) -> str:
-    r, g, b = (int(hexcolor[i:i + 2], 16) for i in (1, 3, 5))
-    return "#%02x%02x%02x" % (min(255, r + 48), min(255, g + 48), min(255, b + 48))
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["still", "probe", "gif"])
@@ -453,9 +460,16 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--window-ms", type=int, default=1500)
     ap.add_argument("--after-exchange", action="store_true")
+    # The mid-session STILL must show a BLANK composer: with suggestions
+    # enabled the suggester lands a ghost there (#91 review finding) —
+    # pass --no-ghost to pin the blank state (the ghost state is its own
+    # scenario).
+    ap.add_argument("--no-ghost", action="store_true")
     args = ap.parse_args()
+    if args.mode in ("still", "gif") and not args.out:
+        ap.error(f"{args.mode} requires --out FILE")
 
-    app = App()
+    app = App(no_ghost=args.no_ghost)
     try:
         if args.mode == "probe":
             if args.after_exchange:
@@ -474,14 +488,12 @@ def main():
             app.send(b"\r")
             app.wait_for("independently")   # the turn is streaming (active)
             # Active phase: type while the turn streams — the blink is live.
-            # Recording covers exactly the typing span plus a trailing beat
-            # of idle-after-active blink, so the loop shows the cursor.
-            app._recording = True
+            # The window covers the typing span plus a trailing beat with
+            # no input, so the loop shows the cursor toggling.
+            app._mark = time.monotonic()
             app.type("thanks!", per_key=0.24)
             time.sleep(0.8)                 # a trailing blink beat, no input
-            app._recording = False
-            span_ms = int((app._chunks[-1][0] - app._chunks[0][0]) * 1000)
-            app.gif(args.out, duration_ms=span_ms)
+            app.gif(args.out)
     finally:
         app.close()
 

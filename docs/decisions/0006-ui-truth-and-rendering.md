@@ -89,8 +89,9 @@ exists only while work is in flight:
   (streaming, no token yet), `Streaming…` (tokens arrived), `Running tool…`
   (`:executing_tool`). Spinner is a braille frame set stepped by the tick.
 - **Input box** — rounded border in dim gray, `❯` as the block title in
-  accent, placeholder text (`ask anything — Enter send · Shift+Enter newline
-  · Esc interrupt · Ctrl+Q quit`) in dim. `wrap_mode: :word_or_glyph` so long
+  accent, the composer's placeholder in dim (the placeholder text and its
+  visibility rule live in [ADR 0015](0015-input-surface-cursor-stats-ghost.md)
+  §3 and its 2026-10-30 amendment). `wrap_mode: :word_or_glyph` so long
   words/URLs wrap at word boundaries and split at glyph boundaries only when
   unbreakable.
 - **Message rows** — user input echoed dim with a bold `❯ ` prefix on its
