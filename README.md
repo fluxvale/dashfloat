@@ -106,8 +106,10 @@ skippable, files written 0600 as you go.
 key is `DASHFLOAT_API_KEY`, else `keys[profile][baseUrl of the active
 provider]`); `--model <nickname>` selects a model within the active
 provider's menu. A stray inline `apiKey` in settings.json5 is warned about
-and ignored — never a fallback. The status bar names the active model
-`nickname (profile)`. Put your provider's own base URL in `baseUrl`;
+and ignored — never a fallback. The status footer names the active
+provider and model `provider - model` (preset URL → `zai`/`synthetic`,
+else the settings label, else the URL host). Put your provider's own base
+URL in `baseUrl`;
 DashFloat appends `/chat/completions`. At startup DashFloat also refreshes
 the model catalog from each of the active profile's providers (`GET
 {baseUrl}/models`, fail-open, in-memory): a model's reported context window

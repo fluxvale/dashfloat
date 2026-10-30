@@ -18,6 +18,7 @@ defmodule DashFloat.TUI.State do
   alias DashFloat.Accounting
   alias DashFloat.Config
   alias DashFloat.Config.Onboarding
+  alias DashFloat.Config.Presets
   alias DashFloat.Images
   alias DashFloat.Mode
   alias DashFloat.Tools
@@ -47,6 +48,12 @@ defmodule DashFloat.TUI.State do
 
   @typedoc "The open attach prompt's editable path draft (ADR 0018 §5)."
   @type attach_prompt :: %{draft: String.t()}
+
+  @typedoc """
+  The bare /title dialog (ADR 0023's 2026-10-31 amendment): the editable
+  draft and the last rename refusal, nil closed.
+  """
+  @type title_dialog :: %{draft: String.t(), error: String.t() | nil}
 
   @typedoc """
   One keypress's outcome. The chat actions are ADR 0002/0006/0007; the mode
@@ -174,7 +181,12 @@ defmodule DashFloat.TUI.State do
     # display metadata only, never bytes (the agent reads at submit); `attach`
     # is the open attach prompt's path draft, nil closed.
     attachments: [],
-    attach: nil
+    attach: nil,
+    # The session title (ADR 0023): the boot/resume mount value, kept current
+    # by the agent's {:title, _} push (issue #106); pre-fills the dialog.
+    title: nil,
+    # The bare /title dialog (issue #106), nil closed.
+    title_dialog: nil
   ]
 
   @type t :: %__MODULE__{
@@ -225,7 +237,9 @@ defmodule DashFloat.TUI.State do
           suggest_debounce_ms: non_neg_integer(),
           palette: Palette.t() | nil,
           attachments: [attachment()],
-          attach: attach_prompt() | nil
+          attach: attach_prompt() | nil,
+          title: String.t() | nil,
+          title_dialog: title_dialog() | nil
         }
 
   @typedoc """
@@ -237,7 +251,8 @@ defmodule DashFloat.TUI.State do
   @typedoc """
   One message of the stream contract (see `stream_message/2` and ADR 0002 /
   0006 / 0007). The agent is the single voice; the tool messages are ADR 0007,
-  the mode messages ADR 0016.
+  the mode messages ADR 0016, the title messages ADR 0023's 2026-10-31
+  amendment.
   """
   @type stream_msg ::
           {:token, String.t()}
@@ -256,6 +271,8 @@ defmodule DashFloat.TUI.State do
           | {:entry, :tool | :system, String.t()}
           | {:mode, Mode.mode()}
           | {:tool_preview, confirm_msg()}
+          | {:title, String.t()}
+          | {:title_refused, String.t()}
 
   @typep tool_call_msg :: %{id: term(), name: String.t(), args: map()}
 
@@ -303,7 +320,10 @@ defmodule DashFloat.TUI.State do
       # fetcher gates the runner's arm (the default suite stays hermetic)
       # and the debounce delay is injectable for the timing tests.
       suggest_fetcher: Keyword.get(opts, :suggest_fetcher),
-      suggest_debounce_ms: Keyword.get(opts, :suggest_debounce_ms, 600)
+      suggest_debounce_ms: Keyword.get(opts, :suggest_debounce_ms, 600),
+      # The session title (ADR 0023): the boot --title or the resumed file's
+      # title — the dialog's prefill (issue #106).
+      title: Keyword.get(opts, :title)
     }
 
     replay(state, Keyword.get(opts, :transcript, []), Keyword.get(opts, :resume_note))
@@ -434,22 +454,51 @@ defmodule DashFloat.TUI.State do
   end
 
   @doc """
-  The status bar's model label ([ADR 0008](../../docs/decisions/0008-config-layout-profiles-json5.md)):
-  `"nickname (profile)"`, falling back to the bare nickname, then the model id.
+  The status footer's model label as `"<provider> - <model>"` — the provider
+  ladder and the dropped profile suffix are ADR 0015 §2's amendment (issue
+  #109): the base_url's preset label ([`DashFloat.Config.Presets.label/1`]),
+  else the active provider's settings label, else the URL host; the model
+  part is the nickname, else the id. nil only when nothing resolves — the
+  footer's "—" arm.
   """
   @spec provider_label(t()) :: String.t() | nil
   def provider_label(%__MODULE__{provider: {:ok, provider}}), do: label(provider)
   def provider_label(%__MODULE__{}), do: nil
 
-  defp label(%DashFloat.Config{nickname: nickname, profile: profile})
-       when is_binary(nickname) and is_binary(profile),
-       do: "#{nickname} (#{profile})"
+  defp label(%DashFloat.Config{nickname: nickname, model: model} = config) do
+    with model when is_binary(model) <- nickname || model,
+         provider when is_binary(provider) <- provider_name(config) do
+      "#{provider} - #{model}"
+    else
+      _missing -> nil
+    end
+  end
 
-  defp label(%DashFloat.Config{nickname: nickname}) when is_binary(nickname),
-    do: nickname
+  # The provider half of the footer label, in ADR 0015 §2's ladder order:
+  # (a) the base_url's preset ("zai" / "synthetic") — first-class, always
+  # ahead of the settings entry's (possibly host-defaulted) label; (b) the
+  # active provider's settings label; (c) the URL host (env-only boots,
+  # providers []). No base_url — nothing to classify.
+  defp provider_name(%DashFloat.Config{base_url: nil}), do: nil
 
-  defp label(%DashFloat.Config{model: model}) when is_binary(model), do: model
-  defp label(_other), do: nil
+  defp provider_name(%DashFloat.Config{base_url: base_url, providers: providers}) do
+    Presets.label(base_url) || settings_label(base_url, providers) ||
+      DashFloat.Config.host_label(base_url)
+  end
+
+  defp settings_label(base_url, providers) do
+    case Enum.find(providers, fn provider ->
+           trim_slash(provider.base_url) == trim_slash(base_url)
+         end) do
+      nil -> nil
+      provider -> provider.label
+    end
+  end
+
+  # The caller (provider_name's ladder) guards base_url nil above; the
+  # settings entries always carry a base_url (parse_provider ignores the
+  # baseUrl-less).
+  defp trim_slash(url), do: String.trim_trailing(url, "/")
 
   @doc "The selected model's image capability (ADR 0018 §1): true only for a resolved provider carrying `images: true`."
   @spec provider_images?(t()) :: boolean()
@@ -746,6 +795,18 @@ defmodule DashFloat.TUI.State do
 
   def attach_paste(%__MODULE__{} = state, _content), do: state
 
+  @doc """
+  A paste while the /title dialog is open (issue #106): bracketed paste
+  appends to the draft, newlines normalized out — the attach prompt's rule
+  (ADR 0018 §5). The composer is never touched while the dialog owns the input.
+  """
+  @spec title_paste(t(), String.t()) :: t()
+  def title_paste(%__MODULE__{title_dialog: %{draft: draft} = dialog} = state, content)
+      when is_binary(content),
+      do: %{state | title_dialog: %{dialog | draft: draft <> strip_newlines(content)}}
+
+  def title_paste(%__MODULE__{} = state, _content), do: state
+
   defp strip_newlines(content) do
     content
     |> String.replace("\r\n", "")
@@ -810,6 +871,34 @@ defmodule DashFloat.TUI.State do
 
   defp route_key(%{confirm: pending} = state, _code, _modifiers, _now) when pending != nil,
     do: {state, nil}
+
+  # The /title dialog (issue #106) is a key mode like the attach prompt
+  # (ADR 0018 §5): while open it swallows every key but the global quits
+  # above — printable characters and Backspace edit the draft, Enter submits
+  # through the UNCHANGED rename seam (the agent's reply closes the dialog or
+  # errors it), Esc cancels. No history, no mode cycle, no palette mid-dialog.
+  defp route_key(%{title_dialog: %{draft: draft}} = state, "enter", mods, _now)
+       when mods in [[], ["ctrl"]],
+       do: {%{state | title_dialog: %{draft: draft, error: nil}}, {:set_title, draft}}
+
+  defp route_key(%{title_dialog: %{}} = state, "esc", _modifiers, _now),
+    do: {%{state | title_dialog: nil}, nil}
+
+  # The draft's edit rules are the attach prompt's: Backspace slices the last
+  # grapheme, single printable characters append (a shifted printable is an
+  # UPPERCASE character, not a chord), and every other key is swallowed.
+  defp route_key(%{title_dialog: %{draft: draft} = dialog} = state, code, modifiers, _now) do
+    cond do
+      code == "backspace" ->
+        {%{state | title_dialog: %{dialog | draft: String.slice(draft, 0..-2//1)}}, nil}
+
+      modifiers in [[], ["shift"]] and single_char?(code) and String.valid?(code) ->
+        {%{state | title_dialog: %{dialog | draft: draft <> code}}, nil}
+
+      true ->
+        {state, nil}
+    end
+  end
 
   # The attach prompt (ADR 0018 §5) is a key mode like confirmation mode:
   # while open it swallows every key but the global quits above — printable
@@ -1349,8 +1438,14 @@ defmodule DashFloat.TUI.State do
     end
   end
 
-  # The agent owns title normalization, uniqueness, and validation — even ""
-  # goes through (ADR 0023 §7's rename seam).
+  # Bare /title opens the dialog pre-filled with the current title
+  # (issue #106); /title <name> keeps the inline path — the agent owns title
+  # normalization, uniqueness, and validation either way (ADR 0023 §7's
+  # rename seam).
+  defp run_command(state, "title", "") do
+    {%{state | title_dialog: %{draft: state.title || "", error: nil}}, nil}
+  end
+
   defp run_command(state, "title", rest), do: {state, {:set_title, rest}}
 
   # /compact rides ADR 0022's eviction on demand (issue #92): the agent
@@ -1465,6 +1560,12 @@ defmodule DashFloat.TUI.State do
       phase change (ADR 0016)
     * `{:tool_preview, request}` — append the preview entry built by
       `Render.confirm_preview/1` without arming `state.confirm` (ADR 0016)
+    * `{:title, title}` — the display-only title push (ADR 0023's
+      2026-10-31 amendment): set the title and close an open dialog —
+      the rename succeeded
+    * `{:title_refused, reason}` — set the open dialog's error (draft kept);
+      a no-op with no dialog open — the agent's system entry is the log
+      record for the inline form
     * `{:entry, kind, text}` — append a complete entry
 
   `now` is monotonic milliseconds (injectable so the rate math is testable).
@@ -1564,6 +1665,22 @@ defmodule DashFloat.TUI.State do
   # separately as {:entry, :system, _}. The agent validates the mode at its
   # seam, so the echo — like every stream message — is trusted agent voice.
   def stream_message(state, {:mode, mode}, _now), do: %{state | mode: mode}
+
+  # The display-only title push (issue #106): the dialog's prefill and the
+  # footer-adjacent state stay current, and an open dialog closes — the rename
+  # succeeded, nothing left to show.
+  def stream_message(state, {:title, title}, _now) when is_binary(title),
+    do: %{state | title: title, title_dialog: nil}
+
+  # The rename refusal lands IN the open dialog (draft kept, issue #106);
+  # with no dialog open it is a no-op — the inline form's log record is the
+  # agent's own system entry.
+  def stream_message(state, {:title_refused, reason}, _now) when is_binary(reason) do
+    case state.title_dialog do
+      nil -> state
+      dialog -> %{state | title_dialog: %{dialog | error: reason}}
+    end
+  end
 
   # A proposal or execution receipt (ADR 0016 §4): the preview rows a human
   # would confirm, landed without arming the decision.

@@ -293,3 +293,43 @@ prompt normalizes, confirms, and waits — preserving ADR 0014 §5's
    writes nothing on an all-UUID store, degrades on failure; the
    steady-state no-write sentinel; `--resume <timestamp-id>` refuses as a
    title.
+
+## Amendment (2026-10-31, issue #106): bare /title opens a dialog; the TUI becomes title-aware
+
+The owner's smoke test hit the gap this ADR's §7 left open: bare `/title`
+did nothing visible, and the TUI never learned the title it was carrying.
+This amendment **supersedes §7's closing clause** — "No TUI surface ships
+in this slice; the TUI stays title-unaware beyond the agent's system
+entries" — and nothing else. The rename seam is untouched: every path
+still rides the verbatim `{:set_title, ui, title}` send, with the agent
+owning normalization, uniqueness, and persistence exactly as recorded in
+§7.
+
+1. **Bare `/title` opens an input dialog** ([ADR 0020](0020-command-surface.md)'s
+   modal pattern: a centered Popup, palette keys swallowed, the global
+   quits still working). It is pre-filled with the current title when one
+   exists; Enter submits the draft through the unchanged
+   `{:set_title, ui, title}` seam and the dialog stays open until the
+   agent's reply closes or errors it; Esc cancels. `/title <name>` inline
+   is unchanged. On the `--resume --title` combination (§6's boot-time
+   rename) the mount value follows the agent's own precedence — the
+   override wins, because the session's live title after that boot IS the
+   override; the loaded file's old title never pre-fills.
+2. **The TUI learns titles** two ways: a `:title` mount opt (the boot
+   `--title`'s normalized form, or a resumed session's own file title),
+   which pre-fills the dialog, plus two display-only pushes from the
+   agent — `{:title, t}` at every successful set/adoption (rename seam
+   and auto-title alike; it closes an open dialog) and
+   `{:title_refused, reason}` at every refusal (normalize errors and the
+   holder collision), carrying the entry's human text minus the
+   `[title not set: …]` framing. An open dialog renders the refusal —
+   naming the holder id, per §4's uniqueness rule — instead of making the
+   user read it out of the log; the system entries remain the log record
+   in both cases. Nothing new at the agent's rename mechanics: the pushes
+   are `display/2` sends alongside the entries that were already there.
+   The title's only TUI consumer this slice is the dialog's prefill — no
+   footer or chrome display ships; a visible title surface is future
+   work.
+3. **Refused titles never lose the draft** — the dialog keeps its text
+   across a refusal, so a collision is fixed with a retype, not a
+   re-open.

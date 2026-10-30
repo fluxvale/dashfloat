@@ -3646,7 +3646,9 @@ defmodule DashFloat.AgentTest do
 
     assert instruction =~ "Propose a concise title"
 
-    # The scripted reply titles the session: entry and file.
+    # The scripted reply titles the session: the display push, the entry, and
+    # the file (issue #106).
+    assert_receive {:title, "Fix the login bug"}, 2_000
     assert_receive {:entry, :system, "[session titled: Fix the login bug]"}, 2_000
 
     {:ok, session} = Session.load(sessions, session_id(sessions))
@@ -3982,6 +3984,7 @@ defmodule DashFloat.AgentTest do
     assert_receive {:phase, :idle}, 2_000
 
     send(agent, {:set_title, self(), "  Rename   Me  "})
+    assert_receive {:title, "Rename Me"}, 2_000
     assert_receive {:entry, :system, "[session titled: Rename Me]"}, 2_000
     assert %{session_title: "Rename Me"} = :sys.get_state(agent)
 
@@ -3998,14 +4001,18 @@ defmodule DashFloat.AgentTest do
     send(agent, {:prompt, self(), "hello", []})
     assert_receive {:phase, :idle}, 2_000
 
-    for {raw, refusal} <- [
-          {"", "[title not set: may not be empty]"},
-          {"   ", "[title not set: may not be empty]"},
-          {String.duplicate("a", 81), "[title not set: may not exceed 80 characters]"},
-          {"0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c",
+    for {raw, reason, refusal} <- [
+          {"", "may not be empty", "[title not set: may not be empty]"},
+          {"   ", "may not be empty", "[title not set: may not be empty]"},
+          {String.duplicate("a", 81), "may not exceed 80 characters",
+           "[title not set: may not exceed 80 characters]"},
+          {"0192ab4c-1e5f-7d3a-9b8c-2d4e6f8a1b3c", "may not look like a session id",
            "[title not set: may not look like a session id]"}
         ] do
       send(agent, {:set_title, self(), raw})
+      # The dialog push (issue #106) carries the same human text, minus the
+      # framing; the entry stays the log record.
+      assert_receive {:title_refused, ^reason}, 2_000
       assert_receive {:entry, :system, ^refusal}, 2_000
     end
 
@@ -4026,6 +4033,10 @@ defmodule DashFloat.AgentTest do
     assert_receive {:phase, :idle}, 2_000
 
     send(agent, {:set_title, self(), "taken name"})
+    # The dialog push names the holder too (issue #106).
+    assert_receive {:title_refused, reason}, 2_000
+    assert reason == ~s("taken name" is already taken by session #{@other_id_2})
+
     assert_receive {:entry, :system, taken}, 2_000
     assert taken == "[title not set: \"taken name\" is already taken by session #{@other_id_2}]"
     assert %{session_title: nil} = :sys.get_state(agent)
@@ -4061,6 +4072,7 @@ defmodule DashFloat.AgentTest do
     assert_receive {:phase, :idle}, 2_000
 
     send(agent, {:set_title, self(), "  Off   Grid  "})
+    assert_receive {:title, "Off Grid"}, 2_000
     assert_receive {:entry, :system, "[session titled: Off Grid]"}, 2_000
     assert %{session_title: "Off Grid"} = :sys.get_state(agent)
   end
@@ -4072,6 +4084,7 @@ defmodule DashFloat.AgentTest do
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
     send(agent, {:set_title, self(), "Early"})
+    assert_receive {:title, "Early"}, 2_000
     assert_receive {:entry, :system, "[session titled: Early]"}, 2_000
     assert %{session_title: "Early"} = :sys.get_state(agent)
 

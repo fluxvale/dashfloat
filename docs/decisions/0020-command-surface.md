@@ -111,6 +111,8 @@ PageUp/PageDown stay log-scroll; inside a modal palette they are swallowed.
   `{:set_title, ui, title}`. The agent owns normalization, uniqueness, and
   persistence; its system entries (`[session titled: T]`, the refusal
   reasons) are the whole UI — the TUI adds no title validation of its own.
+  Bare `/title` opens the input dialog — see [ADR 0023](0023-session-titles-and-uuid-ids.md)'s
+  2026-10-31 amendment.
 - Unknown command — a `:system` warning entry naming the offender and
   `/help`.
 

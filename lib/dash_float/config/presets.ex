@@ -32,6 +32,25 @@ defmodule DashFloat.Config.Presets do
   @spec all() :: [preset()]
   def all, do: @presets
 
+  # The footer's provider labels (ADR 0015 §2's amendment, issue #109),
+  # keyed by base URL exactly like the suggest table: a preset URL ALWAYS
+  # reads its preset label, even when the settings entry carries a
+  # host-defaulted label — the presets are the first-class providers.
+  @labels Map.new(@presets, fn preset ->
+            {String.trim_trailing(preset.base_url, "/"), preset.label}
+          end)
+
+  @doc """
+  The provider's display label (issue #109), keyed by base URL; nil for
+  custom providers (the caller falls back to the settings label, then the
+  URL host). The URL is normalized like `suggest_model/1`'s (a trailing
+  slash is convention, not identity), so a preset URL pasted with one still
+  resolves.
+  """
+  @spec label(String.t()) :: String.t() | nil
+  def label(base_url),
+    do: Map.get(@labels, String.trim_trailing(base_url, "/"))
+
   # The provider→cheap-side-request-model table (ADR 0015 §3): the
   # officially supported presets ship one each — the owner's budget call
   # (cheap tier = low spend by default). A custom OpenAI-compatible provider

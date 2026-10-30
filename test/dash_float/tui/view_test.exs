@@ -23,15 +23,16 @@ defmodule DashFloat.TUI.ViewTest do
         View.regions({80, 24}, 1, false)
 
       assert {status.height, log.height, activity.height, input.height, footer.height} ==
-               {1, 17, 0, 3, 1}
+               {1, 15, 0, 3, 1}
 
-      assert status.y == 1 and log.y == 2 and activity.y == 19 and input.y == 19
-      assert Enum.map([status, log, activity, input, footer], & &1.width) == [78, 78, 78, 78, 78]
-      # One cell of padding on every side (issue #28): nothing at the edges.
-      assert status.x == 1 and log.x == 1 and input.x == 1 and footer.x == 1
+      assert status.y == 2 and log.y == 3 and activity.y == 18 and input.y == 18
+      assert Enum.map([status, log, activity, input, footer], & &1.width) == [76, 76, 76, 76, 76]
+      # Two cells of padding on every side (issues #28 and #108): nothing at
+      # the edges.
+      assert status.x == 2 and log.x == 2 and input.x == 2 and footer.x == 2
       # The footer sits directly under the input (ADR 0015 §2).
-      assert input.y + input.height == 22 and footer.y == 22
-      assert footer.y + footer.height == 23
+      assert input.y + input.height == 21 and footer.y == 21
+      assert footer.y + footer.height == 22
     end
 
     test "an active phase claims one activity row between log and input" do
@@ -39,15 +40,16 @@ defmodule DashFloat.TUI.ViewTest do
         View.regions({80, 24}, 1, true)
 
       assert activity.height == 1
-      assert log.height == 16
-      assert activity.y == 18 and input.y == 19 and footer.y == 22
+      assert log.height == 14
+      assert activity.y == 17 and input.y == 18 and footer.y == 21
     end
 
     test "the input grows with the draft" do
       %{log: log, activity: activity, input: input, footer: footer} =
         View.regions({80, 24}, 5, true)
 
-      assert input.height == 7
+      # 7 requested, capped at a third of the inset area (20 rows → 6).
+      assert input.height == 6
       assert_region_sum({80, 24}, [log, activity, input, footer])
     end
 
@@ -64,14 +66,14 @@ defmodule DashFloat.TUI.ViewTest do
       assert activity.height + input.height + footer.height <= 1
     end
 
-    # Issue #28: the wrap width is the log rect's width — one seam, so
-    # wrap, re-wrap, windowing, and selection can never disagree.
+    # Issues #28 + #108: the wrap width is the log rect's width — one seam,
+    # so wrap, re-wrap, windowing, and selection can never disagree.
     test "content_width is the log rect width across odd and narrow frames" do
       for width <- [3, 4, 12, 25, 61, 78, 80, 81, 120] do
         %{log: log} = View.regions({width, 24}, 1, false)
 
-        assert View.content_width(width) == max(width - 2, 1)
-        assert log.width == max(width - 2, 0)
+        assert View.content_width(width) == max(width - 4, 1)
+        assert log.width == max(width - 4, 0)
       end
 
       # Degenerate frames clamp to one column, never zero.
@@ -243,7 +245,7 @@ defmodule DashFloat.TUI.ViewTest do
 
       widget = log_widget(state, 80, 24)
       lines = widget.text
-      assert length(lines) == 17
+      assert length(lines) == 15
       assert flatten(List.last(lines)) =~ "line 100"
       # the window is pre-scrolled; the paragraph itself does no scrolling
       assert widget.scroll == {0, 0}
@@ -307,7 +309,7 @@ defmodule DashFloat.TUI.ViewTest do
         end)
 
       widget = log_widget(state, 80, 24)
-      assert length(widget.text) == 17
+      assert length(widget.text) == 15
     end
 
     test "the status position never shows an inverted range on tiny frames" do
@@ -345,16 +347,16 @@ defmodule DashFloat.TUI.ViewTest do
       state = State.stream_message(new_state(), {:entry, :system, long})
       [entry] = state.entries
 
-      # Blank separator + one 78-column row per 78 chars (the padded width,
+      # Blank separator + one 76-column row per 76 chars (the padded width,
       # issue #28); the wrapped pieces join back to exactly the input.
-      assert length(entry.lines) == 1 + div(5_000, 78) + 1
+      assert length(entry.lines) == 1 + div(5_000, 76) + 1
       assert Enum.map_join(entry.lines, &flatten/1) == long
 
       # The windowed view agrees with the accounting: follow shows the last
-      # 17 display rows — 16 full rows plus the 8-char tail, nothing else.
+      # 15 display rows — 14 full rows plus the 60-char tail, nothing else.
       visible = log_lines(state)
-      assert length(visible) == 17
-      assert Enum.map_join(visible, &flatten/1) == String.duplicate("x", 16 * 78 + 8)
+      assert length(visible) == 15
+      assert Enum.map_join(visible, &flatten/1) == String.duplicate("x", 14 * 76 + 60)
     end
 
     test "a tiny frame renders without raising" do
@@ -467,18 +469,19 @@ defmodule DashFloat.TUI.ViewTest do
       assert footer_text(new_state(provider: provider)) =~ "gpt-test"
     end
 
-    test "the label shows nickname and profile when configured (ADR 0008)" do
+    test "the label names provider and model; the profile suffix is gone (issue #109)" do
       provider =
         {:ok,
          %DashFloat.Config{
-           base_url: "http://x",
+           base_url: "https://api.z.ai/api/coding/paas/v4",
            model: "glm-5.3",
            api_key: "k",
            nickname: "Sol",
            profile: "work"
          }}
 
-      assert footer_text(new_state(provider: provider)) =~ "Sol (work)"
+      assert footer_text(new_state(provider: provider)) =~ "zai - Sol"
+      refute footer_text(new_state(provider: provider)) =~ "(work)"
     end
 
     # The capability glyph (ADR 0018 §1): visible before any attach attempt.
@@ -540,7 +543,7 @@ defmodule DashFloat.TUI.ViewTest do
 
       [line] = footer_line(state)
       [_cwd, _sep, model, sep, ctx | _rest] = line.spans
-      assert model.content == "test-model"
+      assert model.content == "x - test-model"
       assert sep.content == " · "
       assert ctx.content == "4.1k/128k · 3.2%"
       assert ctx.style == Theme.style(:dim)
@@ -665,11 +668,21 @@ defmodule DashFloat.TUI.ViewTest do
     # the hints, the hints drop and the draft's TAIL fills the freed space
     # — the path being edited stays readable, `…` marks the clipped head.
     test "the attach prompt replaces the idle row with label, draft, cursor, and hints" do
+      # At the default 80 cols the draft owns the row and the hints drop
+      # (below); a frame wide enough to fit everything shows the full prompt.
+      state = %{new_state(test_mode: {84, 24}) | attach: %{draft: "c.png"}}
+
+      text = activity_text(state, 84)
+      assert text =~ "Attach image: c.png█"
+      assert text =~ "⏎ attach · tab complete · esc keep · ^o close · ^d clear"
+    end
+
+    test "at 80 cols a draft that leaves no room for the hints drops them" do
       state = %{new_state() | attach: %{draft: "c.png"}}
 
       text = activity_text(state)
       assert text =~ "Attach image: c.png█"
-      assert text =~ "⏎ attach · tab complete · esc keep · ^o close · ^d clear"
+      refute text =~ "tab complete"
     end
 
     test "a wide attach draft drops the hints and tail-shows into the row" do
@@ -678,7 +691,7 @@ defmodule DashFloat.TUI.ViewTest do
 
       line = activity_text(state)
       # the whole prompt fits the content width — the draft is cut, not wrapped
-      assert String.length(line) <= 78
+      assert String.length(line) <= 76
       refute line =~ long
       assert line =~ "Attach image: "
       # the hints yielded, the tail survived, the head is a marked clip
@@ -1030,11 +1043,11 @@ defmodule DashFloat.TUI.ViewTest do
       end
     end
 
-    # Issue #28: the margin takes two columns off the wrap width — at odd
-    # frame widths (61 → 59 content columns, 81 → 79) the wrap math must use
-    # the padded width consistently. No truncation at the pane edge.
+    # Issues #28 + #108: the margin takes four columns off the wrap width —
+    # at odd frame widths (61 → 57 content columns, 81 → 77) the wrap math
+    # must use the padded width consistently. No truncation at the pane edge.
     test "padded wrap width holds at odd and narrow frame widths" do
-      for {frame_w, expected} <- [{19, 17}, {20, 18}, {61, 59}, {81, 79}] do
+      for {frame_w, expected} <- [{19, 15}, {20, 16}, {61, 57}, {81, 77}] do
         base = new_state(test_mode: {frame_w, 24})
         state = State.stream_message(base, {:entry, :system, fox_text()})
 
@@ -1317,6 +1330,88 @@ defmodule DashFloat.TUI.ViewTest do
     end
   end
 
+  describe "the title dialog (issue #106)" do
+    defp dialog_state(draft, error) do
+      %{new_state() | title_dialog: %{draft: draft, error: error}}
+    end
+
+    defp dialog_paragraph(state) do
+      [{%ExRatatui.Widgets.Popup{content: %ExRatatui.Widgets.Paragraph{} = paragraph}, _area}] =
+        state
+        |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+        |> Enum.take(-1)
+
+      paragraph
+    end
+
+    test "the dialog rides last, a Popup over the five chrome widgets" do
+      state = dialog_state("fix it", nil)
+
+      widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+      assert length(widgets) == 6
+
+      assert {%ExRatatui.Widgets.Popup{}, _area} = List.last(widgets)
+    end
+
+    test "the box carries the accent title, the draft row, and the dim hint" do
+      buffer = drawn_text(dialog_state("fix it", nil))
+
+      assert buffer =~ "Session title"
+      assert buffer =~ "❯ fix it█"
+      assert buffer =~ "⏎ rename · esc cancel"
+    end
+
+    test "the refusal renders in the error role, wrapped so the holder id never clips" do
+      holder = "0192aa10-b002-7c00-8000-00000000000c"
+      error = ~s("Taken Name" is already taken by session #{holder})
+
+      buffer = drawn_text(dialog_state("Taken Name", error))
+      assert buffer =~ "already taken"
+      assert buffer =~ holder
+
+      # Every refusal row carries the :error role, and the wrap keeps each
+      # row inside the box's inner width (60% of the 76-cell area, minus
+      # borders → 43 columns).
+      paragraph = dialog_paragraph(dialog_state("Taken Name", error))
+      [_draft, _hint | error_lines] = paragraph.text
+
+      assert error_lines != []
+
+      for %ExRatatui.Text.Line{spans: [span]} <- error_lines do
+        assert span.style == Theme.style(:error)
+        assert String.length(span.content) <= 43
+      end
+    end
+
+    test "a closed dialog renders no dialog widgets" do
+      widgets = View.render(new_state(), %ExRatatui.Frame{width: 80, height: 24})
+      assert length(widgets) == 5
+    end
+
+    # Review F2: titles run to 80 chars, the box's inner width at 80 cols is
+    # 43 — an over-long draft head-clips with `…` (the attach row's own
+    # tail-showing rule) so the block cursor stays visible at the end,
+    # where editing happens.
+    test "an over-long draft tail-shows with a head-clip marker, cursor visible" do
+      draft = String.duplicate("x", 79)
+
+      buffer = drawn_text(dialog_state(draft, nil))
+      assert buffer =~ "█"
+
+      [%ExRatatui.Text.Line{spans: [prefix, body]} | _rest] =
+        dialog_paragraph(dialog_state(draft, nil)).text
+
+      assert prefix.content == "❯ "
+      assert String.starts_with?(body.content, "…")
+      # The row fits the 43-column inner width: prefix + `…` + tail + cursor.
+      assert String.length(prefix.content) + String.length(body.content) <= 43
+      # The cursor rides the END of the draft: the last grapheme before █ is
+      # the draft's tail — the span is exactly the budget (40) + the cursor.
+      assert String.ends_with?(body.content, "x█")
+      assert String.length(body.content) == 41
+    end
+  end
+
   ## helpers
 
   # The error-styled rows of a rendered setup box (issue #42 probes): the
@@ -1383,14 +1478,14 @@ defmodule DashFloat.TUI.ViewTest do
     Enum.map_join(line.spans, "", & &1.content)
   end
 
-  defp activity(state) do
+  defp activity(state, w \\ 80) do
     state
-    |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+    |> View.render(%ExRatatui.Frame{width: w, height: 24})
     |> Enum.at(2)
   end
 
-  defp activity_text(state) do
-    {widget, _rect} = activity(state)
+  defp activity_text(state, w \\ 80) do
+    {widget, _rect} = activity(state, w)
     Enum.map_join(widget.text, "", &flatten/1)
   end
 

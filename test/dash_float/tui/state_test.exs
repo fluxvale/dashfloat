@@ -127,42 +127,126 @@ defmodule DashFloat.TUI.StateTest do
   end
 
   describe "provider_label/1" do
-    test "nickname and profile compose as \"nickname (profile)\"" do
-      provider =
+    # The footer label is "<provider> - <model>" (ADR 0015 §2's amendment,
+    # issue #109); the profile suffix is gone from the footer entirely.
+    test "a preset base_url names the preset — zai with a nickname, synthetic with one too" do
+      zai =
         {:ok,
          %DashFloat.Config{
-           base_url: "http://x",
+           base_url: "https://api.z.ai/api/coding/paas/v4",
            model: "glm-5.3",
            api_key: "k",
            nickname: "Sol",
-           profile: "work"
+           profile: "demo"
          }}
 
-      state = new_state(provider: provider)
-      assert State.provider_label(state) == "Sol (work)"
-    end
-
-    test "falls back to the bare nickname without a profile, then the model id" do
-      nickname_only =
+      synthetic =
         {:ok,
-         %DashFloat.Config{base_url: "http://x", model: "glm-5.3", api_key: "k", nickname: "Sol"}}
+         %DashFloat.Config{
+           base_url: "https://api.synthetic.new/openai/v1",
+           model: "glm-4.7",
+           api_key: "k",
+           nickname: "Sol"
+         }}
 
-      model_only = {:ok, %DashFloat.Config{base_url: "http://x", model: "glm-5.3", api_key: "k"}}
-
-      nickname_state = new_state(provider: nickname_only)
-      model_state = new_state(provider: model_only)
-      assert State.provider_label(nickname_state) == "Sol"
-      assert State.provider_label(model_state) == "glm-5.3"
+      zai_state = new_state(provider: zai)
+      synthetic_state = new_state(provider: synthetic)
+      assert State.provider_label(zai_state) == "zai - Sol"
+      assert State.provider_label(synthetic_state) == "synthetic - Sol"
     end
 
-    test "nil for an error provider, no provider, or a provider with no names" do
+    test "a preset match survives a trailing slash and beats a settings label" do
+      slashed =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "https://api.z.ai/api/coding/paas/v4/",
+           model: "glm-5.3",
+           api_key: "k",
+           nickname: "Sol",
+           # The settings entry's host-defaulted label loses to the preset:
+           # the presets are the first-class providers (ADR 0015 §2).
+           providers: [
+             %{
+               label: "api.z.ai",
+               base_url: "https://api.z.ai/api/coding/paas/v4",
+               api_key: "k"
+             }
+           ]
+         }}
+
+      slashed_state = new_state(provider: slashed)
+      assert State.provider_label(slashed_state) == "zai - Sol"
+    end
+
+    test "a custom provider shows the settings label, trailing slashes trimmed on both sides" do
+      custom =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "http://localhost:8080/v1/",
+           model: "llama",
+           api_key: "k",
+           nickname: "Sol",
+           providers: [
+             %{label: "homelab", base_url: "http://localhost:8080/v1", api_key: "k"}
+           ]
+         }}
+
+      mirrored =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "http://localhost:8080/v1",
+           model: "llama",
+           api_key: "k",
+           nickname: "Sol",
+           providers: [
+             %{label: "homelab", base_url: "http://localhost:8080/v1/", api_key: "k"}
+           ]
+         }}
+
+      custom_state = new_state(provider: custom)
+      mirrored_state = new_state(provider: mirrored)
+      assert State.provider_label(custom_state) == "homelab - Sol"
+      assert State.provider_label(mirrored_state) == "homelab - Sol"
+    end
+
+    test "an unlabeled custom provider (env-only boots: providers []) degrades to the URL host" do
+      unlabeled =
+        {:ok,
+         %DashFloat.Config{base_url: "http://127.0.0.1:8080/v1", model: "llama", api_key: "k"}}
+
+      host_only =
+        {:ok,
+         %DashFloat.Config{base_url: "not a url", model: "llama", api_key: "k", nickname: "Sol"}}
+
+      unlabeled_state = new_state(provider: unlabeled)
+      host_only_state = new_state(provider: host_only)
+      assert State.provider_label(unlabeled_state) == "127.0.0.1 - llama"
+      assert State.provider_label(host_only_state) == "not a url - Sol"
+    end
+
+    test "nil for an error provider, no provider, no base_url, or no model part" do
       error_state = new_state(provider: {:error, "nope"})
       blank_state = new_state()
+      # No base_url — nothing to classify the provider from (the settings
+      # scan still compares each entry against a nil url harmlessly).
+      no_url =
+        new_state(
+          provider:
+            {:ok,
+             %DashFloat.Config{
+               model: "glm-5.3",
+               api_key: "k",
+               providers: [%{label: "kept", base_url: "http://x", models: []}]
+             }}
+        )
+
       # A Config with neither nickname nor model (hand-made, e.g. an
       # env-only shape) has no label — the view's placeholder takes over.
       nameless = new_state(provider: {:ok, %DashFloat.Config{base_url: "http://x", api_key: "k"}})
+
       assert State.provider_label(error_state) == nil
       assert State.provider_label(blank_state) == nil
+      assert State.provider_label(no_url) == nil
       assert State.provider_label(nameless) == nil
     end
   end
@@ -391,24 +475,24 @@ defmodule DashFloat.TUI.StateTest do
     test "down anchors, drag extends, up copies; click-to-clear" do
       state = selected_state()
 
-      {anchored, nil} = State.select_mouse(state, "down", 1, 3)
+      {anchored, nil} = State.select_mouse(state, "down", 1, 4)
       assert anchored.selection.anchor == {1, 0}
       # The gesture snapshots the entries' display-row count as its base —
       # the finalize boundary (review P1).
       assert anchored.selection.base_rows == 4
       assert anchored.selection.head == {1, 0}
 
-      {extended, nil} = State.select_mouse(anchored, "drag", 6, 5)
+      {extended, nil} = State.select_mouse(anchored, "drag", 7, 6)
       assert extended.selection.head == {3, 5}
 
-      {released, {:copy, text}} = State.select_mouse(extended, "up", 6, 5)
+      {released, {:copy, text}} = State.select_mouse(extended, "up", 7, 6)
       assert match?(%{head: _}, released.selection)
       # Last row slices through col 5's cell ("beta l" — the pointed cell
       # is included; review P2a).
       assert text == "alpha line\n\nbeta l"
 
       # Press+release without extension clears…
-      {cleared, nil} = State.select_mouse(anchored, "up", 1, 3)
+      {cleared, nil} = State.select_mouse(anchored, "up", 1, 4)
       assert cleared.selection == nil
       # …and an empty selection copies nothing (the nil clause's contract).
       assert State.selection_text(cleared) == ""
@@ -430,15 +514,15 @@ defmodule DashFloat.TUI.StateTest do
       # Below the log (over the input box): clamps to the last row, and the
       # column clamps to the padded width (one past the last column).
       {below, nil} = State.select_mouse(selected_state(), "down", 999, 23)
-      assert below.selection.anchor == {3, 78}
+      assert below.selection.anchor == {3, 76}
     end
 
     test "a blank-only selection copies nothing and clears" do
       # An empty entry renders as blank separator + empty line: rows 0-1.
       state = State.stream_message(new_state(), {:entry, :system, ""})
 
-      {anchored, nil} = State.select_mouse(state, "down", 1, 2)
-      {released, action} = State.select_mouse(anchored, "up", 1, 3)
+      {anchored, nil} = State.select_mouse(state, "down", 3, 3)
+      {released, action} = State.select_mouse(anchored, "up", 3, 4)
 
       assert action == nil
       assert released.selection == nil
@@ -477,7 +561,7 @@ defmodule DashFloat.TUI.StateTest do
 
       scrolled = State.wheel_scroll(state, :up)
       refute scrolled.follow?
-      top = State.effective_scroll(scrolled, 17)
+      top = State.effective_scroll(scrolled, 15)
       assert top > 0
 
       # Click on the status bar (screen row 0): anchors the viewport's
@@ -486,10 +570,10 @@ defmodule DashFloat.TUI.StateTest do
       assert above.selection.anchor == {top, 0}
 
       # Drag into the input pane (screen row 23): the viewport's last
-      # visible row (17-row idle viewport, ADR 0015's footer: rows
-      # top..top + 16).
+      # visible row (15-row idle viewport, issues #28 + #108: rows
+      # top..top + 14).
       {below, _nil} = State.select_mouse(scrolled, "down", 1, 23)
-      assert below.selection.anchor == {top + 16, 0}
+      assert below.selection.anchor == {top + 14, 0}
     end
 
     test "click jitter below the drag threshold clears instead of copying" do
@@ -498,20 +582,20 @@ defmodule DashFloat.TUI.StateTest do
       state = selected_state()
 
       # Same cell (1-cell extent): a plain click.
-      {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
-      {same, action} = State.select_mouse(anchored, "up", 1, 3)
+      {anchored, _nil} = State.select_mouse(state, "down", 2, 4)
+      {same, action} = State.select_mouse(anchored, "up", 2, 4)
       assert action == nil
       assert same.selection == nil
 
       # Adjacent cell (2-cell extent): still wobble.
-      {anchored2, _nil} = State.select_mouse(state, "down", 1, 3)
-      {wobbled, action2} = State.select_mouse(anchored2, "up", 2, 3)
+      {anchored2, _nil} = State.select_mouse(state, "down", 2, 4)
+      {wobbled, action2} = State.select_mouse(anchored2, "up", 3, 4)
       assert action2 == nil
       assert wobbled.selection == nil
 
       # Two cells away (3-cell extent): a deliberate selection — copies.
-      {anchored3, _nil} = State.select_mouse(state, "down", 1, 3)
-      {dragged3, {:copy, text}} = State.select_mouse(anchored3, "up", 3, 3)
+      {anchored3, _nil} = State.select_mouse(state, "down", 2, 4)
+      {dragged3, {:copy, text}} = State.select_mouse(anchored3, "up", 4, 4)
       assert match?(%{head: _}, dragged3.selection)
       assert text == "alp"
     end
@@ -609,8 +693,8 @@ defmodule DashFloat.TUI.StateTest do
 
       # Select into the live reply (rows 0-1; the base is 0 — no entries).
       {anchored, _nil} = State.select_mouse(ticked, "down", 1, 2)
-      {dragged, _nil} = State.select_mouse(anchored, "drag", 10, 3)
-      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 10, 3)
+      {dragged, _nil} = State.select_mouse(anchored, "drag", 10, 4)
+      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 10, 4)
       assert selected.selection.base_rows == 0
 
       cancelled =
@@ -648,7 +732,9 @@ defmodule DashFloat.TUI.StateTest do
       # after the last tick) and equal in count while differing in
       # content, so row counts cannot decide — the guard is positional.
       # Display rows: 0 blank, 1 "warm", then the reply's rows from 2.
-      warm = new_state(test_mode: {20, 24})
+      # 22 cols → content 18: "one two three" AND "one two three four"
+      # each fit one padded row (the equal-count premise below).
+      warm = new_state(test_mode: {22, 24})
 
       base = State.stream_message(warm, {:entry, :system, "warm"})
 
@@ -664,9 +750,9 @@ defmodule DashFloat.TUI.StateTest do
 
       # Above the reply (row 1): a real drag within "warm" that survives
       # the finalize untouched.
-      {anchored, _no_copy} = State.select_mouse(dirty, "down", 1, 3)
-      {dragged, _no_copy} = State.select_mouse(anchored, "drag", 4, 3)
-      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 4, 3)
+      {anchored, _no_copy} = State.select_mouse(dirty, "down", 1, 4)
+      {dragged, _no_copy} = State.select_mouse(anchored, "drag", 4, 4)
+      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 4, 4)
 
       finalized = State.stream_message(selected, {:phase, :idle}, 1_300)
       assert finalized.selection != nil
@@ -680,9 +766,9 @@ defmodule DashFloat.TUI.StateTest do
 
       # Reaching into the reply (row 2, the reply's blank separator row)
       # clears even at that equal count.
-      {into, _no_copy} = State.select_mouse(dirty, "down", 1, 4)
-      {into_drag, _no_copy} = State.select_mouse(into, "drag", 6, 5)
-      {into_selected, {:copy, _reply_text}} = State.select_mouse(into_drag, "up", 6, 5)
+      {into, _no_copy} = State.select_mouse(dirty, "down", 1, 5)
+      {into_drag, _no_copy} = State.select_mouse(into, "drag", 6, 6)
+      {into_selected, {:copy, _reply_text}} = State.select_mouse(into_drag, "up", 6, 6)
       assert match?(%{head: _}, into_selected.selection)
 
       replaced = State.stream_message(into_selected, {:phase, :idle}, 1_400)
@@ -1482,9 +1568,9 @@ defmodule DashFloat.TUI.StateTest do
       final = State.stream_message(over, {:phase, :idle}, 1_300)
       [entry] = final.entries
       assert entry.text == over_cap
-      # blank separator + 64 KiB + 1 of x's at 78 columns (the padded width)
-      # = 841 display rows
-      assert length(entry.lines) == 1 + div(64 * 1024, 78) + 1
+      # blank separator + 64 KiB + 1 of x's at 76 columns (the padded width)
+      # = 864 display rows
+      assert length(entry.lines) == 1 + div(64 * 1024, 76) + 1
     end
 
     test "needs_tick?/1 is true only while active and unscheduled" do
@@ -1569,15 +1655,15 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up on a viewport-fitting log is a no-op (stays pinned)" do
-      # The real idle viewport at 80x24 is 17 rows with the margin (issue
-      # #28; ADR 0015's footer took one more row); 8 entries = blank + line
-      # each fit inside one viewport.
-      base = full_state(8)
-      assert State.log_line_count(base) == 16
+      # The real idle viewport at 80x24 is 15 rows with the margin (issues
+      # #28 + #108; ADR 0015's footer took one more row); 7 entries = blank
+      # + line each fit inside one viewport.
+      base = full_state(7)
+      assert State.log_line_count(base) == 14
 
       {paged, nil} = State.handle_key(base, "page_up", [])
       assert paged.follow?
-      assert State.effective_scroll(paged, 17) == 0
+      assert State.effective_scroll(paged, 15) == 0
     end
 
     test "submit re-pins the log so the new reply is visible" do
@@ -1599,47 +1685,47 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up unfollows and pages back; page_down re-pins at the bottom" do
-      # 200 lines, 17-row viewport (the padded 80x24 layout with ADR 0015's
-      # footer) → bottom 183.
+      # 200 lines, 15-row viewport (the padded 80x24 layout with ADR 0015's
+      # footer) → bottom 185.
       base = full_state(100)
       {up_one, nil} = State.handle_key(base, "page_up", [])
       refute up_one.follow?
-      assert State.effective_scroll(up_one, 17) == 166
+      assert State.effective_scroll(up_one, 15) == 170
 
       {up_two, nil} = State.handle_key(up_one, "page_up", [])
-      assert State.effective_scroll(up_two, 17) == 149
+      assert State.effective_scroll(up_two, 15) == 155
 
       {down_one, nil} = State.handle_key(up_two, "page_down", [])
-      assert State.effective_scroll(down_one, 17) == 166
+      assert State.effective_scroll(down_one, 15) == 170
 
       {down_two, nil} = State.handle_key(down_one, "page_down", [])
       assert down_two.follow?
-      assert State.effective_scroll(down_two, 17) == 183
+      assert State.effective_scroll(down_two, 15) == 185
     end
 
     test "wheel_scroll: one notch is three lines; up unfollows, down re-pins at the bottom" do
       base = full_state(100)
-      assert State.effective_scroll(base, 17) == 183
+      assert State.effective_scroll(base, 15) == 185
 
       wheeled = State.wheel_scroll(base, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 17) == 180
+      assert State.effective_scroll(wheeled, 15) == 182
 
       again = State.wheel_scroll(wheeled, :up)
-      assert State.effective_scroll(again, 17) == 177
+      assert State.effective_scroll(again, 15) == 179
 
       down = State.wheel_scroll(again, :down)
       refute down.follow?
-      assert State.effective_scroll(down, 17) == 180
+      assert State.effective_scroll(down, 15) == 182
 
       pinned = State.wheel_scroll(down, :down)
       assert pinned.follow?
-      assert State.effective_scroll(pinned, 17) == 183
+      assert State.effective_scroll(pinned, 15) == 185
     end
 
     test "wheel up on a viewport-fitting log is a no-op (stays pinned)" do
-      base = full_state(8)
-      assert State.log_line_count(base) == 16
+      base = full_state(7)
+      assert State.log_line_count(base) == 14
       assert State.wheel_scroll(base, :up) == base
     end
 
@@ -1654,12 +1740,12 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.phase == :confirming
 
-      # The activity row is up while confirming: the viewport is 16 rows
+      # The activity row is up while confirming: the viewport is 14 rows
       # (ADR 0015's footer took one from the log).
-      bottom = State.effective_scroll(state, 16)
+      bottom = State.effective_scroll(state, 14)
       wheeled = State.wheel_scroll(state, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 16) == bottom - 3
+      assert State.effective_scroll(wheeled, 14) == bottom - 3
     end
 
     test "new content does not move an unfollowed view, but clamping still holds" do
@@ -2527,6 +2613,36 @@ defmodule DashFloat.TUI.StateTest do
       assert Enum.map_join(user.lines, "\n", &flatten/1) =~ "📎 image"
     end
 
+    # Issue #107: the resumed log keeps the user/assistant distinction —
+    # replay rides Render.entry_lines/2 (the one styler), so the replayed
+    # user rows carry the bold :user role and the accent ❯ prefix, while
+    # the assistant rows stay plain.
+    test "a replayed user turn keeps the bold :user style and the accent prefix" do
+      transcript = [
+        %{"role" => "user", "content" => "first question"},
+        %{"role" => "assistant", "content" => "an answer."}
+      ]
+
+      assert [%{kind: :user} = user, %{kind: :assistant} = assistant] =
+               new_state(transcript: transcript).entries
+
+      user_style = Theme.style(:user)
+      accent_bold = %{Theme.style(:accent) | modifiers: [:bold]}
+
+      [_sep, first | rest] = user.lines
+
+      assert [%ExRatatui.Text.Span{content: "❯ ", style: ^accent_bold}, %{style: ^user_style}] =
+               first.spans
+
+      assert Enum.all?(rest, fn line ->
+               Enum.all?(line.spans, &(&1.style == user_style))
+             end)
+
+      assert Enum.all?(assistant.lines, fn line ->
+               Enum.all?(line.spans, &(&1.style == %ExRatatui.Style{}))
+             end)
+    end
+
     test "arguments that do not decode render the (invalid arguments) arm" do
       transcript = [
         %{
@@ -2902,8 +3018,11 @@ defmodule DashFloat.TUI.StateTest do
       assert State.input_text(state) == ""
     end
 
-    test "a bare /title sends the empty title — the agent owns validation" do
-      assert {_state, {:set_title, ""}} = enter_typed(new_state(), "/title ")
+    test "a bare /title opens the dialog pre-filled with the current title" do
+      titled = Map.put(new_state(), :title, "Fix the login")
+      {state, nil} = enter_typed(titled, "/title ")
+
+      assert state.title_dialog == %{draft: "Fix the login", error: nil}
     end
 
     test "/compact returns the action; trailing text is ignored" do
@@ -3630,6 +3749,143 @@ defmodule DashFloat.TUI.StateTest do
         |> State.stream_message({:phase, :idle}, 1_000)
 
       assert length(refused.attachments) == 1
+    end
+  end
+
+  ## The /title dialog (issue #106; ADR 0023's 2026-10-31 amendment)
+
+  describe "the /title dialog" do
+    # The dialog as bare /title opens it: idle, pre-filled, no error.
+    defp dialog_open(opts \\ []) do
+      opts
+      |> new_state()
+      |> enter_typed("/title ")
+      |> elem(0)
+    end
+
+    test "bare /title with no current title opens with an empty draft" do
+      assert dialog_open().title_dialog == %{draft: "", error: nil}
+    end
+
+    test "a paste with no dialog open is a no-op (the TUI clause guards the open state)" do
+      closed = new_state(title: "Kept")
+
+      pasted = State.title_paste(closed, "pasted title\n")
+
+      assert pasted.title_dialog == nil
+      assert pasted.title == "Kept"
+    end
+
+    test "bare /title via the filter palette's Enter opens the same dialog" do
+      # No trailing space: Enter executes the SELECTED match, which lands on
+      # run_command(state, "title", "") — the dialog clause, not the inline.
+      {state, nil} = enter_typed(new_state(title: "Via Palette"), "/title")
+
+      assert state.title_dialog == %{draft: "Via Palette", error: nil}
+    end
+
+    test "typing appends, a shifted printable uppercases, backspace slices the last grapheme" do
+      state =
+        dialog_open()
+        |> press("f", [])
+        |> press("i", [])
+        |> press("x", [])
+        |> press("I", ["shift"])
+        |> press("t", [])
+        |> press("backspace", [])
+
+      assert state.title_dialog.draft == "fixI"
+
+      # backspacing past the start is a no-op
+      emptied =
+        Enum.reduce(1..9, state, fn _n, acc -> press(acc, "backspace", []) end)
+
+      assert emptied.title_dialog.draft == ""
+    end
+
+    test "a paste appends newline-stripped; the composer stays untouched" do
+      state = State.title_paste(dialog_open(), "fix it\r\n")
+
+      assert state.title_dialog.draft == "fix it"
+      assert State.input_text(state) == ""
+    end
+
+    test "enter returns {:set_title, draft} and keeps the dialog open, error reset" do
+      state = %{dialog_open() | title_dialog: %{draft: "fix it", error: "stale refusal"}}
+
+      {submitted, {:set_title, "fix it"}} = State.handle_key(state, "enter", [])
+
+      # The dialog stays open: the agent's {:title, _} closes it or
+      # {:title_refused, _} errors it.
+      assert submitted.title_dialog == %{draft: "fix it", error: nil}
+    end
+
+    test "enter accepts the ctrl modifier; esc closes" do
+      state = dialog_open()
+      {sent, {:set_title, ""}} = State.handle_key(state, "enter", ["ctrl"])
+      assert sent.title_dialog != nil
+
+      {closed, nil} = State.handle_key(state, "esc", [])
+      assert closed.title_dialog == nil
+    end
+
+    test "{:title, t} sets the title and closes an open dialog" do
+      opened = dialog_open(title: "Old")
+      titled = State.stream_message(opened, {:title, "New"}, 1_000)
+
+      assert titled.title == "New"
+      assert titled.title_dialog == nil
+    end
+
+    test "{:title_refused, r} errors the open dialog, keeping the draft" do
+      reason = ~s("x" is already taken by session 0192aa10-b002-7c00-8000-00000000000c)
+      typed = press(dialog_open(title: "Old"), "x", [])
+
+      refused = State.stream_message(typed, {:title_refused, reason}, 1_000)
+
+      assert refused.title_dialog == %{draft: "Oldx", error: reason}
+    end
+
+    test "{:title_refused, r} with no dialog open is a no-op" do
+      state = State.stream_message(new_state(), {:title_refused, "may not be empty"}, 1_000)
+
+      assert state.title_dialog == nil
+      assert state.entries == []
+    end
+
+    test "the open dialog swallows up/down/tab/page keys — no history, no mode cycle, no palette" do
+      state =
+        dialog_open()
+        |> Map.put(:history, ["/old"])
+        |> Map.put(:suggestion, "ghost")
+        |> press("up", [])
+        |> press("down", [])
+        |> press("tab", [])
+        |> press("page_up", [])
+        |> press("back_tab", [])
+        |> press("p", ["ctrl"])
+        |> press("u", ["ctrl"])
+
+      assert state.title_dialog.draft == ""
+      assert state.history == ["/old"]
+      assert state.mode == :build
+      assert state.palette == nil
+      assert state.suggestion == "ghost"
+    end
+
+    test "the global quits still work while the dialog is open" do
+      state = dialog_open()
+      assert {^state, :quit} = State.handle_key(state, "q", ["ctrl"])
+
+      {armed, nil} = State.handle_key(state, "c", ["ctrl"], 1_000)
+      assert armed.exit_guard_at == 1_000
+    end
+
+    test "the inline form is unchanged: /title <name> returns {:set_title, name}" do
+      {state, {:set_title, "fix the login"}} = enter_typed(new_state(), "/title fix the login")
+
+      assert state.title_dialog == nil
+      assert State.input_text(state) == ""
     end
   end
 end

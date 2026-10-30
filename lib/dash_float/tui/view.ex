@@ -40,10 +40,10 @@ defmodule DashFloat.TUI.View do
     unchained: :error
   }
 
-  # One cell of padding on every side of the chrome (issue #28; ADR 0006
-  # amendment): text never hugs a screen edge, and the log rect's width —
-  # which IS the wrap width — shrinks with it.
-  @margin 1
+  # Two cells of padding on every side of the chrome (issues #28 and #108;
+  # ADR 0006 amendment): text never hugs a screen edge, and the log rect's
+  # width — which IS the wrap width — shrinks with it.
+  @margin 2
 
   # The composer's placeholder, shown ONLY before the session's first
   # exchange (ADR 0015 §3, amended #91). The key map lives in /help.
@@ -54,12 +54,15 @@ defmodule DashFloat.TUI.View do
   @attach_label "Attach image: "
   @attach_hint "  ⏎ attach · tab complete · esc keep · ^o close · ^d clear"
 
+  # The /title dialog's hint line (issue #106).
+  @title_dialog_hint "⏎ rename · esc cancel"
+
   @doc """
   Splits `width` x `height` into status (1 row), log (rest), activity
   (1 row while an overlay exists — an active phase, the exit prompt, or the
   open attach prompt — else 0), input (`2 + input_lines` rows, clamped to a
   third of the frame), and the permanent stats footer (1 row, ADR 0015) —
-  the whole chrome inset by one cell per side.
+  the whole chrome inset by two cells per side.
   """
   @spec regions({integer(), integer()}, integer(), boolean()) :: %{
           status: Rect.t(),
@@ -133,6 +136,7 @@ defmodule DashFloat.TUI.View do
     # The transient row exists for an active phase OR an armed exit guard
     # (issue #28; ADR 0006 amendment) — even while idle.
     regions = regions({width, height}, State.input_line_count(state), State.overlay?(state))
+    area = inset_area(width, height)
 
     [
       {status_widget(state, regions.log.height), regions.status},
@@ -140,7 +144,7 @@ defmodule DashFloat.TUI.View do
       {activity_widget(state), regions.activity},
       {input_widget(state), regions.input},
       {footer_widget(state), regions.footer}
-    ] ++ palette_widgets(state, inset_area(width, height))
+    ] ++ palette_widgets(state, area) ++ title_dialog_widgets(state, area)
   end
 
   ## Setup screens (ADR 0009: forced selection + onboarding wizard)
@@ -401,7 +405,7 @@ defmodule DashFloat.TUI.View do
   # is silently clipped mid-token (issue #42).
   defp error_lines(message, width) do
     message
-    |> wrap_remedy(max(width - 4, 1))
+    |> wrap_remedy(max(width - 2 * @margin - 2, 1))
     |> Enum.map(&{&1, :error})
   end
 
@@ -410,7 +414,7 @@ defmodule DashFloat.TUI.View do
   # error.
   defp note_lines(message, width) do
     message
-    |> wrap_remedy(max(width - 4, 1))
+    |> wrap_remedy(max(width - 2 * @margin - 2, 1))
     |> Enum.map(&{&1, :dim})
   end
 
@@ -776,9 +780,16 @@ defmodule DashFloat.TUI.View do
          %State{palette: %Palette{kind: :commands, items: items, selected: selected}},
          area
        ) do
+    # percent_width 70 (hostile review F1): at 80 cols the inset area is 76
+    # wide, so the popup's inner width is 51 — every registry description
+    # fits whole. The widget's default 50 clipped the longest rows
+    # mid-word even before the margin (37 inner cols), and margin 2 made it
+    # one column worse; the issue's done-when demands no palette regression
+    # at 80.
     SlashCommands.render_autocomplete(items,
       area: area,
       selected: selected,
+      percent_width: 70,
       highlight_style: Theme.style(:accent),
       style: Theme.style(:dim)
     )
@@ -829,6 +840,70 @@ defmodule DashFloat.TUI.View do
        },
        percent_width: 50,
        percent_height: 40
+     }, area}
+  end
+
+  ## Title dialog (issue #106; ADR 0023's 2026-10-31 amendment)
+
+  # Rendered last — on top of every region (and any palette; the two are
+  # mutually exclusive, the dialog only opens from an idle bare /title).
+  defp title_dialog_widgets(%State{title_dialog: nil}, _area), do: []
+
+  defp title_dialog_widgets(%State{title_dialog: %{draft: draft, error: error}}, area) do
+    # The refusal wraps to the box's inner width (60% of the area, minus the
+    # borders) so the holder id never clips — wrap_remedy's semantics.
+    inner = max(div(area.width * 60, 100) - 2, 1)
+
+    lines =
+      [
+        # The attach prompt's row shape: accent prompt glyph, the draft with
+        # the block cursor (ADR 0018 §5) — and its tail-showing rule: an
+        # over-long draft head-clips with `…` (titles run to 80 chars, the
+        # box is narrower, and the cursor must stay visible — the dialog's
+        # whole job is editing that string; hostile review F2).
+        Line.new([
+          Span.new("❯ ", style: Theme.style(:accent)),
+          Span.new(dialog_draft(draft, inner) <> "█", style: Theme.style(:assistant))
+        ]),
+        Line.new([Span.new(@title_dialog_hint, style: Theme.style(:hint))])
+      ] ++ refusal_lines(error, inner)
+
+    [title_dialog_box(lines, area)]
+  end
+
+  # The attach row's own solution (attach_layout): the TAIL shows — the
+  # cursor rides at the end, where editing happens — into the row's budget
+  # after the `❯ ` prefix AND the cursor's own cell, `…` marking the
+  # clipped head.
+  defp dialog_draft(draft, inner) do
+    budget = max(inner - String.length("❯ ") - 1, 1)
+
+    if String.length(draft) < budget,
+      do: draft,
+      else: "…" <> String.slice(draft, String.length(draft) - budget + 1, budget)
+  end
+
+  defp refusal_lines(nil, _width), do: []
+
+  defp refusal_lines(error, width) do
+    for text <- wrap_remedy(error, width),
+        do: Line.new([Span.new(text, style: Theme.style(:error))])
+  end
+
+  defp title_dialog_box(lines, area) do
+    {%Popup{
+       content: %Paragraph{
+         text: lines,
+         block: %Block{
+           title: Span.new(" Session title ", style: Theme.style(:accent)),
+           borders: [:all],
+           border_type: :rounded,
+           border_style: Theme.style(:dim)
+         },
+         scroll: {0, 0}
+       },
+       percent_width: 60,
+       percent_height: 35
      }, area}
   end
 end

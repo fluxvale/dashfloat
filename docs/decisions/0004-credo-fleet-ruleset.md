@@ -94,3 +94,11 @@ is field 41, same flat-struct rationale (pure data the render contract
 reads whole; nesting it into the numeric `stats` map would muddy that
 type). `max_fields` moves to 41 — again the smallest whole number above
 the actual size, so the creep gate stands.
+
+**Rider (2026-10-31, [issue #106](https://github.com/fluxvale/dashfloat/issues/106)):**
+the title and its dialog ([ADR
+0023](0023-session-titles-and-uuid-ids.md)'s 2026-10-31 amendment) are
+fields 44 and 45 — the dialog is the attach prompt's shape (a pure
+draft+error map the key router and the view read whole). `max_fields`
+moves to 45, again the smallest whole number above the actual size, so
+the creep gate stands.

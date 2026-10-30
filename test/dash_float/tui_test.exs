@@ -1220,9 +1220,10 @@ defmodule DashFloat.TUITest do
     assert state.history == ["hello tui"]
     assert system_entries(state) == []
 
-    # The footer under the composer names the configured model (label
-    # fallback chain, ADR 0015 §2); the status bar keeps phase truth.
-    assert State.provider_label(state) == "test-model"
+    # The footer under the composer names provider and model (ADR 0015 §2's
+    # amendment: no settings entry matches, so the host degrades in); the
+    # status bar keeps phase truth.
+    assert State.provider_label(state) == "localhost - test-model"
     assert footer_text(state) =~ "test-model"
     refute status_text(state) =~ "test-model"
     assert status_text(state) =~ "Idle"
@@ -1355,14 +1356,17 @@ defmodule DashFloat.TUITest do
   ## and the picker state; /model is proven END TO END with a real agent and
   ## the loopback server — the switch must reach the NEXT request.
 
-  test "/title delivers the rename seam: the typed title, then the bare empty one" do
+  test "/title delivers the rename seam: the typed title, then the dialog's submit" do
     {:ok, pid} = start_tui()
 
     submit(pid, "/title fix the login")
     assert_receive {:set_title, ^pid, "fix the login"}, 1_000
 
-    # A command submit never flips the phase, so the bare form follows directly.
+    # Bare /title opens the dialog; Enter submits its draft through the same
+    # seam — the agent owns validation either way.
     submit(pid, "/title")
+    eventually(pid, fn s -> s.title_dialog != nil end)
+    press(pid, "enter")
     assert_receive {:set_title, ^pid, ""}, 1_000
   end
 
@@ -1405,6 +1409,88 @@ defmodule DashFloat.TUITest do
 
     press(pid, "esc")
     eventually(pid, fn s -> s.palette == nil end)
+  end
+
+  ## The /title dialog (issue #106) driven through the app: the default fake
+  ## agent (this test process) answers with the title pushes.
+
+  describe "the /title dialog" do
+    defp open_dialog(pid) do
+      submit(pid, "/title")
+      eventually(pid, fn s -> s.title_dialog != nil end)
+    end
+
+    test "bare /title opens the dialog pre-filled from the mount title" do
+      {:ok, pid} = start_tui(title: "Booted Title")
+
+      state = open_dialog(pid)
+
+      assert state.title_dialog == %{draft: "Booted Title", error: nil}
+    end
+
+    test "enter sends the draft; the agent's {:title, _} closes the dialog and updates" do
+      {:ok, pid} = start_tui(title: "Old")
+
+      open_dialog(pid)
+      type(pid, "Name")
+      press(pid, "enter")
+
+      assert_receive {:set_title, ^pid, "OldName"}, 1_000
+
+      # The dialog is still open, error cleared, until the agent's reply.
+      assert get_state(pid).title_dialog == %{draft: "OldName", error: nil}
+
+      send(pid, {:title, "OldName"})
+      state = eventually(pid, fn s -> s.title_dialog == nil end)
+      assert state.title == "OldName"
+    end
+
+    test "the agent's {:title_refused, _} errors the open dialog, draft kept" do
+      {:ok, pid} = start_tui()
+      open_dialog(pid)
+      type(pid, "Taken")
+      press(pid, "enter")
+
+      assert_receive {:set_title, ^pid, "Taken"}, 1_000
+
+      reason = ~s("Taken" is already taken by session 0192aa10-b002-7c00-8000-00000000000c)
+      send(pid, {:title_refused, reason})
+
+      state = eventually(pid, fn s -> s.title_dialog.error != nil end)
+      assert state.title_dialog == %{draft: "Taken", error: reason}
+    end
+
+    test "esc closes the dialog and nothing is sent" do
+      {:ok, pid} = start_tui()
+
+      open_dialog(pid)
+      press(pid, "esc")
+
+      eventually(pid, fn s -> s.title_dialog == nil end)
+      refute_received {:set_title, _, _}
+    end
+
+    test "a paste feeds the open dialog's draft, not the composer" do
+      {:ok, pid} = start_tui()
+      open_dialog(pid)
+
+      inject(pid, %ExRatatui.Event.Paste{content: "pasted name\r\n"})
+
+      state = eventually(pid, fn s -> s.title_dialog == %{draft: "pasted name", error: nil} end)
+      assert State.input_text(state) == ""
+    end
+
+    test "the agent's pushes reach the state with no dialog open" do
+      {:ok, pid} = start_tui()
+
+      send(pid, {:title, "Inline Title"})
+      assert eventually(pid, &(&1.title == "Inline Title")).title_dialog == nil
+
+      send(pid, {:title_refused, "may not be empty"})
+      state = eventually(pid, &(&1.title == "Inline Title"))
+      assert state.title_dialog == nil
+      assert state.entries == []
+    end
   end
 
   # A final-only episode: one content frame, then DONE — the agent returns to
@@ -2567,15 +2653,17 @@ defmodule DashFloat.TUITest do
     assert bare.selection == nil
 
     # down at log row 1 ("selectable line 1"), drag to row 3, release.
-    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 3, y: 3})
+    # (16 lines in the 15-row idle viewport: follow pins the bottom, so the
+    # view sits at scroll 1 — screen row 3 is display row 1.)
+    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 4, y: 3})
     drag = eventually(pid, &(&1.selection != nil))
     assert drag.selection.anchor == {1, 2}
 
-    inject(pid, %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 5, y: 5})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 6, y: 5})
     extended = get_state(pid)
     assert extended.selection.head == {3, 4}
 
-    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 5, y: 5})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 6, y: 5})
     released = get_state(pid)
 
     # The highlight stays after the copy (terminal convention)…
@@ -2587,8 +2675,8 @@ defmodule DashFloat.TUITest do
     assert State.selection_text(released) == "lectable line 1\n\nselec"
 
     # Click-to-clear: a press+release without extension clears it.
-    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 3, y: 3})
-    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 3, y: 3})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 4, y: 3})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 4, y: 3})
     cleared = get_state(pid)
     assert cleared.selection == nil
   end
@@ -2609,9 +2697,9 @@ defmodule DashFloat.TUITest do
              threaded =
                Enum.reduce(
                  [
-                   %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3},
-                   %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 12, y: 3},
-                   %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 12, y: 3}
+                   %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 4},
+                   %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 13, y: 4},
+                   %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 13, y: 4}
                  ],
                  test_state,
                  fn event, acc ->
@@ -2634,8 +2722,8 @@ defmodule DashFloat.TUITest do
     dragging =
       Enum.reduce(
         [
-          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3},
-          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 12, y: 3}
+          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 4},
+          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 13, y: 4}
         ],
         live,
         fn event, acc ->
@@ -2644,7 +2732,7 @@ defmodule DashFloat.TUITest do
         end
       )
 
-    up = %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 12, y: 3}
+    up = %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 13, y: 4}
 
     output =
       ExUnit.CaptureIO.capture_io(fn ->

@@ -523,14 +523,19 @@ defmodule DashFloat.Agent do
         resolve_title(%{state | ui: ui}, cleaned)
 
       {:error, :empty} ->
+        # The refusal rides the dialog too (issue #106): the display-only
+        # push and the entry carry the same human text.
+        display(ui, {:title_refused, "may not be empty"})
         display(ui, {:entry, :system, "[title not set: may not be empty]"})
         {:noreply, state}
 
       {:error, :too_long} ->
+        display(ui, {:title_refused, "may not exceed 80 characters"})
         display(ui, {:entry, :system, "[title not set: may not exceed 80 characters]"})
         {:noreply, state}
 
       {:error, :reserved} ->
+        display(ui, {:title_refused, "may not look like a session id"})
         display(ui, {:entry, :system, "[title not set: may not look like a session id]"})
         {:noreply, state}
     end
@@ -1394,6 +1399,7 @@ defmodule DashFloat.Agent do
       n ->
         title = candidate(proposal, n)
         new_state = persist(%{state | session_title: title, title_ref: nil})
+        display(new_state.ui, {:title, title})
         display(new_state.ui, {:entry, :system, "[session titled: #{title}]"})
         {:noreply, new_state}
     end
@@ -1412,6 +1418,7 @@ defmodule DashFloat.Agent do
   # sets, and confirms; persist just has no file to rewrite.
   defp resolve_title(%__MODULE__{session_dir: nil} = state, cleaned) do
     new_state = persist_if_started(%{state | session_title: cleaned})
+    display(state.ui, {:title, cleaned})
     display(state.ui, {:entry, :system, "[session titled: #{cleaned}]"})
     {:noreply, new_state}
   end
@@ -1420,10 +1427,16 @@ defmodule DashFloat.Agent do
     case Title.title_holder(dir, cleaned, id) do
       nil ->
         new_state = persist_if_started(%{state | session_title: cleaned})
+        display(state.ui, {:title, cleaned})
         display(state.ui, {:entry, :system, "[session titled: #{cleaned}]"})
         {:noreply, new_state}
 
       holder ->
+        display(
+          state.ui,
+          {:title_refused, ~s("#{cleaned}" is already taken by session #{holder})}
+        )
+
         display(
           state.ui,
           {:entry, :system,
