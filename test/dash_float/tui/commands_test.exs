@@ -5,10 +5,10 @@ defmodule DashFloat.TUI.CommandsTest do
   alias DashFloat.TUI.Commands
 
   describe "all/0" do
-    test "the seven registry commands, each described, none aliased" do
+    test "the eight registry commands, each described, none aliased" do
       commands = Commands.all()
 
-      assert Enum.map(commands, & &1.name) == ~w(clear help mode model profile quit title)
+      assert Enum.map(commands, & &1.name) == ~w(clear compact help mode model profile quit title)
       assert Enum.all?(commands, &(&1.description != "" and &1.aliases == []))
     end
   end

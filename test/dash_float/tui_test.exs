@@ -1312,6 +1312,13 @@ defmodule DashFloat.TUITest do
     assert_receive {:set_title, ^pid, ""}, 1_000
   end
 
+  test "/compact delivers to the agent as {:compact, pid}" do
+    {:ok, pid} = start_tui()
+
+    submit(pid, "/compact")
+    assert_receive {:compact, ^pid}, 1_000
+  end
+
   test "/mode plan reaches the agent through shift+tab's seam" do
     {:ok, pid} = start_tui()
 

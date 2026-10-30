@@ -2,7 +2,11 @@
 
 - **Status:** Accepted (design; start go given by the owner Oct 27 on the PA's
   lane framing, Oct 26 owner shaping recorded in
-  [issue #43](https://github.com/fluxvale/dashfloat/issues/43)).
+  [issue #43](https://github.com/fluxvale/dashfloat/issues/43));
+  **amended 2026-10-30** ([issue #92](https://github.com/fluxvale/dashfloat/issues/92) —
+  manual `/compact`; see
+  [Amendment (2026-10-30, issue #92): manual /compact](#amendment-2026-10-30-issue-92-manual-compact)
+  below).
 - **Date:** 2026-10-29
 - **Implements:** [issue #43](https://github.com/fluxvale/dashfloat/issues/43) —
   the context half of Phase 4 of the
@@ -133,6 +137,9 @@ exactly one check. Consequences:
 - Compaction covers resumed sessions at their first prompt — ADR 0014 §6's
   "no truncation, no accounting" clause ends here, at the seam it reserved.
 - Mid-turn mutation is structurally impossible: there is no second hook.
+  *(Amended 2026-10-30: the [`/compact`
+  seam](#amendment-2026-10-30-issue-92-manual-compact) below adds an
+  idle-only entry point to this same pass — still never mid-turn.)*
 - Eviction rewrites the session file immediately (the compacted list plus its
   record, §6), so the persisted session and the next request agree — and the
   dropped turns are absent from both (issue #43's visibility clause).
@@ -253,8 +260,10 @@ no prompt for an instruction to steer. The seam this slice leaves:
   and accept the old-binary drop.
 - **Bumping the session schema to v2** — rejected: no existing field's
   *reading* changes; ADR 0014 built the v1 additive seam for exactly this.
-- **Summarization, `/compact` command, instruction plumbing** — out of scope:
-  stage 2 (issue #43's staging; §8).
+- **Summarization, instruction plumbing** — out of scope: stage 2 (issue
+  #43's staging; §8). The `/compact` half of this line graduated in the
+  [2026-10-30 amendment](#amendment-2026-10-30-issue-92-manual-compact)
+  below.
 
 ## Consequences
 
@@ -308,3 +317,54 @@ no prompt for an instruction to steer. The seam this slice leaves:
 9. **Stage-2 seam:** a profile `settings.compaction` loads without the
    unknown-key warning and changes nothing — the loaded `Config` is
    field-identical with and without it.
+
+## Amendment (2026-10-30, issue #92): manual `/compact`
+
+**Status:** Accepted. The owner's v0.2.0 smoke test
+([issue #92](https://github.com/fluxvale/dashfloat/issues/92)) asked how to
+trigger compaction manually — it was prompt-time-automatic only. `/compact`
+joins the command surface ([ADR 0020](0020-command-surface.md)) as a registry
+entry whose action is one plain send, `{:compact, ui}`, to the agent — which
+runs **the same eviction the prompt-time hook runs**: `maybe_compact`'s
+compacting branch is extracted into one shared pass (plan, mutate, record,
+persist, announce; §4–§6 above, unchanged). No second compaction
+implementation exists; the automatic path behaves identically.
+
+1. **The same ~80% trigger governs the manual path.** Below it, `/compact`
+   is a no-op whose feedback entry reports where the estimate stands —
+   `[context: at or under the 80% trigger — nothing to compact (est 940 of
+   2000, 47.0%)]` (`Accounting.usage/3`, §7; "at or under" because the
+   trigger is *strictly past* 80%, §3). Three reasons:
+   - Under drop-oldest, eviction is pure discard — stage-2 summarization
+     (§8) does not exist yet — so compacting a mostly-empty window destroys
+     context the next request could have carried, reclaiming nothing that
+     is at risk.
+   - Forcing eviction below the trigger needs either a second `Accounting`
+     API (a zero-threshold compact degenerates, by the
+     one-remaining-turn rule, into "drop everything but the last turn") or
+     a forked loop with different stop conditions — the fork the issue
+     forbids.
+   - The control the owner asked for is timing, not semantics: the command
+     runs the check **now** instead of waiting for the next prompt to trip
+     it. When turns do drop, the entry is the automatic path's entry
+     verbatim (`[context: dropped N oldest turn(s) — est B→A of W]`), the
+     drop is recorded in `compactions` like any other, and an oversize
+     survivor (§4) warns identically from either path.
+2. **Idle-only.** `{:compact, ui}` is accepted in `status: :idle` only —
+   alongside the prompt hook, one of the two points where the message list
+   is stable. §5's "mid-turn mutation is structurally impossible"
+   invariant stands: no mutation path can fire mid-turn, and a compact sent
+   while a turn is open is ignored like a busy prompt (the TUI gates
+   command submission on idle, submit's own gate, so that clause is
+   race-only defense). Idle-gating also protects the anchor: a mid-episode
+   drop would desync the `request_len` measurement minted at episode start
+   (§1).
+3. **Persistence matches the mutation.** A dropping `/compact` rewrites the
+   session file immediately (compacted list plus `compactions` record, §6).
+   A pass that dropped nothing — the below-trigger no-op and the oversize
+   warning alike — writes nothing at all: there is nothing to save, a
+   failed-save notice on an unchanged session would be noise, and an
+   unprompted launch must leave nothing behind (ADR 0014 §5). With no
+   configured window (or no resolved provider) the command says so —
+   `[context: no context window configured — nothing to compact]` — §2's
+   "nothing is guessed" governs the manual path too.

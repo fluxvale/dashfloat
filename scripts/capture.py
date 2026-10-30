@@ -19,8 +19,11 @@ Usage (from a worktree root, against the CURRENT tree's code):
     scripts/capture.py still --scenario first-run  --out FILE.png
     scripts/capture.py still --scenario mid-session --no-ghost --out FILE.png
     scripts/capture.py still --scenario ghost       --out FILE.png
+    scripts/capture.py still --scenario compact-session    --out FILE.png
+    scripts/capture.py still --scenario slash-autocomplete --out FILE.png
     scripts/capture.py probe [--window-ms 1500] [--after-exchange]
     scripts/capture.py gif   --out FILE.gif
+    scripts/capture.py gif   --scenario slash-autocomplete --out FILE.gif
 
 Scenarios:
     first-run   fresh session: composer empty, no exchanges yet
@@ -29,7 +32,19 @@ Scenarios:
                  the suggester's ghost lands there — the ghost is its own
                  scenario)
     ghost       after a completed exchange + suggest side-request landed
+    compact-session
+                a resumed fixture session (two ~20 KB turns, no anchor) over
+                the 80% trigger of its 20000-token window: /compact drops the
+                oldest turn and the [context: dropped ...] entry lands
+    slash-autocomplete
+                the draft is "/" (still) or "/c" mid-typing (gif): the
+                command popup, /compact included
     probe       idle byte-rate: 0 bytes over the window == 0 renders/s
+
+The scratch root is hermetic: XDG_CONFIG_HOME and XDG_DATA_HOME both point
+at it, so settings, keys, and session files (including the compact-session
+fixture) land in the scratch — never in the user's real ~/.config or
+~/.local/share.
 
 The mock answers SSE streams (`stream: true`), the suggest side-request,
 the auto-title side-request, and /models — enough for a full session.
@@ -48,6 +63,7 @@ import sys
 import termios
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pyte
@@ -140,6 +156,37 @@ def _brighten(hexcolor: str) -> str:
     return "#%02x%02x%02x" % (min(255, r + 48), min(255, g + 48), min(255, b + 48))
 
 
+def scratch_dir() -> str:
+    """The per-run scratch root: config and data (XDG_CONFIG_HOME and
+    XDG_DATA_HOME) both live here, so captures never touch the user's
+    real home."""
+    return f"/tmp/opencode/dashfloat-capture-{os.getpid()}"
+
+
+def write_compact_fixture(scratch: str) -> str:
+    """The compact-session fixture: a session file whose two user/assistant
+    turns carry ~20 KB messages (~5000 heuristic tokens each, bytes/4) and
+    no anchor. Resumed under a 20000-token window the estimate (~20000)
+    sits over the 80% trigger (16000) with two droppable turns — /compact
+    drops exactly the oldest one. Returns the session id."""
+    session_id = str(uuid.uuid4())
+    messages = []
+    for turn in ("one", "two"):
+        filler = f"turn {turn} filler " + "x" * 19985
+        messages.append({"role": "user", "content": filler})
+        messages.append({"role": "assistant", "content": filler})
+    sessions = f"{scratch}/dashfloat/sessions"
+    os.makedirs(sessions, exist_ok=True)
+    with open(f"{sessions}/{session_id}.json", "w") as f:
+        json.dump({
+            "version": 1,
+            "id": session_id,
+            "created_at": "2026-10-30T00:00:00Z",
+            "messages": messages,
+        }, f)
+    return session_id
+
+
 class MockHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # silence — the mock never talks over the capture
@@ -192,7 +239,8 @@ class MockHandler(BaseHTTPRequestHandler):
 class App:
     """The real TUI under a real pty, plus the capture operations."""
 
-    def __init__(self, mix_args=("run", "--no-halt"), no_ghost=False):
+    def __init__(self, mix_args=("run", "--no-halt"), no_ghost=False,
+                 context=524288, resume=None):
         self.sink = None  # callable(bytes) set during read loop
         self.screen = pyte.Screen(COLS, ROWS)
         self.stream = pyte.ByteStream(self.screen)
@@ -209,7 +257,7 @@ class App:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         port = self.server.server_address[1]
 
-        scratch = f"/tmp/opencode/dashfloat-capture-{os.getpid()}"
+        scratch = scratch_dir()
         os.makedirs(f"{scratch}/dashfloat", exist_ok=True)
         base = f"http://127.0.0.1:{port}/v1"
         with open(f"{scratch}/dashfloat/settings.json5", "w") as f:
@@ -224,7 +272,7 @@ class App:
                 "    providers: [{\n"
                 "      label: 'mock',\n"
                 f"      baseUrl: '{base}',\n"
-                "      models: [{ nickname: 'Sol', model: 'glm-5.3', context: 524288 }],\n"
+                f"      models: [{{ nickname: 'Sol', model: 'glm-5.3', context: {context} }}],\n"
                 "    }],\n"
                 "  }],\n"
                 "}\n"
@@ -235,12 +283,18 @@ class App:
         env = dict(os.environ)
         env.update({
             "XDG_CONFIG_HOME": scratch,
+            # Sessions land under the XDG data dir (Session.dir/0) — point
+            # it at the scratch too, so resume fixtures and saves stay
+            # hermetic (never the user's ~/.local/share).
+            "XDG_DATA_HOME": scratch,
             "TERM": "xterm-256color",
             # Dev may recompile on entry; keep that noise out of the boot.
             "MIX_ENV": "dev",
         })
         if no_ghost:
             env["DASHFLOAT_SUGGEST"] = "false"
+        if resume:
+            mix_args = ("run", "--no-halt", "--", "--resume", resume)
         self.pid, self.master = pty.fork()
         if self.pid == 0:
             os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -381,11 +435,14 @@ class App:
         self.render(crop_rows=crop_rows).save(path)
         print(f"still  {path} ({os.path.getsize(path)} bytes)")
 
-    def gif(self, path: str, fps=10, crop_rows=12):
+    def gif(self, path: str, fps=10, crop_rows=12, min_span=0.0):
         """Render the marked window as frames. The replay screen is fed the
         FULL byte history from boot up to each frame's horizon, so every
         frame carries the complete UI (static chrome included); the window
-        itself starts at the mark."""
+        itself starts at the mark. `min_span` (seconds) extends the frame
+        count past the last byte event — an idle app emits nothing, but the
+        final state must still fall inside a frame horizon (Pillow merges
+        pixel-identical frames, so trailing duplicates cost nothing)."""
         if self._mark is None:
             raise RuntimeError("no recording mark was set")
         metrics = self._metrics(scale=2)
@@ -401,7 +458,11 @@ class App:
             _, chunk = events.pop(0)
             self.feed(chunk)
         window = [e for e in events if e[0] >= self._mark]
-        n_frames = max(1, int((window[-1][0] - self._mark) * 1000 / step))
+        n_frames = max(
+            1,
+            int((window[-1][0] - self._mark) * 1000 / step),
+            int(min_span * 1000 / step),
+        )
         for i in range(n_frames):
             horizon = self._mark + (i + 1) * step / 1000
             while events and events[0][0] <= horizon:
@@ -434,6 +495,12 @@ class App:
         self.wait_for(GHOST_TEXT, timeout=10)
         time.sleep(0.4)                # the ghost's render to land
 
+    def scenario_compact_session(self):
+        self.type("/compact")
+        self.send(b"\r")
+        self.wait_for("dropped 1 oldest turn(s)")
+        self.wait_quiet()              # the entry settled; composer empty
+
     def close(self):
         self._alive = False
         try:
@@ -456,8 +523,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["still", "probe", "gif"])
     ap.add_argument("--scenario", default="first-run",
-                    choices=["first-run", "mid-session", "ghost"])
+                    choices=["first-run", "mid-session", "ghost",
+                             "compact-session", "slash-autocomplete"])
     ap.add_argument("--out", default=None)
+    # The compact-session flow shoots TWO stills: --out after the drop,
+    # --out2 after the follow-up no-op command (its below-trigger entry).
+    ap.add_argument("--out2", default=None)
     ap.add_argument("--window-ms", type=int, default=1500)
     ap.add_argument("--after-exchange", action="store_true")
     # The mid-session STILL must show a BLANK composer: with suggestions
@@ -469,7 +540,16 @@ def main():
     if args.mode in ("still", "gif") and not args.out:
         ap.error(f"{args.mode} requires --out FILE")
 
-    app = App(no_ghost=args.no_ghost)
+    # The compact-session scenario boots from a fixture session file written
+    # BEFORE the app starts: a 20000-token window whose trigger the resumed
+    # transcript (two ~20 KB turns, no anchor) sits over.
+    resume = None
+    if args.scenario == "compact-session":
+        resume = write_compact_fixture(scratch_dir())
+
+    app = App(no_ghost=args.no_ghost,
+              context=20000 if args.scenario == "compact-session" else 524288,
+              resume=resume)
     try:
         if args.mode == "probe":
             if args.after_exchange:
@@ -482,7 +562,41 @@ def main():
                 app.scenario_mid_session()
             elif args.scenario == "ghost":
                 app.scenario_ghost()
-            app.screenshot(args.out)
+            elif args.scenario == "compact-session":
+                # Both stills in one run: the drop, then the follow-up
+                # no-op command's below-trigger entry.
+                app.scenario_compact_session()
+                app.screenshot(args.out)
+                if args.out2:
+                    app.type("/compact")
+                    app.send(b"\r")
+                    app.wait_for("at or under the 80% trigger")
+                    app.wait_quiet()
+                    app.screenshot(args.out2)
+            elif args.scenario == "slash-autocomplete":
+                app.type("/")
+                time.sleep(0.4)        # the popup renders
+            if args.scenario != "compact-session":
+                app.screenshot(args.out)
+        elif args.scenario == "slash-autocomplete":
+            # The popup opening AND narrowing: "/" opens the full list, "c"
+            # narrows it to /clear + /compact. The narrowed state is ASSERTED
+            # before recording — a keystroke lost in flight must fail the
+            # capture, not ship a GIF where nothing happens (#92 review).
+            app._mark = time.monotonic()
+            app.type("/c", per_key=0.5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                screen = app.text()
+                if "compact" in screen and "/help" not in screen:
+                    break
+                time.sleep(0.1)
+            else:
+                raise TimeoutError("the narrowed command popup never rendered")
+            time.sleep(0.5)                # a settled beat on the narrowed list
+            # 16 rows: the narrowed popup rides higher than the full list,
+            # and /clear + /compact must be legible in the final frame.
+            app.gif(args.out, crop_rows=16, min_span=1.5)
         else:
             app.type("what is elixir?")
             app.send(b"\r")

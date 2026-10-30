@@ -213,6 +213,14 @@ defmodule DashFloat.TUI do
     state
   end
 
+  # /compact (issue #92): a plain send — the agent runs ADR 0022's eviction
+  # pass and owns every feedback entry; the command path is idle-gated like
+  # submit.
+  defp run_action(:compact, state) do
+    send(state.agent, {:compact, self()})
+    state
+  end
+
   # /model's switch is a plain send and NOTHING else: the agent reads its
   # provider per episode, so the swap lands on the NEXT request; no local
   # change (State already swapped its provider copy) and no catalog restart
