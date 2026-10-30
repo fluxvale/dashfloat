@@ -1677,6 +1677,58 @@ defmodule DashFloat.TUI.StateTest do
       assert State.effective_scroll(state, 20) == 182
     end
 
+    # Typing snaps the transcript to the tail (issue #110): any composer
+    # EDIT while the view rests above the bottom re-pins immediately — the
+    # keystroke is the requirement, not focus, and no timer rides this.
+    test "a draft-editing keystroke re-pins the log to the tail" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      refute paged.follow?
+
+      {typed, nil} = State.handle_key(paged, "h", [])
+      assert typed.follow?
+      assert typed.scroll == 0
+      assert State.effective_scroll(typed, 20) == 180
+      assert State.input_text(typed) == "h"
+    end
+
+    test "backspace editing an existing draft re-pins too" do
+      base = full_state(100)
+      {drafted, nil} = State.handle_key(base, "a", [])
+      {paged, nil} = State.handle_key(drafted, "page_up", [])
+      refute paged.follow?
+
+      {edited, nil} = State.handle_key(paged, "backspace", [])
+      assert edited.follow?
+      assert State.input_text(edited) == ""
+    end
+
+    test "a paste re-pins the log to the tail" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      refute paged.follow?
+
+      pasted = State.paste(paged, "pasted text")
+      assert pasted.follow?
+      assert State.input_text(pasted) == "pasted text"
+    end
+
+    # The negative space, recorded (issue #110's decision): cursor-only
+    # keys and history navigation are not "entering text" — the view stays
+    # where the reader put it.
+    test "cursor-only keys and history navigation do NOT re-pin" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      refute paged.follow?
+
+      {moved, nil} = State.handle_key(paged, "left", [])
+      refute moved.follow?
+
+      with_history = %{paged | history: ["old"]}
+      {recalled, nil} = State.handle_key(with_history, "up", [])
+      refute recalled.follow?
+    end
+
     test "follow pins to the bottom as content grows" do
       state = full_state(50)
       assert State.effective_scroll(state, 20) == 80
@@ -2864,6 +2916,46 @@ defmodule DashFloat.TUI.StateTest do
       assert back == typed
     end
 
+    # Tab completes to the SELECTED match (issue #105; ADR 0020's
+    # 2026-10-31 amendment): "/name " — trailing space closes the popup and
+    # leaves room for args; the cursor lands at the end, editable.
+    test "tab completes the draft to the highlighted match with a trailing space" do
+      typed = type(new_state(), "/mod")
+
+      assert Enum.map(typed.palette.items, & &1.name) == ["mode", "model"]
+
+      {completed, nil} = State.handle_key(typed, "tab", [])
+
+      assert State.input_text(completed) == "/mode "
+      assert completed.palette == nil
+    end
+
+    test "tab honors the arrow-key selection, not just the head of the list" do
+      state =
+        new_state()
+        |> type("/mod")
+        |> press("down", [])
+
+      assert state.palette.selected == 1
+
+      {completed, nil} = State.handle_key(state, "tab", [])
+
+      assert State.input_text(completed) == "/model "
+      assert completed.palette == nil
+    end
+
+    test "a completion from a history-recalled draft leaves history" do
+      recalled = press(%{new_state() | history: ["/mode"]}, "up", [])
+
+      assert recalled.history_index == 0
+      assert %{mode: :filter} = recalled.palette
+
+      {completed, nil} = State.handle_key(recalled, "tab", [])
+
+      assert completed.history_index == nil
+      assert State.input_text(completed) == "/mode "
+    end
+
     test "up/down move the popup selection and never touch history" do
       moved =
         new_state()
@@ -3415,6 +3507,117 @@ defmodule DashFloat.TUI.StateTest do
       refute State.provider_images?(incapable)
       refute State.provider_images?(new_state())
       refute State.provider_images?(unresolved)
+    end
+
+    # The drag-and-drop shape (issue #112; ADR 0018's 2026-10-31
+    # amendment): a bracketed paste whose whole content is a path to an
+    # existing image file becomes a pending chip — never literal path text.
+    test "a pasted image path attaches instead of typing" do
+      dir = images_dir()
+      path = write_image(dir, "dropped.png")
+
+      fresh = new_state(provider: @capable)
+      state = State.paste(fresh, path <> "\r\n")
+
+      assert state.attachments == [%{path: path, name: "dropped.png", kb: 1}]
+      assert State.input_text(state) == ""
+      assert state.entries == []
+    end
+
+    test "two drops number per queue order; a pop renumbers" do
+      dir = images_dir()
+      one = write_image(dir, "one.png")
+      two = write_image(dir, "two.png")
+
+      fresh = new_state(provider: @capable)
+
+      state =
+        fresh
+        |> State.paste(one)
+        |> then(&State.paste(&1, two))
+
+      assert Enum.map(state.attachments, & &1.path) == [one, two]
+
+      {popped, nil} = State.handle_key(state, "backspace", [])
+      assert Enum.map(popped.attachments, & &1.path) == [one]
+      assert State.input_text(popped) == ""
+    end
+
+    test "backspace with draft text edits the draft, not the chips" do
+      dir = images_dir()
+      path = write_image(dir, "dropped.png")
+
+      fresh = new_state(provider: @capable)
+
+      state =
+        fresh
+        |> State.paste(path)
+        |> then(&type(&1, "hi"))
+
+      {edited, nil} = State.handle_key(state, "backspace", [])
+      assert edited.attachments == [%{path: path, name: "dropped.png", kb: 1}]
+      assert State.input_text(edited) == "h"
+    end
+
+    test "a non-image paste stays ordinary text — even a path" do
+      dir = images_dir()
+      missing = Path.join(dir, "nope.png")
+      text = State.paste(new_state(), missing)
+
+      assert text.attachments == []
+      assert State.input_text(text) == missing
+
+      prose = State.paste(new_state(), "hello world")
+      assert prose.attachments == []
+      assert State.input_text(prose) == "hello world"
+
+      multi = State.paste(new_state(), "#{write_image(dir, "a.png")} and more")
+      assert multi.attachments == []
+      assert State.input_text(multi) == "#{Path.join(dir, "a.png")} and more"
+    end
+
+    test "a drop on a non-capable model refuses visibly; nothing typed" do
+      dir = images_dir()
+      path = write_image(dir, "dropped.png")
+
+      fresh = new_state(provider: @incapable)
+      state = State.paste(fresh, path)
+
+      assert state.attachments == []
+      assert State.input_text(state) == ""
+      assert [{:system, entry}] = pairs(state)
+      assert entry =~ "[images: model Sol does not accept images"
+    end
+
+    test "an empty paste stays ordinary (nothing to drop)" do
+      fresh = new_state(provider: @capable)
+      state = State.paste(fresh, "")
+      assert state.attachments == []
+      assert State.input_text(state) == ""
+    end
+
+    test "an over-cap dropped image refuses visibly through the shared check" do
+      dir = images_dir()
+      path = write_image(dir, "huge.png")
+      File.write!(path, :binary.copy("x", 10 * 1024 * 1024 + 1))
+
+      fresh = new_state(provider: @capable)
+      state = State.paste(fresh, path)
+
+      assert state.attachments == []
+      assert State.input_text(state) == ""
+      assert [{:system, entry}] = pairs(state)
+      assert entry =~ "exceeds the 10 MiB image cap"
+    end
+
+    test "a drop works mid-stream too — the queue only rides a submit" do
+      dir = images_dir()
+      path = write_image(dir, "dropped.png")
+
+      state = State.paste(%{new_state(provider: @capable) | phase: :streaming}, path)
+
+      assert Enum.map(state.attachments, & &1.path) == [path]
+      assert State.input_text(state) == ""
     end
 
     test "ctrl+o opens the prompt while idle; a second ctrl+o closes it" do

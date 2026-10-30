@@ -6,8 +6,10 @@ defmodule DashFloat.TUI do
   cancels, confirmation decisions, and mode switches (ADR 0016) are plain
   sends to the agent (ADR 0007) — the agent is the single voice streaming
   back into the UI, and this
-  process starts no tasks. The activity tick (ADR 0006) is the one timer this
-  process owns — scheduled only while work is in flight.
+  process starts no tasks. The activity tick (ADR 0006) and the idle
+  cursor blink (issue #104; ADR 0006's 2026-10-31 amendment — the first
+  sanctioned REPEATING idle timer) are the repeating timers this process
+  owns — the tick only while work is in flight, the blink only while idle.
 
   Run with `mix run --no-halt`. Quit with Ctrl+Q, or a double Ctrl+C: the
   first press shows a prompt, the second within two seconds exits
@@ -32,6 +34,13 @@ defmodule DashFloat.TUI do
 
   @tick :dashfloat_tick
   @tick_ms 125
+  # The idle cursor blink (issue #104; ADR 0006's 2026-10-31 amendment):
+  # a dedicated slow timer — riding the 125 ms activity tick would draw
+  # 8 frames/s idle; this draws 2. Sanctioned exception #5, the first
+  # REPEATING idle timer: bounded, honest, and recorded in the ADR with
+  # its measured rate.
+  @blink :dashfloat_blink
+  @blink_ms 500
   @exit_guard :dashfloat_exit_guard
   @suggest :dashfloat_suggest
 
@@ -74,6 +83,7 @@ defmodule DashFloat.TUI do
     |> State.claim_agent()
     |> maybe_start_catalog()
     |> herdr_report()
+    |> schedule_blink()
     |> then(&{:ok, &1})
   end
 
@@ -272,6 +282,22 @@ defmodule DashFloat.TUI do
     end
   end
 
+  # The idle cursor blink (issue #104; ADR 0006 amendment — sanctioned
+  # exception #5): staleness first (the tick's exact rule), then toggle and
+  # re-arm through the choke point — one frame per toggle, 2 frames/s at
+  # the 500 ms cadence, and nothing while active (the tick animates the
+  # active cursor) or in setup (no composer to blink over).
+  def handle_info(@blink, state) do
+    if stale_blink?(state) do
+      {:noreply, state, %{render?: false}}
+    else
+      state
+      |> State.blink()
+      |> Map.put(:blink_ref, nil)
+      |> schedule()
+    end
+  end
+
   # The exit-guard expiry (issue #28; ADR 0006 amendment — sanctioned
   # exception #3): a ONE-SHOT timer armed only by an explicit Ctrl+C. It
   # clears the transient prompt the moment the window dies — at most one
@@ -385,6 +411,13 @@ defmodule DashFloat.TUI do
   defp stale_suggest?(%{suggest_ref: nil}), do: true
   defp stale_suggest?(%{suggest_ref: ref}), do: Process.read_timer(ref) != false
 
+  # Same staleness rule for the blink timer (issue #104): no tracked
+  # timer, or one still pending, means the message is an orphan from a
+  # cancelled or superseded arm — dropped without a frame.
+  defp stale_blink?(%{blink_ref: nil}), do: true
+
+  defp stale_blink?(%{blink_ref: ref}), do: Process.read_timer(ref) != false
+
   # The debounce fired for real: clear the ref, then resolve the model
   # config and start the supervised side-request on the reply tail.
   defp dispatch_suggest(state) do
@@ -425,13 +458,15 @@ defmodule DashFloat.TUI do
   end
 
   # The single tick choke point (ADR 0006): any active phase keeps exactly one
-  # timer pending; idle always cancels it. Idle => no timers => no renders.
-  # The two sanctioned one-shot exceptions: the user-armed exit guard (issue
-  # #28) and the suggest debounce (sanctioned exception #4, ADR 0015 §3).
+  # timer pending; idle always cancels it — and, since issue #104, keeps
+  # exactly one blink timer pending instead (bounded, never both). The
+  # sanctioned one-shot exceptions: the user-armed exit guard (issue #28)
+  # and the suggest debounce (sanctioned exception #4, ADR 0015 §3).
   defp schedule(state) do
     state =
       state
       |> schedule_tick()
+      |> schedule_blink()
       |> schedule_guard(System.monotonic_time(:millisecond))
       |> suggest_reap()
       |> suggest_arm()
@@ -479,6 +514,46 @@ defmodule DashFloat.TUI do
         state
     end
   end
+
+  # The idle blink's arm (issue #104; ADR 0006 amendment — sanctioned
+  # exception #5): exactly one pending timer while the chat UI is idle —
+  # cancelled on every exit from idle (the active cursor rides the tick),
+  # re-armed on every return, the phase reset visible so the first idle
+  # frame always draws the cursor. Arming is live-only by default: the
+  # hermetic suite never arms one (the suggest-arm pattern); an injected
+  # `blink_ms:` opts a test in at its own cadence. A fired-but-undrained
+  # timer is left alone — its message drains through the staleness check.
+  defp schedule_blink(%{blink_ref: nil} = state) do
+    if blinkable?(state), do: arm_blink(state), else: reset_blink(state)
+  end
+
+  defp schedule_blink(%{blink_ref: ref} = state) when is_reference(ref) do
+    cond do
+      not blinkable?(state) ->
+        Process.cancel_timer(ref)
+        reset_blink(%{state | blink_ref: nil})
+
+      Process.read_timer(ref) == false ->
+        # Fired but not yet drained: the toggle is already queued.
+        state
+
+      true ->
+        state
+    end
+  end
+
+  defp blinkable?(%{live?: false, blink_ms: nil}), do: false
+
+  defp blinkable?(%{setup: nil, phase: :idle}), do: true
+
+  defp blinkable?(_state), do: false
+
+  defp arm_blink(%{blink_ms: ms} = state),
+    do: %{state | blink_ref: Process.send_after(self(), @blink, ms || @blink_ms)}
+
+  defp reset_blink(%{blink_on: true} = state), do: state
+
+  defp reset_blink(state), do: %{state | blink_on: true}
 
   # Exactly one expiry timer per armed window: disarm cancels a pending
   # timer, arming schedules one when none is live, a fired-but-undrained

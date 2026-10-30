@@ -1155,15 +1155,16 @@ defmodule DashFloat.TUI.ViewTest do
       assert placeholder(input(fresh_ghost)) == "try asking about elixir"
     end
 
-    # The attachment chip (ADR 0018 §5): the title carries the pending count.
-    test "the title shows the 📎 n chip only while attachments are pending" do
+    # The attachment chips (ADR 0018's 2026-10-31 amendment): the title
+    # carries one numbered chip per pending attachment, in queue order.
+    test "the title shows numbered [Image #n] chips only while attachments are pending" do
       assert input_title(new_state()).content == "❯ "
 
       one = %{new_state() | attachments: [%{path: "p", name: "a.png", kb: 1}]}
-      assert input_title(one).content == "❯ 📎 1"
+      assert input_title(one).content == "❯ [Image #1]"
 
       two = %{one | attachments: one.attachments ++ [%{path: "q", name: "b.jpg", kb: 2}]}
-      assert input_title(two).content == "❯ 📎 2"
+      assert input_title(two).content == "❯ [Image #1] [Image #2]"
     end
 
     defp input_title(state) do
@@ -1174,8 +1175,9 @@ defmodule DashFloat.TUI.ViewTest do
     defp placeholder({widget, _rect}), do: widget.placeholder
   end
 
-  # The composer's cursor artifact (ADR 0015 §1): focus-gated, static at
-  # idle, blink-riding-the-tick in active phases.
+  # The composer's cursor artifact (ADR 0015 §1, amended by issue #104):
+  # focus-gated, blink-toggled at idle, blink-riding-the-tick in active
+  # phases.
   describe "input cursor" do
     defp cursor_style(state) do
       {widget, _rect} = input(state)
@@ -1189,11 +1191,26 @@ defmodule DashFloat.TUI.ViewTest do
       end
     end
 
-    test "focused and idle: static reversed, regardless of anim_step (zero timers)" do
+    test "focused and idle: the blink phase gates the artifact (issue #104)" do
       for step <- 0..7 do
         state = %{new_state() | phase: :idle, anim_step: step}
         assert cursor_style(state) == Theme.style(:cursor), "step #{step}"
       end
+
+      # The idle blink (ADR 0006's 2026-10-31 amendment): blink_on false is
+      # the invisible half-period — the toggle frame's whole content.
+      for step <- 0..7 do
+        state = %{new_state() | phase: :idle, anim_step: step, blink_on: false}
+        assert cursor_style(state) == %ExRatatui.Style{}, "step #{step}"
+      end
+    end
+
+    test "blink/1 toggles the phase and nothing else" do
+      base = %{new_state() | phase: :idle}
+      off = State.blink(base)
+      assert off.blink_on == false
+      on = State.blink(off)
+      assert on.blink_on == true
     end
 
     # Prominence regression (#91): reversed alone inherits the terminal's
