@@ -1213,9 +1213,10 @@ defmodule DashFloat.TUITest do
     assert state.history == ["hello tui"]
     assert system_entries(state) == []
 
-    # The footer under the composer names the configured model (label
-    # fallback chain, ADR 0015 §2); the status bar keeps phase truth.
-    assert State.provider_label(state) == "test-model"
+    # The footer under the composer names provider and model (ADR 0015 §2's
+    # amendment: no settings entry matches, so the host degrades in); the
+    # status bar keeps phase truth.
+    assert State.provider_label(state) == "localhost - test-model"
     assert footer_text(state) =~ "test-model"
     refute status_text(state) =~ "test-model"
     assert status_text(state) =~ "Idle"

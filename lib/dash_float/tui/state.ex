@@ -17,6 +17,7 @@ defmodule DashFloat.TUI.State do
 
   alias DashFloat.Accounting
   alias DashFloat.Config.Onboarding
+  alias DashFloat.Config.Presets
   alias DashFloat.Images
   alias DashFloat.Mode
   alias DashFloat.Tools
@@ -433,22 +434,56 @@ defmodule DashFloat.TUI.State do
   end
 
   @doc """
-  The status bar's model label ([ADR 0008](../../docs/decisions/0008-config-layout-profiles-json5.md)):
-  `"nickname (profile)"`, falling back to the bare nickname, then the model id.
+  The status footer's model label as `"<provider> - <model>"` — the provider
+  ladder and the dropped profile suffix are ADR 0015 §2's amendment (issue
+  #109): the base_url's preset label ([`DashFloat.Config.Presets.label/1`]),
+  else the active provider's settings label, else the URL host; the model
+  part is the nickname, else the id. nil only when nothing resolves — the
+  footer's "—" arm.
   """
   @spec provider_label(t()) :: String.t() | nil
   def provider_label(%__MODULE__{provider: {:ok, provider}}), do: label(provider)
   def provider_label(%__MODULE__{}), do: nil
 
-  defp label(%DashFloat.Config{nickname: nickname, profile: profile})
-       when is_binary(nickname) and is_binary(profile),
-       do: "#{nickname} (#{profile})"
+  defp label(%DashFloat.Config{nickname: nickname, model: model} = config) do
+    with model when is_binary(model) <- nickname || model,
+         provider when is_binary(provider) <- provider_name(config) do
+      "#{provider} - #{model}"
+    else
+      _missing -> nil
+    end
+  end
 
-  defp label(%DashFloat.Config{nickname: nickname}) when is_binary(nickname),
-    do: nickname
+  # The provider half of the footer label, in ADR 0015 §2's ladder order:
+  # (a) the base_url's preset ("zai" / "synthetic") — first-class, always
+  # ahead of the settings entry's (possibly host-defaulted) label; (b) the
+  # active provider's settings label; (c) the URL host (env-only boots,
+  # providers []). No base_url — nothing to classify.
+  defp provider_name(%DashFloat.Config{base_url: nil}), do: nil
 
-  defp label(%DashFloat.Config{model: model}) when is_binary(model), do: model
-  defp label(_other), do: nil
+  defp provider_name(%DashFloat.Config{base_url: base_url, providers: providers}) do
+    Presets.label(base_url) || settings_label(base_url, providers) || host_label(base_url)
+  end
+
+  defp settings_label(base_url, providers) do
+    case Enum.find(providers, fn provider ->
+           trim_slash(provider.base_url) == trim_slash(base_url)
+         end) do
+      nil -> nil
+      provider -> provider.label
+    end
+  end
+
+  # Same rule as Config's own host label: the URI host, else the raw string.
+  defp host_label(base_url) do
+    case URI.parse(base_url) do
+      %URI{host: nil} -> base_url
+      %URI{host: host} -> host
+    end
+  end
+
+  defp trim_slash(nil), do: nil
+  defp trim_slash(url), do: String.trim_trailing(url, "/")
 
   @doc "The selected model's image capability (ADR 0018 §1): true only for a resolved provider carrying `images: true`."
   @spec provider_images?(t()) :: boolean()

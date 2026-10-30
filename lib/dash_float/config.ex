@@ -32,8 +32,8 @@ defmodule DashFloat.Config do
   `DashFloat.Application` and rides into the TUI as a mount opt; the UI
   process performs no file I/O (ADR 0005's contract, unchanged — the
   startup wizard/modal is the sanctioned exception, ADR 0009). The status
-  bar shows the selected entry's nickname and profile via
-  `DashFloat.TUI.State.provider_label/1`.
+  footer names the provider and model via
+  `DashFloat.TUI.State.provider_label/1` (ADR 0015 §2's amendment).
 
   Malformed config degrades to the least-surprising working state with a
   warning naming the field or profile — never a crash, never silent

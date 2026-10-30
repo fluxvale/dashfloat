@@ -127,42 +127,101 @@ defmodule DashFloat.TUI.StateTest do
   end
 
   describe "provider_label/1" do
-    test "nickname and profile compose as \"nickname (profile)\"" do
-      provider =
+    # The footer label is "<provider> - <model>" (ADR 0015 §2's amendment,
+    # issue #109); the profile suffix is gone from the footer entirely.
+    test "a preset base_url names the preset — zai with a nickname, synthetic with one too" do
+      zai =
         {:ok,
          %DashFloat.Config{
-           base_url: "http://x",
+           base_url: "https://api.z.ai/api/coding/paas/v4",
            model: "glm-5.3",
            api_key: "k",
            nickname: "Sol",
-           profile: "work"
+           profile: "demo"
          }}
 
-      state = new_state(provider: provider)
-      assert State.provider_label(state) == "Sol (work)"
-    end
-
-    test "falls back to the bare nickname without a profile, then the model id" do
-      nickname_only =
+      synthetic =
         {:ok,
-         %DashFloat.Config{base_url: "http://x", model: "glm-5.3", api_key: "k", nickname: "Sol"}}
+         %DashFloat.Config{
+           base_url: "https://api.synthetic.new/openai/v1",
+           model: "glm-4.7",
+           api_key: "k",
+           nickname: "Sol"
+         }}
 
-      model_only = {:ok, %DashFloat.Config{base_url: "http://x", model: "glm-5.3", api_key: "k"}}
-
-      nickname_state = new_state(provider: nickname_only)
-      model_state = new_state(provider: model_only)
-      assert State.provider_label(nickname_state) == "Sol"
-      assert State.provider_label(model_state) == "glm-5.3"
+      zai_state = new_state(provider: zai)
+      synthetic_state = new_state(provider: synthetic)
+      assert State.provider_label(zai_state) == "zai - Sol"
+      assert State.provider_label(synthetic_state) == "synthetic - Sol"
     end
 
-    test "nil for an error provider, no provider, or a provider with no names" do
+    test "a preset match survives a trailing slash and beats a settings label" do
+      slashed =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "https://api.z.ai/api/coding/paas/v4/",
+           model: "glm-5.3",
+           api_key: "k",
+           nickname: "Sol",
+           # The settings entry's host-defaulted label loses to the preset:
+           # the presets are the first-class providers (ADR 0015 §2).
+           providers: [
+             %{
+               label: "api.z.ai",
+               base_url: "https://api.z.ai/api/coding/paas/v4",
+               api_key: "k"
+             }
+           ]
+         }}
+
+      slashed_state = new_state(provider: slashed)
+      assert State.provider_label(slashed_state) == "zai - Sol"
+    end
+
+    test "a custom provider shows the settings label, trailing slashes trimmed on both sides" do
+      custom =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "http://localhost:8080/v1/",
+           model: "llama",
+           api_key: "k",
+           nickname: "Sol",
+           providers: [
+             %{label: "homelab", base_url: "http://localhost:8080/v1", api_key: "k"}
+           ]
+         }}
+
+      custom_state = new_state(provider: custom)
+      assert State.provider_label(custom_state) == "homelab - Sol"
+    end
+
+    test "an unlabeled custom provider (env-only boots: providers []) degrades to the URL host" do
+      unlabeled =
+        {:ok,
+         %DashFloat.Config{base_url: "http://127.0.0.1:8080/v1", model: "llama", api_key: "k"}}
+
+      host_only =
+        {:ok,
+         %DashFloat.Config{base_url: "not a url", model: "llama", api_key: "k", nickname: "Sol"}}
+
+      unlabeled_state = new_state(provider: unlabeled)
+      host_only_state = new_state(provider: host_only)
+      assert State.provider_label(unlabeled_state) == "127.0.0.1 - llama"
+      assert State.provider_label(host_only_state) == "not a url - Sol"
+    end
+
+    test "nil for an error provider, no provider, no base_url, or no model part" do
       error_state = new_state(provider: {:error, "nope"})
       blank_state = new_state()
+      # No base_url — nothing to classify the provider from.
+      no_url = new_state(provider: {:ok, %DashFloat.Config{model: "glm-5.3", api_key: "k"}})
       # A Config with neither nickname nor model (hand-made, e.g. an
       # env-only shape) has no label — the view's placeholder takes over.
       nameless = new_state(provider: {:ok, %DashFloat.Config{base_url: "http://x", api_key: "k"}})
+
       assert State.provider_label(error_state) == nil
       assert State.provider_label(blank_state) == nil
+      assert State.provider_label(no_url) == nil
       assert State.provider_label(nameless) == nil
     end
   end

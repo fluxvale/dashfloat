@@ -10,6 +10,10 @@
   the footer gains tokens-used + percent-of-context from the accounting API
   and the top bar's `ctx` field is deleted; see
   [Amendment (2026-10-30, issue #67 stage 2)](#amendment-2026-10-30-issue-67-stage-2-tokens-used--percent-of-context)
+  below); **amended again 2026-10-31**
+  ([issue #109](https://github.com/fluxvale/dashfloat/issues/109) — the
+  footer's model span becomes `provider - model`; see
+  [Amendment (2026-10-31, issue #109)](#amendment-2026-10-31-issue-109-the-footers-model-span-becomes-provider---model)
   below).
 - **Date:** 2026-10-29
 - **Implements:** [issue #66](https://github.com/fluxvale/dashfloat/issues/66),
@@ -277,3 +281,42 @@ deleted with the field. The footer reads, left to right:
    (last-frame-wins banking at finalize). `{:usage, _}` frames still
    reconcile the rate's token count; the percent and totals now come only
    from the accounting API.
+
+## Amendment (2026-10-31, issue #109): the footer's model span becomes provider - model
+
+The owner's smoke test found the footer naming the model but not **which
+provider it sits under** — the profile identifies the config, not the
+endpoint. This amendment supersedes the span-composition line of §2 and of
+the [stage-2 amendment](#amendment-2026-10-30-issue-67-stage-2-tokens-used--percent-of-context)
+in one respect: the model span `<model>` becomes
+`<provider> - <model>`, so the footer reads
+`❯ <cwd> · <provider> - <model> · <used>/<window> · <percent>% · <rate> tok/s`.
+Still one compact span — never the full base_url, never a second span.
+
+1. **The provider ladder**, resolved at render time from the resolved
+   config, in precedence order (stated once, here):
+   - **(a) Preset match** — the base_url's entry in
+     `DashFloat.Config.Presets.label/1` ("zai" / "synthetic",
+     trailing-slash-insensitive like `suggest_model/1`). A preset URL
+     **always** reads its preset label, even when the settings entry
+     carries a (host-defaulted) label: the presets are the first-class
+     providers and the owner's examples use those names.
+   - **(b) Settings label** — the active profile's `providers` entry whose
+     `baseUrl` equals the config's (trailing slashes trimmed on both
+     sides), by its `label` — already explicit-or-host at parse time
+     ([ADR 0008](0008-config-layout-profiles-json5.md)). An explicitly
+     labeled custom URL shows that label.
+   - **(c) Host degrade** — no matching entry (env-only boots,
+     `providers: []`): the base_url's `URI.parse` host, else the raw
+     string. An unlabeled custom URL degrades here the same way.
+2. **The model part** is `nickname || model` — the issue's own examples:
+   `zai - glm-5.3` (id), `synthetic - fixer` (nickname).
+3. **The profile suffix moves out.** ADR 0008's `"nickname (profile)"`
+   footer form is retired — the issue asks for provider + model, not
+   profile; the profile stays reachable via `/profile`
+   ([ADR 0020](0020-command-surface.md)). nil still only when nothing
+   resolves (no provider classification) — the footer's "—" arm.
+4. **Cadence unchanged.** The span stays a render-time read of
+   `State.provider_label/1`, so `/model` and `/profile` switches show on
+   the next frame exactly as the model span always did — nothing new at
+   any agent seam ([ADR 0007](0007-tool-calls-and-execution.md)).
