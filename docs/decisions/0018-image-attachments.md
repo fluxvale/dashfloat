@@ -70,16 +70,22 @@ submit), then one image part per attachment:
 list verbatim, and atom- or string-keyed parts encode identically. Like
 every message, image parts ride the transcript for the session's life and
 are re-sent on every later episode of that conversation; token and billing
-accounting for re-sent images is provider-side. Assistant, tool, and system
-messages never carry parts.
+accounting for re-sent images is provider-side. The chars/4 heuristic
+([ADR 0022](0022-context-accounting-and-compaction.md) §1) weights a
+list-content message by its parts — the text and the data-URL bytes — so
+the context estimate (and the footer's percent) stays truthful between
+usage frames instead of scoring an image turn at zero. Assistant, tool,
+and system messages never carry parts — which is also why the AUTO safety
+check's prompt ([ADR 0016](0016-interaction-modes.md) §6, built from tool
+args and preview lines only) can never see an image part: no leak vector,
+verified at implementation time.
 
-**Persistence coordination (ADR 0014, in flight on `feat/session-persistence`):
-the session file persists `state.messages` verbatim, so image-bearing user
-messages round-trip as list-content messages. ADR 0014's load validation
-currently types user `content` as binary — when it lands, it must also
+**Persistence coordination (ADR 0014): 0014 landed on main BEFORE this
+ADR's implementation, persisting `state.messages` verbatim; per the
+land-first rule this lane adapts — its load validation widens here to
 accept a list of content parts (each `type`/`text` or
-`type`/`image_url.url`), extending its round-trip test with an
-image-bearing fixture. This ADR lands first; the 0014 branch adapts.**
+`type`/`image_url.url`), and its round-trip test gains an image-bearing
+fixture.**
 Resuming an image-bearing session under a non-image model then sends parts
 to a text model; the provider's HTTP error surfaces through ADR 0005's
 taxonomy (`[llm: HTTP …]`) — visible and honest, which is the rule.
@@ -140,7 +146,10 @@ at submit — never in the UI process.
 `{:prompt, ui, text}` becomes `{:prompt, ui, text, paths}` (a list of image
 paths, `[]` for a plain turn). The agent reads and encodes the bytes, builds
 the content parts, and starts the episode; the TUI never touches image
-bytes and keeps only `{path, name, kb}` metadata for display.
+bytes and keeps only `{path, name, kb}` metadata for display. Pending
+attachments clear when the agent's `{:phase, :streaming}` echo opens the
+turn — a submit-time refusal never echoes it, so the pending set survives
+the refusal exactly as §4 requires.
 
 ### 7. Testing
 
@@ -182,8 +191,8 @@ tolerance arm.
 - The 10 MiB cap bounds each file; a turn with many attachments still
   multiplies (the request body carries all of them). Acceptable until a
   real transcript hits it.
-- ADR 0014 (in flight) must widen its user-content validation to parts, per
-  §2.
+- ADR 0014 landed first; this lane widened its user-content validation to
+  parts, per §2.
 - The composer gains its first file-reading surface; it stays scoped to
   completion and one `stat`, and the ADR 0002 process contract is otherwise
   untouched.
