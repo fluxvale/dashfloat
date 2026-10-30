@@ -1212,7 +1212,7 @@ defmodule DashFloat.ApplicationTest do
     sessions = Path.join(tmp_dir(), "sessions")
     {agent, sup} = start_agent(server, sandbox, sessions)
 
-    send(agent, {:prompt, self(), "start the job"})
+    send(agent, {:prompt, self(), "start the job", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
     assert_receive {:confirm, _ref, %{id: "call_boot"}}, 2_000
 
@@ -1272,7 +1272,7 @@ defmodule DashFloat.ApplicationTest do
       if Process.alive?(fresh_sup), do: Process.exit(fresh_sup, :kill)
     end)
 
-    send(resumed, {:prompt, self(), "finish it"})
+    send(resumed, {:prompt, self(), "finish it", []})
     assert_receive {:sse_request, "POST", _, _, body}, 2_000
 
     assert [

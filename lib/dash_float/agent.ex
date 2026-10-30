@@ -12,6 +12,7 @@ defmodule DashFloat.Agent do
 
   alias DashFloat.Accounting
   alias DashFloat.Config
+  alias DashFloat.Images
   alias DashFloat.LLM.ChatStream
   alias DashFloat.Mode
   alias DashFloat.ProjectInstructions
@@ -210,29 +211,39 @@ defmodule DashFloat.Agent do
   ## UI messages (plain sends; the UI process is the sender)
 
   @impl GenServer
-  def handle_info({:prompt, ui, text}, %__MODULE__{status: :idle} = state)
-      when is_pid(ui) and is_binary(text) do
+  def handle_info({:prompt, ui, text, paths}, %__MODULE__{status: :idle} = state)
+      when is_pid(ui) and is_binary(text) and is_list(paths) do
     case state.provider do
       {:error, message} ->
         display(ui, {:entry, :system, no_provider_text(message)})
         display(ui, {:phase, :idle})
         {:noreply, state}
 
-      {:ok, _config} ->
-        state = %{state | ui: ui, messages: state.messages ++ [%{role: "user", content: text}]}
+      {:ok, config} ->
+        case user_message(config, text, paths) do
+          {:ok, message} ->
+            state = %{state | ui: ui, messages: state.messages ++ [message]}
 
-        # Compact and persist before the episode starts: a kill mid-stream
-        # must lose at most the reply, never the question (ADR 0014 §5), and
-        # compaction rides the same seam — after the append, before the
-        # episode, the one point every request passes through (ADR 0022 §5).
-        # One persist per prompt, so a failed save shows one notice (m4).
-        state = maybe_compact(state)
-        start_episode(state)
+            # Compact and persist before the episode starts: a kill mid-stream
+            # must lose at most the reply, never the question (ADR 0014 §5), and
+            # compaction rides the same seam — after the append, before the
+            # episode, the one point every request passes through (ADR 0022 §5).
+            # One persist per prompt, so a failed save shows one notice (m4).
+            state = maybe_compact(state)
+            start_episode(state)
+
+          {:error, refusal} ->
+            # The image gate's visible refusal (ADR 0018 §4): nothing is
+            # appended, nothing is sent, and the UI returns to idle.
+            display(ui, {:entry, :system, refusal})
+            display(ui, {:phase, :idle})
+            {:noreply, state}
+        end
     end
   end
 
   # A prompt while busy is a UI bug (the UI gates on phase): ignore, never crash.
-  def handle_info({:prompt, _ui, _text}, state), do: {:noreply, state}
+  def handle_info({:prompt, _ui, _text, _paths}, state), do: {:noreply, state}
 
   # /compact (issue #92; ADR 0022's amendment): the same eviction the
   # prompt-time hook runs, on demand — never a second implementation. The
@@ -608,6 +619,44 @@ defmodule DashFloat.Agent do
   end
 
   def handle_info({:DOWN, _ref, :process, _pid, _reason}, state), do: {:noreply, state}
+
+  ## The prompt's image gate (ADR 0018 §4/§6)
+
+  # The submit-time user message (ADR 0018 §2): a plain turn keeps the string
+  # content; a turn carrying paths is gated on the selected model's capability
+  # and on re-reading each file — the agent owns the bytes at submit. A
+  # refusal names the model or the path and lands as an `[images: …]` entry.
+  defp user_message(_config, text, []), do: {:ok, %{role: "user", content: text}}
+
+  defp user_message(%Config{images: false} = config, _text, _paths) do
+    {:error, "[images: model #{model_name(config)} does not accept images — attach refused]"}
+  end
+
+  defp user_message(_config, text, paths) do
+    with {:ok, urls} <- data_urls(paths) do
+      {:ok, %{role: "user", content: text_parts(text) ++ image_parts(urls)}}
+    end
+  end
+
+  defp data_urls(paths) do
+    Enum.reduce_while(paths, {:ok, []}, fn path, {:ok, urls} ->
+      case Images.data_url(path) do
+        {:ok, url} -> {:cont, {:ok, urls ++ [url]}}
+        {:error, reason} -> {:halt, {:error, "[images: " <> reason <> "]"}}
+      end
+    end)
+  end
+
+  # The text part leads, omitted when the prompt is empty — an image-only
+  # turn is a legal submit (ADR 0018 §2).
+  defp text_parts(""), do: []
+  defp text_parts(text), do: [%{type: "text", text: text}]
+
+  defp image_parts(urls), do: Enum.map(urls, &%{type: "image_url", image_url: %{url: &1}})
+
+  # The refusal names the model — the nickname, else the id (ADR 0018 §4).
+  defp model_name(%Config{nickname: nil, model: model}), do: model
+  defp model_name(%Config{nickname: nickname}), do: nickname
 
   ## Episode loop
 

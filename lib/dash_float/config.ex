@@ -89,7 +89,10 @@ defmodule DashFloat.Config do
     :auto_title,
     :nickname,
     :profile,
-    providers: []
+    providers: [],
+    # The selected entry's image-capability flag (ADR 0018 §1): a strict
+    # boolean — true means the model accepts image attachments.
+    images: false
   ]
 
   @type provider :: %{
@@ -103,6 +106,7 @@ defmodule DashFloat.Config do
           model: String.t(),
           api_key: String.t(),
           context_tokens: pos_integer() | nil,
+          images: boolean(),
           suggest: false | String.t() | nil,
           auto_title: false | String.t() | nil,
           nickname: String.t() | nil,
@@ -299,6 +303,8 @@ defmodule DashFloat.Config do
   (ADR 0006). `suggest` (ADR 0015) and `autoTitle` (#80) flow the same way:
   `false` opts the side-request out, a string pins that model id, and absent
   or unusable is nil — the provider's default cheap model, never an error.
+  `images` (ADR 0018) rides the selected entry: a strict boolean, absent or
+  unusable means not image-capable — warned, never an error.
   """
   @spec load(Path.t(), map(), keyword()) :: classification()
   def load(dir, env, cli) when is_binary(dir) and is_map(env) and is_list(cli) do
@@ -565,6 +571,7 @@ defmodule DashFloat.Config do
     build(
       effective(nil, nil, nil, nil, env),
       context(env, entry),
+      false,
       tri_state(env, @suggest_var, nil, "suggest"),
       tri_state(env, @auto_title_var, nil, "autoTitle"),
       nil,
@@ -581,6 +588,7 @@ defmodule DashFloat.Config do
     build(
       effective(provider, entry, keys, profile, env),
       context(env, entry),
+      entry && entry.images,
       tri_state(env, @suggest_var, profile.settings, "suggest"),
       tri_state(env, @auto_title_var, profile.settings, "autoTitle"),
       entry && entry.nickname,
@@ -770,7 +778,7 @@ defmodule DashFloat.Config do
     nil
   end
 
-  defp build(values, context_tokens, suggest, auto_title, nickname, profile, providers) do
+  defp build(values, context_tokens, images, suggest, auto_title, nickname, profile, providers) do
     case Enum.reject(@fields, fn {field, _var} -> value(values[field]) end) do
       [] ->
         config =
@@ -783,6 +791,8 @@ defmodule DashFloat.Config do
          %{
            config
            | context_tokens: context_tokens,
+             # nil (no selected entry) is not capable (ADR 0018 §1).
+             images: images || false,
              suggest: suggest,
              auto_title: auto_title,
              nickname: value(nickname),
@@ -1018,7 +1028,8 @@ defmodule DashFloat.Config do
         %{
           nickname: value(entry["nickname"]) || model,
           model: model,
-          context: entry["context"]
+          context: entry["context"],
+          images: parse_images(entry["images"])
         }
     end
   end
@@ -1026,6 +1037,19 @@ defmodule DashFloat.Config do
   defp parse_model(_other) do
     Logger.warning("#{@main_file}: a models entry that is not an object is ignored")
     nil
+  end
+
+  # The image-capability flag is a strict boolean (ADR 0018 §1): true means
+  # capable, absent or false means not; anything else warns naming the field
+  # and means not — ADR 0009's tolerance principle, the context shape.
+  defp parse_images(true), do: true
+  defp parse_images(false), do: false
+  defp parse_images(nil), do: false
+
+  defp parse_images(_other) do
+    Logger.warning("images is not a boolean — treating the model as not image-capable")
+
+    false
   end
 
   # MCP entries are storage shape only (no client yet, ADR 0009): name and

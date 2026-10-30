@@ -525,7 +525,7 @@ defmodule DashFloat.TUI do
   # The agent seam (ADR 0007): plain sends, both directions — fake agents in
   # tests are plain processes receiving these.
   defp prompt_agent(prompt, state) do
-    send(state.agent, {:prompt, self(), prompt})
+    send(state.agent, {:prompt, self(), prompt, []})
     state
   end
 
