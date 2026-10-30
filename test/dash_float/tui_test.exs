@@ -1254,6 +1254,53 @@ defmodule DashFloat.TUITest do
     eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
   end
 
+  test "the footer's context span populates from an agent snapshot and reaches the screen" do
+    provider =
+      {:ok,
+       %Config{
+         base_url: "http://localhost:1",
+         model: "test-model",
+         api_key: "test-key-123",
+         context_tokens: 128_000
+       }}
+
+    {:ok, pid} = start_tui(provider: provider)
+    submit(pid, "stream for the footer")
+
+    assert_receive {:prompt, ui_pid, "stream for the footer"}, 1_000
+
+    # Pre-snapshot: the span is hidden — no ratio anywhere in the footer.
+    blank = get_state(pid)
+    refute footer_text(blank) =~ "128k"
+
+    send(
+      ui_pid,
+      {:context,
+       %{
+         messages: [%{role: "user", content: "stream for the footer"}],
+         anchor: %{tokens: 4_100, index: 1}
+       }}
+    )
+
+    send(ui_pid, {:token, "x"})
+
+    state =
+      eventually(pid, fn s -> s.context != nil and s.in_flight != nil end)
+
+    # (a) Render-output seam: the span carries tokens-used and percent.
+    assert footer_text(state) =~ "4.1k/128k · 3.2%"
+
+    # (b) Drawn-buffer probe: the span reaches the screen.
+    term = ExRatatui.init_test_terminal(80, 24)
+    widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+    assert :ok = ExRatatui.draw(term, widgets)
+    buffer = ExRatatui.get_buffer_content(term)
+    assert buffer =~ "4.1k/128k"
+
+    send(ui_pid, {:phase, :idle})
+    eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
+  end
+
   test "Esc during streaming sends {:cancel} to the agent and the agent's ack lands" do
     {:ok, pid} = start_tui()
     submit(pid, "cancel me")
@@ -2243,13 +2290,22 @@ defmodule DashFloat.TUITest do
 
     send(ui_pid, {:token, "Hello"})
     send(ui_pid, {:usage, %{prompt_tokens: 120, completion_tokens: 42, total_tokens: 162}})
+
+    send(
+      ui_pid,
+      {:context,
+       %{
+         messages: [%{role: "user", content: "count me"}, %{role: "assistant", content: "Hello"}],
+         anchor: %{tokens: 162, index: 2}
+       }}
+    )
+
     send(ui_pid, {:phase, :idle})
 
     state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
 
     assert state.stats.prompt_tokens == 120
     assert state.stats.completion_tokens == 42
-    assert state.stats.context_total == 162
     assert entry?(state, :assistant, "Hello")
 
     # Ordering proof: the usage message is handled before the idle phase.
@@ -2261,7 +2317,9 @@ defmodule DashFloat.TUITest do
     assert usage_at != nil and idle_at != nil
     assert usage_at < idle_at
 
-    assert status_text(state) =~ "ctx 162"
+    # The snapshot landed (stage-2 span truth) and the bar no longer carries ctx.
+    assert state.context.anchor == %{tokens: 162, index: 2}
+    refute status_text(state) =~ "ctx"
   end
 
   test "tool rows land in the log and the executing_tool phase names itself" do

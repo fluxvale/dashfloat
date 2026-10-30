@@ -368,15 +368,17 @@ defmodule DashFloat.Agent do
   # The episode's usage frame completes the anchor minted at episode start
   # (ADR 0022 §1): its prompt_tokens measured over the request's message
   # count. Display forwarding of pending_usage is unchanged (last frame wins
-  # at turn end, ADR 0007 §5).
+  # at turn end, ADR 0007 §5). The refreshed anchor rides a context push —
+  # the footer's span re-reads the measured estimate (ADR 0015 §2
+  # amendment).
   def handle_info({:usage, usage}, %__MODULE__{status: :streaming} = state),
     do:
       {:noreply,
-       %{
+       push_context(%{
          state
          | pending_usage: usage,
            anchor: %{tokens: usage.prompt_tokens, index: state.request_len}
-       }}
+       })}
 
   def handle_info({:usage, _usage}, state), do: {:noreply, state}
 
@@ -1361,14 +1363,20 @@ defmodule DashFloat.Agent do
   # :session_dir — the nil default keeps tests and embedded starters off the
   # user's XDG dir. A failed save degrades to a warning plus one system
   # entry; the turn continues — persistence never joins the episode loop
-  # (ADR 0014 §5).
-  defp persist(%__MODULE__{session_dir: nil} = state), do: state
+  # (ADR 0014 §5). The context push rides the same seam: every caller is a
+  # transcript mutation, and the footer's span re-reads off the snapshot
+  # even with persistence off (ADR 0015 §2 amendment).
+  defp persist(state), do: write_session(push_context(state))
+
+  defp write_session(%__MODULE__{session_dir: nil} = state), do: state
 
   # Id, pin, and created_at are minted once, at the first save. An error
   # provider never reaches a persist (the prompt arm guards it), so the pin
   # always reads off an {:ok, config}.
-  defp persist(%__MODULE__{session_id: nil} = state) do
-    persist(%{
+  defp write_session(%__MODULE__{session_id: nil} = state) do
+    # Recurse through write_session, not persist: the minted-id rewrite is
+    # the same transcript mutation the outer persist already pushed for.
+    write_session(%{
       state
       | session_id: Session.new_id(),
         session_created_at: now_iso8601_utc(),
@@ -1377,11 +1385,11 @@ defmodule DashFloat.Agent do
   end
 
   # A hand-built resume map may carry no created_at; the first save stamps it.
-  defp persist(%__MODULE__{session_created_at: nil} = state) do
-    persist(%{state | session_created_at: now_iso8601_utc()})
+  defp write_session(%__MODULE__{session_created_at: nil} = state) do
+    write_session(%{state | session_created_at: now_iso8601_utc()})
   end
 
-  defp persist(
+  defp write_session(
          %__MODULE__{
            ui: ui,
            session_dir: dir,
@@ -1454,6 +1462,16 @@ defmodule DashFloat.Agent do
   ## Display helpers
 
   defp display(ui, message) when is_pid(ui), do: send(ui, message)
+
+  # The stage-2 footer seam (ADR 0022 §7 binding, ADR 0015 §2 amendment):
+  # the {messages, anchor} snapshot the footer's Accounting.usage/3 read
+  # computes from, pushed at every transcript mutation (persist) and at each
+  # usage frame (the anchor's own refresh). Pure data — the TUI owns the
+  # display window and the render-time read.
+  defp push_context(%__MODULE__{ui: ui} = state) do
+    display(ui, {:context, %{messages: state.messages, anchor: state.anchor}})
+    state
+  end
 
   defp tool_result_msg(call, result) do
     %{

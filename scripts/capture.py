@@ -24,6 +24,7 @@ Usage (from a worktree root, against the CURRENT tree's code):
     scripts/capture.py probe [--window-ms 1500] [--after-exchange]
     scripts/capture.py gif   --out FILE.gif
     scripts/capture.py gif   --scenario slash-autocomplete --out FILE.gif
+    scripts/capture.py gif   --scenario growing-session --context 4096 --out FILE.gif
 
 Scenarios:
     first-run   fresh session: composer empty, no exchanges yet
@@ -32,6 +33,10 @@ Scenarios:
                  the suggester's ghost lands there — the ghost is its own
                  scenario)
     ghost       after a completed exchange + suggest side-request landed
+    growing-session
+                two completed exchanges whose usage frames grow the
+                footer's tokens-used span (issue #67 stage 2); pass a
+                small --context (4096) so the percent is legible
     compact-session
                 a resumed fixture session (two ~20 KB turns, no anchor) over
                 the 80% trigger of its 20000-token window: /compact drops the
@@ -214,13 +219,13 @@ class MockHandler(BaseHTTPRequestHandler):
         system = " ".join(m.get("content", "") for m in req.get("messages", [])
                           if m.get("role") == "system")
         if req.get("stream") is True:
-            self._sse()
+            self._sse(req)
         elif "title" in system:
             self._json({"choices": [{"message": {"content": TITLE_TEXT}}]})
         else:
             self._json({"choices": [{"message": {"content": GHOST_TEXT}}]})
 
-    def _sse(self):
+    def _sse(self, req):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -229,8 +234,14 @@ class MockHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(frame)}\n\n".encode())
             self.wfile.flush()
             time.sleep(0.13)
+        # The usage frame mirrors what a real provider reports: the request's
+        # own size in tokens (bytes/4 over the messages — the same heuristic
+        # ADR 0022 §1 uses between frames), so the footer's tokens-used span
+        # grows turn over turn as the conversation accumulates.
+        prompt_tokens = sum(len((m.get("content") or "").encode())
+                            for m in req.get("messages", [])) // 4
         usage = {"choices": [], "usage": {
-            "prompt_tokens": 21, "completion_tokens": 34}}
+            "prompt_tokens": prompt_tokens, "completion_tokens": 34}}
         self.wfile.write(f"data: {json.dumps(usage)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
@@ -490,6 +501,38 @@ class App:
         self.wait_for("rest")          # the reply's last word landed
         self.wait_quiet()              # the turn finalized; composer empty
 
+    # Two completed exchanges over a small window: the footer's tokens-used
+    # span grows across turns (issue #67 stage 2). Asserted, not assumed —
+    # a mock that stopped reporting usage must fail the capture, not ship a
+    # GIF where the count stands still. The second question is longer so
+    # the growth moves the used label, not just the percent's decimal.
+    def scenario_growing_session(self) -> list[str]:
+        seen = []
+        for question in (
+            "what is elixir?",
+            "and how do supervisors, links, and process registries fit "
+            "together — please walk me through the whole supervision tree "
+            "story in detail, from restart strategies to process isolation",
+        ):
+            self.type(question)
+            self.send(b"\r")
+            self.wait_for("rest")      # the scripted reply's last word
+            self.wait_quiet()
+            seen.append(self.footer_span())
+        assert "/" in seen[0] and "/" in seen[1], \
+            f"the footer's context span never populated: {seen}"
+        assert seen[0] != seen[1], \
+            f"the footer's context span never grew: {seen}"
+        return seen
+
+    def footer_span(self) -> str:
+        """The footer row — the LAST row whose first glyph is ❯ (user log
+        echoes start with ❯ too; the footer sits under the composer)."""
+        for row in reversed(self.screen.display):
+            if row.lstrip().startswith("❯"):
+                return row.rstrip()
+        return ""
+
     def scenario_ghost(self):
         self.scenario_mid_session()
         self.wait_for(GHOST_TEXT, timeout=10)
@@ -524,13 +567,18 @@ def main():
     ap.add_argument("mode", choices=["still", "probe", "gif"])
     ap.add_argument("--scenario", default="first-run",
                     choices=["first-run", "mid-session", "ghost",
-                             "compact-session", "slash-autocomplete"])
+                             "growing-session", "compact-session",
+                             "slash-autocomplete"])
     ap.add_argument("--out", default=None)
     # The compact-session flow shoots TWO stills: --out after the drop,
     # --out2 after the follow-up no-op command (its below-trigger entry).
     ap.add_argument("--out2", default=None)
     ap.add_argument("--window-ms", type=int, default=1500)
     ap.add_argument("--after-exchange", action="store_true")
+    # Override the per-model context window the scratch settings carry
+    # (issue #67 stage 2): the default 524288 leaves the footer's percent
+    # rounding to 0 — a small honest window (8192) makes the span legible.
+    ap.add_argument("--context", type=int, default=None)
     # The mid-session STILL must show a BLANK composer: with suggestions
     # enabled the suggester lands a ghost there (#91 review finding) —
     # pass --no-ghost to pin the blank state (the ghost state is its own
@@ -547,9 +595,9 @@ def main():
     if args.scenario == "compact-session":
         resume = write_compact_fixture(scratch_dir())
 
-    app = App(no_ghost=args.no_ghost,
-              context=20000 if args.scenario == "compact-session" else 524288,
-              resume=resume)
+    context = args.context or (
+        20000 if args.scenario == "compact-session" else 524288)
+    app = App(no_ghost=args.no_ghost, context=context, resume=resume)
     try:
         if args.mode == "probe":
             if args.after_exchange:
@@ -562,6 +610,9 @@ def main():
                 app.scenario_mid_session()
             elif args.scenario == "ghost":
                 app.scenario_ghost()
+            elif args.scenario == "growing-session":
+                seen = app.scenario_growing_session()
+                print(f"footer  turn1={seen[0]!r} turn2={seen[1]!r}")
             elif args.scenario == "compact-session":
                 # Both stills in one run: the drop, then the follow-up
                 # no-op command's below-trigger entry.
@@ -597,6 +648,16 @@ def main():
             # 16 rows: the narrowed popup rides higher than the full list,
             # and /clear + /compact must be legible in the final frame.
             app.gif(args.out, crop_rows=16, min_span=1.5)
+        elif args.scenario == "growing-session":
+            # Mark BEFORE the first send: the GIF covers both turns — the
+            # span appears with the first turn's persist and grows with the
+            # second's usage frame. 12 rows keep the composer, footer, and
+            # the tail of the log legible.
+            app._mark = time.monotonic()
+            seen = app.scenario_growing_session()
+            print(f"footer  turn1={seen[0]!r} turn2={seen[1]!r}")
+            time.sleep(0.5)                # a settled beat on the final count
+            app.gif(args.out, crop_rows=12, min_span=1.0)
         else:
             app.type("what is elixir?")
             app.send(b"\r")

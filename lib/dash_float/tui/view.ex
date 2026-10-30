@@ -425,10 +425,11 @@ defmodule DashFloat.TUI.View do
 
   ## Status bar
 
-  # One left-flowing line: mode, context, phase, log position — non-empty
-  # groups joined with a separator BETWEEN them, so a fresh session opens
-  # with the phase dot, never a dangling leading separator. cwd, model, and
-  # rate moved to the stats footer (ADR 0015 §2) — moved, not duplicated.
+  # One left-flowing line: mode, phase, log position — non-empty groups
+  # joined with a separator BETWEEN them, so a fresh session opens with the
+  # phase dot, never a dangling leading separator. cwd, model, and rate
+  # moved to the stats footer (ADR 0015 §2), and ctx followed them in stage
+  # 2 (ADR 0015 §2 amendment) — moved, not duplicated.
   # The mode span leads (ADR 0016 §7): it is session state, always shown.
   defp status_widget(state, log_height) do
     {label, role} = Map.fetch!(@phases, state.phase)
@@ -436,7 +437,6 @@ defmodule DashFloat.TUI.View do
     spans =
       [
         mode_spans(state),
-        context_spans(state),
         phase_spans(label, role),
         position_spans(state, log_height)
       ]
@@ -448,10 +448,18 @@ defmodule DashFloat.TUI.View do
   end
 
   # The stats footer under the composer (ADR 0015 §2): cwd, model, live
-  # tok/s in the old status-bar span vocabulary. Static data read at render
-  # time — live while streaming because the tick recomputes the rate; the
-  # rate span is omitted entirely until a rate exists.
+  # tok/s in the old status-bar span vocabulary, plus the stage-2
+  # tokens-used + percent-of-context span (ADR 0015 §2 amendment). Static
+  # data read at render time — live while streaming because the tick
+  # recomputes the rate; the rate and context spans are omitted entirely
+  # until one exists.
   defp footer_widget(state) do
+    context_spans =
+      case State.context_label(state) do
+        nil -> []
+        label -> [separator(), Span.new(label, style: Theme.style(:dim))]
+      end
+
     rate_spans =
       case State.rate_label(state) do
         nil -> []
@@ -465,7 +473,7 @@ defmodule DashFloat.TUI.View do
             [
               separator(),
               Span.new(State.provider_label(state) || "—", style: Theme.style(:assistant))
-            ] ++ rate_spans
+            ] ++ context_spans ++ rate_spans
         )
       ]
     }
@@ -478,12 +486,6 @@ defmodule DashFloat.TUI.View do
     label = Mode.label(state.mode)
 
     [Span.new(label, style: Theme.style(role))]
-  end
-
-  defp context_spans(%{stats: %{context_total: 0}}), do: []
-
-  defp context_spans(state) do
-    [Span.new("ctx " <> State.context_label(state), style: Theme.style(:dim))]
   end
 
   defp phase_spans(label, role) do

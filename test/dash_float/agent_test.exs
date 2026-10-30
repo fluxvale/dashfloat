@@ -3076,6 +3076,59 @@ defmodule DashFloat.AgentTest do
     assert Process.alive?(agent3)
   end
 
+  # The stage-2 footer seam (ADR 0015 §2 amendment): the {messages, anchor}
+  # snapshot the footer's Accounting.usage/3 read computes from, pushed at
+  # every transcript mutation (the persist seam) and each usage frame.
+  @tag :tmp_dir
+  test "prompt, usage frame, and finalize each push a context snapshot", ctx do
+    server = start_server([final_episode("hello there", usage: {10, 5, 15})])
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir, session_dir: Path.join(ctx.tmp_dir, "sessions"))
+
+    send(agent, {:prompt, self(), "hi"})
+
+    # The prompt's push: system + question, no anchor yet — the frame has
+    # not landed, so the footer estimates heuristically until it does.
+    assert_receive {:context,
+                    %{
+                      messages: [%{role: "system"} = sys, %{role: "user", content: "hi"}],
+                      anchor: nil
+                    }},
+                   2_000
+
+    assert is_binary(sys.content)
+    assert_receive {:sse_request, "POST", _, _, _body}, 2_000
+
+    # The usage frame's push: the anchor minted from the frame's
+    # prompt_tokens over the request's message count (ADR 0022 §1).
+    assert_receive {:context, %{messages: _, anchor: %{tokens: 10, index: 2}}}, 2_000
+
+    # The finalize's push: the assistant reply joined the list.
+    assert_receive {:context,
+                    %{
+                      messages: [_, _, %{role: "assistant", content: "hello there"}],
+                      anchor: %{tokens: 10, index: 2}
+                    }},
+                   2_000
+
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "the context push rides with persistence off too (footer truth needs no file)",
+       ctx do
+    server = start_server([final_episode("ack")])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    send(agent, {:prompt, self(), "hi"})
+    assert_receive {:sse_request, "POST", _, _, _body}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # No session_dir, no file — the snapshot still landed for the footer.
+    assert_receive {:context, %{messages: [_, _], anchor: nil}}, 2_000
+  end
+
   @tag :tmp_dir
   test "a resumed-agent save keeps the pre-compaction file shape (m3)", ctx do
     sessions = Path.join(ctx.tmp_dir, "sessions")

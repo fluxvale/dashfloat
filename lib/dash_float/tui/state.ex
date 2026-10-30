@@ -15,6 +15,7 @@ defmodule DashFloat.TUI.State do
   pure. See ADRs 0002, 0006, and 0007.
   """
 
+  alias DashFloat.Accounting
   alias DashFloat.Config.Onboarding
   alias DashFloat.Mode
   alias DashFloat.Tools
@@ -69,9 +70,7 @@ defmodule DashFloat.TUI.State do
           first_token_at: integer() | nil,
           rate: float() | nil,
           prompt_tokens: non_neg_integer() | nil,
-          completion_tokens: non_neg_integer() | nil,
-          context_total: non_neg_integer(),
-          turn_total: non_neg_integer() | nil
+          completion_tokens: non_neg_integer() | nil
         }
 
   @max_history 500
@@ -122,10 +121,13 @@ defmodule DashFloat.TUI.State do
       first_token_at: nil,
       rate: nil,
       prompt_tokens: nil,
-      completion_tokens: nil,
-      context_total: 0,
-      turn_total: nil
+      completion_tokens: nil
     },
+    # The stage-2 context snapshot (ADR 0015 §2 amendment): the agent's
+    # {messages, anchor} pair, pushed at every transcript mutation and each
+    # usage frame — what the footer's Accounting.usage/3 read computes from.
+    # nil until the first push (the span is hidden, the rate-span pattern).
+    context: nil,
     scroll: 0,
     follow?: true,
     # Terminal-pane focus (ADR 0015 §1): gates the composer's cursor
@@ -173,6 +175,7 @@ defmodule DashFloat.TUI.State do
           anim_step: non_neg_integer(),
           tick_ref: reference() | nil,
           stats: stats(),
+          context: %{messages: [map()], anchor: Accounting.anchor()} | nil,
           scroll: non_neg_integer(),
           follow?: boolean(),
           focused?: boolean(),
@@ -226,6 +229,7 @@ defmodule DashFloat.TUI.State do
                completion_tokens: non_neg_integer(),
                total_tokens: non_neg_integer()
              }}
+          | {:context, %{messages: [map()], anchor: Accounting.anchor()}}
           | {:phase, :streaming}
           | {:phase, :executing_tool | :checking | :idle}
           | {:tool_call, tool_call_msg()}
@@ -579,18 +583,30 @@ defmodule DashFloat.TUI.State do
     do: :erlang.float_to_binary(rate, decimals: 1)
 
   @doc """
-  Context usage, `4.1k` or `4.1k/128k` when a provider window is configured;
-  `—` until something has streamed.
+  The footer's context span (ADR 0015 §2 amendment, issue #67 stage 2):
+  tokens-used and percent-of-context from the accounting API (ADR 0022 §7)
+  over the agent's snapshot — `4.2k/128k · 3.3%`, the absolute total alone
+  with no display window, `nil` before the first snapshot lands (the span is
+  hidden, the rate-span pattern). The denominator is the TUI's display
+  window (config, else the catalog fallback — display-only, ADR 0022 §2).
   """
-  @spec context_label(t()) :: String.t()
-  def context_label(%__MODULE__{stats: %{context_total: 0}}), do: "—"
+  @spec context_label(t()) :: String.t() | nil
+  def context_label(%__MODULE__{context: nil}), do: nil
 
-  def context_label(%__MODULE__{stats: %{context_total: total}} = state) do
-    case provider_context_tokens(state) do
-      nil -> humanize(total)
-      window -> humanize(total) <> "/" <> humanize(window)
+  def context_label(%__MODULE__{context: %{messages: messages, anchor: anchor}} = state) do
+    case Accounting.usage(messages, anchor, provider_context_tokens(state)) do
+      %{used: used, window: nil} ->
+        humanize(used)
+
+      %{used: used, window: window, percent: percent} ->
+        humanize(used) <> "/" <> humanize(window) <> " · " <> percent_label(percent)
     end
   end
+
+  # One decimal, trailing `.0` trimmed — humanize/1's number rule, stated
+  # once (ADR 0015 §2 amendment).
+  defp percent_label(nil), do: ""
+  defp percent_label(percent), do: trim_zero(percent) <> "%"
 
   @doc "Token counts for humans: 999 reads 999, 1_500 1.5k, 1_048_576 1m."
   @spec humanize(integer()) :: String.t()
@@ -1119,8 +1135,9 @@ defmodule DashFloat.TUI.State do
 
     * `{:token, text}` — append to the in-flight entry verbatim, count it, start
       the rate clock on the first token, mark the live lines stale
-    * `{:usage, map}` — reconcile prompt/completion tokens, add the frame's
-      total to the context accumulator; no phase change
+    * `{:usage, map}` — reconcile prompt/completion tokens; no phase change
+    * `{:context, snapshot}` — adopt the agent's context snapshot (the
+      footer's tokens-used source, ADR 0015 §2 amendment); no phase change
     * `{:phase, :streaming}` — set the phase only; re-announcing streaming
       never finalizes (a producer resuming after a tool interlude must not
       fragment its reply)
@@ -1172,28 +1189,31 @@ defmodule DashFloat.TUI.State do
   def stream_message(%{phase: :idle} = state, {:usage, _usage}, _now), do: state
 
   def stream_message(state, {:usage, usage}, _now) when is_map(usage) do
-    %{
-      prompt_tokens: prompt,
-      completion_tokens: completion,
-      total_tokens: total
-    } = usage
+    %{prompt_tokens: prompt, completion_tokens: completion} = usage
 
-    # Usage frames carry the turn's running total — single-frame providers
+    # Usage frames carry the turn's running count — single-frame providers
     # send it once, per-chunk reporters on every frame. The turn's truth is
-    # the LAST frame, banked once at finalize (ADR 0006); summing every frame
-    # would inflate the context on per-chunk providers.
+    # the LAST frame (the same last-frame-wins rule as the agent's
+    # pending_usage, ADR 0007 §5); the count feeds the rate math only —
+    # the footer's tokens-used comes from the context snapshot's
+    # Accounting.usage/3 read (ADR 0015 §2 amendment).
     stats = %{
       state.stats
       | prompt_tokens: prompt,
         completion_tokens: completion,
         # The usage frame is the authoritative count: the per-delta estimate is
         # reconciled here, so the frozen rate is computed from real tokens.
-        tokens: completion,
-        turn_total: total
+        tokens: completion
     }
 
     %{state | stats: stats}
   end
+
+  # The stage-2 context snapshot (ADR 0015 §2 amendment): pure data in, pure
+  # data stored — the footer's usage read happens at render.
+  def stream_message(state, {:context, %{messages: messages, anchor: anchor}}, _now)
+      when is_list(messages),
+      do: %{state | context: %{messages: messages, anchor: anchor}}
 
   # Any phase message supersedes a pending confirm: the agent is the single
   # voice, and a confirm the UI never decided must not outlive the turn it
@@ -1344,21 +1364,15 @@ defmodule DashFloat.TUI.State do
     if to_row >= base, do: %{state | selection: nil}, else: state
   end
 
-  # The turn's banked usage total joins the conversation accumulator exactly
-  # once, here (ADR 0006). Phase 3 caveat: a producer that emits the tool
-  # transition before flushing usage would fold that episode's total into the
-  # next episode's banking slot — producers must send usage before each phase
-  # change (the in-contract order).
+  # The turn's rate freezes here (ADR 0006); the context total is NOT banked
+  # anymore — the footer's tokens-used span reads Accounting.usage/3 off the
+  # agent's context snapshot (ADR 0015 §2 amendment, issue #67 stage 2).
   defp frozen(%{stats: stats}, now) do
     %{
       stats
       | rate: rate(stats.tokens, stats.first_token_at, now) || stats.rate,
         tokens: 0,
-        first_token_at: nil,
-        # The turn's banked usage total joins the conversation accumulator
-        # exactly once, here (ADR 0006).
-        context_total: stats.context_total + (stats.turn_total || 0),
-        turn_total: nil
+        first_token_at: nil
     }
   end
 

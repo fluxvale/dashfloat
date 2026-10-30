@@ -85,3 +85,12 @@ gain.
 check parameters cannot be scoped per file — 40 was chosen as the smallest
 whole number above the struct's actual size, so any future field creep past
 40 still fails the gate.
+
+**Rider (2026-10-30, [issue #67](https://github.com/fluxvale/dashfloat/issues/67)
+stage 2):** the gate fired exactly as designed — the footer's context
+snapshot carry ([ADR
+0015](0015-input-surface-cursor-stats-ghost.md) §2's stage-2 amendment)
+is field 41, same flat-struct rationale (pure data the render contract
+reads whole; nesting it into the numeric `stats` map would muddy that
+type). `max_fields` moves to 41 — again the smallest whole number above
+the actual size, so the creep gate stands.

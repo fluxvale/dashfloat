@@ -130,12 +130,18 @@ defmodule DashFloat.TUI.ViewTest do
           {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 4_100}},
           1_500
         )
+        |> State.stream_message(
+          {:context,
+           %{messages: [%{role: "user", content: "ab"}], anchor: %{tokens: 4_100, index: 1}}},
+          1_600
+        )
         |> State.stream_message({:phase, :idle}, 2_000)
 
-      # ctx keeps its slot on the status bar, before the phase cluster (the
-      # rate and model assertions live with the footer describe now). The
-      # mode span leads every group (ADR 0016 §7).
-      assert status_text(state) =~ ~r/Build · ctx 4\.1k\/128k · ● Idle · /
+      # ctx left the bar in stage 2 (ADR 0015 §2 amendment): mode, phase,
+      # position — the tokens truth lives in the footer's context span now.
+      assert status_text(state) =~ ~r/Build · ● Idle · /
+      refute status_text(state) =~ "ctx"
+      assert footer_text(state) =~ ~r/4\.1k\/128k · 3\.2%/
     end
 
     test "the status bar is one line of styled spans, dim separators between" do
@@ -185,17 +191,18 @@ defmodule DashFloat.TUI.ViewTest do
       end
     end
 
-    test "the context label shows the accumulated usage" do
-      state =
-        new_state()
-        |> Map.put(:phase, :streaming)
-        |> State.stream_message(
-          {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 4_100}},
-          1_000
-        )
-        |> State.stream_message({:phase, :idle}, 2_000)
+    test "the context span reads the accounting call over the agent's snapshot" do
+      snapshot =
+        {:context,
+         %{messages: [%{role: "user", content: String.duplicate("a", 16_400)}], anchor: nil}}
 
-      assert status_text(state) =~ "ctx 4.1k"
+      base = new_state(provider: provider(128_000))
+      state = State.stream_message(base, snapshot, 1_000)
+
+      assert footer_text(state) =~ ~r/4\.1k\/128k · 3\.2%/
+
+      # Hidden pre-first-turn: no snapshot, no span (the rate-span pattern).
+      refute footer_text(new_state()) =~ "128k"
     end
 
     test "empty log shows a placeholder" do
@@ -504,6 +511,43 @@ defmodule DashFloat.TUI.ViewTest do
       # The usage frame reconciles the count (2 deltas batched 5 tokens), so
       # the frozen rate uses the authoritative 5 tokens over the 1 s window.
       assert footer_text(state) =~ ~r/test-model · 5\.0 tok\/s/
+    end
+
+    # The stage-2 span (ADR 0015 §2 amendment): tokens-used and
+    # percent-of-context from Accounting.usage/3 over the agent snapshot.
+    test "the context span sits between the model and the rate, dim, hidden until a snapshot exists" do
+      snapshot =
+        {:context,
+         %{messages: [%{role: "user", content: String.duplicate("a", 16_400)}], anchor: nil}}
+
+      base = new_state(provider: provider(128_000))
+
+      state =
+        base
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "a"}, 1_000)
+        |> State.stream_message(snapshot, 1_500)
+        |> State.stream_message({:phase, :idle}, 2_000)
+
+      [line] = footer_line(state)
+      [_cwd, _sep, model, sep, ctx | _rest] = line.spans
+      assert model.content == "test-model"
+      assert sep.content == " · "
+      assert ctx.content == "4.1k/128k · 3.2%"
+      assert ctx.style == Theme.style(:dim)
+    end
+
+    test "no display window means the absolute total alone (ADR 0022 §2)" do
+      snapshot =
+        {:context,
+         %{messages: [%{role: "user", content: String.duplicate("a", 16_400)}], anchor: nil}}
+
+      base = new_state()
+      state = State.stream_message(base, snapshot, 1_000)
+
+      assert footer_text(state) =~ "4.1k"
+      refute footer_text(state) =~ "4.1k/"
+      refute footer_text(state) =~ "· 3"
     end
   end
 
