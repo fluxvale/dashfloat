@@ -92,6 +92,25 @@ Scenarios:
     attach-refusal
                 the same attach attempt on a NON-capable model: the
                 visible [images: …] refusal entry in the log (nothing sent)
+    drop-image  the drag-and-drop flow (issue #112, ADR 0018 amendment) on
+                an IMAGE-CAPABLE model: a bracketed-pasted image path
+                becomes the [Image #1] chip (never path text), a second
+                paste numbers #2, Backspace pops the newest chip, and the
+                submit streams the reply with its 📎 indicator rows (gif)
+    drop-refusal
+                the same drop on a NON-capable model: the visible refusal,
+                no chip, no typed path (still)
+    idle-blink  the idle cursor blink (issue #104): no input at all, the
+                composer cursor toggles at the recorded cadence — the
+                frame rate is asserted in a bounded band BEFORE the gif
+                (the ADR's measured renders/s)
+    tab-complete
+                "/mod" + Tab completes to "/model " (popup closes), then
+                "/c" + down + Tab completes the ARROW-SELECTED "/compact "
+                (issue #105; ADR 0020 amendment) — each act asserted
+    snap-scroll a resumed 40-turn log, two wheel-ups unfollow (the tail's
+                last line scrolls off), one keystroke re-pins to the tail
+                (issue #110) — asserted both ways
     reading-session
                 two completed exchanges so user/assistant alternate in the
                 log (issues #107/#108 stills). Asserts, before the still:
@@ -115,7 +134,9 @@ Scenarios:
                 closes, Esc cancels untouched, and /title <name> inline
                 still lands its entry with no dialog — five stills, every
                 act asserted before its still is written
-    probe       idle byte-rate: 0 bytes over the window == 0 renders/s
+    probe       idle frame-rate: bursts of tiny one-cell diffs, ~2/s
+                since the idle blink (issue #104) — bounded, never large;
+                0 bursts would mean the blink died
 
 The scratch root is hermetic: XDG_CONFIG_HOME and XDG_DATA_HOME both point
 at it, so settings, keys, and session files (including the compact-session
@@ -407,6 +428,32 @@ def write_image_fixture(scratch: str) -> str:
     return path
 
 
+def write_snap_fixture(scratch: str, turns: int = 40) -> str:
+    """The typing-snap fixture (issue #110): `turns` numbered user/assistant
+    exchanges — enough wrapped rows to overflow any 24-row viewport several
+    times, with a UNIQUE tail ("turn <last> done") the capture can prove
+    visible-or-not. Returns the session id."""
+    session_id = str(uuid.uuid4())
+    words = ["one", "two", "three", "four", "five", "six", "seven",
+             "eight", "nine", "ten"]
+    messages = []
+    for n in range(1, turns + 1):
+        body = f"turn {words[(n - 1) % 10]} of the snap fixture, line {n}"
+        messages.append({"role": "user", "content": f"question {n}"})
+        messages.append({"role": "assistant", "content": body})
+    messages[-1]["content"] += " — turn forty done"
+    sessions = f"{scratch}/dashfloat/sessions"
+    os.makedirs(sessions, exist_ok=True)
+    with open(f"{sessions}/{session_id}.json", "w") as f:
+        json.dump({
+            "version": 1,
+            "id": session_id,
+            "created_at": "2026-10-31T00:00:00Z",
+            "messages": messages,
+        }, f)
+    return session_id
+
+
 def write_reading_fixture(scratch: str) -> str:
     """The resume-session fixture (#107): two short user/assistant turns.
     Resumed with --resume, the log is rebuilt by replay — the capture
@@ -575,6 +622,8 @@ class App:
         self._chunks: list[tuple[float, bytes]] = []
         self._mark: float | None = None  # the GIF window's start time
         self._total = 0
+        self._loud_total = 0   # bytes of LOUD writes only (see _read)
+        self._last_loud = time.monotonic()
         self._alt = False  # saw the app enter the alternate screen
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
@@ -661,6 +710,15 @@ class App:
 
     ALT_ENTER = b"\x1b[?1049h"
 
+    # A real frame (full draw, redraw, streamed chunk) is comfortably over
+    # this; the idle cursor blink's diff (issue #104) is a single reversed
+    # cell plus cursor handling — a few dozen bytes, never this big.
+    # KNOWN CAVEAT (review F7): a mid-stream spinner-only tick frame could
+    # in principle land under this too — no scenario waits for quiet
+    # mid-stream today; if one ever does, wait_for a content needle
+    # instead of wait_quiet.
+    QUIET_CHUNK_BYTES = 96
+
     def feed(self, chunk: bytes):
         """Feed the terminal emulator, discarding anything the app wrote
         BEFORE entering the alternate screen (boot logger noise lands
@@ -691,23 +749,32 @@ class App:
             now = time.monotonic()
             self._total += len(chunk)
             self._chunks.append((now, chunk))
+            # "Loud" writes are real frames (full draws, redraws, stream
+            # chunks); anything smaller is the idle cursor blink's
+            # one-cell diff (issue #104) — periodic, tiny, and never a
+            # reason to keep waiting for quiet.
+            if len(chunk) >= self.QUIET_CHUNK_BYTES:
+                self._loud_total += len(chunk)
+                self._last_loud = now
             self.feed(chunk)
             if self.sink:
                 self.sink(chunk)
 
     def wait_boot(self, timeout=120):
-        """Boot + first frame + quiet: >= 600 ms of silence after >= 800 B,
-        with the alternate screen entered (compile noise lands BEFORE the
-        alt screen and can silence for a beat mid-build — without the alt
-        gate a cold first run "boots" mid-compile and the first exchange
-        times out)."""
+        """Boot + first frame + quiet: >= 600 ms with no LOUD write after
+        >= 800 B, with the alternate screen entered (compile noise lands
+        BEFORE the alt screen and can silence for a beat mid-build —
+        without the alt gate a cold first run "boots" mid-compile and the
+        first exchange times out). Since the idle blink (issue #104) an
+        idle app still emits a tiny one-cell diff ~2x/s forever — those
+        never reset the quiet window (QUIET_CHUNK_BYTES)."""
         deadline = time.monotonic() + timeout
-        last = self._total
+        last_loud = self._loud_total
         quiet_since = None
         while time.monotonic() < deadline:
             time.sleep(0.1)
-            if self._total != last:
-                last = self._total
+            if self._loud_total != last_loud:
+                last_loud = self._loud_total
                 quiet_since = None
                 continue
             if self._total > 800 and self._alt:
@@ -732,15 +799,11 @@ class App:
         raise TimeoutError(f"screen never showed {needle!r}")
 
     def wait_quiet(self, window=0.8):
-        last, since = -1, None
-        while True:
-            time.sleep(0.1)
-            if self._total != last:
-                last, since = self._total, None
-                continue
-            since = since or time.monotonic()
-            if time.monotonic() - since >= window:
-                return
+        """No LOUD write for `window` seconds. The idle blink's one-cell
+        diffs (issue #104) never count — quiet means "nothing substantive
+        changed", not "zero bytes"."""
+        while time.monotonic() - self._last_loud < window:
+            time.sleep(0.05)
 
     def send(self, data: bytes):
         os.write(self.master, data)
@@ -750,12 +813,45 @@ class App:
             self.send(ch.encode())
             time.sleep(per_key)
 
+    # A real bracketed paste (issue #112's drop flow): the terminal wraps
+    # the payload in ESC[200~ … ESC[201~ — the exact bytes a terminal
+    # emits when a dropped file's path lands in the composer.
+    def paste(self, text: str):
+        self.send(b"\x1b[200~" + text.encode() + b"\x1b[201~")
+
+    # One wheel notch (SGR mouse encoding, button 64 = up / 65 = down) —
+    # what mouse capture delivers to the app (issue #21's amendment).
+    def wheel(self, direction: str):
+        button = 64 if direction == "up" else 65
+        self.send(f"\x1b[<{button};40;10M".encode())
+
     def probe(self, window_ms: int) -> int:
         """Bytes the app pushes to the terminal with NO input — the idle
-        render rate at the terminal boundary. 0 == no renders."""
+        render rate at the terminal boundary. 0 == no renders. Since the
+        idle blink (issue #104) a fresh idle app emits a SMALL periodic
+        diff at ~2/s: the probe is now a bounded-rate probe — use
+        frame_rate() to count the bursts."""
         before = self._total
         time.sleep(window_ms / 1000)
         return self._total - before
+
+    def frame_rate(self, window_ms: int) -> tuple[int, int]:
+        """(bursts, bytes) the app pushed with NO input over the window:
+        chunks grouped into bursts by a 120 ms gap each count as one
+        rendered frame — the idle blink's measured renders/s (issue #104).
+        ~2 bursts over a 1 s window is the recorded 500 ms cadence."""
+        start = time.monotonic()
+        time.sleep(window_ms / 1000)
+        writes = [(t, c) for t, c in self._chunks if t >= start]
+        bursts = 0
+        last_t = None
+        nbytes = 0
+        for t, c in writes:
+            nbytes += len(c)
+            if last_t is None or t - last_t > 0.12:
+                bursts += 1
+            last_t = t
+        return bursts, nbytes
 
     # -- rendering --------------------------------------------------------
 
@@ -1071,7 +1167,7 @@ class App:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             title = self.composer_title()
-            if title and "📎" in title:
+            if title and "[Image #1]" in title:
                 break
             time.sleep(0.1)
         else:
@@ -1099,13 +1195,174 @@ class App:
         assert "rest" not in self.text(), \
             "the refusal still streamed a reply — a request went out"
 
-    # The composer block's title row (the bordered input's top line, which
-    # carries the pending chip) — the first row of the composer block; the
-    # block's title sits directly above the draft row.
-    def composer_title(self) -> str:
+    # The drop scenarios (issue #112; ADR 0018's 2026-10-31 amendment): a
+    # bracketed-pasted path to an existing image file becomes a numbered
+    # chip. drop-image runs on the CAPABLE model (chip -> send -> wire),
+    # drop-refusal on the default non-capable one (visible refusal).
+    def scenario_drop_image(self) -> str:
+        path = self.attach_fixture()
+        second = path.replace("shot.png", "second.jpg")
+        with open(second, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"\x22" * 120)
+
+        def wait_title(needle, pop=None, timeout=10):
+            # Waits until the composer title contains `needle` — and, when
+            # `pop` is given, does NOT contain it (the popped chip).
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                title = self.composer_title()
+                if pop is not None:
+                    if needle in title and pop not in title:
+                        return
+                elif needle in title:
+                    return
+                time.sleep(0.1)
+            raise TimeoutError(f"composer title never reached {needle!r}")
+
+        self.paste(path + "\r\n")
+        wait_title("[Image #1]")
+        assert path not in self.text(), \
+            "the dropped path typed into the composer as literal text"
+
+        self.paste(second)
+        wait_title("[Image #1] [Image #2]")
+
+        # Backspace on the empty draft pops the newest chip (and
+        # renumbers); the settle beat holds the popped state long enough
+        # to be its own GIF frame (hostile review F5).
+        self.send(b"\x7f")
+        wait_title("[Image #1]", pop="[Image #2]")
+        time.sleep(0.8)
+        # ...and the re-drop restores two
+        self.paste(second)
+        wait_title("[Image #1] [Image #2]")
+
+        self.type("what is this?")
+        self.send(b"\r")
+        self.wait_for("rest")          # the scripted reply's last word
+        self.wait_quiet()
+        assert "shot.png" in self.text(), \
+            "the submitted turn's 📎 indicator line never rendered"
+        return path
+
+    def scenario_drop_refusal(self):
+        path = self.attach_fixture()
+        self.paste(path)
+        self.wait_for("[images:", timeout=10)
+        self.wait_quiet()
+        assert "[Image" not in self.composer_title(), \
+            "a refused drop still landed a chip"
+        assert path not in self.text(), \
+            "the refused drop typed its path into the composer"
+        assert "rest" not in self.text(), \
+            "the refusal still streamed a reply — a request went out"
+
+    # The Tab-complete flow (issue #105; ADR 0020 amendment): "/mod" + Tab
+    # completes to the highlighted head "/mode " (registry order — mode
+    # precedes model; popup closes), then "/c" + down + Tab completes the
+    # ARROW-SELECTED "/compact " — both asserted before the GIF is
+    # written. (pyte rows are padded, so the trailing typed space is
+    # asserted by the popup's closure + the completed name; the unit tests
+    # pin the space byte itself.)
+    def scenario_tab_complete(self):
+        assert "❯" in self.composer_title(), "composer never rendered"
+        self._mark = time.monotonic()
+        self.type("/mod", per_key=0.4)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            screen = self.text()
+            if "show or switch" in screen and "pick a model" in screen:
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("the narrowed /mod popup never rendered")
+        self.send(b"\t")
+        while time.monotonic() < deadline:
+            if self.draft_text().rstrip() == "/mode":
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("Tab never completed the command")
+        assert "pick a model" not in self.text(), \
+            "the popup survived the completion"
+        # second beat: the arrow-selected match completes, not the head
+        for _ in range(6):
+            self.send(b"\x7f")
+        time.sleep(0.3)
+        self.type("/c", per_key=0.4)
+        while time.monotonic() < deadline:
+            if "compact now" in self.text():
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("the /c popup never rendered")
+        self.send(b"\x1b[B")           # Down — select /compact
+        time.sleep(0.4)
+        self.send(b"\t")
+        while time.monotonic() < deadline:
+            if self.draft_text().rstrip() == "/compact":
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("Tab never completed the arrow-selected match")
+        assert "compact now" not in self.text(), \
+            "the popup survived the second completion"
+
+    # The composer's draft row: the first row INSIDE the input box — the
+    # row directly under the title border row, stripped of its "│ " border
+    # prefix AND suffix (the row renders as "│ /model … │").
+    def draft_text(self) -> str:
         for i, row in enumerate(self.screen.display):
-            if row.lstrip().startswith("❯"):
-                return row.rstrip()
+            s = row.rstrip()
+            if s.lstrip().startswith("╭") and "❯" in s:
+                if i + 1 < len(self.screen.display):
+                    return self.screen.display[i + 1].strip().strip("│").strip()
+        return ""
+
+    # The typing-snap flow (issue #110): resume a long log, wheel up
+    # unfollows (the position span reads L..-../.. and the tail's last
+    # line scrolls off), one keystroke re-pins to the tail, and the last
+    # line is visible again.
+    def scenario_snap_scroll(self):
+        assert "follow L" in self.text(), \
+            "the resumed log never reached a follow state"
+        # Mark BEFORE the wheel-ups: the GIF must contain the scroll-back
+        # state itself, not only the snap back (hostile review F1).
+        self._mark = time.monotonic()
+        self.wheel("up")
+        self.wheel("up")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if "follow" not in self.text():
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("the wheel never unfollowed the tail")
+        assert re.search(r"\bL\d+-\d+/\d+", self.text()), \
+            f"the scrolled position span never rendered: {self.text()[:120]!r}"
+        assert "forty" not in self.text(), \
+            "the tail's last line is still visible after scrolling away"
+
+        self.type("h", per_key=0.4)
+        while time.monotonic() < deadline:
+            if "follow L" in self.text():
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("typing never re-pinned the log to the tail")
+        assert "forty" in self.text(), \
+            "the re-pinned view does not show the tail's last line"
+
+    # The composer block's title row (the bordered input's top line, which
+    # carries the pending chips). The row is the box's TOP BORDER with the
+    # title span inlaid — "╭❯ [Image #1] ───…" — NOT the footer's "❯ cwd"
+    # row (which also starts with the glyph; a first cut matched it and the
+    # attach asserts passed on the footer's 📎 capability glyph instead).
+    def composer_title(self) -> str:
+        for row in self.screen.display:
+            s = row.rstrip()
+            if s.lstrip().startswith("╭") and "❯" in s:
+                return s.strip()
         return ""
 
     # -- the /title dialog (issue #106) ------------------------------------
@@ -1253,7 +1510,8 @@ def main():
                              "slash-autocomplete", "attach",
                              "attach-refusal", "reading-session",
                              "resume-session", "model-switch",
-                             "title-dialog"])
+                             "title-dialog", "idle-blink", "tab-complete",
+                             "snap-scroll", "drop-image", "drop-refusal"])
     ap.add_argument("--out", default=None)
     # The compact-session flow shoots TWO stills: --out after the drop,
     # --out2 after the follow-up no-op command (its below-trigger entry).
@@ -1341,6 +1599,10 @@ def main():
         context = context  # None unless pinned
     elif args.scenario == "resume-session":
         resume = write_reading_fixture(scratch_dir())
+    elif args.scenario == "snap-scroll":
+        # A 40-turn fixture log overflows the 24-row viewport several
+        # times over — the scroll-back state is real (issue #110).
+        resume = write_snap_fixture(scratch_dir())
     elif args.scenario == "title-dialog":
         # A holder session owns "Held Name"; the resumed fixture is titled
         # "Resume Me" — the dialog must pre-fill from it (issue #106).
@@ -1349,7 +1611,7 @@ def main():
 
     if context is None and args.scenario not in ("stock-compact", "default-window"):
         context = 524288
-    images = args.scenario == "attach"
+    images = args.scenario in ("attach", "drop-image")
     # The CLI flag (issue #109) outranks a scenario's own base URL choice.
     app = App(no_ghost=args.no_ghost, context=context, resume=resume,
               images=images, cols=args.cols, rows=args.rows,
@@ -1366,9 +1628,14 @@ def main():
         if args.mode == "probe":
             if args.after_exchange:
                 app.scenario_mid_session()
+            # Since the idle blink (issue #104) the probe's honest reading
+            # is the BOUNDED rate: bursts of tiny one-cell diffs, ~2/s at
+            # the recorded 500 ms cadence, zero anything larger.
+            bursts, nbytes = app.frame_rate(args.window_ms)
             print(f"probe  window={args.window_ms}ms "
                   f"{'after-exchange' if args.after_exchange else 'fresh-session'} "
-                  f"bytes={app.probe(args.window_ms)}")
+                  f"frames={bursts} bytes={nbytes} "
+                  f"({1000 * bursts / max(args.window_ms, 1):.1f} frames/s)")
         elif args.mode == "still":
             if args.scenario == "mid-session":
                 app.scenario_mid_session()
@@ -1417,6 +1684,8 @@ def main():
                 app.scenario_attach()
             elif args.scenario == "attach-refusal":
                 app.scenario_attach_refusal()
+            elif args.scenario == "drop-refusal":
+                app.scenario_drop_refusal()
             elif args.scenario == "model-switch":
                 app.scenario_model_switch()
             elif args.scenario == "title-dialog":
@@ -1460,6 +1729,46 @@ def main():
             app._mark = time.monotonic()
             app.scenario_attach()
             time.sleep(0.5)            # a settled beat on the final state
+            app.gif(args.out, crop_rows=24, min_span=1.0)
+        elif args.scenario == "idle-blink":
+            # The idle cursor blink (issue #104), the motion capture: no
+            # input at all — the composer's cursor toggles on its own
+            # timer. The rate is ASSERTED before the GIF: the measured
+            # renders/s is ADR 0006's recorded cost (a capture whose
+            # number is off fails, not ships).
+            app.wait_quiet()
+            bursts, nbytes = app.frame_rate(2000)
+            rate = bursts / 2.0
+            assert 1.2 <= rate <= 3.0, \
+                f"idle frame rate {rate:.1f}/s outside the bounded band " \
+                f"(bursts={bursts}, bytes={nbytes})"
+            assert nbytes < 512, \
+                f"idle bytes {nbytes} over 2 s are not a one-cell diff"
+            app._mark = time.monotonic()
+            time.sleep(3.2)            # ~6 toggles at the 500 ms cadence
+            app.gif(args.out, crop_rows=24, min_span=3.0)
+            print(f"blink  measured {rate:.1f} frames/s idle "
+                  f"({nbytes} bytes over 2 s)")
+        elif args.scenario == "tab-complete":
+            # The completion in motion (issue #105): the popup narrows,
+            # Tab lands "/model ", the second beat completes the
+            # arrow-SELECTED /compact. The scenario asserts each act.
+            app.scenario_tab_complete()
+            time.sleep(0.5)            # a settled beat on the final draft
+            app.gif(args.out, crop_rows=20, min_span=1.5)
+        elif args.scenario == "snap-scroll":
+            # Scroll back, type, snap (issue #110): the scenario asserts
+            # the unfollowed span, the invisible tail, and the re-pin.
+            app.scenario_snap_scroll()
+            time.sleep(0.5)
+            app.gif(args.out, crop_rows=24, min_span=1.0)
+        elif args.scenario == "drop-image":
+            # The whole drop flow (issue #112): paste -> chip #1 ->
+            # paste -> #2 -> backspace pop -> re-drop -> submit -> the
+            # streamed reply with its 📎 indicator rows. Full frame.
+            app._mark = time.monotonic()
+            app.scenario_drop_image()
+            time.sleep(0.5)
             app.gif(args.out, crop_rows=24, min_span=1.0)
         elif args.scenario == "growing-session":
             # Mark BEFORE the first send: the GIF covers both turns — the

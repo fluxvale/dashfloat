@@ -14,6 +14,10 @@
   ([issue #109](https://github.com/fluxvale/dashfloat/issues/109) — the
   footer's model span becomes `provider - model`; see
   [Amendment (2026-10-31, issue #109)](#amendment-2026-10-31-issue-109-the-footers-model-span-becomes-provider---model)
+  below); **amended again 2026-10-31**
+  ([issue #104](https://github.com/fluxvale/dashfloat/issues/104) — the
+  idle cursor now blinks; see
+  [Amendment (2026-10-31, issue #104): the idle cursor blinks](#amendment-2026-10-31-issue-104-the-idle-cursor-blinks)
   below).
 - **Date:** 2026-10-29
 - **Implements:** [issue #66](https://github.com/fluxvale/dashfloat/issues/66),
@@ -320,3 +324,20 @@ Still one compact span — never the full base_url, never a second span.
    `State.provider_label/1`, so `/model` and `/profile` switches show on
    the next frame exactly as the model span always did — nothing new at
    any agent seam ([ADR 0007](0007-tool-calls-and-execution.md)).
+
+## Amendment (2026-10-31, issue #104): the idle cursor blinks
+
+**Status:** Accepted. Supersedes the "focused + idle" bullet of §1 above —
+its "costing **zero new timers** (ADR 0006's idle ⇒ no timers ⇒ no renders
+stands untouched)" parenthetical AND its "static bright reversed" wording —
+which the owner's smoke test
+([issue #104](https://github.com/fluxvale/dashfloat/issues/104)) reversed.
+Everything else in §1 stands: the focus gate (unfocused shows no cursor,
+still zero extra renders), the explicit bright pair, and the active-phase
+blink riding the 125 ms tick. The idle blink is a dedicated 500 ms timer —
+**measured 2.0 renders/s while idle** — owned, costed, and recorded by
+[ADR 0006](0006-ui-truth-and-rendering.md)'s 2026-10-31 blink amendment
+(exception #5); this note only keeps §1's record coherent. The Tab rule in
+§3 is untouched: the ghost arms and lands only on an EMPTY draft, so a
+`/`-prefixed draft never carries a ghost, and the filter popup's Tab
+(issue #105, ADR 0020's amendment) cannot fight Tab-the-ghost.

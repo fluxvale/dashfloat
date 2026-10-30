@@ -28,6 +28,29 @@ defmodule DashFloat.Images do
   @type meta :: %{name: String.t(), kb: pos_integer()}
 
   @doc """
+  The drop-detection predicate (ADR 0018's 2026-10-31 amendment): true when
+  `path` names an existing regular file with an image extension — no cap
+  test (that is `check/1`'s to refuse on). The composer's bracketed-paste
+  hook asks this before a paste converts to an attachment; one `stat`, the
+  same sanctioned read shape as the attach prompt.
+  """
+  @spec image_file?(Path.t()) :: boolean()
+  def image_file?(path) do
+    case File.stat(path) do
+      {:ok, %File.Stat{type: :regular}} ->
+        ext =
+          path
+          |> Path.extname()
+          |> String.downcase()
+
+        Map.has_key?(@mimes, ext)
+
+      _other ->
+        false
+    end
+  end
+
+  @doc """
   The attach prompt's check (ADR 0018 §5): validates `path` without reading
   image bytes — it must exist, be a regular file, carry an image extension,
   and sit under the 10 MiB cap (per its stat). Returns the display metadata —

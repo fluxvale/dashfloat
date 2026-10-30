@@ -27,6 +27,11 @@
   entries bold with an accent `❯` prefix, the chrome margin widened to two
   cells; see
   [Amendment (2026-10-31, issues #107 + #108)](#amendment-2026-10-31-issues-107--108-user-entry-style-margin-2)
+  below); **amended again 2026-10-31**
+  ([issue #104](https://github.com/fluxvale/dashfloat/issues/104) — the
+  idle cursor blinks: the zero-render idle discipline gains one bounded,
+  measured exception; see
+  [Amendment (2026-10-31, issue #104): the idle cursor blinks](#amendment-2026-10-31-issue-104-the-idle-cursor-blinks)
   below)
 - **Date:** 2026-10-24
 - **Implements:** [issue #16](https://github.com/fluxvale/dashfloat/issues/16) — Phase 2.5 of the
@@ -681,3 +686,50 @@ and the user-row styling in the [theme table](#theme-as-data) and
   so the whole chrome moves together and the log rect is still the wrap
   width, by construction. At 80×24 the idle log keeps 15 rows — the
   top/bottom air is what makes the window read as framed.
+
+## Amendment (2026-10-31, issue #104): the idle cursor blinks
+
+**Status:** Accepted. The owner's v0.3.0 smoke test (Oct 31) decided the
+question [issue #91](https://github.com/fluxvale/dashfloat/issues/91)
+deferred to him: the idle cursor BLINKS. Supersedes the animation model's
+"**Idle ⇒ no timers ⇒ no renders.**" clause and the sentence right below it
+("an idle DashFloat renders nothing on a timer, ever"), plus the matching
+idle-cursor clause of
+[ADR 0015](0015-input-surface-cursor-stats-ghost.md) §1 ("costing zero new
+timers"; its "static bright reversed" wording — see that ADR's same-day
+amendment). Every other idle discipline stands (no parse in `render/2`, no
+timers beyond the ones enumerated here, render-suppressed stale messages).
+Restatements of the old discipline in other ADRs (e.g. ADR 0007's process
+notes) are read against this amendment, not independently.
+
+- **Sanctioned exception #5 — the first REPEATING idle timer.** A dedicated
+  `:dashfloat_blink` timer at **500 ms** (the active-phase blink's own
+  half-period) toggles `blink_on` and draws exactly one frame per toggle:
+  **measured 2.0 renders/s while idle, ~50 bytes per frame at the terminal**
+  (pty probe over 3 s: 6 frame-bursts, 297 bytes — the one-cell cursor diff;
+  `scripts/capture.py probe`). That is the honest cost the owner accepted:
+  idle is no longer zero renders, and this ADR no longer claims it is.
+- **Dedicated timer, not the tick.** Riding the existing 125 ms activity
+  tick would re-render at 8 Hz idle — 4× the accepted cost — and couple the
+  blink to spinner bookkeeping. The blink owns its own timer, the same
+  single-choke-point discipline as the tick: exactly one pending while the
+  chat UI is idle (arm at mount and after every event; a fired-but-undrained
+  timer is left to drain), cancelled on every exit from idle — the active
+  cursor keeps riding the tick — with `blink_on` reset visible so the first
+  idle frame always draws the cursor. Stale blink messages (cancelled or
+  superseded arms) are render-suppressed, exactly like stale ticks.
+- **Blink unconditionally; focus does not gate it.** The probe showed the
+  cost is a one-cell diff twice a second — negligible — so the simpler rule
+  wins: the timer runs whenever the chat UI is idle, focused or not. An
+  unfocused pane's cursor artifact stays hidden (ADR 0015 §1 unchanged), so
+  its toggle frames carry no visible change; that inert symmetry is the
+  price of not threading focus state through the timer. Setup screens (no
+  composer) never arm it.
+- **The suite stays hermetic.** Arming is live-only by default (the
+  suggest-arm pattern, ADR 0015 §3): an injected `blink_ms:` opts a test in
+  at its own cadence; the default suite arms nothing, so every
+  renders-stay-flat-at-idle assertion in it keeps holding — now as the
+  no-injection contract, not as the idle discipline.
+- **Capture rig.** `wait_boot`/`wait_quiet` treat writes under 96 bytes as
+  blink noise (quiet means "nothing substantive changed", not "zero
+  bytes"); the probe reports bursts/s as the blink's metric.

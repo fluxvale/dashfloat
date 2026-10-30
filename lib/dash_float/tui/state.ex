@@ -132,6 +132,14 @@ defmodule DashFloat.TUI.State do
     in_flight_dirty: false,
     anim_step: 0,
     tick_ref: nil,
+    # The idle cursor blink (issue #104; ADR 0006's 2026-10-31 amendment):
+    # `blink_on` is the display phase (true = cursor cell drawn), `blink_ref`
+    # the pending timer (owned by the TUI process), `blink_ms` the injectable
+    # cadence — nil means "live runs blink at the TUI's default; the
+    # hermetic suite never arms one" (the suggest-arm pattern).
+    blink_on: true,
+    blink_ref: nil,
+    blink_ms: nil,
     exit_guard_at: nil,
     exit_guard_ref: nil,
     stats: %{
@@ -208,6 +216,9 @@ defmodule DashFloat.TUI.State do
           in_flight_dirty: boolean(),
           anim_step: non_neg_integer(),
           tick_ref: reference() | nil,
+          blink_on: boolean(),
+          blink_ref: reference() | nil,
+          blink_ms: non_neg_integer() | nil,
           stats: stats(),
           context: %{messages: [map()], anchor: Accounting.anchor()} | nil,
           scroll: non_neg_integer(),
@@ -329,6 +340,10 @@ defmodule DashFloat.TUI.State do
       # and the debounce delay is injectable for the timing tests.
       suggest_fetcher: Keyword.get(opts, :suggest_fetcher),
       suggest_debounce_ms: Keyword.get(opts, :suggest_debounce_ms, 600),
+      # The idle blink's injectable cadence (issue #104): present only when
+      # a test opts in — its presence is what un-hermetically-gates the
+      # timer arm (the suggest_fetcher pattern); live runs use the default.
+      blink_ms: Keyword.get(opts, :blink_ms),
       # The session title (ADR 0023): the boot --title or the resumed file's
       # title — the dialog's prefill (issue #106).
       title: Keyword.get(opts, :title),
@@ -793,12 +808,84 @@ defmodule DashFloat.TUI.State do
   @spec input_line_count(t()) :: non_neg_integer()
   def input_line_count(%__MODULE__{input: input}), do: ExRatatui.textarea_line_count(input)
 
-  @doc "Inserts pasted text at the cursor (bracketed paste), normalizing CRLF and CR."
+  @doc """
+  Inserts pasted text at the cursor (bracketed paste), normalizing CRLF and
+  CR. A paste whose ENTIRE content is a path to an existing image file
+  converts to an attachment instead — the drag-and-drop shape (issue #112;
+  ADR 0018's 2026-10-31 amendment): terminals paste a dropped file's path,
+  and the composer answers with a chip, never literal path text. Refusals
+  follow the attach prompt's visible-entry rule. Either way the composer
+  was edited: the log re-pins to the tail (issue #110).
+  """
   @spec paste(t(), String.t()) :: t()
-  def paste(%__MODULE__{input: input} = state, content) when is_binary(content) do
-    ExRatatui.textarea_insert_str(input, normalize_newlines(content))
-    refresh_palette(dismiss_suggestion(leave_history(state)))
+  def paste(%__MODULE__{} = state, content) when is_binary(content) do
+    normalized = normalize_newlines(content)
+
+    case dropped_image(state, normalized) do
+      nil ->
+        ExRatatui.textarea_insert_str(state.input, normalized)
+        follow_tail(refresh_palette(dismiss_suggestion(leave_history(state))))
+
+      attached ->
+        attached
+    end
   end
+
+  # The drop test (ADR 0018 amendment): the whole paste — surrounding
+  # whitespace and the trailing newline terminals add stripped, nothing
+  # else — must be a single whitespace-free path naming an existing
+  # regular image file. A
+  # paste with interior newlines, spaces, or a path that is not an image
+  # file is ordinary text (a pasted path as prose keeps its Ctrl+O).
+  # Detection is paste-only by design: typed paths can never accidentally
+  # convert (recorded in the amendment).
+  defp dropped_image(%__MODULE__{} = state, normalized) do
+    candidate = String.trim(normalized)
+
+    if drop_shaped?(candidate) and Images.image_file?(candidate) do
+      {:ok, state} = drop_attach(state, candidate)
+      state
+    else
+      nil
+    end
+  end
+
+  defp drop_shaped?(""), do: false
+
+  defp drop_shaped?(candidate) do
+    not (candidate =~ ~r/\s/) and candidate =~ ~r/\.(png|jpe?g|gif|webp)$/i
+  end
+
+  # The drop's gates mirror the attach prompt's Enter (ADR 0018 §4): the
+  # capability refusal names the model and keeps the paste out of the
+  # draft; a capable model runs the shared path check (an over-cap image
+  # refuses visibly — never a silent drop); success appends the pending
+  # chip. Any phase may drop — the composer owns pastes whenever no other
+  # input mode does, and the queue only rides a submit.
+  defp drop_attach(%__MODULE__{provider: {:ok, %DashFloat.Config{images: false}}} = state, _path) do
+    {:ok, config} = state.provider
+
+    refusal =
+      "[images: model #{image_model_name(config)} does not accept images — attach refused]"
+
+    {:ok, follow_tail(append_entry(state, :system, refusal))}
+  end
+
+  defp drop_attach(%__MODULE__{} = state, path) do
+    case Images.check(path) do
+      {:ok, meta} ->
+        {:ok,
+         follow_tail(%{state | attachments: state.attachments ++ [Map.put(meta, :path, path)]})}
+
+      {:error, reason} ->
+        {:ok, follow_tail(append_entry(state, :system, "[images: " <> reason <> "]"))}
+    end
+  end
+
+  # Any composer edit re-pins the log to its tail (issue #110): the user
+  # extending the conversation watches it grow. Scrolling, cursor-only
+  # keys, and history navigation do not ride this — entering text does.
+  defp follow_tail(%__MODULE__{} = state), do: %{state | scroll: 0, follow?: true}
 
   @doc """
   A paste while the attach prompt is open (ADR 0018 §5): bracketed paste
@@ -1003,6 +1090,27 @@ defmodule DashFloat.TUI.State do
     run_submitted_command(state, input_text(state), command.name, "")
   end
 
+  # Filter Tab COMPLETES to the selected match (issue #105; ADR 0020's
+  # 2026-10-31 amendment): the draft becomes "/<name> " — the trailing
+  # space closes the popup (args may follow) and leaves the cursor at the
+  # end, editable. The selection is the popup's own highlighted row — the
+  # same one arrows move and Enter runs, one selection model. Plain Tab
+  # only: shift+tab keeps its swallow above the mode cycle, real terminals
+  # emit BackTab. The clause sits above the ghost-text Tab: a slash draft
+  # is never empty, so the ghost never arms beside it (ADR 0015 §3 arms
+  # and lands on an empty draft only) — the two Tab rules cannot fight.
+  defp route_key(%{palette: %Palette{mode: :filter} = palette} = state, "tab", [], _now) do
+    command = Enum.at(palette.items, palette.selected)
+
+    state
+    |> leave_history()
+    |> set_draft("/" <> command.name <> " ")
+    |> refresh_palette()
+    |> dismiss_suggestion()
+    |> follow_tail()
+    |> then(&{&1, nil})
+  end
+
   # Esc dismisses either palette; the filter's dismissal survives until the
   # next draft edit re-derives it.
   defp route_key(%{palette: palette} = state, "esc", _modifiers, _now) when palette != nil,
@@ -1055,6 +1163,20 @@ defmodule DashFloat.TUI.State do
     if on_last_row?(state), do: {history_next(state), nil}, else: forward(state, "down", [])
   end
 
+  # A chip pops before the draft loses its last grapheme (issue #112; ADR
+  # 0018 amendment): Backspace on an empty draft — the cursor sits at the
+  # chips' boundary, the chip row renders ahead of the draft — removes the
+  # NEWEST pending attachment; numbering re-derives from the queue. With
+  # draft text, Backspace keeps its ordinary edit (the chip is not "over"
+  # the cursor until the draft is empty).
+  defp route_key(%{attachments: [_chip | _rest]} = state, "backspace", [], _now) do
+    if input_text(state) == "" do
+      {follow_tail(%{state | attachments: Enum.drop(state.attachments, -1)}), nil}
+    else
+      forward(state, "backspace", [])
+    end
+  end
+
   # Tab materializes the ghost (ADR 0015 §3): the draft becomes the landed
   # suggestion (editable, cursor at end). No ghost — or a non-empty draft —
   # falls through to the textarea unchanged.
@@ -1065,6 +1187,7 @@ defmodule DashFloat.TUI.State do
       |> set_draft(suggestion)
       |> refresh_palette()
       |> dismiss_suggestion()
+      |> follow_tail()
       |> then(&{&1, nil})
     else
       forward(state, "tab", [])
@@ -1081,11 +1204,12 @@ defmodule DashFloat.TUI.State do
     # Editing while browsing history keeps the edited text: it becomes the
     # live draft (no longer restorable by navigating down). The filter
     # palette re-derives only when the draft actually changed — Esc's
-    # dismissal survives cursor-only keys (ADR 0020).
+    # dismissal survives cursor-only keys (ADR 0020) — and a real edit
+    # re-pins the log to its tail (issue #110): keystrokes, not focus.
     edited = dismiss_suggestion(leave_history(state))
 
     state =
-      if input_text(edited) == before, do: edited, else: refresh_palette(edited)
+      if input_text(edited) == before, do: edited, else: follow_tail(refresh_palette(edited))
 
     {state, nil}
   end
@@ -1879,6 +2003,16 @@ defmodule DashFloat.TUI.State do
 
     {state, :cont}
   end
+
+  @doc """
+  Toggles the idle cursor's blink phase (issue #104; ADR 0006's 2026-10-31
+  amendment) — one state flip, drawn by the TUI's blink timer frame. Pure;
+  the timer lives in the TUI process. Entering an active phase resets the
+  phase to visible (`true`) so the first idle frame always shows the
+  cursor.
+  """
+  @spec blink(t()) :: t()
+  def blink(%__MODULE__{} = state), do: %{state | blink_on: not state.blink_on}
 
   defp refresh_in_flight(%{in_flight_dirty: false} = state), do: state
 

@@ -17,6 +17,29 @@ defmodule DashFloat.ImagesTest do
     Path.join(dir, name)
   end
 
+  describe "image_file?/1 (the drop-detection predicate, ADR 0018 amendment)" do
+    test "an existing regular image file is a drop candidate" do
+      for name <- ~w(a.png b.JPG c.jpeg d.gif e.webp) do
+        path = tmp_path(name)
+        File.write!(path, @png_bytes)
+        assert Images.image_file?(path), name
+      end
+    end
+
+    test "missing files, non-image extensions, and directories are not" do
+      missing = tmp_path("gone.png")
+      refute Images.image_file?(missing)
+
+      text = tmp_path("notes.txt")
+      File.write!(text, "hi")
+      refute Images.image_file?(text)
+
+      dir = tmp_path("adir.png")
+      File.mkdir_p!(dir)
+      refute Images.image_file?(dir)
+    end
+  end
+
   describe "check/1 (the attach prompt's stat-only gate, ADR 0018 §5)" do
     test "a valid image returns its name and size in KB" do
       path = tmp_path("photo.png")

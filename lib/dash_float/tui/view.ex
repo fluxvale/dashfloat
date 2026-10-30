@@ -742,19 +742,33 @@ defmodule DashFloat.TUI.View do
   defp placeholder(%State{entries: []}), do: @input_hint
   defp placeholder(%State{}), do: nil
 
-  # The composer's title (ADR 0018 §5): pending attachments ride the title
-  # as a count — the one chip the composer shows for them.
+  # The composer's title (ADR 0018's 2026-10-31 amendment): pending
+  # attachments render as numbered chips — `[Image #1] [Image #2]` — in
+  # queue order beside the prompt glyph; the number is the queue position
+  # (re-derived on every pop), the whole row accent like the glyph it
+  # extends. Supersedes the `📎 n` count.
   defp input_title(%State{attachments: []}),
     do: Span.new("❯ ", style: Theme.style(:accent))
 
-  defp input_title(%State{attachments: attachments}),
-    do: Span.new("❯ 📎 #{length(attachments)}", style: Theme.style(:accent))
+  defp input_title(%State{attachments: attachments}) do
+    chips =
+      attachments
+      |> Enum.with_index(1)
+      |> Enum.map_join(" ", fn {_attachment, n} -> "[Image ##{n}]" end)
 
-  # The composer's cursor artifact (ADR 0015 §1): absent while the pane is
-  # unfocused, static bright reversed while idle (zero timers — ADR 0006's
-  # idle discipline stands), and a 500 ms on/off blink in active phases riding
-  # the existing 125 ms tick — 4 anim_steps on, 4 off at the 8 Hz budget.
+    Span.new("❯ " <> chips, style: Theme.style(:accent))
+  end
+
+  # The composer's cursor artifact (ADR 0015 §1, amended by issue #104):
+  # absent while the pane is unfocused, a 500 ms on/off blink while idle —
+  # the dedicated blink timer toggles `blink_on` (ADR 0006's 2026-10-31
+  # amendment; 2 frames/s, the honest recorded cost) — and the same 500 ms
+  # blink in active phases riding the existing 125 ms tick: 4 anim_steps
+  # on, 4 off at the 8 Hz budget.
   defp cursor_style(%State{focused?: false}), do: %Style{}
+
+  defp cursor_style(%State{phase: :idle, blink_on: false}), do: %Style{}
+
   defp cursor_style(%State{phase: :idle}), do: Theme.style(:cursor)
 
   defp cursor_style(%State{anim_step: step}) do

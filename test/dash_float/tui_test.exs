@@ -2352,6 +2352,97 @@ defmodule DashFloat.TUITest do
     assert Runtime.snapshot(pid).render_count == frozen
   end
 
+  # The idle cursor blink (issue #104; ADR 0006's 2026-10-31 amendment —
+  # sanctioned exception #5, the first REPEATING idle timer). The default
+  # suite stays hermetic: without an injected cadence the timer never arms
+  # (the suggest-arm pattern), so every flat-render assertion above holds.
+  # These tests opt IN through `blink_ms:` and watch the real wiring.
+  describe "the idle cursor blink (issue #104)" do
+    test "the timer arms at mount with an injected cadence and toggles the phase" do
+      {:ok, pid} = start_tui(blink_ms: 20, provider: provider())
+
+      # The phase flips on the timer: blink_on reaches false, then true…
+      eventually(pid, fn s -> s.blink_on == false end, 300)
+      toggled_back = eventually(pid, fn s -> s.blink_on == true end, 300)
+
+      # …exactly one timer stays pending the whole time, and each toggle
+      # drew a frame (the honest bounded cost — 2 renders/s at 500 ms).
+      assert toggled_back.blink_ref != nil
+      assert toggled_back.phase == :idle
+      assert Runtime.snapshot(pid).render_count > 1
+    end
+
+    test "leaving idle cancels the blink and resets the phase visible" do
+      {:ok, pid} = start_tui(blink_ms: 20, provider: provider())
+      eventually(pid, fn s -> s.blink_on == false end, 300)
+
+      submit(pid, "stream now")
+      assert_receive {:prompt, ui_pid, "stream now", []}, 1_000
+
+      active =
+        eventually(pid, fn s ->
+          s.phase == :streaming and s.tick_ref != nil and s.blink_ref == nil
+        end)
+
+      assert active.blink_on == true
+
+      send(ui_pid, {:phase, :idle})
+      back = eventually(pid, fn s -> s.phase == :idle and s.blink_ref != nil end)
+      assert back.blink_on == true
+    end
+
+    test "a stale blink message is dropped without a frame" do
+      idle = State.new(test_mode: {80, 24})
+      assert {:noreply, ^idle, %{render?: false}} = TUI.handle_info(:dashfloat_blink, idle)
+
+      # A blink whose tracked timer has not fired yet is stale — it belongs
+      # to a superseded arm; the live timer is left alone.
+      ref = Process.send_after(self(), :never, 10_000)
+      pending = %{idle | blink_ref: ref}
+
+      assert {:noreply, ^pending, %{render?: false}} = TUI.handle_info(:dashfloat_blink, pending)
+      assert is_integer(Process.read_timer(ref))
+      Process.cancel_timer(ref)
+    end
+
+    test "a fired blink toggles through the choke point and re-arms" do
+      armed = State.new(test_mode: {80, 24}, blink_ms: 20)
+      fired_ref = Process.send_after(self(), :dashfloat_blink, 1)
+      Process.sleep(5)
+
+      assert {:noreply, toggled} =
+               TUI.handle_info(:dashfloat_blink, %{armed | blink_ref: fired_ref})
+
+      assert toggled.blink_on == false
+      # The choke point re-armed exactly one fresh timer.
+      assert toggled.blink_ref != nil and toggled.blink_ref != fired_ref
+      Process.cancel_timer(toggled.blink_ref)
+
+      # The hermetic default (no injected cadence) never re-arms: the
+      # toggle is reset visible with no timer pending.
+      plain = State.new(test_mode: {80, 24})
+      stale_ref = Process.send_after(self(), :dashfloat_blink, 1)
+      Process.sleep(5)
+
+      assert {:noreply, reset} =
+               TUI.handle_info(:dashfloat_blink, %{plain | blink_ref: stale_ref})
+
+      assert reset.blink_on == true
+      assert reset.blink_ref == nil
+    end
+
+    test "the default suite never arms: renders stay flat at idle" do
+      {:ok, pid} = start_tui(provider: provider())
+      Process.sleep(50)
+
+      assert get_state(pid).blink_ref == nil
+
+      settled = Runtime.snapshot(pid).render_count
+      Process.sleep(300)
+      assert Runtime.snapshot(pid).render_count == settled
+    end
+  end
+
   test "the render counter is the metric of record: it ticks during activity only" do
     {:ok, pid} = start_tui()
 
@@ -3373,8 +3464,8 @@ defmodule DashFloat.TUITest do
       attached = eventually(pid, fn s -> s.attachments != [] end)
       assert attached.attachments == [%{path: path, name: "alpha.png", kb: 1}]
       assert attached.attach == nil
-      # the chip rides the composer title
-      assert composer_title(attached) == "❯ 📎 1"
+      # the chips ride the composer title (issue #112's numbering)
+      assert composer_title(attached) == "❯ [Image #1]"
 
       # the turn submits with the attachment's path on the seam
       submit(pid, "what is this?")
@@ -3396,7 +3487,7 @@ defmodule DashFloat.TUITest do
       # the agent's streaming echo clears the pending set (ADR 0018 §6)
       send(ui_pid, {:phase, :streaming})
       cleared = eventually(pid, fn s -> s.attachments == [] end)
-      refute composer_title(cleared) =~ "📎"
+      refute composer_title(cleared) =~ "[Image"
 
       send(ui_pid, {:phase, :idle})
     end
@@ -3420,6 +3511,67 @@ defmodule DashFloat.TUITest do
       assert state.attach == %{draft: "/tmp/opencode/nope.png"}
       assert state.attachments == []
       assert state.phase == :idle
+    end
+
+    # The drag-and-drop shape (issue #112; ADR 0018's 2026-10-31
+    # amendment): a bracketed paste of an existing image path attaches as a
+    # numbered chip — the path never types into the draft.
+    test "a bracketed-pasted image path becomes a numbered chip, not text" do
+      dir = images_dir()
+      path = Path.join(dir, "dropped.png")
+      File.write!(path, "12345678")
+
+      {:ok, pid} = start_tui(provider: capable_provider())
+
+      inject(pid, %ExRatatui.Event.Paste{content: path <> "\r\n"})
+
+      state = eventually(pid, fn s -> s.attachments != [] end)
+      assert state.attachments == [%{path: path, name: "dropped.png", kb: 1}]
+      assert State.input_text(state) == ""
+      assert composer_title(state) == "❯ [Image #1]"
+
+      # a second drop numbers on; Backspace on the empty draft pops the
+      # newest chip and renumbers
+      other = Path.join(dir, "second.jpg")
+      File.write!(other, "12345678")
+      inject(pid, %ExRatatui.Event.Paste{content: other})
+
+      two = eventually(pid, fn s -> length(s.attachments) == 2 end)
+      assert composer_title(two) == "❯ [Image #1] [Image #2]"
+
+      press(pid, "backspace")
+      popped = eventually(pid, fn s -> length(s.attachments) == 1 end)
+      assert Enum.map(popped.attachments, & &1.path) == [path]
+      assert composer_title(popped) == "❯ [Image #1]"
+
+      # the submit seam carries the queue; the streaming echo clears it
+      submit(pid, "what is this?")
+      assert_receive {:prompt, ui_pid, "what is this?", [^path]}, 1_000
+
+      send(ui_pid, {:phase, :streaming})
+      eventually(pid, fn s -> s.attachments == [] end)
+      send(ui_pid, {:phase, :idle})
+    end
+
+    test "a dropped image path on a non-capable model refuses visibly" do
+      dir = images_dir()
+      path = Path.join(dir, "dropped.png")
+      File.write!(path, "12345678")
+
+      {:ok, pid} = start_tui(provider: provider())
+
+      inject(pid, %ExRatatui.Event.Paste{content: path})
+
+      state =
+        eventually(pid, fn s ->
+          Enum.any?(s.entries, &(&1.kind == :system and &1.text =~ "[images:"))
+        end)
+
+      assert state.attachments == []
+      assert State.input_text(state) == ""
+
+      last = List.last(state.entries)
+      assert last.text =~ "model test-model does not accept images"
     end
   end
 
