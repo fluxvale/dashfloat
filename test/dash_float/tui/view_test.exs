@@ -1398,7 +1398,7 @@ defmodule DashFloat.TUI.ViewTest do
       buffer = drawn_text(dialog_state(draft, nil))
       assert buffer =~ "█"
 
-      [%ExRatatui.Text.Line{spans: [prefix, body]} | _] =
+      [%ExRatatui.Text.Line{spans: [prefix, body]} | _rest] =
         dialog_paragraph(dialog_state(draft, nil)).text
 
       assert prefix.content == "❯ "
