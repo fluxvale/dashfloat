@@ -57,10 +57,10 @@ defmodule DashFloat.Config.Onboarding do
           label: String.t(),
           base_url: String.t(),
           key: String.t() | nil,
-          models: [%{nickname: String.t(), model: String.t()}],
+          models: [%{nickname: String.t(), model: String.t(), context: pos_integer() | nil}],
           # The fetch snapshot at finish (issue #65): what the loop's esc-pop
           # restores. Never written out — settings_doc/1 maps explicit fields.
-          fetched: [String.t()]
+          fetched: [DashFloat.Config.Catalog.entry()]
         }
 
   @type t :: %__MODULE__{
@@ -68,7 +68,7 @@ defmodule DashFloat.Config.Onboarding do
           draft: String.t(),
           pending: provider_draft() | nil,
           choice: non_neg_integer(),
-          fetched: [String.t()],
+          fetched: [DashFloat.Config.Catalog.entry()],
           profile_name: String.t(),
           providers: [provider_draft()],
           mcp: [%{name: String.t(), command: String.t(), args: [String.t()], token: nil | :ref}],
@@ -273,8 +273,8 @@ defmodule DashFloat.Config.Onboarding do
 
   defp step_key(state, :model_pick, "enter") do
     case option(state) do
-      {:model, id} ->
-        {finish_provider(add_model(state, id)), nil}
+      {:model, entry} ->
+        {finish_provider(add_model(state, entry)), nil}
 
       :manual ->
         {to_manual(state), nil}
@@ -408,9 +408,11 @@ defmodule DashFloat.Config.Onboarding do
       # The picker's highlight is step/3's restore job: choice 0 on a first
       # arrival, the remembered position on a back-then-forward return —
       # clamped to the list that just arrived, which a refetch may have
-      # SHRUNK under a remembered position (issue #65).
+      # SHRUNK under a remembered position (issue #65). The full entries
+      # stay (not just ids): their observed `context` (issue #111) rides
+      # the picker into the written settings when the provider carries it.
       landed = step(state, :model_pick, "")
-      %{landed | fetched: ids, choice: min(landed.choice, length(ids))}
+      %{landed | fetched: entries, choice: min(landed.choice, length(entries))}
     end
   end
 
@@ -463,6 +465,10 @@ defmodule DashFloat.Config.Onboarding do
   The wizard's final settings document (ADR 0009 shape): one profile — the
   named one, `defaultProfile` by construction — with its providers and MCP
   entries. Labels are written explicitly: they are what the user confirmed.
+  A picked model's observed window (issue #111) is written when the
+  provider's `/models` carried one — observed metadata is the freshest
+  truth and belongs in the file; a model no source knows stays context-less
+  and rides the runtime seed/default.
   """
   @spec settings_doc(t()) :: map()
   def settings_doc(%__MODULE__{} = state) do
@@ -479,7 +485,12 @@ defmodule DashFloat.Config.Onboarding do
                 "baseUrl" => provider.base_url,
                 "models" =>
                   Enum.map(provider.models, fn model ->
-                    %{"nickname" => model.nickname, "model" => model.model}
+                    model_doc =
+                      %{"nickname" => model.nickname, "model" => model.model}
+
+                    if window = usable_window(model.context),
+                      do: Map.put(model_doc, "context", window),
+                      else: model_doc
                   end)
               }
             end),
@@ -493,6 +504,9 @@ defmodule DashFloat.Config.Onboarding do
       ]
     }
   end
+
+  defp usable_window(window) when is_integer(window) and window > 0, do: window
+  defp usable_window(_other), do: nil
 
   ## Option lists (selection steps)
 
@@ -617,10 +631,20 @@ defmodule DashFloat.Config.Onboarding do
 
   defp manual_with_note(state, note), do: %{to_manual(state) | note: note}
 
-  defp add_model(state, id), do: %{state | pending: add_model_to(state.pending, id)}
+  defp add_model(state, model), do: %{state | pending: add_model_to(state.pending, model)}
 
-  defp add_model_to(pending, id),
-    do: %{pending | models: pending.models ++ [%{nickname: id, model: id}]}
+  # A picked entry carries its observed window when the provider reported
+  # one (issue #111) — the picker's whole point over the bare id; a typed
+  # manual id knows none. The `:context` key is read loosely: hand-built
+  # test drafts may omit it.
+  defp add_model_to(pending, %{model: id} = entry) when is_binary(id),
+    do: %{
+      pending
+      | models: pending.models ++ [%{nickname: id, model: id, context: Map.get(entry, :context)}]
+    }
+
+  defp add_model_to(pending, id) when is_binary(id),
+    do: %{pending | models: pending.models ++ [%{nickname: id, model: id, context: nil}]}
 
   defp finish_provider(state) do
     # The finish snapshots the fetch state onto the provider (issue #65):

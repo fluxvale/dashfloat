@@ -73,6 +73,28 @@ defmodule DashFloat.Config.CatalogTest do
       auth_header!(:absent)
     end
 
+    test "context_length — the metadata real OpenAI-compatible catalogs carry (issue #111)" do
+      # Synthetic's live /models reports `context_length` per model (probed
+      # 2026-10-30); the plain `context` spelling stays supported and loses
+      # to nothing — either observed value beats every assumption.
+      server =
+        start_server!([
+          http_ok(
+            ~s({"data": [{"id": "syn:small:text", "context_length": 196608},
+                                {"id": "syn:large:text", "context_length": 524288, "context": 999}]})
+          )
+        ])
+
+      base = SSEServer.base_url(server)
+
+      assert {:ok, entries} = Catalog.fetch(base, nil)
+
+      assert entries == [
+               %{model: "syn:small:text", context: 196_608},
+               %{model: "syn:large:text", context: 524_288}
+             ]
+    end
+
     test "non-2xx reports the HTTP status" do
       server =
         start_server!([

@@ -71,14 +71,19 @@ defmodule DashFloat.Config.Catalog do
 
   # The OpenAI listing shape: {"data": [{"id": "…"}, …]}. Anything else is a
   # schema mismatch and fails open. `context` is optional metadata (not part
-  # of the OpenAI shape; a provider that reports it refreshes the entry).
+  # of the OpenAI shape; a provider that reports it refreshes the entry):
+  # `context_length` is what real OpenAI-compatible catalogs carry (probed:
+  # Synthetic reports it per model; Z.AI's coding endpoint reports nothing).
   defp parse(%{"data" => entries}) when is_list(entries) do
     parsed =
       for entry <- entries,
           is_map(entry),
           id <- [usable(entry["id"])],
           is_binary(id) do
-        %{model: id, context: positive_int(entry["context"])}
+        %{
+          model: id,
+          context: positive_int(entry["context_length"]) || positive_int(entry["context"])
+        }
       end
 
     {:ok, parsed}

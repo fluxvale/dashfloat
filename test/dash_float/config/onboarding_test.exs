@@ -114,6 +114,53 @@ defmodule DashFloat.Config.OnboardingTest do
       assert state.profile_name == "personal"
     end
 
+    test "a picked model's observed window is written into settings.json5 (issue #111)" do
+      # The provider's /models carried context_length for one model: the
+      # pick persists it as the entry's `context` — observed metadata is
+      # the freshest truth and belongs in the file. A model without one
+      # (or a typed manual id) stays context-less and rides the runtime
+      # seed/default.
+      results =
+        {:ok, [%{model: "m-observed", context: 262_144}, %{model: "m-bare", context: nil}]}
+
+      picker = Onboarding.models_arrived(at_fetching(), results)
+
+      picked = press(picker, ["enter"])
+      observed = Onboarding.settings_doc(picked)
+
+      assert [
+               %{
+                 "models" => [
+                   %{"nickname" => "m-observed", "model" => "m-observed", "context" => 262_144}
+                 ]
+               }
+             ] = hd(observed["profiles"])["providers"]
+
+      # A pick whose entry carried no metadata writes no context key —
+      # byte-compatible with the pre-#111 shape.
+      bare_picked = press(picker, ["down", "enter"])
+      bare = Onboarding.settings_doc(bare_picked)
+
+      assert [
+               %{
+                 "models" => [%{"nickname" => "m-bare", "model" => "m-bare"} = bare_model]
+               }
+             ] = hd(bare["profiles"])["providers"]
+
+      refute Map.has_key?(bare_model, "context")
+
+      # A typed manual id knows no window either.
+      manual = press(at_fetching(), ["esc"])
+      typed_pick = press(manual, String.codepoints("m-typed") ++ ["enter"])
+      typed = Onboarding.settings_doc(typed_pick)
+
+      assert [
+               %{"models" => [%{"nickname" => "m-typed", "model" => "m-typed"} = typed_model]}
+             ] = hd(typed["profiles"])["providers"]
+
+      refute Map.has_key?(typed_model, "context")
+    end
+
     test "backspace edits the draft" do
       state =
         press(
@@ -297,16 +344,16 @@ defmodule DashFloat.Config.OnboardingTest do
              ]
     end
 
-    test "ids populate the picker; nickname defaults to the id" do
+    test "ids populate the picker; nickname defaults to the id; an observed window rides the pick (issue #111)" do
       results = {:ok, [%{model: "m-a", context: nil}, %{model: "m-b", context: 8}]}
       state = Onboarding.models_arrived(at_fetching(), results)
 
       assert state.step == :model_pick
-      assert state.fetched == ["m-a", "m-b"]
+      assert state.fetched == [%{model: "m-a", context: nil}, %{model: "m-b", context: 8}]
 
       picked = press(state, ["down", "enter"])
       assert picked.step == :loop
-      assert [%{models: [%{nickname: "m-b", model: "m-b"}]}] = picked.providers
+      assert [%{models: [%{nickname: "m-b", model: "m-b", context: 8}]}] = picked.providers
     end
 
     test "an empty list falls back to manual with the reason on screen" do
@@ -587,12 +634,17 @@ defmodule DashFloat.Config.OnboardingTest do
       picked = press(picker, ["down", "enter"])
       assert picked.step == :loop
 
-      assert [%{models: [%{nickname: "m-b", model: "m-b"}], fetched: ["m-a", "m-b"]}] =
+      assert [
+               %{
+                 models: [%{nickname: "m-b", model: "m-b"}],
+                 fetched: [%{model: "m-a"}, %{model: "m-b"}]
+               }
+             ] =
                picked.providers
 
       popped = press(picked, ["esc"])
       assert popped.step == :model_pick
-      assert popped.fetched == ["m-a", "m-b"]
+      assert popped.fetched == [%{model: "m-a"}, %{model: "m-b"}]
       assert popped.providers == []
       assert popped.choice == 1
 
@@ -601,13 +653,18 @@ defmodule DashFloat.Config.OnboardingTest do
                base_url: @zai_url,
                key: "k",
                models: [],
-               fetched: ["m-a", "m-b"]
+               fetched: [%{model: "m-a"}, %{model: "m-b"}]
              }
 
       # Re-picking re-finishes the provider exactly once.
       refinished = press(popped, ["enter"])
 
-      assert [%{models: [%{nickname: "m-b", model: "m-b"}], fetched: ["m-a", "m-b"]}] =
+      assert [
+               %{
+                 models: [%{nickname: "m-b", model: "m-b"}],
+                 fetched: [%{model: "m-a"}, %{model: "m-b"}]
+               }
+             ] =
                refinished.providers
 
       # The snapshot never reaches the settings document.
@@ -775,7 +832,7 @@ defmodule DashFloat.Config.OnboardingTest do
       # Provider one finishes from the picker: its snapshot is the list.
       picker = Onboarding.models_arrived(at_fetching(), {:ok, [%{model: "m-a"}]})
       one = press(picker, ["enter"])
-      assert [%{fetched: ["m-a"]}] = one.providers
+      assert [%{fetched: [%{model: "m-a"}]}] = one.providers
 
       # Provider two keyless: no fetch ran, and every manual entry clears
       # fetched — the finish must snapshot [], never provider one's list.
@@ -784,7 +841,7 @@ defmodule DashFloat.Config.OnboardingTest do
       assert two.fetched == []
 
       finished = press(two, ["enter"])
-      assert [%{fetched: ["m-a"]}, %{fetched: []}] = finished.providers
+      assert [%{fetched: [%{model: "m-a"}]}, %{fetched: []}] = finished.providers
     end
 
     test "a bracketed paste feeds the memory: the pasted key round-trips" do
@@ -816,7 +873,7 @@ defmodule DashFloat.Config.OnboardingTest do
       assert refetched.step == :fetching
 
       relanded = Onboarding.models_arrived(refetched, {:ok, [%{model: "only"}]})
-      assert relanded.fetched == ["only"]
+      assert relanded.fetched == [%{model: "only"}]
       assert relanded.choice == 1
 
       # Enter on the clamped highlight picks the manual option — no crash.

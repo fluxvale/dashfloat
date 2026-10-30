@@ -367,7 +367,7 @@ defmodule DashFloat.TUI.View do
   defp provider_option(_wizard, :skip),
     do: "Skip — configure later"
 
-  defp model_pick_option(_wizard, {:model, id}), do: id
+  defp model_pick_option(_wizard, {:model, %{model: id}}), do: id
 
   defp model_pick_option(_wizard, :manual), do: "Type a model id"
 

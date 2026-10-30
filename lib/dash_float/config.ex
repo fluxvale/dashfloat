@@ -44,6 +44,7 @@ defmodule DashFloat.Config do
   alias DashFloat.Config.JSON5
   alias DashFloat.Config.Migration
   alias DashFloat.Config.Posture
+  alias DashFloat.Config.Presets
 
   require Logger
 
@@ -142,6 +143,33 @@ defmodule DashFloat.Config do
   def config_dir do
     :filename.basedir(:user_config, "dashfloat")
   end
+
+  @doc """
+  The context window and its source (issue #111, ADR 0022 §2 amendment):
+  the explicit value (`context_tokens` — env or the entry's `context`)
+  wins; else the standard presets' seeded window for this base URL + model
+  id; else the documented 128 Ki default. Never nil on a resolved config —
+  a `:default` result must be surfaced with the visible note (`~` footer
+  marker, the note in `/compact`'s reply), never silently. The `/models`
+  observed layer sits BETWEEN explicit and seed and lives in the TUI
+  (`State.provider_context_tokens/1`), which is where the catalog lands.
+  """
+  @spec context_window(t()) :: {pos_integer(), :configured | :seeded | :default}
+  def context_window(%__MODULE__{context_tokens: n}) when is_integer(n) and n > 0,
+    do: {n, :configured}
+
+  def context_window(%__MODULE__{base_url: base_url, model: model})
+      when is_binary(base_url) and is_binary(model) do
+    case Presets.context_window(base_url, model) do
+      nil -> {Presets.default_window(), :default}
+      seeded -> {seeded, :seeded}
+    end
+  end
+
+  # A hand-built config with no usable base URL or model (test scaffolding,
+  # the Accounting.trust precedent): nothing is knowable — the documented
+  # default, visibly.
+  def context_window(%__MODULE__{}), do: {Presets.default_window(), :default}
 
   ## Onboarding writes (ADR 0009: the startup wizard's sanctioned writers)
 
