@@ -280,6 +280,52 @@ defmodule DashFloat.AccountingTest do
     end
   end
 
+  describe "compact/3 pinned system message (ADR 0019)" do
+    test "a leading system message stays pinned through eviction" do
+      system = %{role: "system", content: pad(400)}
+
+      # Weights: turn A 200, turn B 450, turn C 700 tokens — both oldest
+      # turns leave, the system message does not count as one and stays
+      # first over whatever survives, and the survivor fits the budget.
+      turns = [user(400), assistant(400), user(1800), user(1400), assistant(1400)]
+
+      assert %{kept: kept, dropped: 2, oversize: false} =
+               Accounting.compact([system | turns], nil, 1000)
+
+      assert kept == [system | Enum.drop(turns, 3)]
+    end
+
+    test "the anchor shifts with the pin and back — the boundary holds" do
+      system = %{role: "system", content: pad(400)}
+      turns = [user(400), assistant(400), user(400), user(400), assistant(400)]
+
+      # The anchor covers the system message, the first turn, and the second
+      # turn's user message (4 of 6).
+      assert %{kept: kept, anchor: anchor, dropped: 1} =
+               Accounting.compact([system | turns], %{tokens: 1500, index: 4}, 2000)
+
+      # shed took the covered user+assistant of the dropped first turn; the
+      # returned index still counts the pinned system message it covers.
+      assert anchor == %{tokens: 1300, index: 2}
+      assert kept == [system | Enum.drop(turns, 2)]
+
+      # The returned pair is consistent: the estimate counts the anchor's
+      # coverage plus the uncovered tail of the kept list.
+      assert Accounting.estimate(kept, anchor) == 1300 + 200
+    end
+
+    test "a system message that is not leading is not pinned" do
+      # Deliberate scope (ADR 0019): only the session-start system message is
+      # pinned. One that lands mid-transcript groups into its user's turn and
+      # drops with it.
+      messages = [user(1600), %{role: "system", content: pad(1600)}, user(1600), assistant(1600)]
+
+      assert %{kept: kept, dropped: 1} = Accounting.compact(messages, nil, 1000)
+
+      assert kept == Enum.drop(messages, 2)
+    end
+  end
+
   describe "compact/3 randomized" do
     test "a seeded randomized run never yields an unpaired call" do
       :rand.seed(:exsss, {1, 2, 3})

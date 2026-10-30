@@ -398,6 +398,15 @@ defmodule DashFloat.Session do
     end
   end
 
+  # The session-start system prompt (ADR 0019) persists with the transcript:
+  # content must be a string, and it neither opens nor closes a tool-call
+  # batch — the batch state passes through untouched.
+  defp check_message(path, index, %{"role" => "system"} = message, batch) do
+    with :ok <- check_string(path, index, "content", Map.get(message, "content")) do
+      {:ok, batch}
+    end
+  end
+
   defp check_message(path, index, _message, _announced),
     do: {:error, "#{path}: message #{index} has no known \"role\""}
 

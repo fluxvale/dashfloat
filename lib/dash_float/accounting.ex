@@ -58,23 +58,38 @@ defmodule DashFloat.Accounting do
   while the estimate sits above `div(window * 4, 5)` and more than one turn
   remains, so `kept` is always a suffix of `messages` and no `tool_calls`
   batch can be split from its results (ADR 0022 §4). A leading non-user
-  prelude is its own first group. The anchor sheds the weights of the
-  messages a drop takes, and `oversize` flags a surviving turn that is itself
-  above the budget.
+  prelude is its own first group. A leading `system` message is session
+  context, not a turn (ADR 0019): it stays pinned — never evicted. The
+  anchor sheds the weights of the messages a drop takes, and `oversize`
+  flags a surviving turn that is itself above the budget.
   """
   @spec compact([map()], anchor(), pos_integer()) ::
           %{kept: [map()], anchor: anchor(), dropped: non_neg_integer(), oversize: boolean()}
   def compact(messages, anchor, window) do
     threshold = div(window * 4, 5)
-    {groups, anchor, dropped} = evict(turns(messages), trust(anchor, messages), threshold, 0)
-    kept = Enum.concat(groups)
 
-    %{
-      kept: kept,
-      anchor: anchor,
-      dropped: dropped,
-      oversize: estimate(kept, anchor) > threshold
-    }
+    case split_system(messages) do
+      {[system], rest} ->
+        plan = compact(rest, shift(anchor), window)
+
+        %{
+          plan
+          | kept: [system | plan.kept],
+            anchor: unshift(plan.anchor),
+            oversize: estimate([system | plan.kept], unshift(plan.anchor)) > threshold
+        }
+
+      :none ->
+        {groups, anchor, dropped} = evict(turns(messages), trust(anchor, messages), threshold, 0)
+        kept = Enum.concat(groups)
+
+        %{
+          kept: kept,
+          anchor: anchor,
+          dropped: dropped,
+          oversize: estimate(kept, anchor) > threshold
+        }
+    end
   end
 
   defp sum_weights(messages) do
@@ -136,6 +151,27 @@ defmodule DashFloat.Accounting do
   end
 
   defp user?(message), do: field(message, :role) == "user"
+
+  # The pinned leading system message (ADR 0019): the anchor shifts with the
+  # split so its coverage boundary stays on the same message, and shifts
+  # back so callers holding the full list stay consistent. An anchor that
+  # covers nothing covers nothing either way.
+  defp split_system([first | rest]) do
+    if system?(first), do: {[first], rest}, else: :none
+  end
+
+  defp split_system([]), do: :none
+
+  defp system?(message), do: field(message, :role) == "system"
+
+  defp shift(nil), do: nil
+
+  defp shift(%{tokens: tokens, index: index}),
+    do: %{tokens: tokens, index: max(index - 1, 0)}
+
+  defp unshift(nil), do: nil
+
+  defp unshift(%{tokens: tokens, index: index}), do: %{tokens: tokens, index: index + 1}
 
   # Oldest turns leave whole, one at a time, while the estimate sits above
   # the trigger and more than one turn remains (ADR 0022 §4).
