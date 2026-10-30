@@ -43,7 +43,9 @@ Reading-surface captures (issues #107 + #108):
 
 Provider-span captures (issue #109): point the scratch settings
 at any endpoint (a REAL preset URL boots fine — the footer resolves
-its label at render time, zero network), drop the provider's label,
+its label at render time; no chat request is needed — the boot-time
+catalog refresh still ATTEMPTS GET {baseUrl}/models at the real endpoint
+and fails open, which is offline-safe), drop the provider's label,
 drive a /model switch, and ASSERT the footer span before the still
 is written — a capture whose claim is unverified fails, never ships.
 
@@ -574,10 +576,11 @@ class App:
         scratch = scratch_dir()
         os.makedirs(f"{scratch}/dashfloat", exist_ok=True)
         # --base-url (issue #109): point the scratch settings at any
-        # endpoint — a REAL preset URL boots fine, nothing is sent until a
-        # prompt is submitted and the footer resolves its label at render
-        # time with zero network (the mount-time catalog refresh fails
-        # open, silently).
+        # endpoint — a REAL preset URL boots fine, no chat request is
+        # sent until a prompt is submitted and the footer resolves its
+        # label at render time (the mount-time catalog refresh still
+        # attempts GET {baseUrl}/models there and fails open — offline-safe,
+        # silent).
         base = base_url or f"http://127.0.0.1:{port}/v1"
         # --unlabeled (issue #109): drop the settings label AND the
         # defaultProvider that names it — the provider entry degrades to
@@ -1311,6 +1314,13 @@ def main():
                 time.sleep(0.4)        # the popup renders
                 assert "/compact" in app.text(), \
                     "the command popup never rendered"
+                # The popup-fit claim (review F1): the widest registry row
+                # renders WHOLE at 80 cols — no mid-word clipping inside
+                # the box.
+                assert "compact now if over the 80% trigger" in app.text(), \
+                    "the /compact row clips inside the popup at 80 cols"
+                assert "input history survives" in app.text(), \
+                    "the /clear row clips inside the popup at 80 cols"
                 assert_claims()
             elif args.scenario == "reading-session":
                 app.scenario_reading_session()

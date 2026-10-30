@@ -1364,6 +1364,29 @@ defmodule DashFloat.TUI.ViewTest do
       widgets = View.render(new_state(), %ExRatatui.Frame{width: 80, height: 24})
       assert length(widgets) == 5
     end
+
+    # Review F2: titles run to 80 chars, the box's inner width at 80 cols is
+    # 43 — an over-long draft head-clips with `…` (the attach row's own
+    # tail-showing rule) so the block cursor stays visible at the end,
+    # where editing happens.
+    test "an over-long draft tail-shows with a head-clip marker, cursor visible" do
+      draft = String.duplicate("x", 79)
+
+      buffer = drawn_text(dialog_state(draft, nil))
+      assert buffer =~ "█"
+
+      [%ExRatatui.Text.Line{spans: [prefix, body]} | _] =
+        dialog_paragraph(dialog_state(draft, nil)).text
+
+      assert prefix.content == "❯ "
+      assert String.starts_with?(body.content, "…")
+      # The row fits the 43-column inner width: prefix + `…` + tail + cursor.
+      assert String.length(prefix.content) + String.length(body.content) <= 43
+      # The cursor rides the END of the draft: the last grapheme before █ is
+      # the draft's tail — the span is exactly the budget (40) + the cursor.
+      assert String.ends_with?(body.content, "x█")
+      assert String.length(body.content) == 41
+    end
   end
 
   ## helpers

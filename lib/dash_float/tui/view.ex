@@ -780,9 +780,16 @@ defmodule DashFloat.TUI.View do
          %State{palette: %Palette{kind: :commands, items: items, selected: selected}},
          area
        ) do
+    # percent_width 70 (hostile review F1): at 80 cols the inset area is 76
+    # wide, so the popup's inner width is 51 — every registry description
+    # fits whole. The widget's default 50 clipped the longest rows
+    # mid-word even before the margin (37 inner cols), and margin 2 made it
+    # one column worse; the issue's done-when demands no palette regression
+    # at 80.
     SlashCommands.render_autocomplete(items,
       area: area,
       selected: selected,
+      percent_width: 70,
       highlight_style: Theme.style(:accent),
       style: Theme.style(:dim)
     )
@@ -850,15 +857,30 @@ defmodule DashFloat.TUI.View do
     lines =
       [
         # The attach prompt's row shape: accent prompt glyph, the draft with
-        # the block cursor (ADR 0018 §5).
+        # the block cursor (ADR 0018 §5) — and its tail-showing rule: an
+        # over-long draft head-clips with `…` (titles run to 80 chars, the
+        # box is narrower, and the cursor must stay visible — the dialog's
+        # whole job is editing that string; hostile review F2).
         Line.new([
           Span.new("❯ ", style: Theme.style(:accent)),
-          Span.new(draft <> "█", style: Theme.style(:assistant))
+          Span.new(dialog_draft(draft, inner) <> "█", style: Theme.style(:assistant))
         ]),
         Line.new([Span.new(@title_dialog_hint, style: Theme.style(:hint))])
       ] ++ refusal_lines(error, inner)
 
     [title_dialog_box(lines, area)]
+  end
+
+  # The attach row's own solution (attach_layout): the TAIL shows — the
+  # cursor rides at the end, where editing happens — into the row's budget
+  # after the `❯ ` prefix AND the cursor's own cell, `…` marking the
+  # clipped head.
+  defp dialog_draft(draft, inner) do
+    budget = max(inner - String.length("❯ ") - 1, 1)
+
+    if String.length(draft) < budget,
+      do: draft,
+      else: "…" <> String.slice(draft, String.length(draft) - budget + 1, budget)
   end
 
   defp refusal_lines(nil, _width), do: []
