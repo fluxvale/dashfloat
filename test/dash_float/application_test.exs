@@ -1276,6 +1276,7 @@ defmodule DashFloat.ApplicationTest do
     assert_receive {:sse_request, "POST", _, _, body}, 2_000
 
     assert [
+             %{"role" => "system"},
              %{"role" => "user", "content" => "start the job"},
              %{"role" => "assistant", "content" => nil, "tool_calls" => [call]},
              %{"role" => "tool", "tool_call_id" => "call_boot", "content" => content},
@@ -1291,7 +1292,7 @@ defmodule DashFloat.ApplicationTest do
     assert session_id(sessions) == id
 
     {:ok, next} = Session.load(sessions, id)
-    assert length(next.messages) == 5
+    assert length(next.messages) == 6
     assert List.last(next.messages)["content"] == "finished from the resumed boot"
 
     # The hand-off write chain never sees the key (env api_key above).

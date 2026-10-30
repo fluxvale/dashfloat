@@ -229,6 +229,25 @@ defmodule DashFloat.AgentTest do
     |> Map.fetch!("messages")
   end
 
+  # The session-start system message (ADR 0019) rides every request and
+  # every persisted transcript. Its content is cwd/git dependent, so tests
+  # assert its presence and shape, never its bytes — the accounting-driven
+  # ones measure its weight where the window tuning matters. The discovery
+  # rides along: the sandboxes live inside this repo, so the live prompt
+  # picks up the repo's own AGENTS.md and the mirror must too. Load-bearing:
+  # the sandbox writes stay under /tmp/, which .gitignore excludes — tracked
+  # writes would flip the git line between this mirror's probe and the
+  # agent's and break the byte-equality asserts below.
+  defp system_message(cwd) do
+    %{
+      "role" => "system",
+      "content" =>
+        DashFloat.SystemPrompt.build(cwd,
+          project_instructions: DashFloat.ProjectInstructions.load(cwd)
+        )
+    }
+  end
+
   defp tool_result_of(body, id) do
     body
     |> request_messages()
@@ -302,6 +321,7 @@ defmodule DashFloat.AgentTest do
     messages = request_messages(second_body)
 
     assert [
+             %{"role" => "system", "content" => _system_prompt},
              %{"role" => "user"},
              %{"role" => "assistant", "tool_calls" => [assistant_call]},
              %{"role" => "tool", "tool_call_id" => "call_1", "content" => result_json}
@@ -316,6 +336,43 @@ defmodule DashFloat.AgentTest do
     # The final episode streams into the log and returns the UI to idle.
     assert_receive {:token, "wrote it"}, 2_000
     assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "the first request message is the session system prompt", ctx do
+    server = start_server([final_episode()])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+
+    assert [%{"role" => "system", "content" => content} | _rest] = request_messages(body)
+    assert content =~ "You are DashFloat"
+    assert content =~ "Working directory:"
+  end
+
+  @tag :tmp_dir
+  test "a fresh session's system prompt carries the discovered AGENTS.md files", ctx do
+    # A .git marker one level up stops the walk; the repo's own AGENTS.md,
+    # further above, must NOT ride along (ADR 0019).
+    root = Path.join(ctx.tmp_dir, "root")
+    proj = Path.join(root, "proj")
+    git_marker = Path.join(root, ".git")
+    File.mkdir_p!(proj)
+    File.mkdir_p!(git_marker)
+
+    agents = Path.join(proj, "AGENTS.md")
+    File.write!(agents, "always answer with a haiku\n")
+
+    server = start_server([final_episode()])
+    {agent, _sup} = start_agent(server, proj)
+
+    send(agent, {:prompt, self(), "hello"})
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+
+    assert [%{"role" => "system", "content" => content} | _rest] = request_messages(body)
+    assert content =~ "always answer with a haiku"
+    assert content =~ "--- #{agents} ---"
   end
 
   @tag :tmp_dir
@@ -1484,7 +1541,13 @@ defmodule DashFloat.AgentTest do
         truncated: false
       })
 
-    assert session.messages == [
+    assert [
+             %{"role" => "system", "content" => system_content} | transcript
+           ] = session.messages
+
+    assert system_content =~ "You are DashFloat"
+
+    assert transcript == [
              %{"role" => "user", "content" => "read it"},
              %{
                "role" => "assistant",
@@ -1530,6 +1593,7 @@ defmodule DashFloat.AgentTest do
              "created_at" => created_at,
              "pin" => %{"profile" => nil, "model" => "test-model"},
              "messages" => [
+               %{"role" => "system"},
                %{"role" => "user", "content" => "create the file"},
                %{
                  "role" => "assistant",
@@ -1555,7 +1619,8 @@ defmodule DashFloat.AgentTest do
 
     {:ok, session} = Session.load(sessions, id)
 
-    assert [%{"role" => "user"}, %{"role" => "assistant"}, tool, final] = session.messages
+    assert [%{"role" => "system"}, %{"role" => "user"}, %{"role" => "assistant"}, tool, final] =
+             session.messages
 
     assert Jason.decode!(tool["content"]) == %{
              "ok" => true,
@@ -1676,6 +1741,7 @@ defmodule DashFloat.AgentTest do
     {:ok, session} = Session.load(sessions, id)
 
     assert [
+             %{"role" => "system"},
              %{"role" => "user"},
              %{"role" => "assistant", "content" => nil, "tool_calls" => calls},
              tool_a,
@@ -1731,6 +1797,7 @@ defmodule DashFloat.AgentTest do
     assert {:ok, session} = Session.load(sessions, id)
 
     assert [
+             %{"role" => "system"},
              %{"role" => "user"},
              %{"role" => "assistant", "content" => nil, "tool_calls" => calls},
              tool_a,
@@ -1780,6 +1847,7 @@ defmodule DashFloat.AgentTest do
     assert {:ok, session} = Session.load(sessions, id)
 
     assert [
+             %{"role" => "system"},
              %{"role" => "user"},
              %{"role" => "assistant", "content" => nil, "tool_calls" => calls},
              tool_a,
@@ -1817,6 +1885,7 @@ defmodule DashFloat.AgentTest do
     {:ok, session} = Session.load(sessions, session_id(sessions))
 
     assert [
+             %{"role" => "system"},
              %{"role" => "user"},
              %{"role" => "assistant", "tool_calls" => calls},
              tool_run,
@@ -1875,8 +1944,11 @@ defmodule DashFloat.AgentTest do
     assert File.ls!(ctx.tmp_dir) == ["notes.md"]
   end
 
+  # Named to keep "api_key" out of the tmp dir name: the cwd rides the
+  # persisted system prompt (ADR 0019), so the literal refute below must
+  # only ever trip on the field name itself.
   @tag :tmp_dir
-  test "the provider's api_key never reaches the session file", ctx do
+  test "the provider's key never reaches the session file", ctx do
     sentinel = "sentinel-key-" <> String.duplicate("x", 32)
     server = start_server([final_episode("done")])
     sessions = Path.join(ctx.tmp_dir, "sessions")
@@ -1941,6 +2013,7 @@ defmodule DashFloat.AgentTest do
 
     assert %{
              "messages" => [
+               %{"role" => "system"},
                %{"role" => "user", "content" => "write it"},
                %{"role" => "assistant", "tool_calls" => [call]}
              ]
@@ -1952,7 +2025,12 @@ defmodule DashFloat.AgentTest do
     # result, the file itself untouched.
     {:ok, session} = Session.load(sessions, id)
 
-    assert [%{"role" => "user"}, %{"role" => "assistant"}, tool] = session.messages
+    assert [
+             %{"role" => "system"},
+             %{"role" => "user"},
+             %{"role" => "assistant"},
+             tool
+           ] = session.messages
 
     assert %{"role" => "tool", "tool_call_id" => "call_k", "content" => repair_json} = tool
     assert Jason.decode!(repair_json) == %{"ok" => false, "cancelled" => true}
@@ -1969,6 +2047,7 @@ defmodule DashFloat.AgentTest do
     assert_receive {:sse_request, "POST", _, _, body}, 2_000
 
     assert [
+             %{"role" => "system"},
              %{"role" => "user", "content" => "write it"},
              %{"role" => "assistant", "content" => nil, "tool_calls" => [resumed_call]},
              %{"role" => "tool", "tool_call_id" => "call_k", "content" => content},
@@ -1984,7 +2063,7 @@ defmodule DashFloat.AgentTest do
     assert session_id(sessions) == id
 
     {:ok, next} = Session.load(sessions, id)
-    assert length(next.messages) == 5
+    assert length(next.messages) == 6
     assert List.last(next.messages)["content"] == "picked up where we left off"
   end
 
@@ -2282,10 +2361,11 @@ defmodule DashFloat.AgentTest do
   # (deterministic — every response is scripted), so the agent's anchored
   # estimate tracks the transcript's true weight exactly. `first_overrides`
   # maps a turn number to the compacted first-request list expected in place
-  # of the full history.
-  defp read_scripts(specs, first_overrides \\ %{}) do
+  # of the full history; `prefix` is the leading system message (ADR 0019)
+  # the live agent seeds, so the frames count its weight too.
+  defp read_scripts(specs, first_overrides, prefix) do
     {scripts, _transcript} =
-      Enum.map_reduce(specs, [], fn spec, transcript ->
+      Enum.map_reduce(specs, prefix, fn spec, transcript ->
         first = Map.get(first_overrides, spec.k, transcript ++ [user_message(spec.prompt)])
 
         # The second episode's request: the batch flushed, the final reply not
@@ -2307,9 +2387,9 @@ defmodule DashFloat.AgentTest do
     Enum.concat(scripts)
   end
 
-  defp start_read_server(ctx, specs, first_overrides \\ %{}) do
+  defp start_read_server(ctx, specs, first_overrides \\ %{}, prefix \\ []) do
     for spec <- specs, do: write_sandbox(ctx, spec.args["path"], spec.content)
-    start_server(read_scripts(specs, first_overrides))
+    start_server(read_scripts(specs, first_overrides, prefix))
   end
 
   # Drives each prompt to idle, collecting both forwarded request bodies of
@@ -2326,31 +2406,39 @@ defmodule DashFloat.AgentTest do
 
   @tag :tmp_dir
   test "compaction drops the oldest whole turns when the estimate crosses 80%", ctx do
-    window = 2000
-    threshold = div(window * 4, 5)
+    # The system message (ADR 0019) rides every request and is pinned through
+    # eviction, so it prefixes the transcript and its measured weight counts.
+    sys = system_message(ctx.tmp_dir)
     specs = [read_turn(1, 800), read_turn(2, 800), read_turn(3, 800)]
-    full = Enum.flat_map(specs, & &1.expected)
+    full = [sys | Enum.flat_map(specs, & &1.expected)]
 
     # The anchored estimate sits under the trigger at the second prompt and
     # crosses it at the third; the pure contract then drops exactly one turn.
-    anchor_after = fn k -> %{tokens: f_of(Enum.take(full, 4 * k - 1)), index: 4 * k - 1} end
+    # The window is derived from the measured estimates — the system
+    # message's weight varies with the cwd and git state.
+    anchor_after = fn k -> %{tokens: f_of(Enum.take(full, 4 * k)), index: 4 * k} end
 
     estimate_at_prompt = fn k ->
       Accounting.estimate(
-        Enum.take(full, 4 * (k - 1)) ++ [user_message("turn #{k}")],
+        Enum.take(full, 4 * (k - 1) + 1) ++ [user_message("turn #{k}")],
         anchor_after.(k - 1)
       )
     end
 
-    assert estimate_at_prompt.(2) <= threshold
-    assert estimate_at_prompt.(3) > threshold
+    under = estimate_at_prompt.(2)
+    over = estimate_at_prompt.(3)
+    window = div((under + div(over - under, 2)) * 5, 4) + 1
+    threshold = div(window * 4, 5)
 
-    messages_at_3 = Enum.take(full, 8) ++ [user_message("turn 3")]
+    assert under <= threshold
+    assert over > threshold
+
+    messages_at_3 = Enum.take(full, 9) ++ [user_message("turn 3")]
     plan = Accounting.compact(messages_at_3, anchor_after.(2), window)
     assert plan.dropped == 1
     refute plan.oversize
 
-    server = start_read_server(ctx, specs, %{3 => plan.kept})
+    server = start_read_server(ctx, specs, %{3 => plan.kept}, [sys])
     sessions = Path.join(ctx.tmp_dir, "sessions")
 
     {agent, _sup} =
@@ -2368,11 +2456,11 @@ defmodule DashFloat.AgentTest do
     assert context_entry ==
              "[context: dropped 1 oldest turn(s) — est #{before}→#{after_estimate} of #{window}]"
 
-    # The next request carries exactly the retained turns: the first turn's
-    # user text and its tool batch are absent, the newest turn is present.
+    # The next request carries exactly the retained turns: the pinned system
+    # message, the retained turns, and the newest turn — never turn 1.
     messages = request_messages(third_first)
     assert messages == plan.kept
-    assert [%{"role" => "user", "content" => "turn 2"} | _rest] = messages
+    assert [%{"role" => "system"}, %{"role" => "user", "content" => "turn 2"} | _rest] = messages
     refute Enum.any?(messages, &(&1["content"] == "turn 1"))
     refute Enum.any?(messages, &match?(%{"tool_call_id" => "call_1"}, &1))
 
@@ -2385,7 +2473,7 @@ defmodule DashFloat.AgentTest do
     {:ok, session} = Session.load(sessions, id)
 
     assert session.messages == plan.kept ++ Enum.drop(turn_3.expected, 1)
-    assert hd(plan.kept)["role"] == "user"
+    assert hd(plan.kept)["role"] == "system"
 
     assert [
              %{
@@ -2402,20 +2490,22 @@ defmodule DashFloat.AgentTest do
 
   @tag :tmp_dir
   test "a transcript under 80% is untouched", ctx do
-    window = 2000
-    threshold = div(window * 4, 5)
+    sys = system_message(ctx.tmp_dir)
 
     # Sized so the third prompt's anchored estimate sits just under the
-    # trigger (~79%) — one more turn would cross it.
+    # trigger (~79%) — one more turn would cross it. The window is derived
+    # from the measured estimate (the system message's weight varies).
     specs = [read_turn(1, 752), read_turn(2, 752), read_turn(3, 752)]
-    full = Enum.flat_map(specs, & &1.expected)
-    anchor_2 = %{tokens: f_of(Enum.take(full, 7)), index: 7}
-    messages_at_3 = Enum.take(full, 8) ++ [user_message("turn 3")]
+    full = [sys | Enum.flat_map(specs, & &1.expected)]
+    anchor_2 = %{tokens: f_of(Enum.take(full, 8)), index: 8}
+    messages_at_3 = Enum.take(full, 9) ++ [user_message("turn 3")]
 
     estimate = Accounting.estimate(messages_at_3, anchor_2)
+    window = div((estimate + 50) * 5, 4) + 1
+    threshold = div(window * 4, 5)
     assert estimate in (threshold - 100)..threshold
 
-    server = start_read_server(ctx, specs)
+    server = start_read_server(ctx, specs, %{}, [sys])
     sessions = Path.join(ctx.tmp_dir, "sessions")
 
     {agent, _sup} =
@@ -2441,8 +2531,8 @@ defmodule DashFloat.AgentTest do
     # carries no context_tokens (the default helper): nothing compacts,
     # nothing is guessed (ADR 0022 §2).
     specs = [read_turn(1, 800), read_turn(2, 800), read_turn(3, 800)]
-    full = Enum.flat_map(specs, & &1.expected)
-    messages_at_3 = Enum.take(full, 8) ++ [user_message("turn 3")]
+    full = [system_message(ctx.tmp_dir) | Enum.flat_map(specs, & &1.expected)]
+    messages_at_3 = Enum.take(full, 9) ++ [user_message("turn 3")]
 
     server = start_read_server(ctx, specs)
     sessions = Path.join(ctx.tmp_dir, "sessions")
@@ -2484,7 +2574,9 @@ defmodule DashFloat.AgentTest do
     refute_received {:entry, :system, "[context: dropped" <> _}
 
     assert_receive {:sse_request, "POST", _, _, body}, 2_000
-    assert request_messages(body) == [%{"role" => "user", "content" => huge}]
+
+    assert [%{"role" => "system"}, %{"role" => "user", "content" => ^huge} | _rest] =
+             request_messages(body)
 
     assert_receive {:token, "noted"}, 2_000
     assert_receive {:phase, :idle}, 2_000
@@ -2496,23 +2588,28 @@ defmodule DashFloat.AgentTest do
 
   @tag :tmp_dir
   test "the anchor persists and is adopted on resume", ctx do
-    window = 2000
-    threshold = div(window * 4, 5)
-
     # Sized so the pure heuristic over the whole transcript stays under the
     # trigger while the anchored estimate crosses it: only an adopted anchor
-    # can produce the eviction asserted below.
+    # can produce the eviction asserted below. The window is derived from the
+    # measured estimates — the system message's weight varies with the cwd.
+    sys = system_message(ctx.tmp_dir)
     specs = [read_turn(1, 780), read_turn(2, 780)]
-    full = Enum.flat_map(specs, & &1.expected)
+    full = [sys | Enum.flat_map(specs, & &1.expected)]
     u3 = user_message("turn 3")
 
     # The resumed agent's anchor: the last scripted frame of turn 2 — F of its
-    # 7-message request — covering those 7 messages.
-    anchor = %{tokens: f_of(Enum.take(full, 7)), index: 7}
+    # 8-message request (the system message rides it, ADR 0019) — covering
+    # those 8 messages.
+    anchor = %{tokens: f_of(Enum.take(full, 8)), index: 8}
     messages_at_resume = full ++ [u3]
 
-    assert Accounting.estimate(messages_at_resume, anchor) > threshold
-    assert Accounting.estimate(messages_at_resume, nil) <= threshold
+    heuristic = Accounting.estimate(messages_at_resume, nil)
+    anchored = Accounting.estimate(messages_at_resume, anchor)
+    window = div((heuristic + div(anchored - heuristic, 2)) * 5, 4) + 1
+    threshold = div(window * 4, 5)
+
+    assert anchored > threshold
+    assert heuristic <= threshold
 
     plan = Accounting.compact(messages_at_resume, anchor, window)
     assert plan.dropped == 1
@@ -2521,7 +2618,7 @@ defmodule DashFloat.AgentTest do
 
     server =
       start_server(
-        read_scripts(specs) ++
+        read_scripts(specs, %{}, [sys]) ++
           [
             final_episode("ack", usage: {f_of(plan.kept ++ [u3]), 5, f_of(plan.kept ++ [u3]) + 5})
           ]
@@ -2544,10 +2641,10 @@ defmodule DashFloat.AgentTest do
       |> read_session()
       |> Jason.decode!()
 
-    assert %{"context" => %{"prompt_tokens" => ^prompt_tokens, "messages" => 7}} = decoded
+    assert %{"context" => %{"prompt_tokens" => ^prompt_tokens, "messages" => 8}} = decoded
 
     {:ok, saved} = Session.load(sessions, id)
-    assert saved.context == %{prompt_tokens: anchor.tokens, messages: 7}
+    assert saved.context == %{prompt_tokens: anchor.tokens, messages: 8}
     assert saved.compactions == []
 
     # A fresh agent adopts both diagnostics — threaded exactly as
@@ -2569,10 +2666,11 @@ defmodule DashFloat.AgentTest do
     send(resumed, {:prompt, self(), "turn 3"})
     assert_receive {:sse_request, "POST", _, _, body}, 2_000
 
-    # plan.kept already carries the prompting user message — the eviction
-    # never touches the newest turn.
+    # plan.kept already carries the pinned system message and the prompting
+    # user message — the eviction never touches either.
     assert request_messages(body) == plan.kept
-    assert hd(request_messages(body))["content"] == "turn 2"
+    messages = request_messages(body)
+    assert Enum.at(messages, 1)["content"] == "turn 2"
     assert_receive {:phase, :idle}, 2_000
 
     # The file gains its first eviction record.
@@ -2695,8 +2793,10 @@ defmodule DashFloat.AgentTest do
     af3 = assistant_message("done 3")
     u4 = user_message("turn 4")
 
-    request_1a = [u1]
-    request_1b = [u1, tc1, tool1]
+    sys = system_message(ctx.tmp_dir)
+
+    request_1a = [sys, u1]
+    request_1b = [sys, u1, tc1, tool1]
     request_2 = request_1b ++ [af1, u2]
     request_3 = request_2 ++ [af2, u3]
 
@@ -2728,7 +2828,7 @@ defmodule DashFloat.AgentTest do
     assert request_messages(body_1b) == request_1b
     assert_receive {:phase, :idle}, 4_000
 
-    assert_band.(%{tokens: f_of(request_1b), index: 3}, [u1, tc1, tool1, af1], request_2, [
+    assert_band.(%{tokens: f_of(request_1b), index: 4}, [sys, u1, tc1, tool1, af1], request_2, [
       af1,
       u2
     ])
@@ -2738,7 +2838,7 @@ defmodule DashFloat.AgentTest do
     assert request_messages(body_2) == request_2
     assert_receive {:phase, :idle}, 4_000
 
-    assert_band.(%{tokens: f_of(request_2), index: 5}, request_2 ++ [af2], request_3, [af2, u3])
+    assert_band.(%{tokens: f_of(request_2), index: 6}, request_2 ++ [af2], request_3, [af2, u3])
 
     send(agent, {:prompt, self(), "turn 3"})
     assert_receive {:sse_request, "POST", _, _, body_3}, 2_000
@@ -2746,7 +2846,7 @@ defmodule DashFloat.AgentTest do
     assert_receive {:phase, :idle}, 4_000
 
     assert_band.(
-      %{tokens: f_of(request_3), index: 7},
+      %{tokens: f_of(request_3), index: 8},
       request_3 ++ [af3],
       request_3 ++ [af3, u4],
       [

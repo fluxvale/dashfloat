@@ -14,8 +14,10 @@ defmodule DashFloat.Agent do
   alias DashFloat.Config
   alias DashFloat.LLM.ChatStream
   alias DashFloat.Mode
+  alias DashFloat.ProjectInstructions
   alias DashFloat.Session
   alias DashFloat.Session.Title
+  alias DashFloat.SystemPrompt
   alias DashFloat.Tools
   alias DashFloat.Tools.Preview
   alias DashFloat.Tools.Runner
@@ -172,7 +174,7 @@ defmodule DashFloat.Agent do
        session_created_at: session_created_at,
        session_title: title || resumed_title,
        title_fetcher: title_fetcher,
-       messages: messages,
+       messages: initial_messages(cwd, resume, messages),
        anchor: anchor,
        compactions: compactions,
        mode: mode,
@@ -1083,6 +1085,20 @@ defmodule DashFloat.Agent do
 
   defp list_or_empty(list) when is_list(list), do: list
   defp list_or_empty(_other), do: []
+
+  # A fresh session opens with the assembled system prompt as its first
+  # message (ADR 0019); a resumed one adopts its transcript verbatim — the
+  # persisted messages already carry the system message the original
+  # session start built.
+  defp initial_messages(cwd, nil, []),
+    do: [
+      %{
+        role: "system",
+        content: SystemPrompt.build(cwd, project_instructions: ProjectInstructions.load(cwd))
+      }
+    ]
+
+  defp initial_messages(_cwd, _resume, messages), do: messages
 
   ## Session persistence
 
