@@ -289,25 +289,30 @@ jobs:
           - **A system prompt with your project's instructions.** Every
             session now runs on an assembled system prompt, and DashFloat
             discovers \`AGENTS.md\` files — from the working directory up
-            to the git root — and includes them, most general first.
-          - **Synthetic repairs and web search.** Malformed tool calls
-            from Synthetic are repaired automatically instead of dying on
-            the parse, and a \`web_search\` tool is available when your
-            configuration carries a Synthetic key.
+            to the git root (or the filesystem root outside a repo) — and
+            includes them, most general first.
+          - **Tool-call repair and web search.** When the model emits a
+            malformed tool call, DashFloat routes it through Synthetic's
+            fix-json repair instead of stalling the turn, and a
+            \`web_search\` tool joins the toolbox — both need a Synthetic
+            key in your configuration.
           - **A composer that reads alive.** The idle cursor renders bright
             on every terminal palette, and the placeholder hint shows only
             before your first exchange.
-          - **Manual compaction.** \`/compact\` compacts the session on
-            demand with visible feedback — no need to wait for the ~80%
-            threshold.
+          - **Manual compaction.** \`/compact\` runs the same drop-oldest
+            compaction the ~80% threshold triggers, on demand and with
+            visible feedback; at or under the trigger it reports where the
+            context stands instead of compacting.
           - **Live context stats.** The footer shows tokens used and the
-            percent of the context window, updating live while the reply
-            streams.
-          - **Image attachments.** On an image-capable model, attach an
-            image by typing its path (PNG, JPEG, GIF, or WebP, up to
-            10 MiB — validated before it sits in the composer); on a model
-            without image support the attach is refused with a visible
-            message, never silently dropped.
+            percent of the context window, kept current as turns complete
+            (the percent needs the model's context window configured —
+            \`context\` on the model in settings, or
+            \`DASHFLOAT_CONTEXT_TOKENS\`).
+          - **Image attachments.** On an image-capable model, Ctrl+O opens
+            the attach prompt: type an image's path (PNG, JPEG, GIF, or
+            WebP, up to 10 MiB — validated before it sits in the composer);
+            on a model without image support the attach is refused with a
+            visible message, never silently dropped.
 
           Upgrading: re-run the install command below — it replaces the
           previous version and keeps your sessions. On macOS,
