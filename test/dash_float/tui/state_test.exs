@@ -3642,6 +3642,14 @@ defmodule DashFloat.TUI.StateTest do
       assert dialog_open().title_dialog == %{draft: "", error: nil}
     end
 
+    test "bare /title via the filter palette's Enter opens the same dialog" do
+      # No trailing space: Enter executes the SELECTED match, which lands on
+      # run_command(state, "title", "") — the dialog clause, not the inline.
+      {state, nil} = enter_typed(new_state(title: "Via Palette"), "/title")
+
+      assert state.title_dialog == %{draft: "Via Palette", error: nil}
+    end
+
     test "typing appends, a shifted printable uppercases, backspace slices the last grapheme" do
       state =
         dialog_open()

@@ -311,7 +311,11 @@ owning normalization, uniqueness, and persistence exactly as recorded in
    exists; Enter submits the draft through the unchanged
    `{:set_title, ui, title}` seam and the dialog stays open until the
    agent's reply closes or errors it; Esc cancels. `/title <name>` inline
-   is unchanged.
+   is unchanged. On the `--resume --title` combination (§6's boot-time
+   rename), the agent boots with the override while the dialog pre-fills
+   from the loaded file's own title — the mount value is deliberately the
+   session's persisted title, and retitling through the dialog remains an
+   explicit act.
 2. **The TUI learns titles** two ways: a `:title` mount opt (the boot
    `--title`'s normalized form, or a resumed session's own file title),
    which pre-fills the dialog, plus two display-only pushes from the
@@ -324,6 +328,9 @@ owning normalization, uniqueness, and persistence exactly as recorded in
    user read it out of the log; the system entries remain the log record
    in both cases. Nothing new at the agent's rename mechanics: the pushes
    are `display/2` sends alongside the entries that were already there.
+   The title's only TUI consumer this slice is the dialog's prefill — no
+   footer or chrome display ships; a visible title surface is future
+   work.
 3. **Refused titles never lose the draft** — the dialog keeps its text
    across a refusal, so a collision is fixed with a retype, not a
    re-open.
