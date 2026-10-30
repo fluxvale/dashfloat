@@ -62,12 +62,14 @@ defmodule DashFloat.Tools.WebSearch do
     end
   rescue
     # An unusable hand-built conf makes Req raise before any request exists —
-    # degrade, never crash the runner (the repair POST's posture, ADR 0021 §3).
-    exception ->
-      %{ok: false, error: "web search failed: " <> Exception.message(exception)}
+    # degrade, never crash the runner, and never quote the raise (its message
+    # can embed a malformed URL, which may carry an in-URL credential): the
+    # generic reason, the repair POST's posture (ADR 0021 §3).
+    _exception ->
+      %{ok: false, error: "web search failed: connection error"}
   catch
-    :exit, reason ->
-      %{ok: false, error: "web search failed: " <> inspect(reason)}
+    :exit, _reason ->
+      %{ok: false, error: "web search failed: connection error"}
   end
 
   # Req decodes an application/json body itself; a different content type

@@ -139,8 +139,7 @@ defmodule DashFloat.Tools.WebSearchTest do
   test "an unusable conf degrades to an error, never a raise" do
     # A non-binary url makes Req raise before any request exists.
     raised = WebSearch.run(%{"query" => @query}, search: %{url: 42, api_key: "k"})
-    assert raised.ok == false
-    assert String.starts_with?(raised.error, "web search failed: ")
+    assert raised == %{ok: false, error: "web search failed: connection error"}
 
     # An out-of-range port makes finch exit(:badarg) — caught the same way.
     exited =
@@ -148,7 +147,6 @@ defmodule DashFloat.Tools.WebSearchTest do
         search: %{url: "http://127.0.0.1:99999999999/v1", api_key: "k"}
       )
 
-    assert exited.ok == false
-    assert String.starts_with?(exited.error, "web search failed: ")
+    assert exited == %{ok: false, error: "web search failed: connection error"}
   end
 end
