@@ -6,6 +6,7 @@ defmodule DashFloat.TUI.StateTest do
   alias DashFloat.Tools
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.State
+  alias DashFloat.TUI.Theme
   alias DashFloat.TUI.View
 
   defp new_state(opts \\ []) do
@@ -42,7 +43,7 @@ defmodule DashFloat.TUI.StateTest do
       |> type(text)
       |> State.handle_key("enter", [])
 
-    assert {:submit, ^text} = action
+    assert {:submit, ^text, []} = action
     Map.put(state, :phase, :idle)
   end
 
@@ -695,7 +696,7 @@ defmodule DashFloat.TUI.StateTest do
         |> type("hello")
         |> State.handle_key("enter", [])
 
-      assert {:submit, "hello"} = action
+      assert {:submit, "hello", []} = action
       assert State.input_text(state) == ""
       assert pairs(state) == [{:user, "hello"}]
       assert state.phase == :streaming
@@ -705,7 +706,7 @@ defmodule DashFloat.TUI.StateTest do
     test "Ctrl+Enter also submits" do
       state = type(new_state(), "hi")
       {_state, action} = State.handle_key(state, "enter", ["ctrl"])
-      assert {:submit, "hi"} = action
+      assert {:submit, "hi", []} = action
     end
 
     test "Shift+Enter and Alt+Enter insert newlines" do
@@ -2257,7 +2258,7 @@ defmodule DashFloat.TUI.StateTest do
       ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
       typed = type(ghosted, "q")
 
-      {state, {:submit, "q"}} = State.handle_key(typed, "enter", [])
+      {state, {:submit, "q", []}} = State.handle_key(typed, "enter", [])
 
       assert state.suggestion == nil
       assert state.suggest_reap == true
@@ -2884,7 +2885,7 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "slash text with an argument is an ordinary message — the escape hatch" do
-      {state, {:submit, "/etc/hosts is weird"}} =
+      {state, {:submit, "/etc/hosts is weird", []}} =
         enter_typed(new_state(), "/etc/hosts is weird")
 
       assert [{:user, "/etc/hosts is weird"}] = pairs(state)
@@ -3001,6 +3002,371 @@ defmodule DashFloat.TUI.StateTest do
 
       assert swallowed.palette == nil
       assert swallowed.confirm != nil
+    end
+  end
+
+  ## Image attachments (ADR 0018 §5/§6)
+
+  describe "image attachments (ADR 0018 §5)" do
+    @capable {:ok,
+              %DashFloat.Config{
+                base_url: "http://x",
+                model: "m",
+                api_key: "k",
+                images: true
+              }}
+
+    @incapable {:ok,
+                %DashFloat.Config{
+                  base_url: "http://x",
+                  model: "m",
+                  api_key: "k",
+                  nickname: "Sol"
+                }}
+
+    defp images_dir do
+      dir =
+        Path.join(
+          "/tmp/opencode",
+          "dashfloat-tui-state-images-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+      dir
+    end
+
+    defp write_image(dir, name) do
+      path = Path.join(dir, name)
+      File.write!(path, "12345678")
+      path
+    end
+
+    # A successful attach to reuse in the flow tests: the prompt was opened,
+    # the path typed, and Enter landed the metadata.
+    defp attached(path) do
+      fresh = new_state(provider: @capable)
+
+      fresh
+      |> press("o", ["ctrl"])
+      |> type(path)
+      |> State.handle_key("enter", [])
+      |> elem(0)
+    end
+
+    defp logical_text(entry), do: Enum.map_join(entry.logical, "\n", &flatten_entry_line/1)
+
+    defp flatten_entry_line(line), do: Enum.map_join(line.spans, "", & &1.content)
+
+    test "provider_images? reads the resolved provider's flag" do
+      capable = new_state(provider: @capable)
+      incapable = new_state(provider: @incapable)
+      unresolved = new_state(provider: {:error, "no provider"})
+
+      assert State.provider_images?(capable)
+      refute State.provider_images?(incapable)
+      refute State.provider_images?(new_state())
+      refute State.provider_images?(unresolved)
+    end
+
+    test "ctrl+o opens the prompt while idle; a second ctrl+o closes it" do
+      fresh = new_state(provider: @capable)
+      {opened, nil} = State.handle_key(fresh, "o", ["ctrl"])
+      assert opened.attach == %{draft: ""}
+
+      # printable keys feed the open prompt's draft
+      typed = type(opened, "/tmp/opencode/a")
+      assert typed.attach == %{draft: "/tmp/opencode/a"}
+
+      {closed, nil} = State.handle_key(typed, "o", ["ctrl"])
+      assert closed.attach == nil
+    end
+
+    test "ctrl+o is inert while streaming, under a palette, and under a pending confirm" do
+      # streaming: the key falls through to the (unaffected) composer, the
+      # prompt never opens
+      {streaming, nil} = State.handle_key(%{new_state() | phase: :streaming}, "o", ["ctrl"])
+      assert streaming.attach == nil
+
+      paletted = press(new_state(), "p", ["ctrl"])
+      {kept, nil} = State.handle_key(paletted, "o", ["ctrl"])
+      assert kept.attach == nil
+      assert kept.palette != nil
+
+      {confirming_state, _ref} = confirming()
+      {swallowed, nil} = State.handle_key(confirming_state, "o", ["ctrl"])
+      assert swallowed.attach == nil
+      assert swallowed.confirm != nil
+    end
+
+    test "typing and backspace edit the draft grapheme-wise" do
+      opened = press(new_state(), "o", ["ctrl"])
+      state = type(opened, "café.png")
+      assert state.attach.draft == "café.png"
+
+      edited = press(state, "backspace", [])
+      assert edited.attach.draft == "café.pn"
+
+      # backspacing past the start is a no-op
+      emptied =
+        Enum.reduce(1..9, edited, fn _n, acc -> press(acc, "backspace", []) end)
+
+      assert emptied.attach.draft == ""
+    end
+
+    test "Enter on an empty draft is a no-op — no refusal, prompt stays open" do
+      opened = press(new_state(), "o", ["ctrl"])
+      entered = press(opened, "enter", [])
+
+      assert entered.attach != nil
+      assert entered.attach.draft == ""
+      assert entered.attachments == []
+      assert entered.entries == []
+    end
+
+    test "a paste feeds the prompt's draft, newlines stripped, composer untouched" do
+      opened = press(new_state(), "o", ["ctrl"])
+      pasted = State.attach_paste(opened, "/tmp/opencode/cat.png\r\n")
+
+      assert pasted.attach.draft == "/tmp/opencode/cat.png"
+      assert State.input_text(pasted) == ""
+    end
+
+    test "overlay? is true with the prompt open, allocating the one activity row" do
+      opened = press(new_state(), "o", ["ctrl"])
+      assert State.overlay?(opened)
+
+      regions = View.regions({80, 24}, State.input_line_count(opened), State.overlay?(opened))
+      assert regions.activity.height == 1
+    end
+
+    test "tab completes the last segment to the longest common prefix, then the extension" do
+      dir = images_dir()
+      write_image(dir, "alpha.png")
+      write_image(dir, "alphabet.jpg")
+      write_image(dir, "beta.gif")
+
+      state =
+        new_state()
+        |> press("o", ["ctrl"])
+        |> type(dir <> "/alp")
+        |> press("tab", [])
+
+      # alpha.png / alphabet.jpg share only "alpha" — no trailing slash
+      assert state.attach.draft == dir <> "/alpha"
+
+      # the further dot completes the extension: alpha. → alpha.png
+      completed =
+        state
+        |> type(".")
+        |> press("tab", [])
+
+      assert completed.attach.draft == dir <> "/alpha.png"
+
+      # a fully-completed name re-tabs as a no-op
+      re_tapped = press(completed, "tab", [])
+      assert re_tapped.attach.draft == dir <> "/alpha.png"
+    end
+
+    test "tab completes a directory with a trailing slash; no match is a no-op" do
+      dir = images_dir()
+      delta = Path.join(dir, "delta")
+      File.mkdir!(delta)
+
+      state =
+        new_state()
+        |> press("o", ["ctrl"])
+        |> type(dir <> "/del")
+        |> press("tab", [])
+
+      assert state.attach.draft == dir <> "/delta/"
+
+      # no matches at all — the draft is untouched
+      stale =
+        new_state()
+        |> press("o", ["ctrl"])
+        |> type(dir <> "/zz")
+        |> press("tab", [])
+
+      assert stale.attach.draft == dir <> "/zz"
+    end
+
+    test "dotfile entries complete only after the typed segment starts with a dot" do
+      dir = images_dir()
+      write_image(dir, ".hidden.png")
+      write_image(dir, "readme.txt")
+
+      # segment "": the dotfile is invisible, the plain file completes
+      plain =
+        new_state()
+        |> press("o", ["ctrl"])
+        |> type(dir <> "/")
+        |> press("tab", [])
+
+      assert plain.attach.draft == dir <> "/readme.txt"
+
+      # segment ".": the dotfile surfaces
+      dotted =
+        new_state()
+        |> press("o", ["ctrl"])
+        |> type(dir <> "/.")
+        |> press("tab", [])
+
+      assert dotted.attach.draft == dir <> "/.hidden.png"
+    end
+
+    test "enter on a valid path attaches the metadata and closes the prompt" do
+      dir = images_dir()
+      alpha = write_image(dir, "alpha.png")
+      alphabet = write_image(dir, "alphabet.jpg")
+
+      first = attached(alpha)
+
+      # success logs nothing — the chip is the only trace
+      assert first.attach == nil
+      assert first.attachments == [%{path: alpha, name: "alpha.png", kb: 1}]
+      assert pairs(first) == []
+
+      # a second attach accumulates
+      second =
+        first
+        |> press("o", ["ctrl"])
+        |> type(alphabet)
+        |> State.handle_key("enter", [])
+        |> elem(0)
+
+      assert Enum.map(second.attachments, & &1.name) == ["alpha.png", "alphabet.jpg"]
+    end
+
+    test "enter under an incapable provider refuses naming the model and keeps the draft" do
+      fresh = new_state(provider: @incapable)
+      opened = press(fresh, "o", ["ctrl"])
+      typed = type(opened, "/tmp/opencode/cat.png")
+
+      {refused, nil} = State.handle_key(typed, "enter", [])
+
+      assert refused.attach == %{draft: "/tmp/opencode/cat.png"}
+      assert refused.attachments == []
+
+      assert pairs(refused) == [
+               {:system, "[images: model Sol does not accept images — attach refused]"}
+             ]
+    end
+
+    test "the capability refusal names the bare model id without a nickname" do
+      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "glm", api_key: "k"}}
+      fresh = new_state(provider: provider)
+      opened = press(fresh, "o", ["ctrl"])
+      typed = type(opened, "/tmp/opencode/cat.png")
+
+      {refused, nil} = State.handle_key(typed, "enter", [])
+
+      assert pairs(refused) == [
+               {:system, "[images: model glm does not accept images — attach refused]"}
+             ]
+    end
+
+    test "enter on a bad path refuses naming the path and keeps the draft" do
+      dir = images_dir()
+      notes = Path.join(dir, "notes.txt")
+      File.write!(notes, "x")
+
+      refusals = [
+        {Path.join(dir, "nope.png"), Path.join(dir, "nope.png") <> ": no such file or directory"},
+        {Path.join(dir, "notes.txt"),
+         Path.join(dir, "notes.txt") <>
+           ": not an image extension (one of .png .jpg .jpeg .gif .webp)"}
+      ]
+
+      for {draft, reason} <- refusals do
+        fresh = new_state(provider: @capable)
+        opened = press(fresh, "o", ["ctrl"])
+        typed = type(opened, draft)
+        {refused, nil} = State.handle_key(typed, "enter", [])
+
+        # the prompt stays open with the draft intact — fix the path, retry
+        assert refused.attach == %{draft: draft}
+        assert refused.attachments == []
+        assert pairs(refused) == [{:system, "[images: " <> reason <> "]"}]
+      end
+    end
+
+    test "esc closes the prompt keeping pending attachments; ctrl+d clears them" do
+      alpha = write_image(images_dir(), "alpha.png")
+      attached_state = attached(alpha)
+
+      reopened = press(attached_state, "o", ["ctrl"])
+      closed = press(reopened, "esc", [])
+      assert closed.attach == nil
+      assert length(closed.attachments) == 1
+
+      # ctrl+d clears all — and closes the prompt it was open with
+      again = press(closed, "o", ["ctrl"])
+      cleared = press(again, "d", ["ctrl"])
+      assert cleared.attach == nil
+      assert cleared.attachments == []
+    end
+
+    test "submit with text and an attachment sends the paths and renders the indicators" do
+      alpha = write_image(images_dir(), "alpha.png")
+      attached_state = attached(alpha)
+      typed = type(attached_state, "what is this?")
+
+      {state, {:submit, "what is this?", [^alpha]}} = State.handle_key(typed, "enter", [])
+
+      # the attachment survives until the agent's streaming echo (ADR 0018 §6)
+      assert state.phase == :streaming
+      assert length(state.attachments) == 1
+
+      # entry text verbatim (ADR 0006); the rendered lines gain the dim
+      # indicator under the prompt text (ADR 0018 §5)
+      [entry] = for(%{kind: :user} = e <- state.entries, do: e)
+      assert entry.text == "what is this?"
+      assert logical_text(entry) == "\n❯ what is this?\n📎 alpha.png (1 KB)"
+      assert hd(List.last(entry.logical).spans).style == Theme.style(:dim)
+    end
+
+    test "submit with a blank draft but pending attachments is the image-only turn" do
+      alpha = write_image(images_dir(), "alpha.png")
+      attached_state = attached(alpha)
+
+      {state, {:submit, "", [^alpha]}} = State.handle_key(attached_state, "enter", [])
+
+      [entry] = for(%{kind: :user} = e <- state.entries, do: e)
+      assert entry.text == ""
+      assert logical_text(entry) == "\n❯ \n📎 alpha.png (1 KB)"
+    end
+
+    test "a command submit leaves pending attachments untouched" do
+      alpha = write_image(images_dir(), "alpha.png")
+      attached_state = attached(alpha)
+      typed = type(attached_state, "/help")
+
+      {state, nil} = State.handle_key(typed, "enter", [])
+
+      assert state.phase == :idle
+      assert length(state.attachments) == 1
+    end
+
+    test "the streaming echo clears pending attachments; a refusal flow does not" do
+      pending = %{new_state() | attachments: [%{path: "/p/a.png", name: "a.png", kb: 1}]}
+
+      cleared = State.stream_message(pending, {:phase, :streaming}, 1_000)
+      assert cleared.attachments == []
+
+      # repeated tool-loop episodes clear an already-empty list — a no-op
+      assert State.stream_message(cleared, {:phase, :streaming}, 1_000).attachments == []
+
+      # the submit-time refusal never echoes streaming: the set survives
+      refused =
+        pending
+        |> State.stream_message(
+          {:entry, :system, "[images: /p/a.png: no such file or directory]"},
+          1_000
+        )
+        |> State.stream_message({:phase, :idle}, 1_000)
+
+      assert length(refused.attachments) == 1
     end
   end
 end

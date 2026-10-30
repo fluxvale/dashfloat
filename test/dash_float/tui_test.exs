@@ -3200,4 +3200,131 @@ defmodule DashFloat.TUITest do
       end
     end
   end
+
+  ## Image attachments (ADR 0018 §5/§6) — the prompt driven through the app.
+
+  describe "image attachments" do
+    defp images_dir do
+      dir =
+        Path.join("/tmp/opencode", "dashfloat-tui-attach-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+      dir
+    end
+
+    defp capable_provider do
+      {:ok,
+       %Config{
+         base_url: "http://localhost:1",
+         model: "test-model",
+         api_key: "test-key-123",
+         images: true
+       }}
+    end
+
+    defp composer_title(state) do
+      {widget, _rect} =
+        state
+        |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+        |> Enum.at(3)
+
+      widget.block.title.content
+    end
+
+    defp type_into_prompt(pid, text) do
+      for ch <- String.codepoints(text), do: press(pid, ch)
+    end
+
+    test "ctrl+o opens the prompt and the activity row renders it while idle" do
+      {:ok, pid} = start_tui(provider: provider())
+
+      press(pid, "o", ["ctrl"])
+
+      state = eventually(pid, fn s -> s.attach != nil end)
+      assert state.attach == %{draft: ""}
+      # the transient row is allocated at idle and carries the prompt
+      assert activity_text(state) =~ "Attach image: "
+
+      # a second ctrl+o closes it
+      press(pid, "o", ["ctrl"])
+      eventually(pid, fn s -> s.attach == nil end)
+    end
+
+    test "a paste feeds the open prompt's draft, not the composer" do
+      {:ok, pid} = start_tui(provider: provider())
+      press(pid, "o", ["ctrl"])
+      eventually(pid, fn s -> s.attach != nil end)
+
+      inject(pid, %ExRatatui.Event.Paste{content: "/tmp/opencode/cat.png\r\n"})
+
+      state = eventually(pid, fn s -> s.attach == %{draft: "/tmp/opencode/cat.png"} end)
+      assert State.input_text(state) == ""
+    end
+
+    test "enter attaches a checked path; the submit seam carries it; streaming clears" do
+      dir = images_dir()
+      path = Path.join(dir, "alpha.png")
+      File.write!(path, "12345678")
+
+      {:ok, pid} = start_tui(provider: capable_provider())
+
+      # open, type the path, attach
+      press(pid, "o", ["ctrl"])
+      eventually(pid, fn s -> s.attach != nil end)
+      type_into_prompt(pid, path)
+      press(pid, "enter")
+
+      attached = eventually(pid, fn s -> s.attachments != [] end)
+      assert attached.attachments == [%{path: path, name: "alpha.png", kb: 1}]
+      assert attached.attach == nil
+      # the chip rides the composer title
+      assert composer_title(attached) == "❯ 📎 1"
+
+      # the turn submits with the attachment's path on the seam
+      submit(pid, "what is this?")
+
+      assert_receive {:prompt, ui_pid, "what is this?", [^path]}, 1_000
+
+      # the :user entry's text stays verbatim; the dim indicator rides the
+      # rendered lines (ADR 0006 / ADR 0018 §5)
+      submitted =
+        eventually(
+          pid,
+          fn s -> match?(%{kind: :user, text: "what is this?"}, List.last(s.entries)) end
+        )
+
+      entry = List.last(submitted.entries)
+      assert entry.text == "what is this?"
+      assert "📎 alpha.png (1 KB)" in flatten_lines(entry.lines)
+
+      # the agent's streaming echo clears the pending set (ADR 0018 §6)
+      send(ui_pid, {:phase, :streaming})
+      cleared = eventually(pid, fn s -> s.attachments == [] end)
+      refute composer_title(cleared) =~ "📎"
+
+      send(ui_pid, {:phase, :idle})
+    end
+
+    test "an attach refusal lands in the log and keeps the prompt open" do
+      # a capable provider: the refusal below is the path check's, not the
+      # capability gate's
+      {:ok, pid} = start_tui(provider: capable_provider())
+
+      press(pid, "o", ["ctrl"])
+      eventually(pid, fn s -> s.attach != nil end)
+      type_into_prompt(pid, "/tmp/opencode/nope.png")
+      press(pid, "enter")
+
+      state =
+        eventually(pid, fn s ->
+          Enum.any?(s.entries, &(&1.kind == :system and &1.text =~ "nope.png"))
+        end)
+
+      # the refusal names the path and the prompt stays open, draft intact
+      assert state.attach == %{draft: "/tmp/opencode/nope.png"}
+      assert state.attachments == []
+      assert state.phase == :idle
+    end
+  end
 end

@@ -7,7 +7,7 @@ defmodule DashFloat.TUI.State do
   at mount so the monitor lives there). The input draft lives in the
   textarea's Rust-side state, reached through its synchronous in-memory API.
   Transitions return `{state, action}` where `action` is `:quit`,
-  `{:submit, prompt}`, `{:confirm, decision}`, `:cancel`, `{:set_mode, mode}`,
+  `{:submit, prompt, paths}`, `{:confirm, decision}`, `:cancel`, `{:set_mode, mode}`,
   the command actions (`{:set_title, title}`, `{:switch_model, _}`,
   `:list_profiles`, `:compact` — ADR 0020), `nil`, or one of the setup actions; the TUI
   interprets actions. The one clock is injectable (`now` arguments,
@@ -17,14 +17,18 @@ defmodule DashFloat.TUI.State do
 
   alias DashFloat.Accounting
   alias DashFloat.Config.Onboarding
+  alias DashFloat.Images
   alias DashFloat.Mode
   alias DashFloat.Tools
   alias DashFloat.TUI.Commands
   alias DashFloat.TUI.Palette
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.Selection
+  alias DashFloat.TUI.Theme
   alias DashFloat.TUI.View
   alias DashFloat.TUI.Wrap
+  alias ExRatatui.Text.Line
+  alias ExRatatui.Text.Span
 
   @type phase :: :idle | :streaming | :executing_tool | :checking | :confirming
   @type entry_kind :: :user | :assistant | :tool | :system
@@ -36,6 +40,12 @@ defmodule DashFloat.TUI.State do
           lines: [ExRatatui.Text.Line.t()]
         }
   @type confirm :: %{ref: term(), id: term(), name: String.t()}
+
+  @typedoc "One pending attachment's display metadata — never the bytes (ADR 0018 §6)."
+  @type attachment :: %{path: String.t(), name: String.t(), kb: pos_integer()}
+
+  @typedoc "The open attach prompt's editable path draft (ADR 0018 §5)."
+  @type attach_prompt :: %{draft: String.t()}
 
   @typedoc """
   One keypress's outcome. The chat actions are ADR 0002/0006/0007; the mode
@@ -49,7 +59,7 @@ defmodule DashFloat.TUI.State do
   """
   @type action ::
           :quit
-          | {:submit, String.t()}
+          | {:submit, String.t(), [String.t()]}
           | {:confirm, :approved | :rejected}
           | :cancel
           | {:set_mode, Mode.mode()}
@@ -82,7 +92,7 @@ defmodule DashFloat.TUI.State do
   @exit_window_ms 2_000
   # /help's key hints (ADR 0020) — the composer's static hints plus the
   # palette and mode keys.
-  @key_hints "Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit · Ctrl+P commands · Shift+Tab mode"
+  @key_hints "Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit · Ctrl+P commands · Ctrl+O attach · Shift+Tab mode"
 
   @enforce_keys [:input]
 
@@ -158,7 +168,12 @@ defmodule DashFloat.TUI.State do
     suggest_debounce_ms: 600,
     # The command palette (ADR 0020): nil closed; :filter is the composer's
     # derived slash autocomplete, :modal is Ctrl+P or a picker.
-    palette: nil
+    palette: nil,
+    # Image attachments (ADR 0018 §5): `attachments` is the pending set —
+    # display metadata only, never bytes (the agent reads at submit); `attach`
+    # is the open attach prompt's path draft, nil closed.
+    attachments: [],
+    attach: nil
   ]
 
   @type t :: %__MODULE__{
@@ -207,7 +222,9 @@ defmodule DashFloat.TUI.State do
             | {module(), atom()}
             | nil,
           suggest_debounce_ms: non_neg_integer(),
-          palette: Palette.t() | nil
+          palette: Palette.t() | nil,
+          attachments: [attachment()],
+          attach: attach_prompt() | nil
         }
 
   @typedoc """
@@ -398,6 +415,11 @@ defmodule DashFloat.TUI.State do
 
   defp label(%DashFloat.Config{model: model}) when is_binary(model), do: model
   defp label(_other), do: nil
+
+  @doc "The selected model's image capability (ADR 0018 §1): true only for a resolved provider carrying `images: true`."
+  @spec provider_images?(t()) :: boolean()
+  def provider_images?(%__MODULE__{provider: {:ok, %DashFloat.Config{images: true}}}), do: true
+  def provider_images?(%__MODULE__{}), do: false
 
   # The startup phase (ADR 0009) owns every key until it clears: the wizard
   # or the forced-selection modal replaces the chat UI. The global Ctrl+C /
@@ -639,6 +661,26 @@ defmodule DashFloat.TUI.State do
     refresh_palette(dismiss_suggestion(leave_history(state)))
   end
 
+  @doc """
+  A paste while the attach prompt is open (ADR 0018 §5): bracketed paste
+  appends to the path draft, newlines normalized out — a pasted path with a
+  trailing newline is the common terminal shape. The composer is never
+  touched while the prompt owns the input.
+  """
+  @spec attach_paste(t(), String.t()) :: t()
+  def attach_paste(%__MODULE__{attach: %{draft: draft}} = state, content)
+      when is_binary(content),
+      do: %{state | attach: %{draft: draft <> strip_newlines(content)}}
+
+  def attach_paste(%__MODULE__{} = state, _content), do: state
+
+  defp strip_newlines(content) do
+    content
+    |> String.replace("\r\n", "")
+    |> String.replace("\r", "")
+    |> String.replace("\n", "")
+  end
+
   defp normalize_newlines(content) do
     content
     |> String.replace("\r\n", "\n")
@@ -696,6 +738,48 @@ defmodule DashFloat.TUI.State do
 
   defp route_key(%{confirm: pending} = state, _code, _modifiers, _now) when pending != nil,
     do: {state, nil}
+
+  # The attach prompt (ADR 0018 §5) is a key mode like confirmation mode:
+  # while open it swallows every key but the global quits above — printable
+  # characters and Backspace edit the path draft, Tab completes against the
+  # filesystem, Enter attaches, Esc closes (pending attachments kept), Ctrl+D
+  # clears them, and a second Ctrl+O closes. It only opens while idle with no
+  # other mode open, so it never fights the phase keys below.
+  defp route_key(%{attach: nil, phase: :idle, palette: nil} = state, "o", ["ctrl"], _now),
+    do: {%{state | attach: %{draft: ""}}, nil}
+
+  defp route_key(%{attach: %{}} = state, "o", ["ctrl"], _now),
+    do: {%{state | attach: nil}, nil}
+
+  defp route_key(%{attach: %{draft: draft}} = state, "enter", mods, _now)
+       when mods in [[], ["ctrl"]],
+       do: attach(state, draft)
+
+  defp route_key(%{attach: %{}} = state, "esc", _modifiers, _now),
+    do: {%{state | attach: nil}, nil}
+
+  defp route_key(%{attach: %{}} = state, "d", ["ctrl"], _now),
+    do: {%{state | attach: nil, attachments: []}, nil}
+
+  defp route_key(%{attach: %{draft: draft}} = state, "tab", _modifiers, _now),
+    do: {%{state | attach: %{draft: complete_path(draft)}}, nil}
+
+  # The draft's edit rules are the wizard's (ADR 0009) — Backspace slices
+  # the last grapheme, single printable characters append — and every other
+  # key (arrows, mode cycling, the palette keys) is swallowed: the prompt is
+  # the whole input surface while it lives.
+  defp route_key(%{attach: %{draft: draft}} = state, code, _modifiers, _now) do
+    cond do
+      code == "backspace" ->
+        {%{state | attach: %{draft: String.slice(draft, 0..-2//1)}}, nil}
+
+      single_char?(code) and String.valid?(code) ->
+        {%{state | attach: %{draft: draft <> code}}, nil}
+
+      true ->
+        {state, nil}
+    end
+  end
 
   # The command palette (ADR 0020). Ctrl+P toggles: open from idle, close
   # whatever kind is open. A modal palette swallows every key but
@@ -823,6 +907,9 @@ defmodule DashFloat.TUI.State do
     {state, nil}
   end
 
+  # The attach draft's printable-key test — the wizard's edit rule (ADR 0009).
+  defp single_char?(code), do: String.length(code) == 1
+
   ## Filter palette (ADR 0020)
 
   # Derived state: recomputed after every draft change. Visible only while
@@ -887,11 +974,12 @@ defmodule DashFloat.TUI.State do
 
   @doc """
   True when a transient row sits between log and input: an active phase
-  (ADR 0006) or the armed exit-guard prompt (issue #28). The view's layout
-  and the scroll viewport both read this — one predicate, one height.
+  (ADR 0006), the armed exit-guard prompt (issue #28), or the open attach
+  prompt (ADR 0018 §5). The view's layout and the scroll viewport both read
+  this — one predicate, one height.
   """
   @spec overlay?(t()) :: boolean()
-  def overlay?(%__MODULE__{phase: :idle, exit_guard_at: nil}), do: false
+  def overlay?(%__MODULE__{phase: :idle, exit_guard_at: nil, attach: nil}), do: false
   def overlay?(%__MODULE__{}), do: true
 
   # Only for actual editing keys; history_prev/next call the textarea API
@@ -916,18 +1004,20 @@ defmodule DashFloat.TUI.State do
 
   @doc """
   Submits the draft: appends a `:user` entry, pushes history, clears the
-  draft, and flips the phase to `:streaming`. A command-shaped draft (ADR
-  0020) runs the command instead — no `:user` entry, no phase flip; a bare
-  unknown `/foo` warns; other slash text submits as an ordinary message. The
-  command paths keep submit's idle gate and bookkeeping. Returns `{state,
-  nil}` when the draft is blank or a request is already in flight (one at a
-  time; queueing is Phase 2).
+  draft, and flips the phase to `:streaming`. A blank draft still submits
+  when attachments are pending — the image-only turn (ADR 0018 §5). A
+  command-shaped draft (ADR 0020) runs the command instead — no `:user`
+  entry, no phase flip, pending attachments untouched; a bare unknown `/foo`
+  warns; other slash text submits as an ordinary message. The command paths
+  keep submit's idle gate and bookkeeping. Returns `{state, nil}` when
+  nothing is submittable — a blank draft and no pending attachments — or a
+  request is already in flight (one at a time; queueing is Phase 2).
   """
   @spec submit(t()) :: {t(), action()}
   def submit(%__MODULE__{} = state) do
     text = input_text(state)
 
-    if state.phase == :idle and text != "" and String.trim(text) != "" do
+    if state.phase == :idle and (String.trim(text) != "" or state.attachments != []) do
       dispatch_submit(state, text)
     else
       {state, nil}
@@ -946,16 +1036,23 @@ defmodule DashFloat.TUI.State do
   defp plain_or_unknown(state, text, trimmed) do
     case bare_slash_prefix(trimmed) do
       nil ->
+        # The pending attachments ride the plain path only (ADR 0018 §5):
+        # the entry's text stays verbatim (ADR 0006) and its rendered lines
+        # gain one indicator per image; clearing waits for the agent's
+        # streaming echo (§6), so a submit-time refusal keeps the set.
+        paths = Enum.map(state.attachments, & &1.path)
+        entry_lines = Render.entry_lines(:user, text) ++ indicator_lines(state.attachments)
+
         state
         |> push_history(text)
-        |> append_entry(:user, text)
+        |> put_entry(:user, text, entry_lines)
         |> clear_input()
         |> Map.put(:phase, :streaming)
         # A new question re-pins the log: the user wants to watch its answer
         # arrive even if they had paged up first.
         |> Map.put(:follow?, true)
         |> dismiss_suggestion()
-        |> then(&{&1, {:submit, text}})
+        |> then(&{&1, {:submit, text, paths}})
 
       # A bare token that is not a registry name can never be an ordinary
       # message — warn instead (ADR 0020).
@@ -995,6 +1092,113 @@ defmodule DashFloat.TUI.State do
     ExRatatui.textarea_set_value(state.input, "")
     state
   end
+
+  ## Attach prompt (ADR 0018 §5)
+
+  # Enter in the attach prompt (ADR 0018 §4): the capability gate first —
+  # the same predicate the agent re-checks at submit, the refusal naming the
+  # model — then the stat-only path check, the refusal naming the path. A
+  # refusal lands as the `[images: …]` system entry and keeps the prompt open
+  # with the draft intact; success keeps only the display metadata and closes.
+  defp attach(
+         %{provider: {:ok, %DashFloat.Config{images: false}} = classification} = state,
+         _draft
+       ) do
+    {:ok, config} = classification
+    entry = "[images: model #{image_model_name(config)} does not accept images — attach refused]"
+    {append_entry(state, :system, entry), nil}
+  end
+
+  # Enter on an empty draft attaches nothing and refuses nothing — the
+  # prompt just stays open (an empty path is not a user intent to resolve).
+  defp attach(state, ""), do: {state, nil}
+
+  defp attach(state, draft) do
+    case Images.check(draft) do
+      {:ok, meta} ->
+        {%{state | attachments: state.attachments ++ [Map.put(meta, :path, draft)], attach: nil},
+         nil}
+
+      {:error, reason} ->
+        {append_entry(state, :system, "[images: " <> reason <> "]"), nil}
+    end
+  end
+
+  # The refusal names the model — the nickname, else the id (ADR 0018 §4);
+  # the agent's own rule, mirrored for the attach-time gate.
+  defp image_model_name(%DashFloat.Config{nickname: nil, model: model}), do: model
+  defp image_model_name(%DashFloat.Config{nickname: nickname}), do: nickname
+
+  # Tab completion (ADR 0018 §5 — the sanctioned UI-process read): one
+  # readdir of the draft's directory completes its last path segment to the
+  # longest common prefix of the visible matches; a completion that lands a
+  # directory gains a trailing "/", dotfile entries only surface once the
+  # typed segment starts with ".", and no matches is a no-op.
+  defp complete_path(draft) do
+    segment =
+      draft
+      |> String.split("/")
+      |> List.last()
+
+    prefix = String.replace_suffix(draft, segment, "")
+    dir = dir_for(prefix)
+
+    case File.ls(dir) do
+      {:ok, entries} ->
+        matches = Enum.filter(entries, &segment_match?(&1, segment))
+        completed(prefix, draft, matches)
+
+      {:error, _reason} ->
+        draft
+    end
+  end
+
+  # A bare segment reads relative to the cwd — the same shape the draft's
+  # prefix keeps when completed.
+  defp dir_for(""), do: "."
+  defp dir_for(prefix), do: prefix
+
+  defp segment_match?(name, segment) do
+    String.starts_with?(name, segment) and
+      (not String.starts_with?(name, ".") or String.starts_with?(segment, "."))
+  end
+
+  defp completed(_prefix, draft, []), do: draft
+
+  defp completed(prefix, draft, matches) do
+    name = Enum.reduce(matches, &shared_prefix/2)
+    candidate = prefix <> name
+
+    cond do
+      candidate == draft ->
+        draft
+
+      name in matches and File.dir?(candidate) ->
+        candidate <> "/"
+
+      true ->
+        candidate
+    end
+  end
+
+  defp shared_prefix(a, b) do
+    a
+    |> String.graphemes()
+    |> Enum.zip(String.graphemes(b))
+    |> Enum.take_while(fn {x, y} -> x == y end)
+    |> Enum.map_join(&elem(&1, 0))
+  end
+
+  # The :user entry's indicator lines (ADR 0018 §5): one dim 📎 row per
+  # attachment under the prompt text — display only, the entry's text stays
+  # the persistence truth (ADR 0006).
+  defp indicator_lines([]), do: []
+
+  defp indicator_lines(attachments),
+    do:
+      Enum.map(attachments, fn %{name: name, kb: kb} ->
+        Line.new([Span.new("📎 #{name} (#{kb} KB)", style: Theme.style(:dim))])
+      end)
 
   ## Slash commands (ADR 0020 — the registry is data; transitions live here)
 
@@ -1138,7 +1342,10 @@ defmodule DashFloat.TUI.State do
     * `{:usage, map}` — reconcile prompt/completion tokens; no phase change
     * `{:context, snapshot}` — adopt the agent's context snapshot (the
       footer's tokens-used source, ADR 0015 §2 amendment); no phase change
-    * `{:phase, :streaming}` — set the phase only; re-announcing streaming
+    * `{:phase, :streaming}` — set the phase and clear the pending
+      attachments (ADR 0018 §6: the turn's images ride the request; a
+      submit-time refusal never echoes this phase, so the refused set
+      survives); re-announcing streaming
       never finalizes (a producer resuming after a tool interlude must not
       fragment its reply)
     * `{:phase, :executing_tool | :checking | :idle}` — set the phase and
@@ -1219,9 +1426,11 @@ defmodule DashFloat.TUI.State do
   # voice, and a confirm the UI never decided must not outlive the turn it
   # belonged to (agent death included — agent_down routes through here).
   # A new turn also kills the old ghost — the reap intent rides the
-  # resulting state (ADR 0015 §3).
+  # resulting state (ADR 0015 §3) — and clears the pending attachments
+  # (ADR 0018 §6): the turn's images are on the wire now. Clearing an
+  # already-empty list is a no-op, so repeated tool-loop episodes are safe.
   def stream_message(state, {:phase, :streaming}, _now),
-    do: dismiss_suggestion(%{state | phase: :streaming, confirm: nil})
+    do: dismiss_suggestion(%{state | phase: :streaming, confirm: nil, attachments: []})
 
   def stream_message(state, {:phase, :idle}, now) do
     # Arm only when THIS transition actually finalized an assistant reply:

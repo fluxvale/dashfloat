@@ -481,6 +481,15 @@ defmodule DashFloat.TUI.ViewTest do
       assert footer_text(new_state(provider: provider)) =~ "Sol (work)"
     end
 
+    # The capability glyph (ADR 0018 §1): visible before any attach attempt.
+    test "shows 📎 beside the label only for an image-capable provider" do
+      capable =
+        {:ok, %DashFloat.Config{base_url: "http://x", model: "glm", api_key: "k", images: true}}
+
+      assert footer_text(new_state(provider: capable)) =~ " 📎"
+      refute footer_text(new_state(provider: provider(nil))) =~ "📎"
+    end
+
     test "the rate shows only once one exists" do
       refute footer_text(new_state()) =~ "tok/s"
 
@@ -625,6 +634,30 @@ defmodule DashFloat.TUI.ViewTest do
     test "the activity row has height zero while idle and one while active" do
       assert View.regions({80, 24}, 1, false).activity.height == 0
       assert View.regions({80, 24}, 1, true).activity.height == 1
+    end
+
+    # The attach prompt (ADR 0018 §5) claims the transient row while open:
+    # accent label, the draft with the composer's block cursor, and the dim
+    # key hints — all on the one line. The hints eat most of an 80-column
+    # row (label 14 + cursor 1 + hints 58), so a full draft shows at 5
+    # characters there.
+    test "the attach prompt replaces the idle row with label, draft, cursor, and hints" do
+      state = %{new_state() | attach: %{draft: "c.png"}}
+
+      text = activity_text(state)
+      assert text =~ "Attach image: c.png█"
+      assert text =~ "⏎ attach · tab complete · esc keep · ^o close · ^d clear"
+    end
+
+    test "a wide attach draft truncates to keep the prompt one row" do
+      long = String.duplicate("p", 80) <> ".png"
+      state = %{new_state() | attach: %{draft: long}}
+
+      line = activity_text(state)
+      # the whole prompt fits the content width — the draft is cut, not wrapped
+      assert String.length(line) <= 78
+      refute line =~ long
+      assert line =~ "Attach image: "
     end
 
     # Issue #28: the armed exit-guard prompt claims the transient row —
@@ -1079,6 +1112,22 @@ defmodule DashFloat.TUI.ViewTest do
 
       fresh_ghost = %{new_state() | suggestion: "try asking about elixir"}
       assert placeholder(input(fresh_ghost)) == "try asking about elixir"
+    end
+
+    # The attachment chip (ADR 0018 §5): the title carries the pending count.
+    test "the title shows the 📎 n chip only while attachments are pending" do
+      assert input_title(new_state()).content == "❯ "
+
+      one = %{new_state() | attachments: [%{path: "p", name: "a.png", kb: 1}]}
+      assert input_title(one).content == "❯ 📎 1"
+
+      two = %{one | attachments: one.attachments ++ [%{path: "q", name: "b.jpg", kb: 2}]}
+      assert input_title(two).content == "❯ 📎 2"
+    end
+
+    defp input_title(state) do
+      {widget, _rect} = input(state)
+      widget.block.title
     end
 
     defp placeholder({widget, _rect}), do: widget.placeholder

@@ -49,12 +49,17 @@ defmodule DashFloat.TUI.View do
   # exchange (ADR 0015 §3, amended #91). The key map lives in /help.
   @input_hint "ask anything"
 
+  # The attach prompt's one activity line (ADR 0018 §5): label, draft, and
+  # the dim key hints.
+  @attach_label "Attach image: "
+  @attach_hint "  ⏎ attach · tab complete · esc keep · ^o close · ^d clear"
+
   @doc """
   Splits `width` x `height` into status (1 row), log (rest), activity
-  (1 row while an overlay exists — an active phase or the exit prompt —
-  else 0), input (`2 + input_lines` rows, clamped to a third of the
-  frame), and the permanent stats footer (1 row, ADR 0015) — the whole
-  chrome inset by one cell per side.
+  (1 row while an overlay exists — an active phase, the exit prompt, or the
+  open attach prompt — else 0), input (`2 + input_lines` rows, clamped to a
+  third of the frame), and the permanent stats footer (1 row, ADR 0015) —
+  the whole chrome inset by one cell per side.
   """
   @spec regions({integer(), integer()}, integer(), boolean()) :: %{
           status: Rect.t(),
@@ -473,10 +478,18 @@ defmodule DashFloat.TUI.View do
             [
               separator(),
               Span.new(State.provider_label(state) || "—", style: Theme.style(:assistant))
-            ] ++ context_spans ++ rate_spans
+            ] ++ images_spans(state) ++ context_spans ++ rate_spans
         )
       ]
     }
+  end
+
+  # The capability glyph (ADR 0018 §1): 📎 beside the model label while the
+  # selected model accepts images — visible before any attach attempt.
+  defp images_spans(%State{} = state) do
+    if State.provider_images?(state),
+      do: [Span.new(" 📎", style: Theme.style(:dim))],
+      else: []
   end
 
   # The mode group is bare — the bar intersperses separators between groups
@@ -615,6 +628,29 @@ defmodule DashFloat.TUI.View do
     }
   end
 
+  # The open attach prompt (ADR 0018 §5) replaces the phase labels — one
+  # line like the exit guard: accent label, the draft with the composer's
+  # block cursor, and the dim key hints, the draft truncated to the row.
+  defp activity_widget(%State{attach: %{draft: draft}} = state) do
+    budget =
+      max(
+        content_width(elem(state.size, 0)) - String.length(@attach_label) -
+          String.length(@attach_hint) - 1,
+        0
+      )
+
+    %Paragraph{
+      text: [
+        Line.new([
+          Span.new(@attach_label, style: Theme.style(:accent)),
+          Span.new(String.slice(draft, 0, budget) <> "█", style: Theme.style(:assistant)),
+          Span.new(@attach_hint, style: Theme.style(:hint))
+        ])
+      ],
+      scroll: {0, 0}
+    }
+  end
+
   defp activity_widget(%{phase: :idle}) do
     %Paragraph{text: [], scroll: {0, 0}}
   end
@@ -654,7 +690,7 @@ defmodule DashFloat.TUI.View do
     %Textarea{
       state: state.input,
       block: %Block{
-        title: Span.new("❯ ", style: Theme.style(:accent)),
+        title: input_title(state),
         borders: [:all],
         border_type: :rounded,
         border_style: Theme.style(:dim)
@@ -678,6 +714,14 @@ defmodule DashFloat.TUI.View do
   defp placeholder(%State{suggestion: suggestion}) when suggestion != nil, do: suggestion
   defp placeholder(%State{entries: []}), do: @input_hint
   defp placeholder(%State{}), do: nil
+
+  # The composer's title (ADR 0018 §5): pending attachments ride the title
+  # as a count — the one chip the composer shows for them.
+  defp input_title(%State{attachments: []}),
+    do: Span.new("❯ ", style: Theme.style(:accent))
+
+  defp input_title(%State{attachments: attachments}),
+    do: Span.new("❯ 📎 #{length(attachments)}", style: Theme.style(:accent))
 
   # The composer's cursor artifact (ADR 0015 §1): absent while the pane is
   # unfocused, static bright reversed while idle (zero timers — ADR 0006's
