@@ -108,14 +108,32 @@ defmodule DashFloat.Accounting do
     |> Enum.sum()
   end
 
-  # Bytes/4 over the counted fields (ADR 0022 §1): the content, plus each
-  # tool call's function name and argument JSON.
-  defp weight(message) do
-    content = field(message, :content)
-    content_weight = if is_binary(content), do: div(byte_size(content), 4), else: 0
+  # Bytes/4 over the counted fields (ADR 0022 §1): the content — a string,
+  # or the summed parts of a list-content message (ADR 0018 §2: a text
+  # part's "text", an image part's "image_url"."url", each byte_size/4) —
+  # plus each tool call's function name and argument JSON.
+  defp weight(message), do: content_weight(field(message, :content)) + calls_weight(message)
 
-    content_weight + calls_weight(message)
+  defp content_weight(content) when is_binary(content), do: div(byte_size(content), 4)
+
+  defp content_weight(content) when is_list(content) do
+    content
+    |> Enum.map(&part_weight/1)
+    |> Enum.sum()
   end
+
+  defp content_weight(_other), do: 0
+
+  defp part_weight(part) do
+    image_url = field(part, :image_url)
+    url = if is_map(image_url), do: field(image_url, :url), else: nil
+
+    div(bytes(field(part, :text)) + bytes(url), 4)
+  end
+
+  # A part of unknown shape weighs 0 (ADR 0018 §2 defines the two shapes).
+  defp bytes(binary) when is_binary(binary), do: byte_size(binary)
+  defp bytes(_other), do: 0
 
   defp calls_weight(message) do
     case field(message, :tool_calls) do

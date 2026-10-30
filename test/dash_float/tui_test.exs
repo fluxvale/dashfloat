@@ -3,7 +3,7 @@ defmodule DashFloat.TUITest do
   App-level tests under `test_mode`: supervised lifecycle, teardown paths
   (including crashes), the agent seam (fake agents are this test process or
   plain spawned processes — the TUI only ever sends
-  `{:prompt, ui, text}` / `{:confirm_decision, ref, decision}` / `{:cancel}` /
+  `{:prompt, ui, text, paths}` / `{:confirm_decision, ref, decision}` / `{:cancel}` /
   `{:set_mode, ui, mode}` / `{:set_title, ui, title}` / `{:set_provider, _}`
   and receives the frozen stream contract, ADR 0007),
   and the responsiveness proof. Not async: they measure timing, share
@@ -1192,7 +1192,7 @@ defmodule DashFloat.TUITest do
     press(pid, "enter")
 
     # Submit is a plain send to the agent with our pid as the reply address.
-    assert_receive {:prompt, ui_pid, "hello tui"}, 1_000
+    assert_receive {:prompt, ui_pid, "hello tui", []}, 1_000
     assert ui_pid == pid
 
     # Mid-stream: the reply grows in flight (one token per message) and is
@@ -1225,7 +1225,7 @@ defmodule DashFloat.TUITest do
     {:ok, pid} = start_tui(provider: provider())
     submit(pid, "stream for the footer")
 
-    assert_receive {:prompt, ui_pid, "stream for the footer"}, 1_000
+    assert_receive {:prompt, ui_pid, "stream for the footer", []}, 1_000
     send(ui_pid, {:token, "x"})
     Process.sleep(20)
     send(ui_pid, {:token, "x"})
@@ -1267,7 +1267,7 @@ defmodule DashFloat.TUITest do
     {:ok, pid} = start_tui(provider: provider)
     submit(pid, "stream for the footer")
 
-    assert_receive {:prompt, ui_pid, "stream for the footer"}, 1_000
+    assert_receive {:prompt, ui_pid, "stream for the footer", []}, 1_000
 
     # Pre-snapshot: the span is hidden — no ratio anywhere in the footer.
     blank = get_state(pid)
@@ -1305,7 +1305,7 @@ defmodule DashFloat.TUITest do
     {:ok, pid} = start_tui()
     submit(pid, "cancel me")
 
-    assert_receive {:prompt, ui_pid, "cancel me"}, 1_000
+    assert_receive {:prompt, ui_pid, "cancel me", []}, 1_000
     send(ui_pid, {:token, "partial"})
     eventually(pid, fn s -> s.in_flight == "partial" end)
 
@@ -1325,7 +1325,7 @@ defmodule DashFloat.TUITest do
 
     # Input is usable again.
     submit(pid, "again")
-    assert_receive {:prompt, ^ui_pid, "again"}, 1_000
+    assert_receive {:prompt, ^ui_pid, "again", []}, 1_000
   end
 
   # Shift+Tab rides the agent seam (ADR 0016 §7): send, then the echo applies.
@@ -1670,12 +1670,12 @@ defmodule DashFloat.TUITest do
     {:ok, pid} = start_tui()
 
     submit(pid, "first")
-    assert_receive {:prompt, ui_pid, "first"}, 1_000
+    assert_receive {:prompt, ui_pid, "first", []}, 1_000
     send(ui_pid, {:phase, :idle})
     eventually(pid, &(&1.phase == :idle))
 
     submit(pid, "second")
-    assert_receive {:prompt, ^ui_pid, "second"}, 1_000
+    assert_receive {:prompt, ^ui_pid, "second", []}, 1_000
     send(ui_pid, {:phase, :idle})
     eventually(pid, &(&1.phase == :idle))
 
@@ -1696,7 +1696,7 @@ defmodule DashFloat.TUITest do
     agent =
       spawn(fn ->
         receive do
-          {:prompt, ui, _text} -> send(ui, {:token, "slow"})
+          {:prompt, ui, _text, _paths} -> send(ui, {:token, "slow"})
         end
 
         # Park until the test kills this process.
@@ -1733,7 +1733,7 @@ defmodule DashFloat.TUITest do
     agent =
       spawn(fn ->
         receive do
-          {:prompt, ui, _text} ->
+          {:prompt, ui, _text, _paths} ->
             send(ui, {:token, "done"})
             send(ui, {:phase, :idle})
         end
@@ -1996,7 +1996,7 @@ defmodule DashFloat.TUITest do
     {:ok, pid} = start_tui()
 
     submit(pid, "seed")
-    assert_receive {:prompt, ui_pid, "seed"}, 1_000
+    assert_receive {:prompt, ui_pid, "seed", []}, 1_000
     send(ui_pid, {:phase, :idle})
     eventually(pid, &(&1.phase == :idle))
 
@@ -2052,7 +2052,7 @@ defmodule DashFloat.TUITest do
   test "the blink toggles over ticks while a turn is live and stops at idle" do
     {:ok, pid} = start_tui()
     submit(pid, "blink")
-    assert_receive {:prompt, ui_pid, "blink"}, 1_000
+    assert_receive {:prompt, ui_pid, "blink", []}, 1_000
 
     send(ui_pid, {:token, "x"})
     eventually(pid, fn s -> s.phase == :streaming and s.tick_ref != nil end)
@@ -2082,7 +2082,7 @@ defmodule DashFloat.TUITest do
     assert screen_text(get_state(pid)) =~ "ask anything"
 
     submit(pid, "first prompt")
-    assert_receive {:prompt, ui_pid, "first prompt"}, 1_000
+    assert_receive {:prompt, ui_pid, "first prompt", []}, 1_000
 
     # The turn finalizes (the in-flight tokens land as the assistant
     # entry); the draft is empty again — no placeholder now.
@@ -2237,7 +2237,7 @@ defmodule DashFloat.TUITest do
     {:ok, pid} = start_tui()
 
     submit(pid, "animate")
-    assert_receive {:prompt, ui_pid, "animate"}, 1_000
+    assert_receive {:prompt, ui_pid, "animate", []}, 1_000
 
     # While active there is always a tick pending and the frame counter climbs.
     eventually(pid, fn s -> s.phase == :streaming and s.tick_ref != nil end)
@@ -2264,7 +2264,7 @@ defmodule DashFloat.TUITest do
 
     idle_before = Runtime.snapshot(pid).render_count
     submit(pid, "rate")
-    assert_receive {:prompt, ui_pid, "rate"}, 1_000
+    assert_receive {:prompt, ui_pid, "rate", []}, 1_000
     eventually(pid, fn s -> s.phase == :streaming end)
 
     # Sample across a quiet gap: the activity tick alone drives renders.
@@ -2286,7 +2286,7 @@ defmodule DashFloat.TUITest do
     :ok = Runtime.enable_trace(pid, limit: 500)
 
     submit(pid, "count me")
-    assert_receive {:prompt, ui_pid, "count me"}, 1_000
+    assert_receive {:prompt, ui_pid, "count me", []}, 1_000
 
     send(ui_pid, {:token, "Hello"})
     send(ui_pid, {:usage, %{prompt_tokens: 120, completion_tokens: 42, total_tokens: 162}})
@@ -2350,7 +2350,7 @@ defmodule DashFloat.TUITest do
   test "the full confirm round trip: preview, decision, and swallowed keys" do
     {:ok, pid} = start_tui()
     submit(pid, "edit that file")
-    assert_receive {:prompt, ui_pid, "edit that file"}, 1_000
+    assert_receive {:prompt, ui_pid, "edit that file", []}, 1_000
 
     ref = make_ref()
 
@@ -2450,7 +2450,7 @@ defmodule DashFloat.TUITest do
 
   defp tall_log(pid) do
     submit(pid, "first question")
-    assert_receive {:prompt, ui_pid, "first question"}, 1_000
+    assert_receive {:prompt, ui_pid, "first question", []}, 1_000
 
     for i <- 1..100, do: send(ui_pid, {:entry, :system, "line #{i}"})
     send(ui_pid, {:phase, :idle})
@@ -2870,7 +2870,7 @@ defmodule DashFloat.TUITest do
   # arms the one-shot ghost.
   defp complete_turn(pid) do
     submit(pid, "hi")
-    assert_receive {:prompt, ui, "hi"}, 1_000
+    assert_receive {:prompt, ui, "hi", []}, 1_000
     send(ui, {:token, "hello there"})
     send(ui, {:phase, :idle})
     eventually(pid, &(&1.entries != [] and &1.phase == :idle))
@@ -3039,7 +3039,7 @@ defmodule DashFloat.TUITest do
              |> State.input_text() == "tell me more!"
 
       press(pid, "enter")
-      assert_receive {:prompt, _ui, "tell me more!"}, 1_000
+      assert_receive {:prompt, _ui, "tell me more!", []}, 1_000
     end
 
     test "typing over a landed ghost dismisses it; the late response is dropped (epoch stale)" do
@@ -3198,6 +3198,133 @@ defmodule DashFloat.TUITest do
         assert {:noreply, ^state, %{render?: false}} =
                  TUI.handle_info({:suggestion, 5, ghost}, state)
       end
+    end
+  end
+
+  ## Image attachments (ADR 0018 §5/§6) — the prompt driven through the app.
+
+  describe "image attachments" do
+    defp images_dir do
+      dir =
+        Path.join("/tmp/opencode", "dashfloat-tui-attach-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+      dir
+    end
+
+    defp capable_provider do
+      {:ok,
+       %Config{
+         base_url: "http://localhost:1",
+         model: "test-model",
+         api_key: "test-key-123",
+         images: true
+       }}
+    end
+
+    defp composer_title(state) do
+      {widget, _rect} =
+        state
+        |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+        |> Enum.at(3)
+
+      widget.block.title.content
+    end
+
+    defp type_into_prompt(pid, text) do
+      for ch <- String.codepoints(text), do: press(pid, ch)
+    end
+
+    test "ctrl+o opens the prompt and the activity row renders it while idle" do
+      {:ok, pid} = start_tui(provider: provider())
+
+      press(pid, "o", ["ctrl"])
+
+      state = eventually(pid, fn s -> s.attach != nil end)
+      assert state.attach == %{draft: ""}
+      # the transient row is allocated at idle and carries the prompt
+      assert activity_text(state) =~ "Attach image: "
+
+      # a second ctrl+o closes it
+      press(pid, "o", ["ctrl"])
+      eventually(pid, fn s -> s.attach == nil end)
+    end
+
+    test "a paste feeds the open prompt's draft, not the composer" do
+      {:ok, pid} = start_tui(provider: provider())
+      press(pid, "o", ["ctrl"])
+      eventually(pid, fn s -> s.attach != nil end)
+
+      inject(pid, %ExRatatui.Event.Paste{content: "/tmp/opencode/cat.png\r\n"})
+
+      state = eventually(pid, fn s -> s.attach == %{draft: "/tmp/opencode/cat.png"} end)
+      assert State.input_text(state) == ""
+    end
+
+    test "enter attaches a checked path; the submit seam carries it; streaming clears" do
+      dir = images_dir()
+      path = Path.join(dir, "alpha.png")
+      File.write!(path, "12345678")
+
+      {:ok, pid} = start_tui(provider: capable_provider())
+
+      # open, type the path, attach
+      press(pid, "o", ["ctrl"])
+      eventually(pid, fn s -> s.attach != nil end)
+      type_into_prompt(pid, path)
+      press(pid, "enter")
+
+      attached = eventually(pid, fn s -> s.attachments != [] end)
+      assert attached.attachments == [%{path: path, name: "alpha.png", kb: 1}]
+      assert attached.attach == nil
+      # the chip rides the composer title
+      assert composer_title(attached) == "❯ 📎 1"
+
+      # the turn submits with the attachment's path on the seam
+      submit(pid, "what is this?")
+
+      assert_receive {:prompt, ui_pid, "what is this?", [^path]}, 1_000
+
+      # the :user entry's text stays verbatim; the dim indicator rides the
+      # rendered lines (ADR 0006 / ADR 0018 §5)
+      submitted =
+        eventually(
+          pid,
+          fn s -> match?(%{kind: :user, text: "what is this?"}, List.last(s.entries)) end
+        )
+
+      entry = List.last(submitted.entries)
+      assert entry.text == "what is this?"
+      assert "📎 alpha.png (1 KB)" in flatten_lines(entry.lines)
+
+      # the agent's streaming echo clears the pending set (ADR 0018 §6)
+      send(ui_pid, {:phase, :streaming})
+      cleared = eventually(pid, fn s -> s.attachments == [] end)
+      refute composer_title(cleared) =~ "📎"
+
+      send(ui_pid, {:phase, :idle})
+    end
+
+    test "an attach refusal lands in the log and keeps the prompt open" do
+      # a capable provider: the refusal below is the path check's, not the
+      # capability gate's
+      {:ok, pid} = start_tui(provider: capable_provider())
+
+      press(pid, "o", ["ctrl"])
+      eventually(pid, fn s -> s.attach != nil end)
+      type_into_prompt(pid, "/tmp/opencode/nope.png")
+      press(pid, "enter")
+
+      state =
+        eventually(pid, fn s ->
+          Enum.any?(s.entries, &(&1.kind == :system and &1.text =~ "nope.png"))
+        end)
+
+      # the refusal names the path and the prompt stays open, draft intact
+      assert state.attach == %{draft: "/tmp/opencode/nope.png"}
+      assert state.attachments == []
+      assert state.phase == :idle
     end
   end
 end

@@ -749,6 +749,59 @@ defmodule DashFloat.SessionTest do
       assert {:error, msg} = load(ctx)
       assert msg =~ "message 2"
     end
+
+    @tag :tmp_dir
+    test "an image-bearing user message round-trips verbatim (ADR 0018 §2)", ctx do
+      messages = [
+        %{
+          "role" => "user",
+          "content" => [
+            %{"type" => "text", "text" => "what is this?"},
+            %{"type" => "image_url", "image_url" => %{"url" => "data:image/png;base64,aGk="}}
+          ]
+        },
+        %{"role" => "assistant", "content" => "a cat"}
+      ]
+
+      save_ok(ctx, messages)
+      assert {:ok, loaded} = load(ctx)
+      assert loaded.messages == messages
+
+      # The round-tripped transcript re-saves and re-loads.
+      assert :ok = Session.save(ctx.tmp_dir, loaded)
+      assert {:ok, reloaded} = load(ctx)
+      assert reloaded.messages == messages
+    end
+
+    @tag :tmp_dir
+    test "a malformed parts list refuses naming the index and the expected shape", ctx do
+      write_body(
+        ctx,
+        body_with([
+          %{
+            "role" => "user",
+            "content" => [
+              %{"type" => "text", "text" => "fine"},
+              %{"type" => "image_url", "image_url" => %{"url" => 42}}
+            ]
+          }
+        ])
+      )
+
+      assert {:error, msg} = load(ctx)
+      assert msg =~ "message 0"
+      assert msg =~ ~s("content")
+      assert msg =~ ~s({"type": "image_url", "image_url": {"url": string}})
+    end
+
+    @tag :tmp_dir
+    test "user content that is neither a string nor a parts list refuses with both shapes", ctx do
+      write_body(ctx, body_with([%{"role" => "user", "content" => %{"junk" => true}}]))
+
+      assert {:error, msg} = load(ctx)
+      assert msg =~ "message 0"
+      assert msg =~ "must be a string or a list of content parts"
+    end
   end
 
   describe "session id shape" do

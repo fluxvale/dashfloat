@@ -911,6 +911,126 @@ defmodule DashFloat.ConfigTest do
     end
   end
 
+  describe "images flag on the models entry (ADR 0018 §1)" do
+    test "images: true on the selected entry parses to a capable config" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{
+              baseUrl: '#{@base_url}',
+              models: [
+                { model: 'm1' },
+                { model: 'vision', images: true },
+              ],
+            }],
+            settings: { defaultModel: 'vision' },
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      assert {:ok, %Config{model: "vision", images: true}} = Config.load(dir, %{}, [])
+    end
+
+    test "absent or false means not image-capable" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{
+              baseUrl: '#{@base_url}',
+              models: [
+                { model: 'plain' },
+                { model: 'off', images: false },
+              ],
+            }],
+            settings: { defaultModel: 'off' },
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      assert {:ok, %Config{model: "off", images: false}} = Config.load(dir, %{}, [])
+    end
+
+    test "junk warns naming the field and means not image-capable" do
+      for junk <- ["'yes'", "1"] do
+        dir = tmp_dir()
+
+        write!(
+          dir,
+          """
+          {
+            configVersion: 3,
+            defaultProfile: 'work',
+            profiles: [{
+              name: 'work',
+              providers: [{
+                baseUrl: '#{@base_url}',
+                models: [{ model: 'm1', images: #{junk} }],
+              }],
+            }],
+          }
+          """
+        )
+
+        write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+        logs =
+          capture_log(fn ->
+            assert {:ok, %Config{model: "m1", images: false}} = Config.load(dir, %{}, [])
+          end)
+
+        assert logs =~ "images is not a boolean — treating the model as not image-capable"
+      end
+    end
+
+    test "the flag rides the selected entry only: a capable sibling leaves the default incapable" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{
+              baseUrl: '#{@base_url}',
+              models: [
+                { model: 'plain' },
+                { model: 'vision', images: true },
+              ],
+            }],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      assert {:ok, %Config{model: "plain", images: false}} = Config.load(dir, %{}, [])
+    end
+  end
+
   describe "Presets.suggest_model/1 (ADR 0015)" do
     test "the preset cheap models keyed by base URL; nil for custom providers" do
       assert Presets.suggest_model("https://api.z.ai/api/coding/paas/v4") == "glm-5.3-flash"

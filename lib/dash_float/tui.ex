@@ -157,6 +157,11 @@ defmodule DashFloat.TUI do
       when setup != nil,
       do: schedule(State.setup_paste(state, content))
 
+  # The attach prompt (ADR 0018 §5) takes pastes into its path draft too —
+  # a pasted path is the supported shape; the composer stays untouched.
+  def handle_event(%ExRatatui.Event.Paste{content: content}, %State{attach: %{}} = state),
+    do: schedule(State.attach_paste(state, content))
+
   def handle_event(%ExRatatui.Event.Paste{content: content}, state),
     do: schedule(State.paste(state, content))
 
@@ -190,7 +195,7 @@ defmodule DashFloat.TUI do
 
   defp setup_action(action, state), do: schedule(run_action(action, state))
 
-  defp run_action({:submit, prompt}, state), do: prompt_agent(prompt, state)
+  defp run_action({:submit, prompt, paths}, state), do: prompt_agent(prompt, paths, state)
   defp run_action({:confirm, decision}, state), do: confirm_decision(decision, state)
   defp run_action(:cancel, state), do: cancel_agent(state)
   defp run_action({:select_profile, name}, state), do: resolve_setup(state, name)
@@ -523,9 +528,10 @@ defmodule DashFloat.TUI do
   def exit_code(_reason), do: 1
 
   # The agent seam (ADR 0007): plain sends, both directions — fake agents in
-  # tests are plain processes receiving these.
-  defp prompt_agent(prompt, state) do
-    send(state.agent, {:prompt, self(), prompt})
+  # tests are plain processes receiving these. `paths` carries the pending
+  # attachments (ADR 0018 §6); the agent owns the bytes.
+  defp prompt_agent(prompt, paths, state) do
+    send(state.agent, {:prompt, self(), prompt, paths})
     state
   end
 

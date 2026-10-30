@@ -142,7 +142,10 @@ parser is strictly better); Jason (no JSON5 support — the whole point).
   omitted), `model` (required), `context` (optional positive integer;
   unusable values are nil, never errors — ADR 0006 rule), and free-form extras
   (octofriend files carry `modalities`, `reasoning`, `type`) which are
-  tolerated silently for forward compatibility.
+  tolerated silently for forward compatibility. (Amended by
+  [ADR 0018](0018-image-attachments.md): the entry may also carry `images:
+  true` — a strict boolean flag marking the model image-capable; absent,
+  `false`, or junk-with-warning means not.)
 - `yourName` is parsed by nothing yet — storage shape.
 - `configVersion` of this layout is `1`. A *newer* version warns and the load
   proceeds best-effort; an older/absent one is tolerated.

@@ -320,7 +320,7 @@ defmodule DashFloat.AgentTest do
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
 
-    send(agent, {:prompt, self(), "create the file"})
+    send(agent, {:prompt, self(), "create the file", []})
     assert_receive {:sse_request, "POST", _, _, _first_body}, 2_000
 
     # The confirmation carries engine-built preview content (ADR 0007 §4).
@@ -366,7 +366,7 @@ defmodule DashFloat.AgentTest do
     server = start_server([final_episode()])
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:sse_request, "POST", _, _, body}, 2_000
 
     assert [%{"role" => "system", "content" => content} | _rest] = request_messages(body)
@@ -390,7 +390,7 @@ defmodule DashFloat.AgentTest do
     server = start_server([final_episode()])
     {agent, _sup} = start_agent(server, proj)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:sse_request, "POST", _, _, body}, 2_000
 
     assert [%{"role" => "system", "content" => content} | _rest] = request_messages(body)
@@ -409,7 +409,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
-    send(agent, {:prompt, self(), "write it"})
+    send(agent, {:prompt, self(), "write it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:confirm, ref, %{name: "write_file"}}, 2_000
@@ -438,7 +438,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
-    send(agent, {:prompt, self(), "read it"})
+    send(agent, {:prompt, self(), "read it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_call, %{id: "call_read", name: "read_file", args: args}}, 2_000
@@ -472,7 +472,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
-    send(agent, {:prompt, self(), "read outside"})
+    send(agent, {:prompt, self(), "read outside", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_result, %{name: "read_file", ok: false, status: status}}, 2_000
@@ -499,7 +499,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
-    send(agent, {:prompt, self(), "write outside"})
+    send(agent, {:prompt, self(), "write outside", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     # The policy runs while building the preview: an escaping mutation never
@@ -528,7 +528,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
-    send(agent, {:prompt, self(), "edit it"})
+    send(agent, {:prompt, self(), "edit it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     refute_received {:confirm, _ref, _preview}
@@ -558,7 +558,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
-    send(agent, {:prompt, self(), "misbehave"})
+    send(agent, {:prompt, self(), "misbehave", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_result, %{id: "call_u", status: status_u}}, 2_000
@@ -592,7 +592,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
-    send(agent, {:prompt, self(), "call it"})
+    send(agent, {:prompt, self(), "call it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_result, %{id: "call_bad", ok: false, status: status}}, 2_000
@@ -634,7 +634,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, synthetic: synthetic_ctx(server))
-    send(agent, {:prompt, self(), "read it"})
+    send(agent, {:prompt, self(), "read it", []})
 
     # conn 0: the episode with the broken call.
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
@@ -681,7 +681,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, synthetic: synthetic_ctx(server))
-    send(agent, {:prompt, self(), "call it"})
+    send(agent, {:prompt, self(), "call it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_result, %{id: "call_bad", ok: false}}, 2_000
@@ -712,7 +712,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, synthetic: synthetic_ctx(server))
-    send(agent, {:prompt, self(), "call it"})
+    send(agent, {:prompt, self(), "call it", []})
 
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
     # The repair request is in flight; cancel lands inside it.
@@ -774,7 +774,7 @@ defmodule DashFloat.AgentTest do
 
     {pinned, _sup} = start_agent(server, ctx.tmp_dir, synthetic: synthetic_ctx(server))
 
-    send(pinned, {:prompt, self(), "search enabled"})
+    send(pinned, {:prompt, self(), "search enabled", []})
     assert_receive {:sse_request, "POST", _, _, with_body}, 2_000
 
     names =
@@ -796,7 +796,7 @@ defmodule DashFloat.AgentTest do
     # advertised array stays the base five.
     {plain, _sup} = start_agent(server, ctx.tmp_dir)
 
-    send(plain, {:prompt, self(), "search disabled"})
+    send(plain, {:prompt, self(), "search disabled", []})
     assert_receive {:sse_request, "POST", _, _, without_body}, 2_000
 
     plain_names =
@@ -838,7 +838,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, synthetic: synthetic_ctx(server))
-    send(agent, {:prompt, self(), "search it"})
+    send(agent, {:prompt, self(), "search it", []})
 
     # conn 0: the episode announcing the search call.
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
@@ -883,7 +883,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, synthetic: %Synthetic{})
-    send(agent, {:prompt, self(), "search anyway"})
+    send(agent, {:prompt, self(), "search anyway", []})
 
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
@@ -904,7 +904,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
-    send(agent, {:prompt, self(), "search anyway"})
+    send(agent, {:prompt, self(), "search anyway", []})
 
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
@@ -940,7 +940,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
-    send(agent, {:prompt, self(), "copy it"})
+    send(agent, {:prompt, self(), "copy it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_result, %{id: "call_rd", ok: true}}, 2_000
@@ -966,7 +966,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, System.tmp_dir!())
-    send(agent, {:prompt, self(), "list"})
+    send(agent, {:prompt, self(), "list", []})
 
     assert_receive {:phase, :idle}, 4_000
 
@@ -985,7 +985,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
-    send(agent, {:prompt, self(), "read it"})
+    send(agent, {:prompt, self(), "read it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_result, %{name: "read_file", ok: true, output: output}}, 2_000
@@ -1009,7 +1009,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, System.tmp_dir!())
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
 
     assert_receive {:token, "partial"}, 2_000
     send(agent, {:cancel})
@@ -1028,7 +1028,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
-    send(agent, {:prompt, self(), "run it"})
+    send(agent, {:prompt, self(), "run it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:confirm, ref, %{name: "execute_command"}}, 2_000
@@ -1058,7 +1058,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
-    send(agent, {:prompt, self(), "run it"})
+    send(agent, {:prompt, self(), "run it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:confirm, ref, %{name: "execute_command"}}, 2_000
@@ -1088,7 +1088,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 30_000)
-    send(agent, {:prompt, self(), "go"})
+    send(agent, {:prompt, self(), "go", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:confirm, run_ref, %{id: "call_run"}}, 2_000
@@ -1131,7 +1131,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
-    send(agent, {:prompt, self(), "run it"})
+    send(agent, {:prompt, self(), "run it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:confirm, ref, %{name: "execute_command"}}, 2_000
@@ -1164,7 +1164,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
-    send(agent, {:prompt, self(), "run it"})
+    send(agent, {:prompt, self(), "run it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:confirm, ref, %{name: "execute_command"}}, 2_000
@@ -1195,7 +1195,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, sup} = start_agent(server, ctx.tmp_dir, exec_timeout: 10_000)
-    send(agent, {:prompt, self(), "run it"})
+    send(agent, {:prompt, self(), "run it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:confirm, ref, %{name: "execute_command"}}, 2_000
@@ -1227,7 +1227,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, sup} = start_agent(server, System.tmp_dir!())
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
 
     assert_receive {:token, "kept"}, 2_000
 
@@ -1251,7 +1251,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :unchained)
-    send(agent, {:prompt, self(), "write it"})
+    send(agent, {:prompt, self(), "write it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     # The receipt lands without arming a confirmation and without a check.
@@ -1283,7 +1283,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetAllow)
-    send(agent, {:prompt, self(), "run it"})
+    send(agent, {:prompt, self(), "run it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:phase, :checking}, 2_000
@@ -1305,7 +1305,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetAsk)
-    send(agent, {:prompt, self(), "run it"})
+    send(agent, {:prompt, self(), "run it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:entry, :system, "[safety check: needs confirmation]"}, 2_000
@@ -1327,7 +1327,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetFail)
-    send(agent, {:prompt, self(), "run it"})
+    send(agent, {:prompt, self(), "run it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:entry, :system, "[safety check unavailable — confirming]"}, 2_000
@@ -1350,7 +1350,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetGarbage)
-    send(agent, {:prompt, self(), "run it"})
+    send(agent, {:prompt, self(), "run it", []})
     assert_receive {:phase, :checking}, 2_000
 
     # The garbage verdict may neither run the call nor kill the GenServer:
@@ -1387,7 +1387,7 @@ defmodule DashFloat.AgentTest do
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParked)
 
-    send(agent, {:prompt, self(), "go"})
+    send(agent, {:prompt, self(), "go", []})
     assert_receive {:phase, :checking}, 2_000
 
     send(agent, {:cancel})
@@ -1426,7 +1426,7 @@ defmodule DashFloat.AgentTest do
         vet_timeout: 10_000
       )
 
-    send(agent, {:prompt, self(), "go"})
+    send(agent, {:prompt, self(), "go", []})
     assert_receive {:phase, :checking}, 2_000
 
     vet = vetting_pid(agent)
@@ -1450,7 +1450,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParked)
-    send(agent, {:prompt, self(), "go"})
+    send(agent, {:prompt, self(), "go", []})
     assert_receive {:phase, :checking}, 2_000
 
     agent
@@ -1474,7 +1474,7 @@ defmodule DashFloat.AgentTest do
       start_server([call_tool_episode("call_kq", "execute_command", %{"command" => "echo x"})])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParked)
-    send(agent, {:prompt, self(), "go"})
+    send(agent, {:prompt, self(), "go", []})
     assert_receive {:phase, :checking}, 2_000
 
     vet = vetting_pid(agent)
@@ -1502,7 +1502,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParkedAllow)
-    send(agent, {:prompt, self(), "go"})
+    send(agent, {:prompt, self(), "go", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
     assert_receive {:phase, :checking}, 2_000
 
@@ -1535,7 +1535,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParkedAllow)
-    send(agent, {:prompt, self(), "go"})
+    send(agent, {:prompt, self(), "go", []})
     assert_receive {:phase, :checking}, 2_000
 
     vet = vetting_pid(agent)
@@ -1564,7 +1564,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParked)
-    send(agent, {:prompt, self(), "go"})
+    send(agent, {:prompt, self(), "go", []})
     assert_receive {:phase, :checking}, 2_000
 
     vet = vetting_pid(agent)
@@ -1592,7 +1592,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParked)
-    send(agent, {:prompt, self(), "go"})
+    send(agent, {:prompt, self(), "go", []})
     assert_receive {:phase, :checking}, 2_000
 
     vet = vetting_pid(agent)
@@ -1623,7 +1623,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto)
-    send(agent, {:prompt, self(), "run it"})
+    send(agent, {:prompt, self(), "run it", []})
     assert_receive {:sse_request, "POST", _, _, _model_first}, 2_000
 
     # The vet is a fresh-context completion: its request carries the static
@@ -1655,7 +1655,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :plan)
-    send(agent, {:prompt, self(), "edit it"})
+    send(agent, {:prompt, self(), "edit it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_preview, %{id: "call_p", name: "edit_file"}}, 2_000
@@ -1683,7 +1683,7 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :plan)
-    send(agent, {:prompt, self(), "read it"})
+    send(agent, {:prompt, self(), "read it", []})
 
     assert_receive {:tool_result, %{id: "call_pr", ok: true, output: output}}, 2_000
     assert output =~ "readable"
@@ -1705,7 +1705,7 @@ defmodule DashFloat.AgentTest do
     assert_receive {:entry, :system, "[mode: Build → Unchained]"}, 2_000
 
     # The next mutating call runs on the new mode's gate: no confirmation.
-    send(agent, {:prompt, self(), "write it"})
+    send(agent, {:prompt, self(), "write it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
     assert_receive {:tool_result, %{id: "call_sm", ok: true}}, 2_000
     assert_receive {:phase, :idle}, 2_000
@@ -1738,7 +1738,7 @@ defmodule DashFloat.AgentTest do
 
     on_exit(fn -> DashFloat.TestTeardown.stop(agent) end)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
 
     assert_receive {:entry, :system, text}, 2_000
     assert text =~ "[llm: connection failed: "
@@ -1755,7 +1755,7 @@ defmodule DashFloat.AgentTest do
 
     on_exit(fn -> DashFloat.TestTeardown.stop(agent) end)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
 
     assert_receive {:entry, :system, text}, 1_000
     assert text =~ "[llm: no provider configured"
@@ -1767,7 +1767,7 @@ defmodule DashFloat.AgentTest do
     server = start_server([[{:send, [@headers, "data: [DONE]\n\n"]}, :close]])
     {agent, _sup} = start_agent(server, System.tmp_dir!())
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
 
     assert_receive {:entry, :system, "[model returned nothing]"}, 2_000
     assert_receive {:phase, :idle}, 2_000
@@ -1780,11 +1780,11 @@ defmodule DashFloat.AgentTest do
       ])
 
     {agent, _sup} = start_agent(server, System.tmp_dir!())
-    send(agent, {:prompt, self(), "first"})
+    send(agent, {:prompt, self(), "first", []})
     assert_receive {:token, "hi"}, 2_000
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
-    send(agent, {:prompt, self(), "second"})
+    send(agent, {:prompt, self(), "second", []})
     send(agent, {:confirm_decision, make_ref(), :approved})
 
     refute_receive {:sse_request, "POST", _, _, _second}, 300
@@ -1841,7 +1841,7 @@ defmodule DashFloat.AgentTest do
     sessions = Path.join(ctx.tmp_dir, "sessions")
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
-    send(agent, {:prompt, self(), "read it"})
+    send(agent, {:prompt, self(), "read it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
     assert_receive {:tool_result, %{id: "call_1", ok: true}}, 2_000
     assert_receive {:phase, :idle}, 2_000
@@ -1910,7 +1910,7 @@ defmodule DashFloat.AgentTest do
     sessions = Path.join(ctx.tmp_dir, "sessions")
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
-    send(agent, {:prompt, self(), "create the file"})
+    send(agent, {:prompt, self(), "create the file", []})
     assert_receive {:confirm, ref, %{id: "call_1"}}, 2_000
 
     id = session_id(sessions)
@@ -1994,7 +1994,7 @@ defmodule DashFloat.AgentTest do
       if Process.alive?(sup), do: Process.exit(sup, :kill)
     end)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:phase, :idle}, 2_000
 
     id = session_id(sessions)
@@ -2030,7 +2030,7 @@ defmodule DashFloat.AgentTest do
       if Process.alive?(raw_sup), do: Process.exit(raw_sup, :kill)
     end)
 
-    send(raw_agent, {:prompt, self(), "hello"})
+    send(raw_agent, {:prompt, self(), "hello", []})
     assert_receive {:entry, :system, failure}, 2_000
     assert failure =~ "llm:"
     assert_receive {:phase, :idle}, 2_000
@@ -2058,7 +2058,7 @@ defmodule DashFloat.AgentTest do
     sessions = Path.join(ctx.tmp_dir, "sessions")
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
-    send(agent, {:prompt, self(), "run both"})
+    send(agent, {:prompt, self(), "run both", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     # Both calls execute; the repeat carries its occurrence rename.
@@ -2113,7 +2113,7 @@ defmodule DashFloat.AgentTest do
     sessions = Path.join(ctx.tmp_dir, "sessions")
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
-    send(agent, {:prompt, self(), "run all three"})
+    send(agent, {:prompt, self(), "run all three", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_result, %{id: "call_1", ok: true}}, 2_000
@@ -2167,7 +2167,7 @@ defmodule DashFloat.AgentTest do
     sessions = Path.join(ctx.tmp_dir, "sessions")
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
-    send(agent, {:prompt, self(), "run the pair"})
+    send(agent, {:prompt, self(), "run the pair", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
     assert_receive {:tool_result, %{id: "dup-2", ok: true}}, 2_000
@@ -2202,7 +2202,7 @@ defmodule DashFloat.AgentTest do
     {agent, _sup} =
       start_agent(server, ctx.tmp_dir, session_dir: sessions, exec_timeout: 30_000)
 
-    send(agent, {:prompt, self(), "go"})
+    send(agent, {:prompt, self(), "go", []})
     assert_receive {:confirm, ref, %{id: "call_run"}}, 2_000
     send(agent, {:confirm_decision, ref, :approved})
     assert_receive {:phase, :executing_tool}, 1_000
@@ -2242,7 +2242,7 @@ defmodule DashFloat.AgentTest do
     server = start_server([final_episode("still fine")])
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: blocked)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
 
     # Each failing save warns once and names the path; the episode continues.
     assert_receive {:entry, :system, text}, 2_000
@@ -2267,7 +2267,7 @@ defmodule DashFloat.AgentTest do
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
 
-    send(agent, {:prompt, self(), "read it"})
+    send(agent, {:prompt, self(), "read it", []})
     assert_receive {:tool_result, %{id: "call_1", ok: true}}, 2_000
     assert_receive {:phase, :idle}, 2_000
 
@@ -2307,7 +2307,7 @@ defmodule DashFloat.AgentTest do
       if Process.alive?(sup), do: Process.exit(sup, :kill)
     end)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:phase, :idle}, 2_000
 
     bytes = read_session(sessions)
@@ -2328,7 +2328,7 @@ defmodule DashFloat.AgentTest do
     sessions = Path.join(ctx.tmp_dir, "sessions")
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
-    send(agent, {:prompt, self(), "write it"})
+    send(agent, {:prompt, self(), "write it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
     assert_receive {:confirm, _ref, %{id: "call_k"}}, 2_000
 
@@ -2374,7 +2374,7 @@ defmodule DashFloat.AgentTest do
         resume: %{id: session.id, pin: session.pin, messages: session.messages}
       )
 
-    send(resumed, {:prompt, self(), "continue"})
+    send(resumed, {:prompt, self(), "continue", []})
     assert_receive {:sse_request, "POST", _, _, body}, 2_000
 
     assert [
@@ -2418,7 +2418,7 @@ defmodule DashFloat.AgentTest do
         }
       )
 
-    send(resumed, {:prompt, self(), "continue"})
+    send(resumed, {:prompt, self(), "continue", []})
     assert_receive {:phase, :idle}, 2_000
 
     {:ok, saved} = Session.load(sessions, "0192aa0c-8e9f-7a2b-8f8e-2f3a4b5c6d7e")
@@ -2441,7 +2441,7 @@ defmodule DashFloat.AgentTest do
         }
       )
 
-    send(resumed, {:prompt, self(), "continue"})
+    send(resumed, {:prompt, self(), "continue", []})
     assert_receive {:phase, :idle}, 2_000
 
     # The same file, under the adopted id, with the adopted created_at.
@@ -2537,7 +2537,7 @@ defmodule DashFloat.AgentTest do
       if Process.alive?(sup), do: Process.exit(sup, :kill)
     end)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:entry, :system, text}, 500
     assert text =~ "no provider configured"
     assert text =~ "valid profiles: work, personal"
@@ -2566,12 +2566,12 @@ defmodule DashFloat.AgentTest do
       if Process.alive?(sup), do: Process.exit(sup, :kill)
     end)
 
-    send(agent, {:prompt, self(), "too early"})
+    send(agent, {:prompt, self(), "too early", []})
     assert_receive {:entry, :system, text}, 500
     assert text =~ "no provider"
 
     send(agent, {:set_provider, provider(server)})
-    send(agent, {:prompt, self(), "after setup"})
+    send(agent, {:prompt, self(), "after setup", []})
 
     assert_receive {:sse_request, "POST", _, _, body}, 2_000
 
@@ -2727,7 +2727,7 @@ defmodule DashFloat.AgentTest do
   # every read turn in order.
   defp drive_read_turns(agent, prompts) do
     for prompt <- prompts do
-      send(agent, {:prompt, self(), prompt})
+      send(agent, {:prompt, self(), prompt, []})
       assert_receive {:sse_request, "POST", _, _, first_body}, 2_000
       assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
       assert_receive {:phase, :idle}, 4_000
@@ -2896,7 +2896,7 @@ defmodule DashFloat.AgentTest do
     {agent, _sup} =
       start_agent(server, ctx.tmp_dir, session_dir: sessions, provider: provider(server, window))
 
-    send(agent, {:prompt, self(), huge})
+    send(agent, {:prompt, self(), huge, []})
 
     assert_receive {:entry, :system,
                     "[context: the remaining turn alone exceeds the 80% window budget — kept whole]"},
@@ -2994,7 +2994,7 @@ defmodule DashFloat.AgentTest do
         }
       )
 
-    send(resumed, {:prompt, self(), "turn 3"})
+    send(resumed, {:prompt, self(), "turn 3", []})
     assert_receive {:sse_request, "POST", _, _, body}, 2_000
 
     # plan.kept already carries the pinned system message and the prompting
@@ -3041,7 +3041,7 @@ defmodule DashFloat.AgentTest do
         resume: resume
       )
 
-    send(agent, {:prompt, self(), "turn 2"})
+    send(agent, {:prompt, self(), "turn 2", []})
     assert_receive {:sse_request, "POST", _, _, _body}, 2_000
     assert_receive {:phase, :idle}, 2_000
     assert Process.alive?(agent)
@@ -3053,7 +3053,7 @@ defmodule DashFloat.AgentTest do
     {agent2, _sup2} =
       start_agent(server, ctx.tmp_dir, provider: provider(server, window), resume: resume2)
 
-    send(agent2, {:prompt, self(), "turn 2"})
+    send(agent2, {:prompt, self(), "turn 2", []})
     assert_receive {:sse_request, "POST", _, _, _body}, 2_000
     assert_receive {:phase, :idle}, 2_000
     assert Process.alive?(agent2)
@@ -3069,7 +3069,7 @@ defmodule DashFloat.AgentTest do
     {agent3, _sup3} =
       start_agent(server, ctx.tmp_dir, provider: provider(server, 100), resume: resume3)
 
-    send(agent3, {:prompt, self(), "last"})
+    send(agent3, {:prompt, self(), "last", []})
     assert_receive {:sse_request, "POST", _, _, body}, 2_000
     messages = request_messages(body)
     refute hd(messages)["content"] == "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1"
@@ -3095,7 +3095,7 @@ defmodule DashFloat.AgentTest do
     {agent, _sup} =
       start_agent(server, ctx.tmp_dir, session_dir: Path.join(ctx.tmp_dir, "sessions"))
 
-    send(agent, {:prompt, self(), "hi"})
+    send(agent, {:prompt, self(), "hi", []})
 
     # The prompt's push: system + question, no anchor yet — the frame has
     # not landed, so the footer estimates heuristically until it does.
@@ -3130,7 +3130,7 @@ defmodule DashFloat.AgentTest do
     server = start_server([final_episode("ack")])
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
 
-    send(agent, {:prompt, self(), "hi"})
+    send(agent, {:prompt, self(), "hi", []})
     assert_receive {:sse_request, "POST", _, _, _body}, 2_000
     assert_receive {:phase, :idle}, 2_000
 
@@ -3214,7 +3214,7 @@ defmodule DashFloat.AgentTest do
       assert abs(estimate - f_of(next_request)) <= 8 * length(appended) + 24
     end
 
-    send(agent, {:prompt, self(), "turn 1"})
+    send(agent, {:prompt, self(), "turn 1", []})
     assert_receive {:sse_request, "POST", _, _, body_1a}, 2_000
     assert request_messages(body_1a) == request_1a
     assert_receive {:sse_request, "POST", _, _, body_1b}, 4_000
@@ -3226,14 +3226,14 @@ defmodule DashFloat.AgentTest do
       u2
     ])
 
-    send(agent, {:prompt, self(), "turn 2"})
+    send(agent, {:prompt, self(), "turn 2", []})
     assert_receive {:sse_request, "POST", _, _, body_2}, 2_000
     assert request_messages(body_2) == request_2
     assert_receive {:phase, :idle}, 4_000
 
     assert_band.(%{tokens: f_of(request_2), index: 6}, request_2 ++ [af2], request_3, [af2, u3])
 
-    send(agent, {:prompt, self(), "turn 3"})
+    send(agent, {:prompt, self(), "turn 3", []})
     assert_receive {:sse_request, "POST", _, _, body_3}, 2_000
     assert request_messages(body_3) == request_3
     assert_receive {:phase, :idle}, 4_000
@@ -3441,7 +3441,7 @@ defmodule DashFloat.AgentTest do
 
     {agent, _sup} = start_agent(server, System.tmp_dir!())
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:token, "half"}, 2_000
 
     send(agent, {:compact, self()})
@@ -3517,7 +3517,7 @@ defmodule DashFloat.AgentTest do
         provider: title_provider(server, model: "glm-5.3-flash")
       )
 
-    send(agent, {:prompt, self(), "title this session"})
+    send(agent, {:prompt, self(), "title this session", []})
     assert_receive {:sse_request, "POST", "/chat/completions", _, _main}, 2_000
     assert_receive {:phase, :idle}, 2_000
 
@@ -3557,7 +3557,7 @@ defmodule DashFloat.AgentTest do
         provider: title_provider(server)
       )
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:sse_request, "POST", _, _, _main}, 2_000
     assert_receive {:phase, :idle}, 2_000
 
@@ -3582,7 +3582,7 @@ defmodule DashFloat.AgentTest do
         title_fetcher: notify_fetcher(self())
       )
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:phase, :idle}, 2_000
     Process.sleep(300)
     refute_received :title_fetcher_called
@@ -3610,7 +3610,7 @@ defmodule DashFloat.AgentTest do
           title_fetcher: notify_fetcher(self())
         )
 
-      send(agent, {:prompt, self(), "hello"})
+      send(agent, {:prompt, self(), "hello", []})
       assert_receive {:phase, :idle}, 2_000
     end
 
@@ -3638,7 +3638,7 @@ defmodule DashFloat.AgentTest do
         title_fetcher: notify_fetcher(self())
       )
 
-    send(agent, {:prompt, self(), "go"})
+    send(agent, {:prompt, self(), "go", []})
     assert_receive {:token, "partial"}, 2_000
     send(agent, {:cancel})
     assert_receive {:entry, :system, "[cancelled]"}, 2_000
@@ -3647,7 +3647,7 @@ defmodule DashFloat.AgentTest do
     # The cancelled turn is not a settled one: no fire.
     refute_received :title_fetcher_called
 
-    send(agent, {:prompt, self(), "again"})
+    send(agent, {:prompt, self(), "again", []})
     assert_receive {:phase, :idle}, 2_000
     assert_receive :title_fetcher_called, 2_000
     Process.sleep(300)
@@ -3670,14 +3670,14 @@ defmodule DashFloat.AgentTest do
         end
       )
 
-    send(agent, {:prompt, self(), "one"})
+    send(agent, {:prompt, self(), "one", []})
     assert_receive {:phase, :idle}, 2_000
     assert_receive :title_fetcher_called, 2_000
 
     # The failure cleared the guard, kept the latch: no entry, no ref.
     assert %{title_fired?: true, title_ref: nil, session_title: nil} = :sys.get_state(agent)
 
-    send(agent, {:prompt, self(), "two"})
+    send(agent, {:prompt, self(), "two", []})
     assert_receive {:phase, :idle}, 2_000
     Process.sleep(300)
     refute_received :title_fetcher_called
@@ -3698,7 +3698,7 @@ defmodule DashFloat.AgentTest do
         end
       )
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:phase, :idle}, 2_000
     send(agent, {:set_title, self(), "User Title"})
     assert_receive {:entry, :system, "[session titled: User Title]"}, 2_000
@@ -3725,7 +3725,7 @@ defmodule DashFloat.AgentTest do
         title_fetcher: fn _config, _context -> {:ok, "Fix the bug"} end
       )
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:entry, :system, "[session titled: Fix the bug (2)]"}, 2_000
 
     session = load_own_session(sessions, agent)
@@ -3746,7 +3746,7 @@ defmodule DashFloat.AgentTest do
         title_fetcher: fn _config, _context -> {:ok, long} end
       )
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     expected = String.slice(long, 0, 76) <> " (2)"
     assert_receive {:entry, :system, "[session titled: " <> _}, 2_000
     assert %{session_title: landed} = :sys.get_state(agent)
@@ -3771,7 +3771,7 @@ defmodule DashFloat.AgentTest do
         title_fetcher: fn _config, _context -> {:ok, "T"} end
       )
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:phase, :idle}, 2_000
     Process.sleep(300)
     refute_received {:entry, :system, "[session titled" <> _}
@@ -3808,7 +3808,7 @@ defmodule DashFloat.AgentTest do
         end
       )
 
-    send(agent, {:prompt, self(), "second question"})
+    send(agent, {:prompt, self(), "second question", []})
     assert_receive {:phase, :idle}, 2_000
     assert_receive {:title_context, context}, 2_000
     assert context == %{user: "first question", assistant: "first answer"}
@@ -3836,7 +3836,7 @@ defmodule DashFloat.AgentTest do
         end
       )
 
-    send(agent, {:prompt, self(), "go"})
+    send(agent, {:prompt, self(), "go", []})
     assert_receive {:phase, :idle}, 2_000
     assert_receive {:title_context, context}, 2_000
 
@@ -3851,7 +3851,7 @@ defmodule DashFloat.AgentTest do
     sessions = Path.join(ctx.tmp_dir, "sessions")
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:phase, :idle}, 2_000
 
     send(agent, {:title_proposal, make_ref(), "Stale"})
@@ -3871,7 +3871,7 @@ defmodule DashFloat.AgentTest do
     sessions = Path.join(ctx.tmp_dir, "sessions")
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:phase, :idle}, 2_000
 
     send(agent, {:set_title, self(), "  Rename   Me  "})
@@ -3888,7 +3888,7 @@ defmodule DashFloat.AgentTest do
     sessions = Path.join(ctx.tmp_dir, "sessions")
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:phase, :idle}, 2_000
 
     for {raw, refusal} <- [
@@ -3915,7 +3915,7 @@ defmodule DashFloat.AgentTest do
     save_titled(sessions, @other_id_2, "Taken Name")
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:phase, :idle}, 2_000
 
     send(agent, {:set_title, self(), "taken name"})
@@ -3933,7 +3933,7 @@ defmodule DashFloat.AgentTest do
     sessions = Path.join(ctx.tmp_dir, "sessions")
     {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:phase, :idle}, 2_000
 
     send(agent, {:set_title, self(), "Alpha"})
@@ -3950,7 +3950,7 @@ defmodule DashFloat.AgentTest do
     server = start_server([final_episode("done")])
     {agent, _sup} = start_agent(server, ctx.tmp_dir)
 
-    send(agent, {:prompt, self(), "hello"})
+    send(agent, {:prompt, self(), "hello", []})
     assert_receive {:phase, :idle}, 2_000
 
     send(agent, {:set_title, self(), "  Off   Grid  "})
@@ -4011,7 +4011,7 @@ defmodule DashFloat.AgentTest do
 
     assert %{session_title: "Resumed Title"} = :sys.get_state(resumed)
 
-    send(resumed, {:prompt, self(), "continue"})
+    send(resumed, {:prompt, self(), "continue", []})
     assert_receive {:phase, :idle}, 2_000
     Process.sleep(300)
     refute_received :title_fetcher_called
@@ -4020,6 +4020,146 @@ defmodule DashFloat.AgentTest do
     {:ok, session} = Session.load(sessions, id)
     assert session.title == "Resumed Title"
     assert List.last(session.messages)["content"] == "resumed fine"
+  end
+
+  ## The image seam (ADR 0018 §4/§6): the request body proves what the model
+  ## sees; refusals prove nothing was sent or appended.
+
+  # An image-capable provider (ADR 0018 §1): the seam tests' fixture.
+  defp image_provider(server) do
+    {:ok, config} = provider(server)
+    {:ok, %Config{config | images: true}}
+  end
+
+  @tag :tmp_dir
+  test "an image turn rides the wire as content parts and re-sends on later episodes", ctx do
+    image = Path.join(ctx.tmp_dir, "pic.png")
+    File.write!(image, <<137, 80, 78, 71, 13, 10>>)
+
+    server = start_server([final_episode("a cat"), final_episode("still a cat")])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, provider: image_provider(server))
+
+    send(agent, {:prompt, self(), "what is this?", [image]})
+    assert_receive {:sse_request, "POST", _, _, first_body}, 2_000
+
+    assert [%{"role" => "system"}, user] = request_messages(first_body)
+    assert %{"role" => "user", "content" => parts} = user
+    assert [%{"type" => "text", "text" => "what is this?"}, image_part] = parts
+    assert %{"type" => "image_url", "image_url" => %{"url" => url}} = image_part
+    assert "data:image/png;base64," <> payload = url
+    assert Base.decode64!(payload) == File.read!(image)
+
+    assert_receive {:token, "a cat"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # Image parts ride the transcript for the session's life (ADR 0018 §2):
+    # the follow-up turn's request carries them again.
+    send(agent, {:prompt, self(), "and now?", []})
+    assert_receive {:sse_request, "POST", _, _, second_body}, 4_000
+
+    assert [
+             %{"role" => "system"},
+             %{"role" => "user", "content" => [_text_part, _image_part]},
+             %{"role" => "assistant", "content" => "a cat"},
+             %{"role" => "user", "content" => "and now?"}
+           ] = request_messages(second_body)
+
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "an image-only turn omits the empty text part", ctx do
+    image = Path.join(ctx.tmp_dir, "pic.png")
+    File.write!(image, <<1, 2, 3>>)
+
+    server = start_server([final_episode()])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, provider: image_provider(server))
+
+    send(agent, {:prompt, self(), "", [image]})
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+
+    assert [%{"role" => "system"}, %{"role" => "user", "content" => [only]}] =
+             request_messages(body)
+
+    assert %{"type" => "image_url", "image_url" => %{"url" => "data:image/png;base64," <> _url}} =
+             only
+
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "an incapable model refuses visibly: no request, nothing appended", ctx do
+    image = Path.join(ctx.tmp_dir, "pic.png")
+    File.write!(image, <<1, 2, 3>>)
+
+    server = start_server([final_episode()])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    send(agent, {:prompt, self(), "hi", [image]})
+    refute_receive {:sse_request, _, _, _, _}, 200
+
+    assert_receive {:entry, :system,
+                    "[images: model test-model does not accept images — attach refused]"},
+                   1_000
+
+    assert_receive {:phase, :idle}, 1_000
+
+    # The refused turn appended nothing: the follow-up's request carries no
+    # list-content message.
+    send(agent, {:prompt, self(), "plain", []})
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+
+    messages = request_messages(body)
+    refute Enum.any?(messages, &is_list(&1["content"]))
+
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "a vanished attachment refuses naming the path, nothing sent", ctx do
+    server = start_server([final_episode()])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, provider: image_provider(server))
+
+    send(agent, {:prompt, self(), "look", [Path.join(ctx.tmp_dir, "gone.png")]})
+    refute_receive {:sse_request, _, _, _, _}, 200
+
+    assert_receive {:entry, :system, entry}, 1_000
+    assert entry =~ "gone.png"
+    assert String.starts_with?(entry, "[images: ")
+    assert_receive {:phase, :idle}, 1_000
+  end
+
+  @tag :tmp_dir
+  test "an image turn persists and round-trips through Session.load", ctx do
+    image = Path.join(ctx.tmp_dir, "pic.png")
+    File.write!(image, <<9, 8, 7>>)
+
+    server = start_server([final_episode()])
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    {agent, _sup} =
+      start_agent(server, ctx.tmp_dir, provider: image_provider(server), session_dir: sessions)
+
+    send(agent, {:prompt, self(), "what is this?", [image]})
+    assert_receive {:phase, :idle}, 2_000
+
+    loaded = load_own_session(sessions, agent)
+
+    assert [
+             %{"role" => "system"},
+             %{"role" => "user", "content" => [text, image_part]}
+             | _rest
+           ] = loaded.messages
+
+    assert %{"type" => "text", "text" => "what is this?"} = text
+
+    assert %{
+             "type" => "image_url",
+             "image_url" => %{"url" => "data:image/png;base64," <> payload}
+           } =
+             image_part
+
+    assert Base.decode64!(payload) == <<9, 8, 7>>
   end
 
   defp free_port do

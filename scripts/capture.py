@@ -44,6 +44,15 @@ Scenarios:
     slash-autocomplete
                 the draft is "/" (still) or "/c" mid-typing (gif): the
                 command popup, /compact included
+    attach      the attach flow on an IMAGE-CAPABLE model (ADR 0018): the
+                scratch settings carry images: true and a fixture PNG;
+                Ctrl+O opens the attach prompt, the path is typed and
+                attached (pending chip 📎), the prompt is submitted, the
+                reply streams, and the log shows the 📎 indicator lines
+                (gif: the whole interaction)
+    attach-refusal
+                the same attach attempt on a NON-capable model: the
+                visible [images: …] refusal entry in the log (nothing sent)
     probe       idle byte-rate: 0 bytes over the window == 0 renders/s
 
 The scratch root is hermetic: XDG_CONFIG_HOME and XDG_DATA_HOME both point
@@ -96,6 +105,13 @@ FONT_CANDIDATES_BOLD = [
     "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
 ]
+# Emoji coverage (U+1F4CE 📎 et al.) the mono fonts lack: the first of
+# these that exists draws any glyph the primary font cannot — a rig-side
+# rendering fallback, the app's bytes are unchanged.
+FONT_CANDIDATES_EMOJI = [
+    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+]
 
 # A conventional dark-terminal palette; pyte names -> hex.
 PALETTE = {
@@ -147,14 +163,79 @@ def cell_colors(ch) -> tuple[str, str]:
 
 
 def paint(draw, metrics, ch, px, py):
-    """One terminal cell: background block first, then the glyph."""
+    """One terminal cell: background block first, then the glyph — from the
+    emoji font, scaled into the cell, when the primary mono font cannot
+    draw it (coverage probe via getmask; an empty mask is the tofu the app
+    never sent)."""
     cell_w, cell_h, font = metrics
     fg, bg = cell_colors(ch)
     if bg != DEFAULT_BG:
         draw.rectangle([px, py, px + cell_w, py + cell_h], fill=bg)
     if ch.data and ch.data != " ":
-        draw.text((px, py), ch.data, font=font,
-                  fill=fg if not ch.bold else _brighten(fg))
+        emoji = emoji_font()
+        if emoji is not None and not glyph_covered(font, ch.data):
+            draw_emoji(draw, emoji, ch.data, px, py, cell_w, cell_h)
+        else:
+            draw.text((px, py), ch.data, font=font,
+                      fill=fg if not ch.bold else _brighten(fg))
+
+
+# Coverage probe: a missing glyph renders the font's .notdef — the same
+# mask as U+0378, a permanently unassigned codepoint no font maps. Byte-
+# equal masks (or an empty mask) mean "not covered — try the emoji font".
+_NOTDEF_MASKS: dict[int, bytes | None] = {}
+
+
+def glyph_covered(font, text: str) -> bool:
+    raw = mask_bytes(font.getmask(text))
+    if id(font) not in _NOTDEF_MASKS:
+        _NOTDEF_MASKS[id(font)] = mask_bytes(font.getmask("\u0378"))
+    notdef = _NOTDEF_MASKS[id(font)]
+    return raw is not None and raw != notdef
+
+
+def mask_bytes(mask) -> bytes | None:
+    """An ImagingCore mask as bytes — None for the empty mask."""
+    return bytes(mask) if mask.size else None
+
+
+# The emoji fallback font, resolved once per process (the None memo means
+# "no emoji font on this machine — render exactly as before").
+_EMOJI_FONT = None
+_EMOJI_RESOLVED = False
+
+
+def emoji_font():
+    global _EMOJI_FONT, _EMOJI_RESOLVED
+    if not _EMOJI_RESOLVED:
+        _EMOJI_RESOLVED = True
+        for path in FONT_CANDIDATES_EMOJI:
+            if os.path.exists(path):
+                try:
+                    # CBDT bitmap strikes: 109 is the size Pillow accepts
+                    # for NotoColorEmoji; the draw scales it into the cell.
+                    _EMOJI_FONT = ImageFont.truetype(path, 109)
+                except OSError:
+                    _EMOJI_FONT = None
+                break
+    return _EMOJI_FONT
+
+
+def draw_emoji(draw, font, glyph, px, py, cell_w, cell_h):
+    """Render the emoji at its fixed strike onto a scratch image, thumbnail
+    to the cell, paste — the only way a CBDT color font fits a cell."""
+    scratch = Image.new("RGBA", (160, 160), (0, 0, 0, 0))
+    sdraw = ImageDraw.Draw(scratch)
+    try:
+        sdraw.text((8, 8), glyph, font=font, embedded_color=True)
+        box = scratch.getbbox()
+        if not box:
+            return  # nothing rendered — leave the cell as-is
+        crop = scratch.crop(box)
+        crop.thumbnail((cell_w, cell_h))
+        draw._image.paste(crop, (px, py), crop)
+    except (ValueError, OSError):
+        pass
 
 
 def _brighten(hexcolor: str) -> str:
@@ -193,6 +274,55 @@ def write_compact_fixture(scratch: str) -> str:
     return session_id
 
 
+def write_image_fixture(scratch: str) -> str:
+    """The attach-flow fixture image (ADR 0018): a few hundred bytes with a
+    PNG magic header — nothing decodes the image (the data URL is base64 of
+    whatever bytes are there), so a stub payload is honest. Returns the
+    ABSOLUTE path (the attach prompt's typed input)."""
+    path = f"{scratch}/shot.png"
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + b"\x11" * 300)
+    return path
+
+
+def content_text(content) -> str:
+    """A message's content as text, tolerating content-parts lists (ADR
+    0018 §2): an image turn's user message carries
+    [{"type": "text", ...}, {"type": "image_url", ...}] — the text parts
+    concatenate, the data URLs are skipped (their base64 would drown the
+    signal)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+def content_bytes(content) -> int:
+    """The content's byte length for the mock usage frame — a list-content
+    message counts its parts (text bytes + data-URL bytes), mirroring the
+    accounting heuristic (ADR 0022 §1) that list-content messages weigh by
+    their parts."""
+    if isinstance(content, str):
+        return len(content.encode())
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                total += len((part.get("text") or "").encode())
+            elif part.get("type") == "image_url":
+                url = part.get("image_url") or {}
+                total += len((url.get("url") or "").encode())
+        return total
+    return 0
+
+
 class MockHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # silence — the mock never talks over the capture
@@ -217,7 +347,8 @@ class MockHandler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(length) or b"{}")
-        system = " ".join(m.get("content", "") for m in req.get("messages", [])
+        system = " ".join(content_text(m.get("content", ""))
+                          for m in req.get("messages", [])
                           if m.get("role") == "system")
         if req.get("stream") is True:
             self._sse(req)
@@ -238,8 +369,10 @@ class MockHandler(BaseHTTPRequestHandler):
         # The usage frame mirrors what a real provider reports: the request's
         # own size in tokens (bytes/4 over the messages — the same heuristic
         # ADR 0022 §1 uses between frames), so the footer's tokens-used span
-        # grows turn over turn as the conversation accumulates.
-        prompt_tokens = sum(len((m.get("content") or "").encode())
+        # grows turn over turn as the conversation accumulates. A
+        # list-content message (an image turn, ADR 0018 §2) counts its
+        # parts' bytes through content_bytes.
+        prompt_tokens = sum(content_bytes(m.get("content"))
                             for m in req.get("messages", [])) // 4
         usage = {"choices": [], "usage": {
             "prompt_tokens": prompt_tokens, "completion_tokens": 34}}
@@ -252,7 +385,7 @@ class App:
     """The real TUI under a real pty, plus the capture operations."""
 
     def __init__(self, mix_args=("run", "--no-halt"), no_ghost=False,
-                 context=524288, resume=None):
+                 context=524288, resume=None, images=False):
         self.sink = None  # callable(bytes) set during read loop
         self.screen = pyte.Screen(COLS, ROWS)
         self.stream = pyte.ByteStream(self.screen)
@@ -272,6 +405,9 @@ class App:
         scratch = scratch_dir()
         os.makedirs(f"{scratch}/dashfloat", exist_ok=True)
         base = f"http://127.0.0.1:{port}/v1"
+        # The images flag rides the models entry (ADR 0018 §1): the attach
+        # scenarios pin it true (capable) or leave it off (incapable).
+        images_field = ", images: true" if images else ""
         with open(f"{scratch}/dashfloat/settings.json5", "w") as f:
             f.write(
                 "{\n"
@@ -284,7 +420,8 @@ class App:
                 "    providers: [{\n"
                 "      label: 'mock',\n"
                 f"      baseUrl: '{base}',\n"
-                f"      models: [{{ nickname: 'Sol', model: 'glm-5.3', context: {context} }}],\n"
+                f"      models: [{{ nickname: 'Sol', model: 'glm-5.3', "
+                f"context: {context}{images_field} }}],\n"
                 "    }],\n"
                 "  }],\n"
                 "}\n"
@@ -555,6 +692,66 @@ class App:
         self.wait_for("dropped 1 oldest turn(s)")
         self.wait_quiet()              # the entry settled; composer empty
 
+    # The attach flow (ADR 0018 §5): Ctrl+O opens the one-line attach
+    # prompt, the fixture's ABSOLUTE path is typed (the completion path is
+    # exercised by the driven tests; here the full path is typed directly),
+    # Enter attaches. ASSERTED before returning: the pending chip landed in
+    # the composer block's title and the footer carries the capability
+    # glyph — a keystroke lost in flight must fail the capture, not ship a
+    # still where nothing attached.
+    def attach_fixture(self) -> str:
+        return write_image_fixture(scratch_dir())
+
+    def scenario_attach(self) -> str:
+        path = self.attach_fixture()
+        assert "📎" in self.footer_span() or "📎" in self.text(), \
+            "the image-capable model's footer never showed the 📎 glyph"
+        self.send(b"\x0f")             # Ctrl+O — the attach prompt opens
+        self.wait_for("attach", timeout=10)
+        time.sleep(1.0)                # a readable beat on the open prompt
+        # per_key slow enough to read in the GIF — the path is the payload
+        self.type(path, per_key=0.06)
+        self.send(b"\r")               # Enter — attach
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            title = self.composer_title()
+            if title and "📎" in title:
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("the pending-attachment chip never landed "
+                               "in the composer title")
+        self.type("what is this?")
+        self.send(b"\r")
+        self.wait_for("rest")          # the scripted reply's last word
+        self.wait_quiet()
+        assert "shot.png" in self.text(), \
+            "the submitted turn's 📎 indicator line never rendered"
+        return path
+
+    # The refusal surface (ADR 0018 §4): the same attach attempt on a
+    # non-capable model — the refusal entry lands in the log and NOTHING
+    # was sent (the mock's reply never streams).
+    def scenario_attach_refusal(self):
+        path = self.attach_fixture()
+        self.send(b"\x0f")             # Ctrl+O
+        self.wait_for("attach", timeout=10)
+        self.type(path, per_key=0.01)
+        self.send(b"\r")
+        self.wait_for("[images:", timeout=10)
+        self.wait_quiet()
+        assert "rest" not in self.text(), \
+            "the refusal still streamed a reply — a request went out"
+
+    # The composer block's title row (the bordered input's top line, which
+    # carries the pending chip) — the first row of the composer block; the
+    # block's title sits directly above the draft row.
+    def composer_title(self) -> str:
+        for i, row in enumerate(self.screen.display):
+            if row.lstrip().startswith("❯"):
+                return row.rstrip()
+        return ""
+
     def close(self):
         self._alive = False
         try:
@@ -579,7 +776,8 @@ def main():
     ap.add_argument("--scenario", default="first-run",
                     choices=["first-run", "mid-session", "ghost",
                              "growing-session", "compact-session",
-                             "slash-autocomplete"])
+                             "slash-autocomplete", "attach",
+                             "attach-refusal"])
     ap.add_argument("--out", default=None)
     # The compact-session flow shoots TWO stills: --out after the drop,
     # --out2 after the follow-up no-op command (its below-trigger entry).
@@ -608,7 +806,9 @@ def main():
 
     context = args.context or (
         20000 if args.scenario == "compact-session" else 524288)
-    app = App(no_ghost=args.no_ghost, context=context, resume=resume)
+    images = args.scenario == "attach"
+    app = App(no_ghost=args.no_ghost, context=context, resume=resume,
+              images=images)
     try:
         if args.mode == "probe":
             if args.after_exchange:
@@ -638,6 +838,10 @@ def main():
             elif args.scenario == "slash-autocomplete":
                 app.type("/")
                 time.sleep(0.4)        # the popup renders
+            elif args.scenario == "attach":
+                app.scenario_attach()
+            elif args.scenario == "attach-refusal":
+                app.scenario_attach_refusal()
             if args.scenario != "compact-session":
                 app.screenshot(args.out)
         elif args.scenario == "slash-autocomplete":
@@ -659,6 +863,17 @@ def main():
             # 16 rows: the narrowed popup rides higher than the full list,
             # and /clear + /compact must be legible in the final frame.
             app.gif(args.out, crop_rows=16, min_span=1.5)
+        elif args.scenario == "attach":
+            # The whole attach interaction: Ctrl+O opens the prompt, the
+            # path types in, Enter attaches (chip lands), the question
+            # submits, the reply streams. The scenario asserts the chip
+            # and the indicator BEFORE the render — a lost keystroke
+            # fails the capture. FULL frame (24 rows): the log indicator
+            # and reply sit near the top, above any bottom-row crop.
+            app._mark = time.monotonic()
+            app.scenario_attach()
+            time.sleep(0.5)            # a settled beat on the final state
+            app.gif(args.out, crop_rows=24, min_span=1.0)
         elif args.scenario == "growing-session":
             # Mark BEFORE the first send: the GIF covers both turns — the
             # span appears with the first turn's persist and grows with the
