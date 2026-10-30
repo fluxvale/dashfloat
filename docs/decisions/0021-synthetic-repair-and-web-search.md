@@ -83,8 +83,8 @@ repair carries its own `receive_timeout`).
 
 One non-streaming `POST {base_url}/chat/completions` with
 `hf:syntheticlab/fix-json`, `temperature: 0`,
-`response_format: %{type: "json_object"}`, a single user message (Octofriend
-'s `fixJsonPrompt` verbatim, raw arguments appended with no separator),
+`response_format: %{type: "json_object"}`, a single user message
+(Octofriend's `fixJsonPrompt` verbatim, raw arguments appended with no separator),
 Bearer auth, `retry: false` (a repair is one attempt; a retry would
 double-bill the same broken string), and `receive_timeout`. A 2xx body's
 `choices[0].message.content` is itself JSON: `{"success": true, "fixed": m}`
