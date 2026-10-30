@@ -862,6 +862,13 @@ def main():
     args = ap.parse_args()
     if args.mode in ("still", "gif") and not args.out:
         ap.error(f"{args.mode} requires --out FILE")
+    # The assert-then-shoot guarantee holds only where ONE still is written
+    # at the end (compact-session writes both stills inside its scenario;
+    # gif/probe write no still) — reject the combos rather than silently
+    # weakening the guarantee (issue #109).
+    if args.expect_label and (args.mode != "still" or args.scenario == "compact-session"):
+        ap.error("--expect-label needs still mode and a scenario that shoots "
+                 "once, at the end")
 
     # The compact-session scenario boots from a fixture session file written
     # BEFORE the app starts: a 20000-token window whose trigger the resumed

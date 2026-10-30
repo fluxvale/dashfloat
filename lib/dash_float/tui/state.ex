@@ -462,7 +462,8 @@ defmodule DashFloat.TUI.State do
   defp provider_name(%DashFloat.Config{base_url: nil}), do: nil
 
   defp provider_name(%DashFloat.Config{base_url: base_url, providers: providers}) do
-    Presets.label(base_url) || settings_label(base_url, providers) || host_label(base_url)
+    Presets.label(base_url) || settings_label(base_url, providers) ||
+      DashFloat.Config.host_label(base_url)
   end
 
   defp settings_label(base_url, providers) do
@@ -471,14 +472,6 @@ defmodule DashFloat.TUI.State do
          end) do
       nil -> nil
       provider -> provider.label
-    end
-  end
-
-  # Same rule as Config's own host label: the URI host, else the raw string.
-  defp host_label(base_url) do
-    case URI.parse(base_url) do
-      %URI{host: nil} -> base_url
-      %URI{host: host} -> host
     end
   end
 

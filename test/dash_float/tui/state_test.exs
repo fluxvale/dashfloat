@@ -191,8 +191,22 @@ defmodule DashFloat.TUI.StateTest do
            ]
          }}
 
+      mirrored =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "http://localhost:8080/v1",
+           model: "llama",
+           api_key: "k",
+           nickname: "Sol",
+           providers: [
+             %{label: "homelab", base_url: "http://localhost:8080/v1/", api_key: "k"}
+           ]
+         }}
+
       custom_state = new_state(provider: custom)
+      mirrored_state = new_state(provider: mirrored)
       assert State.provider_label(custom_state) == "homelab - Sol"
+      assert State.provider_label(mirrored_state) == "homelab - Sol"
     end
 
     test "an unlabeled custom provider (env-only boots: providers []) degrades to the URL host" do

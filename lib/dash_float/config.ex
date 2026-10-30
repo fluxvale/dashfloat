@@ -1013,7 +1013,13 @@ defmodule DashFloat.Config do
     nil
   end
 
-  defp host_label(base_url) do
+  @doc """
+  The URL's host as a label — `URI.parse`'s host, else the raw string. The
+  settings label default (ADR 0009) and the footer's host degrade (ADR 0015
+  §2's amendment, issue #109) share this one rule.
+  """
+  @spec host_label(String.t()) :: String.t()
+  def host_label(base_url) do
     case URI.parse(base_url) do
       %URI{host: nil} -> base_url
       %URI{host: host} -> host
