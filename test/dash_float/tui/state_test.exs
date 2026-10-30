@@ -227,8 +227,19 @@ defmodule DashFloat.TUI.StateTest do
     test "nil for an error provider, no provider, no base_url, or no model part" do
       error_state = new_state(provider: {:error, "nope"})
       blank_state = new_state()
-      # No base_url — nothing to classify the provider from.
-      no_url = new_state(provider: {:ok, %DashFloat.Config{model: "glm-5.3", api_key: "k"}})
+      # No base_url — nothing to classify the provider from (the settings
+      # scan still compares each entry against a nil url harmlessly).
+      no_url =
+        new_state(
+          provider:
+            {:ok,
+             %DashFloat.Config{
+               model: "glm-5.3",
+               api_key: "k",
+               providers: [%{label: "kept", base_url: "http://x", models: []}]
+             }}
+        )
+
       # A Config with neither nickname nor model (hand-made, e.g. an
       # env-only shape) has no label — the view's placeholder takes over.
       nameless = new_state(provider: {:ok, %DashFloat.Config{base_url: "http://x", api_key: "k"}})
@@ -3754,6 +3765,15 @@ defmodule DashFloat.TUI.StateTest do
 
     test "bare /title with no current title opens with an empty draft" do
       assert dialog_open().title_dialog == %{draft: "", error: nil}
+    end
+
+    test "a paste with no dialog open is a no-op (the TUI clause guards the open state)" do
+      closed = new_state(title: "Kept")
+
+      pasted = State.title_paste(closed, "pasted title\n")
+
+      assert pasted.title_dialog == nil
+      assert pasted.title == "Kept"
     end
 
     test "bare /title via the filter palette's Enter opens the same dialog" do
