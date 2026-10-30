@@ -63,6 +63,7 @@ defmodule DashFloat.AgentTest do
   alias DashFloat.Config
   alias DashFloat.Session
   alias DashFloat.SSEServer
+  alias DashFloat.Synthetic
   alias DashFloat.TUI.State
 
   @headers "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
@@ -148,7 +149,7 @@ defmodule DashFloat.AgentTest do
   # A pinned Synthetic context aimed at the loopback server (the ADR 0021 §2
   # test seam): repairs ride the same server's next scripted connection.
   defp synthetic_ctx(server) do
-    %{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
+    %Synthetic{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
   end
 
   # The repair endpoint's 200 responses (Req pre-decodes application/json).
@@ -728,16 +729,14 @@ defmodule DashFloat.AgentTest do
 
     {agent, _sup} =
       start_agent(server, cwd,
-        synthetic: %{base_url: "https://api.synthetic.new/v1", api_key: "sk-pin"}
+        synthetic: %Synthetic{base_url: "https://api.synthetic.new/v1", api_key: "sk-pin"}
       )
 
     # A pinned context never moves (ADR 0021 §2) — even to a Synthetic host.
     send(agent, {:set_provider, provider(server)})
 
-    assert :sys.get_state(agent).synthetic == %{
-             base_url: "https://api.synthetic.new/v1",
-             api_key: "sk-pin"
-           }
+    assert :sys.get_state(agent).synthetic ==
+             %Synthetic{base_url: "https://api.synthetic.new/v1", api_key: "sk-pin"}
 
     assert :sys.get_state(agent).synthetic_pinned? == true
   end
@@ -763,10 +762,8 @@ defmodule DashFloat.AgentTest do
 
     send(discovering, {:set_provider, synthetic_provider})
 
-    assert :sys.get_state(discovering).synthetic == %{
-             base_url: "https://api.synthetic.new/v1",
-             api_key: "test-key-123"
-           }
+    assert :sys.get_state(discovering).synthetic ==
+             %Synthetic{base_url: "https://api.synthetic.new/v1", api_key: "test-key-123"}
   end
 
   ## web_search: advertisement and the safe-class round trip (ADR 0021 §§6–8)
@@ -872,6 +869,29 @@ defmodule DashFloat.AgentTest do
              "count" => 2
            } = Jason.decode!(result_json)
 
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "a pinned ctx with unusable fields degrades web_search to not configured, no crash", ctx do
+    # A hand-pinned struct may hold nil fields (M7): the guard turns it into
+    # "not configured" instead of crashing the agent mid-turn.
+    server =
+      start_server([
+        call_tool_episode("call_u", "web_search", %{"query" => "anything"}),
+        final_episode("noted")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, synthetic: %Synthetic{})
+    send(agent, {:prompt, self(), "search anyway"})
+
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:tool_result, %{id: "call_u", ok: false, status: status}}, 2_000
+    assert status =~ "web search is not configured"
+
+    # The turn continues to the next episode.
+    assert_receive {:sse_request, "POST", _, _, _second}, 4_000
     assert_receive {:phase, :idle}, 2_000
   end
 

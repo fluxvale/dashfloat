@@ -7,6 +7,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
   alias DashFloat.Config
   alias DashFloat.LLM.ChatStream
   alias DashFloat.SSEServer
+  alias DashFloat.Synthetic
 
   @headers "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
 
@@ -933,6 +934,11 @@ defmodule DashFloat.LLM.ChatStreamTest do
     server
   end
 
+  # A minimal advertised-tool def (string keys, Tools.schema's shape): the
+  # repair gate repairs only calls whose name the catalogue advertised
+  # (ADR 0021 §3).
+  defp advertised(name), do: %{"type" => "function", "function" => %{"name" => name}}
+
   # The repair endpoint's responses (application/json: Req pre-decodes them).
   defp repair_ok(fixed) do
     content = Jason.encode!(%{"success" => true, "fixed" => fixed})
@@ -957,8 +963,10 @@ defmodule DashFloat.LLM.ChatStreamTest do
         [{:send, repair_ok(%{"path" => "a.txt"})}, :close]
       ])
 
-    ctx = %{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
-    {_pid, ref} = start_stream(SSEServer.base_url(server), synthetic: ctx)
+    ctx = %Synthetic{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
+
+    {_pid, ref} =
+      start_stream(SSEServer.base_url(server), synthetic: ctx, tools: [advertised("read_file")])
 
     # conn 0 is the stream; the repair (conn 1) completes before stream_done.
     assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 2_000
@@ -995,8 +1003,10 @@ defmodule DashFloat.LLM.ChatStreamTest do
         [{:send, repair_failure()}, :close]
       ])
 
-    ctx = %{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
-    {_pid, ref} = start_stream(SSEServer.base_url(server), synthetic: ctx)
+    ctx = %Synthetic{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
+
+    {_pid, ref} =
+      start_stream(SSEServer.base_url(server), synthetic: ctx, tools: [advertised("read_file")])
 
     assert {:stream_done,
             %{
@@ -1027,8 +1037,10 @@ defmodule DashFloat.LLM.ChatStreamTest do
         [{:sleep, 150}, {:send, repair_ok(%{"path" => "a.txt"})}, :close]
       ])
 
-    ctx = %{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
-    {pid, ref} = start_stream(SSEServer.base_url(server), synthetic: ctx)
+    ctx = %Synthetic{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
+
+    {pid, ref} =
+      start_stream(SSEServer.base_url(server), synthetic: ctx, tools: [advertised("read_file")])
 
     # conn 0 (the stream), then conn 1 — the repair POST is in flight.
     assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 2_000
@@ -1051,8 +1063,10 @@ defmodule DashFloat.LLM.ChatStreamTest do
         [:close]
       ])
 
-    ctx = %{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
-    {_pid, ref} = start_stream(SSEServer.base_url(server), synthetic: ctx)
+    ctx = %Synthetic{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
+
+    {_pid, ref} =
+      start_stream(SSEServer.base_url(server), synthetic: ctx, tools: [advertised("read_file")])
 
     assert {:stream_done,
             %{
@@ -1061,6 +1075,82 @@ defmodule DashFloat.LLM.ChatStreamTest do
             }} = done(collect())
 
     # Exactly one request: no repair POST for a missing function name.
+    assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 2_000
+    refute_receive {:sse_request, _, _, _, _}, 300
+
+    await_exit(ref)
+  end
+
+  test "a cancel mid-loop aborts the remaining repairs" do
+    # Two repairable calls; the first repair responds, then a cancel that
+    # landed mid-loop stops the second repair entirely.
+    opening = fn index, id, name ->
+      ~s(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":#{index},"id":"#{id}","type":"function","function":{"name":"#{name}","arguments":""}}]}}]}\n\n)
+    end
+
+    fragment = fn index, frag ->
+      ~s(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":#{index},"function":{"arguments":#{Jason.encode!(frag)}}}]}}]}\n\n)
+    end
+
+    frames =
+      [opening.(0, "call_a", "read_file"), opening.(1, "call_b", "write_file")] ++
+        [fragment.(0, "{\"path\": "), fragment.(1, "{\"content\": ")]
+
+    server =
+      start_per_connection([
+        [{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close],
+        [{:sleep, 150}, {:send, repair_ok(%{"path" => "a.txt"})}, :close],
+        [{:send, repair_ok(%{"content" => "x"})}, :close]
+      ])
+
+    ctx = %Synthetic{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
+
+    {pid, ref} =
+      start_stream(SSEServer.base_url(server),
+        synthetic: ctx,
+        tools: [advertised("read_file"), advertised("write_file")]
+      )
+
+    # conn 0 (the stream), then conn 1 — repair 1 in flight.
+    assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 2_000
+    assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 2_000
+    send(pid, :cancel)
+
+    # The in-flight repair returns, the remaining repair never fires: the
+    # terminal is the cancel (partial content kept, tool fragments dropped).
+    assert {:stream_done, %{content: "", tool_calls: [], cancelled: true}} = done(collect())
+
+    # The script count proves it: conn 2 never happened.
+    refute_receive {:sse_request, _, _, _, _}, 500
+
+    await_exit(ref)
+  end
+
+  test "a broken-args call for a tool the catalogue never advertised gets no repair" do
+    # The agent discards unadvertised names as unknown tools — repairing one
+    # spends quota for output the agent throws away (ADR 0021 §3).
+    server =
+      start_per_connection([
+        [
+          {:send, [@headers, tool_frames("call_1", "explode", ["{\"path\": "])]},
+          {:send, "data: [DONE]\n\n"},
+          :close
+        ],
+        [{:send, repair_ok(%{"path" => "a.txt"})}, :close]
+      ])
+
+    ctx = %Synthetic{base_url: SSEServer.base_url(server), api_key: "test-key-123"}
+
+    {_pid, ref} =
+      start_stream(SSEServer.base_url(server), synthetic: ctx, tools: [advertised("read_file")])
+
+    assert {:stream_done,
+            %{
+              tool_calls: [%{id: "call_1", name: "explode", error: "invalid JSON arguments"}],
+              cancelled: false
+            }} = done(collect())
+
+    # Exactly one connection: the stream, no repair POST.
     assert_receive {:sse_request, "POST", "/chat/completions", _, _}, 2_000
     refute_receive {:sse_request, _, _, _, _}, 300
 

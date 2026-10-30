@@ -62,6 +62,24 @@ defmodule DashFloat.Tools.WebSearchTest do
     assert result.content == Enum.map_join(entries, "\n", &Jason.encode!/1)
   end
 
+  test "results past the 32 KiB content cap are dropped whole, with a marker" do
+    # Each line ~20 KB: line 1 fits, line 2 would push the joined content
+    # past 32 KiB — it and everything after is dropped (the runner's byte-cap
+    # discipline, ADR 0012).
+    big = fn i -> %{"url" => "https://e#{i}.example", "pad" => String.duplicate("x", 20_000)} end
+    entries = [big.(1), big.(2), big.(3)]
+
+    server = start([{:send, search_ok(entries)}, :close])
+
+    result = run(server, search_timeout: 2_000)
+
+    assert result.ok == true
+    assert result.count == 1
+    assert String.starts_with?(result.content, Jason.encode!(big.(1)))
+    assert String.ends_with?(result.content, "\n… [truncated]")
+    refute result.content =~ "e2.example"
+  end
+
   test "results that are not a list are an unexpected response" do
     server = start([{:send, json_ok("application/json", ~s({"results": "nope"}))}])
 

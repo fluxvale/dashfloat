@@ -55,17 +55,22 @@ The host set is every base-URL host Synthetic has ever served (Octofriend's
 active provider's own fields first, then the profile's provider list, first
 entry wins. `{:error, _}` configs, missing keys, and hand-built structs
 holding non-binaries all yield nil: no context, both features off, every
-caller keeps today's behavior. The context travels as a plain
-`%{base_url:, api_key:}` map so tests can pin one without a config file.
+caller keeps today's behavior. The context travels as an Inspect-guarded
+struct (`api_key` redacted from `inspect/1`, the `Config` discipline) —
+still trivially pinnable in tests. Host matching is case-insensitive:
+`URI.parse/1` does not downcase hosts, and the main stream happily serves an
+uppercase one.
 
 ### 2. The repair hook lives at the stream terminal
 
 `ChatStream.run/5` gains `:synthetic` (a context or nil) and
-`:repair_timeout` (ms, default 15 000), threaded into the episode
-accumulator at the 2xx branch. The `[DONE]` clause: without a context,
-today's terminal report, byte-identical. With one, every call whose error is
-exactly `"invalid JSON arguments"` is repaired — sequentially, in call
-order, inside the already-async stream task. `raw_args` (added to
+`:repair_timeout` (ms, default 15 000, one source:
+`Synthetic.default_repair_timeout/0`), threaded into the episode
+accumulator at the 2xx branch alongside the advertised tool names. The
+`[DONE]` clause: without a context, today's terminal report, byte-identical.
+With one, every call whose error is exactly `"invalid JSON arguments"` —
+for a tool the catalogue actually advertised — is repaired: sequentially, in
+call order, inside the already-async stream task. `raw_args` (added to
 `build_call/1`'s call map — the accumulated argument binary) is the repair
 input. A successful repair replaces the call's `args` with the fixed value
 and clears the error; schema validation then happens in the agent exactly as
@@ -84,15 +89,26 @@ repair carries its own `receive_timeout`).
 One non-streaming `POST {base_url}/chat/completions` with
 `hf:syntheticlab/fix-json`, `temperature: 0`,
 `response_format: %{type: "json_object"}`, a single user message
-(Octofriend's `fixJsonPrompt` verbatim, raw arguments appended with no separator),
+(Octofriend's `fixJsonPrompt` verbatim, byte-for-byte — the fixer model is
+custom-trained on these bytes — raw arguments appended with no separator),
 Bearer auth, `retry: false` (a repair is one attempt; a retry would
-double-bill the same broken string), and `receive_timeout`. A 2xx body's
+double-bill the same broken string), `redirect: false` (a followed redirect
+double-bills too — and would even turn the POST into a GET), and
+`receive_timeout`. A 2xx body's
 `choices[0].message.content` is itself JSON: `{"success": true, "fixed": m}`
-with `m` a map yields `{:ok, m}`; every other outcome — non-2xx (the reason
-names `HTTP <status>`), timeout, transport error, a shape miss, a decode
-failure, `success: false`, a non-map `fixed` — yields
-`{:error, reason}`. It never raises: the agent's turn must not die because a
+with `m` a map yields `{:ok, m}` — a string `m` is decoded once more
+(Octofriend's parse-tool-call parity; the fixer sometimes wraps the object as
+a string) and accepted only when it decodes to a map. Every other outcome —
+non-2xx, timeout, transport error, a shape miss, a decode failure,
+`success: false`, a non-map `fixed` — yields `{:error, reason}` with a
+GENERIC reason (`HTTP <status>`, `timed out`, `connection error`, `an
+unusable response`): the reason never carries exception text, which can
+quote the raw key. It never raises: the agent's turn must not die because a
 repair attempt misbehaved.
+
+Repairs fire only for advertised tools — an unadvertised name is discarded
+upstream, and repairing it spends quota for output the agent throws away;
+Octofriend parity.
 
 ### 4. Model ids
 
@@ -116,19 +132,28 @@ on exactly today's path: the call keeps `args: nil, error: "invalid JSON
 arguments"`, the agent answers with the error tool result, the turn
 continues. Cancellation: a cancel that lands while a repair POST is in
 flight is invisible to the stream loop's own checks, so the repair path —
-and only the repair path — re-checks `cancelled?/0` after the repairs; the
-cancel wins (`terminal_cancel/2`, partial content kept, tool fragments
-dropped). Without repairs attempted there is no re-check: the no-key
-terminal is byte-identical.
+and only the repair path — re-checks `cancelled?/0` after each repair
+attempt: a cancel aborts the remaining repairs the moment the in-flight one
+returns (the last POST's return is the worst-case wait), and the cancel wins
+(`terminal_cancel/2`, partial content kept, tool fragments dropped). Without
+repairs attempted there is no re-check: the no-key terminal is
+byte-identical.
 
 ### 6. The search endpoint seam — `DashFloat.Synthetic.search_url/1`
 
 The web_search POST targets `{root}/v2/search`; the root is the context's
-base URL minus its trailing slash and its OpenAI-compat path suffix —
-`/openai/v1`, `/api/openai/v1`, `/api/v1`, `/v1`, tried longest-specific
-first. A suffix-less base URL (the loopback test server) derives
+base URL minus its trailing slash and its versioned OpenAI-compat path tail —
+`/openai/v1`, `/api/v1`, `/v1`, tried longest-specific first — PRESERVING
+any `/api` mount prefix: `api.X/openai/v1` and `X/api/openai/v1` both keep
+their api root. A suffix-less base URL (the loopback test server) derives
 `{base_url}/v2/search` unchanged, which is what makes the search round-trip
 loopback-testable.
+
+One deliberate unknown: Octofriend always searches at the canonical
+`api.synthetic.new/v2/search` regardless of key host, and which root the
+`/api`-prefixed alias hosts actually serve is UNVERIFIED (no live probes by
+policy). If the real API 404s there, also stripping `/api` is the one-line
+change.
 
 ### 7. web_search — advertisement gated on the context
 
@@ -147,19 +172,26 @@ The tool's risk class is `:safe` (read-only, ADR 0016): the gate sends it
 straight to dispatch in every mode — no preview, no confirmation, no safety
 check. The agent derives the call's target per dispatch from its context
 (`search_url/1` plus the context's key) and threads it to the runner as the
-`:search` opt; a nil context threads nil.
+`:search` opt; a nil context threads nil, and so does an unusable one (a
+pinned struct with non-binary fields) — the tool then answers "not
+configured" and the turn continues.
 
 ### 8. The search call and its rendering
 
 One non-streaming `POST {root}/v2/search` with `{"query": q}`, Bearer auth,
-`retry: false` (one attempt — a retry would double-bill the same query, the
-repair POST's §3 posture), and a `receive_timeout` defaulting to 15 000 ms.
+`retry: false` and `redirect: false` (one attempt at one URL — a retried or
+redirected search double-bills the same query, the repair POST's §3
+posture), and a `receive_timeout` defaulting to 15 000 ms.
 A 2xx body — pre-decoded by Req or a binary decoded with Jason — must carry
 `results` as a list; each entry renders as one JSON line (`Jason.encode!/1`)
 and the lines join with newlines into the result's `content`, Octofriend's
-rendering. Every other outcome — non-2xx (`HTTP <status>`), timeout,
-transport error, a shape miss — is a `%{ok: false, error: ...}` result map,
-never a raise: the agent's turn cannot die on a misbehaving search.
+rendering. The joined content is capped whole-line at 32 KiB (the exec
+tool's byte budget, ADR 0012): lines past the cap are dropped and a final
+`… [truncated]` marker line is appended, and `count` is the number of lines
+INCLUDED — what the model actually sees. Every other outcome — non-2xx
+(`HTTP <status>`), timeout, transport error, a shape miss — is a
+`%{ok: false, error: ...}` result map, never a raise: the agent's turn
+cannot die on a misbehaving search.
 
 ## Alternatives considered
 
@@ -185,13 +217,16 @@ never a raise: the agent's turn cannot die on a misbehaving search.
   replaces an error/retry cycle.
 - The stream terminal's duration gains a repair-shaped tail (bounded by
   `:repair_timeout` per repaired call); Esc still cancels — it takes effect
-  the moment the in-flight repair returns.
+  the moment the in-flight repair returns and aborts the remaining repairs.
 - `raw_args` rides every call map and the terminal report: a small,
   permanent addition to the ChatStream↔Agent contract.
 - Quota: repairs spend Synthetic quota only when a stream actually produces
-  malformed arguments; every test drives the loopback server, never the real
-  endpoint.
+  malformed arguments for an advertised tool; every test drives the loopback
+  server, never the real endpoint.
 - web_search spends quota only when the model calls it, and only on a
   session with a Synthetic context; a keyless session sees an unchanged tool
   list, and the `:safe` class means a call needs no keypress — the search's
   own timeout bounds how long the tool batch can pause on it.
+- Repair and search side-requests are unmetered: their token spend reaches
+  neither the usage display nor the ADR 0022 anchor (Octofriend meters its
+  autofix calls — a candidate follow-up issue).

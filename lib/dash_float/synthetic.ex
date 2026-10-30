@@ -16,31 +16,51 @@ defmodule DashFloat.Synthetic do
   # SYNTHETIC_BASE_URLS), so configs keyed to an old endpoint still qualify.
   @synthetic_hosts ["api.synthetic.new", "synthetic.new", "api.glhf.chat", "glhf.chat"]
 
-  # OpenAI-compat path suffixes those base URLs carry, tried longest-specific
-  # first when deriving the search root (ADR 0021 §4).
-  @suffixes ["/openai/v1", "/api/openai/v1", "/api/v1", "/v1"]
+  # The versioned OpenAI-compat tails those base URLs carry, tried
+  # longest-specific first when deriving the search root. Any `/api` mount
+  # prefix is PRESERVED: api.X/openai/v1 and X/api/openai/v1 both keep their
+  # api root (ADR 0021 §6).
+  @suffixes ["/openai/v1", "/api/v1", "/v1"]
 
   @fix_json_model "hf:syntheticlab/fix-json"
 
   @default_repair_timeout 15_000
 
-  @type ctx :: %{base_url: String.t(), api_key: String.t()}
+  @derive {Inspect, except: [:api_key]}
+  defstruct [:base_url, :api_key]
 
-  # Octofriend's fixJsonPrompt, verbatim: the raw argument string is appended
-  # with no separator (the template ends in a newline).
+  @type ctx :: %__MODULE__{base_url: String.t(), api_key: String.t()}
+
+  # Octofriend's fixJsonPrompt, verbatim byte-for-byte (the fixer model is
+  # custom-trained on these bytes): the raw argument string is appended with
+  # no separator (the template ends in a newline).
   @fix_json_prompt """
   The following string may be broken JSON. Fix it if possible. Respond with JSON in the following
   format, defined as TypeScript types:
 
   // Success response:
-  { success: true, fixed: any }
+  type JsonFixSuccess = {
+    success: true,
+
+    // The parsed JSON
+    fixed: any,
+  };
 
   // Failure response:
-  { success: false }
+  type JsonFixFailure = {
+    success: false,
+  };
 
   If it's more-or-less JSON, fix it and respond with the success response. If it's not, respond with
   the failure response. Here's the string:
   """
+
+  @doc """
+  The repair request's default timeout in ms (ADR 0021 §2) — the one source,
+  shared with ChatStream's `:repair_timeout` opt.
+  """
+  @spec default_repair_timeout() :: pos_integer()
+  def default_repair_timeout, do: @default_repair_timeout
 
   @doc """
   The Synthetic context for a `DashFloat.Config.load/0` outcome: the active
@@ -66,14 +86,16 @@ defmodule DashFloat.Synthetic do
   # binary key. A hand-built config struct may hold anything in these fields.
   defp ctx_for(base_url, api_key) do
     if synthetic_host?(host(base_url)) and usable?(api_key) do
-      %{base_url: base_url, api_key: api_key}
+      %__MODULE__{base_url: base_url, api_key: api_key}
     end
   end
 
   defp host(base_url) when is_binary(base_url), do: URI.parse(base_url).host
   defp host(_other), do: nil
 
-  defp synthetic_host?(host) when is_binary(host), do: host in @synthetic_hosts
+  # URI.parse does not downcase hosts, and the main stream happily serves an
+  # uppercase host — match case-insensitively (ADR 0021 §1).
+  defp synthetic_host?(host) when is_binary(host), do: String.downcase(host) in @synthetic_hosts
   defp synthetic_host?(_other), do: false
 
   defp usable?(key) when is_binary(key), do: String.trim(key) != ""
@@ -84,8 +106,9 @@ defmodule DashFloat.Synthetic do
   argument string (ADR 0021 §3): Octofriend's prompt, the
   `hf:syntheticlab/fix-json` model, `temperature: 0`, and a JSON-object
   response. On success the repaired value is the arguments map. Every other
-  outcome — non-2xx, timeout, transport error, a shape miss, `success: false`,
-  a non-map `fixed` — is `{:error, reason}`; this never raises.
+  outcome is `{:error, reason}` with a GENERIC reason — `HTTP <status>`,
+  `timed out`, `connection error`, or `an unusable response` — never the
+  exception text, which can quote the raw key. This never raises.
 
   Options:
 
@@ -107,8 +130,10 @@ defmodule DashFloat.Synthetic do
              },
              headers: [{"authorization", "Bearer " <> ctx.api_key}],
              # A repair is one attempt: a retry would double-bill the same
-             # broken string (ADR 0021 §3).
+             # broken string, and a followed redirect would too (it would even
+             # turn the POST into a GET) — ADR 0021 §3.
              retry: false,
+             redirect: false,
              receive_timeout: timeout
            ) do
         {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
@@ -117,20 +142,24 @@ defmodule DashFloat.Synthetic do
         {:ok, %Req.Response{status: status}} ->
           {:error, "fix-json failed: HTTP #{status}"}
 
-        {:error, exception} ->
-          {:error, Exception.message(exception)}
+        {:error, %{reason: :timeout}} ->
+          {:error, "fix-json failed: timed out"}
+
+        {:error, _exception} ->
+          {:error, "fix-json failed: connection error"}
       end
     rescue
       # An unusable ctx.base_url makes Req raise before any request exists —
       # the same pre-flight cases ChatStream.check_url refuses. A repair is
-      # best-effort: degrade, never crash the caller (ADR 0021 §3).
-      exception ->
-        {:error, Exception.message(exception)}
+      # best-effort: degrade, never crash the caller (ADR 0021 §3). The
+      # exception text stays out of the reason (it can quote the key).
+      _exception ->
+        {:error, "fix-json failed: connection error"}
     catch
       # finch exits :badarg on an out-of-range port before any request exists
       # (see ChatStream.check_url) — degrade the same way.
-      :exit, reason ->
-        {:error, inspect(reason)}
+      :exit, _reason ->
+        {:error, "fix-json failed: connection error"}
     end
   end
 
@@ -146,25 +175,36 @@ defmodule DashFloat.Synthetic do
   defp extract_fixed(%{"choices" => [%{"message" => %{"content" => content}} | _rest]})
        when is_binary(content) do
     case Jason.decode(content) do
-      {:ok, %{"success" => true, "fixed" => fixed}} when is_map(fixed) ->
-        {:ok, fixed}
-
-      _other ->
-        {:error, "fix-json returned an unusable response"}
+      {:ok, %{"success" => true, "fixed" => fixed}} -> unwrap_fixed(fixed)
+      _other -> {:error, "fix-json returned an unusable response"}
     end
   end
 
   defp extract_fixed(_other), do: {:error, "fix-json returned an unusable response"}
 
+  # The fixer sometimes wraps the object as a JSON string: Octofriend decodes
+  # a string `fixed` one more time (their parse-tool-call.ts).
+  defp unwrap_fixed(fixed) when is_map(fixed), do: {:ok, fixed}
+
+  defp unwrap_fixed(fixed) when is_binary(fixed) do
+    case Jason.decode(fixed) do
+      {:ok, %{} = fixed} -> {:ok, fixed}
+      _other -> {:error, "fix-json returned an unusable response"}
+    end
+  end
+
+  defp unwrap_fixed(_other), do: {:error, "fix-json returned an unusable response"}
+
   @doc """
   The Synthetic search endpoint for a context: the base URL minus its
-  OpenAI-compat path suffix (longest-specific first), plus `/v2/search` —
+  versioned OpenAI-compat path tail (longest-specific first, any `/api`
+  mount prefix preserved — §6), plus `/v2/search` —
   `https://api.synthetic.new/openai/v1` derives
   `https://api.synthetic.new/v2/search`, and a bare loopback URL derives
   `http://127.0.0.1:PORT/v2/search`. Wired by slice B (web_search).
   """
   @spec search_url(ctx()) :: String.t()
-  def search_url(%{base_url: base_url}) do
+  def search_url(%__MODULE__{base_url: base_url}) do
     trimmed = String.trim_trailing(base_url, "/")
 
     root =

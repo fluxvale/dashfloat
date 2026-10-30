@@ -121,9 +121,9 @@ defmodule DashFloat.Agent do
       (default: #{@default_vet_timeout})
     * `:synthetic` — the Synthetic context (ADR 0021 §2): `:discover`
       (the default) resolves it from the provider config (and again on every
-      `{:set_provider, _}`); a map pins that context verbatim and nil turns
-      the features off — both pinned forms survive a provider swap (the
-      loopback test seam)
+      `{:set_provider, _}`); a `DashFloat.Synthetic` struct pins that context
+      verbatim and nil turns the features off — both pinned forms survive a
+      provider swap (the loopback test seam)
     * `:name` — GenServer name (default: `__MODULE__`)
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -175,12 +175,12 @@ defmodule DashFloat.Agent do
       end
 
     # The Synthetic context (ADR 0021 §2): :discover reads the provider
-    # config once here; a map pins the injected context (the loopback test
+    # config once here; a struct pins the injected context (the loopback test
     # seam); an explicit nil (or anything else) is off, pinned.
     {synthetic, synthetic_pinned?} =
       case synthetic_opt do
         :discover -> {Synthetic.context(provider), false}
-        %{} = ctx -> {ctx, true}
+        %Synthetic{} = ctx -> {ctx, true}
         _other -> {nil, true}
       end
 
@@ -951,9 +951,14 @@ defmodule DashFloat.Agent do
   end
 
   # The web_search seam (ADR 0021 §6): the tool's POST target and key derive
-  # from the Synthetic context; nil means WebSearch reports "not configured".
-  defp search_opts(nil), do: nil
-  defp search_opts(ctx), do: %{url: Synthetic.search_url(ctx), api_key: ctx.api_key}
+  # from the Synthetic context; nil — or an unusable one, whose fields would
+  # only crash or mis-dial — means WebSearch reports "not configured" and the
+  # turn continues.
+  defp search_opts(%Synthetic{base_url: base_url, api_key: api_key} = ctx)
+       when is_binary(base_url) and is_binary(api_key),
+       do: %{url: Synthetic.search_url(ctx), api_key: api_key}
+
+  defp search_opts(_other), do: nil
 
   defp record_and_continue(state, call, result) do
     state = %{

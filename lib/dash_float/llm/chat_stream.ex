@@ -23,7 +23,6 @@ defmodule DashFloat.LLM.ChatStream do
   alias DashFloat.Synthetic
 
   @default_idle_timeout 60_000
-  @default_repair_timeout 15_000
   @drain_limit 64 * 1024
   # A single SSE frame that never completes would grow the parser buffer until
   # the node dies: cap it (the parser itself stays pure and unbounded).
@@ -52,15 +51,15 @@ defmodule DashFloat.LLM.ChatStream do
     * `:synthetic` — a `DashFloat.Synthetic.ctx()`; nil (the default) keeps
       today's behavior exactly. Present, malformed argument JSON is repaired
       at the [DONE] terminal (ADR 0021 §3)
-    * `:repair_timeout` — the repair request's timeout in ms
-      (default #{@default_repair_timeout}).
+    * `:repair_timeout` — the repair request's timeout in ms (default:
+      `DashFloat.Synthetic.default_repair_timeout/0`, 15 000).
   """
   @spec run(pid(), DashFloat.Config.t() | {:error, String.t()}, [map()], [map()], keyword()) ::
           :ok
   def run(agent, provider, messages, tools, opts \\ []) when is_pid(agent) do
     idle_timeout = Keyword.get(opts, :idle_timeout, @default_idle_timeout)
     synthetic = Keyword.get(opts, :synthetic)
-    repair_timeout = Keyword.get(opts, :repair_timeout, @default_repair_timeout)
+    repair_timeout = Keyword.get(opts, :repair_timeout, Synthetic.default_repair_timeout())
 
     case request_url(provider) do
       {:error, message} ->
@@ -68,7 +67,16 @@ defmodule DashFloat.LLM.ChatStream do
 
       {:ok, url} ->
         response = post(url, provider, messages, tools, idle_timeout)
-        handle_response(response, agent, provider, idle_timeout, synthetic, repair_timeout)
+
+        handle_response(
+          response,
+          agent,
+          provider,
+          idle_timeout,
+          synthetic,
+          repair_timeout,
+          tool_names(tools)
+        )
     end
   end
 
@@ -147,7 +155,8 @@ defmodule DashFloat.LLM.ChatStream do
          {:ok, provider},
          _idle_timeout,
          _synthetic,
-         _repair_timeout
+         _repair_timeout,
+         _tool_names
        ) do
     if cancelled?() do
       terminal_cancel(agent, "")
@@ -163,7 +172,8 @@ defmodule DashFloat.LLM.ChatStream do
          provider,
          idle_timeout,
          synthetic,
-         repair_timeout
+         repair_timeout,
+         tool_names
        )
        when status in 200..299 do
     if cancelled?(),
@@ -174,6 +184,9 @@ defmodule DashFloat.LLM.ChatStream do
           tool_calls: ToolCalls.new(),
           content: "",
           tool_bytes: 0,
+          # The advertised tool names (ADR 0021 §3): repairs fire only for
+          # calls the catalogue actually advertised.
+          tool_names: tool_names,
           synthetic: synthetic,
           repair_timeout: repair_timeout
         })
@@ -185,7 +198,8 @@ defmodule DashFloat.LLM.ChatStream do
          provider,
          _timeout,
          _synthetic,
-         _repair_timeout
+         _repair_timeout,
+         _tool_names
        )
        when status not in 200..299 do
     drain(agent, provider, resp, status, "")
@@ -305,22 +319,20 @@ defmodule DashFloat.LLM.ChatStream do
   # argument JSON get one fix-json repair attempt before the terminal report.
   defp emit_frames(agent, _provider, resp, [%{data: "[DONE]"} | _rest], acc) do
     Req.cancel_async_response(resp)
-    {calls, repaired?} = repair_calls(ToolCalls.finish(acc.tool_calls), acc)
+    {calls, cancelled?} = repair_calls(ToolCalls.finish(acc.tool_calls), acc)
 
-    # A cancel that landed while a repair POST was in flight wins — it was
-    # invisible to the stream loop's own checks. Without repairs, today's
-    # terminal (no re-check) is byte-identical.
-    if repaired? and cancelled?() do
+    if cancelled? do
+      # A cancel that landed while a repair POST was in flight wins — it was
+      # invisible to the stream loop's own checks (ADR 0021 §5).
       terminal_cancel(agent, acc.content)
-      :done
     else
       send(
         agent,
         {:stream_done, %{content: acc.content, tool_calls: calls, cancelled: false}}
       )
-
-      :done
     end
+
+    :done
   end
 
   defp emit_frames(agent, provider, resp, [%{data: data} | rest], acc) do
@@ -353,18 +365,48 @@ defmodule DashFloat.LLM.ChatStream do
 
   # Sequential repairs, in call order: a repair that succeeds replaces the
   # args (schema validation happens later, in the agent, as usual); a repair
-  # that fails leaves the call exactly as finish/1 built it.
+  # that fails leaves the call exactly as finish/1 built it. Only advertised
+  # tools are repaired — an unadvertised name is discarded upstream, and
+  # repairing it spends quota for output the agent throws away (ADR 0021 §3,
+  # Octofriend parity). A cancel aborts the remaining repairs the moment the
+  # in-flight one returns (ADR 0021 §5); calls needing no repair never check.
   defp repair_calls(calls, acc) do
-    Enum.map_reduce(calls, false, fn
-      %{error: "invalid JSON arguments", raw_args: raw_args} = call, _repaired? ->
+    {done, halted?} =
+      Enum.reduce_while(calls, {[], false}, fn call, {done, halted?} ->
+        case repair_one(call, acc) do
+          {:cont, call} -> {:cont, {[call | done], halted?}}
+          {:halt, call} -> {:halt, {[call | done], true}}
+        end
+      end)
+
+    {Enum.reverse(done), halted?}
+  end
+
+  # One repair attempt: `{:cont, call}` when nothing more is owed (no repair
+  # needed, or the attempt returned and no cancel landed), `{:halt, call}` to
+  # abort the remaining repairs.
+  defp repair_one(%{error: "invalid JSON arguments", raw_args: raw_args, name: name} = call, acc) do
+    if MapSet.member?(acc.tool_names, name) do
+      repaired =
         case Synthetic.repair_json(raw_args, acc.synthetic, receive_timeout: acc.repair_timeout) do
-          {:ok, fixed} -> {%{call | args: fixed, error: nil}, true}
-          {:error, _reason} -> {call, true}
+          {:ok, fixed} -> %{call | args: fixed, error: nil}
+          {:error, _reason} -> call
         end
 
-      call, repaired? ->
-        {call, repaired?}
-    end)
+      # A cancel landing while the POST was in flight was invisible to the
+      # stream loop: check once the attempt returns (ADR 0021 §5).
+      if cancelled?(), do: {:halt, repaired}, else: {:cont, repaired}
+    else
+      # An unadvertised name is discarded upstream — no repair POST.
+      {:cont, call}
+    end
+  end
+
+  defp repair_one(call, _acc), do: {:cont, call}
+
+  # The catalogue's advertised names (string keys, Tools.schema's shape).
+  defp tool_names(tools) do
+    for %{"function" => %{"name" => name}} <- tools, into: MapSet.new(), do: name
   end
 
   # Usage arrives in the stream's final chunk (often with empty choices):

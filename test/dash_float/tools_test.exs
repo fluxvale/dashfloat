@@ -2,6 +2,7 @@ defmodule DashFloat.ToolsTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  alias DashFloat.Synthetic
   alias DashFloat.Tools
 
   describe "schema/1" do
@@ -149,7 +150,7 @@ defmodule DashFloat.ToolsTest do
     end
 
     test "a synthetic context advertises web_search last, with its required query" do
-      ctx = %{base_url: "https://api.synthetic.new/v1", api_key: "sk"}
+      ctx = %Synthetic{base_url: "https://api.synthetic.new/v1", api_key: "sk"}
 
       names =
         ctx
