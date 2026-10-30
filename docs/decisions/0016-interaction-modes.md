@@ -241,10 +241,12 @@ The surfaces that drive the seam:
 ### 8. Chrome
 
 One new status-bar span, always present, leading the top status bar's groups:
-`Build · ctx 4.1k/128k · ● Idle · L12/40` — cwd, model, and live tok/s moved to
+`Build · ● Idle · L12/40` — cwd, model, and live tok/s moved to
 the stats footer under the composer (ADR 0015 §2), so the mode heads the
-session-state bar instead of sitting beside the model. The mode is session-wide
-standing truth; hiding the default would imply "sometimes there is a mode".
+session-state bar instead of sitting beside the model; ctx followed them to
+the footer in #67 stage 2 (ADR 0015 §2's 2026-10-30 amendment). The mode is
+session-wide standing truth; hiding the default would imply "sometimes there
+is a mode".
 
 | Mode | Label | Role |
 | --- | --- | --- |

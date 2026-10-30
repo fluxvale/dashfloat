@@ -311,7 +311,16 @@ defmodule DashFloat.TUI do
     do: schedule(State.stream_message(state, msg))
 
   def handle_info({kind, _payload} = msg, state)
-      when kind in [:token, :phase, :usage, :tool_call, :tool_result, :mode, :tool_preview],
+      when kind in [
+             :token,
+             :phase,
+             :usage,
+             :context,
+             :tool_call,
+             :tool_result,
+             :mode,
+             :tool_preview
+           ],
       do: schedule(State.stream_message(state, msg))
 
   def handle_info({:confirm, _ref, _payload} = msg, state),

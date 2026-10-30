@@ -68,19 +68,20 @@ Five regions *(amended 2026-10-29,
 exists only while work is in flight:
 
 ```
-┌ status ─ 1 row ──────────── ctx 4.1k/128k · ● Streaming · follow L412
+┌ status ─ 1 row ──────────── ● Streaming · follow L412
 │ log     :min 0             (windowed; markdown-rendered assistant rows)
 ├ activity 1 row (0 idle) ── ⠋ Streaming…  esc interrupt
 │ input   2 + draft lines ── rounded border, ❯ title, placeholder, soft wrap
-└ footer  1 row ──────────── ❯ ~/FluxVale/dashfloat · model · 30 tok/s
+└ footer  1 row ──────────── ❯ ~/FluxVale/dashfloat · model · 4.1k/128k · 3.3% · 30 tok/s
 ```
 
 - **Status bar** — one left-flowing `Line` of styled spans, dim separators:
-  `ctx <n>` (+`/<window>` and a percent when configured; omitted entirely
-  until something has streamed), phase dot + label (accent while busy, dim
-  idle), log position (dim). `❯ <cwd>` (dim, last two path segments,
-  `~/`-prefixed), `<model>` (default foreground — truth, not decoration),
-  and `<rate> tok/s` (only after/while a stream has produced tokens) live in
+  phase dot + label (accent while busy, dim idle), log position (dim)
+  *(ctx left the bar in #67 stage 2 — see the 2026-10-30 amendment to
+  [ADR 0015](0015-input-surface-cursor-stats-ghost.md) §2)*. `❯ <cwd>` (dim,
+  last two path segments, `~/`-prefixed), `<model>` (default foreground —
+  truth, not decoration), tokens-used + percent-of-context, and
+  `<rate> tok/s` (only after/while a stream has produced tokens) live in
   the input **footer** — a permanent 1-row region under the composer — per
   [ADR 0015](0015-input-surface-cursor-stats-ghost.md) §2 (moved, not
   duplicated; cursor per §1; ghost text per §3).
@@ -196,17 +197,18 @@ by `DashFloat.TUI.Render.entry_lines/2`. The raw text never re-renders.
   the first token's arrival (injected monotonic clock, below). Recomputed on
   each tick while streaming; frozen at finalize/cancel — the last rate stays
   visible after completion.
-- **Context usage** — the turn's final usage total (the **last** frame wins;
-  per-chunk usage reporters send running totals on every frame, and summing
-  those would inflate the number) is banked once at finalize into a cumulative
-  `total_tokens` across turns (today's engine sends single-turn requests, so
-  the sum is the honest number; when Phase 3/4 send history, `prompt_tokens`
-  already includes it and the display switches to that truth). A usage frame
-  arriving after the turn finalized is ignored — it belongs to a turn that is
-  over. Optional config field `context_tokens` (+ env
-  `DASHFLOAT_CONTEXT_TOKENS`, validated as a positive integer, absent → nil —
-  never an error) supplies the window denominator: `ctx 4.1k/128k`. Without
-  it, the bar shows the absolute total only.
+- **Context usage** — *(the banking this bullet described is deleted — #67
+  stage 2 replaced it; see the 2026-10-30 amendment to
+  [ADR 0015](0015-input-surface-cursor-stats-ghost.md) §2 and
+  [ADR 0022](0022-context-accounting-and-compaction.md) §7)* the footer's
+  tokens-used span reads `Accounting.usage/3` over the agent's
+  {messages, anchor} snapshot — the usage-frame-anchored estimate, not a
+  banked sum of frame totals. A usage frame arriving after the turn
+  finalized is ignored — it belongs to a turn that is over. Optional config
+  field `context_tokens` (+ env `DASHFLOAT_CONTEXT_TOKENS`, validated as a
+  positive integer, absent → nil — never an error) supplies the window
+  denominator — else the TUI's catalog fallback, display-only; without
+  either, the span shows the absolute total only.
 - **Cancellation math** — Esc keeps the partial tokens counted, freezes the
   rate at `tokens / elapsed(now)`, and never divides by zero (no tokens → no
   rate). The usage frame that never arrives simply never reconciles.

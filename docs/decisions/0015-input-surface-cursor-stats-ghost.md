@@ -5,6 +5,11 @@
   cursor carries an explicit bright fg+bg pair, and the placeholder rule is
   tightened; see
   [Amendment (2026-10-30, issue #91)](#amendment-2026-10-30-issue-91-cursor-prominence-placeholder-rule)
+  below); **amended again 2026-10-30**
+  ([issue #67](https://github.com/fluxvale/dashfloat/issues/67) stage 2 —
+  the footer gains tokens-used + percent-of-context from the accounting API
+  and the top bar's `ctx` field is deleted; see
+  [Amendment (2026-10-30, issue #67 stage 2)](#amendment-2026-10-30-issue-67-stage-2-tokens-used--percent-of-context)
   below).
 - **Date:** 2026-10-29
 - **Implements:** [issue #66](https://github.com/fluxvale/dashfloat/issues/66),
@@ -216,3 +221,59 @@ same dim family as the placeholder. Two changes, both style/data only —
      resume note all make the session underway, and a mid-session hint
      ("feels patronizing" — the owner's refinement, Oct 30) renders no
      placeholder.
+
+## Amendment (2026-10-30, issue #67 stage 2): tokens-used + percent-of-context
+
+**Status:** Accepted. The binding this ADR's §2 froze ("stage 2 is bound,
+not built") is now built, against [ADR 0022](0022-context-accounting-and-compaction.md)
+§7's API exactly as PR #81 specced. The footer grows a fourth span and the
+top status bar's banked `ctx` field is **deleted** — the affordance moves,
+its source is replaced: `Accounting.usage/3` (the usage-frame-anchored
+estimate), not the last-frame-wins `context_total` banking, which is
+deleted with the field. The footer reads, left to right:
+`❯ <cwd> · <model> · <used>/<window> · <percent>% · <rate> tok/s`.
+
+1. **Carry and cadence.** The agent owns the message list and the anchor,
+   so it pushes a `{:context, %{messages:, anchor:}}` snapshot to the UI at
+   every **transcript mutation** — the persist seam, which every mutation
+   already passes through (prompt append + compaction, tool batch, tool
+   flush, finalize, cancel fill), persistence on or off — and at each
+   **usage frame** (the anchor's own refresh, mid-episode). The span itself
+   recomputes at render time: `footer_widget/1` reads
+   `Accounting.usage(messages, anchor, window)` per frame. The read walks
+   the whole message list (the viewport only renders visible rows — this
+   is O(messages), not O(viewport)) but each step is an O(1) `byte_size`
+   or map read, so it is microseconds against a frame's milliseconds — and
+   it happens exactly when frames happen: **never while idle** (no new
+   timers; the idle 0-render discipline is untouched by construction), at
+   most the 8 fps budget while active. In-flight deltas are deliberately
+   not counted — the usage frame is the only ground truth ([ADR
+   0022](0022-context-accounting-and-compaction.md)
+   §1); the span moves at frames and mutation pushes, not per stream tick.
+2. **Window.** The denominator is the TUI's **display window** —
+   `provider_context_tokens/1`: the configured per-model `context` (env
+   override), else the standing catalog's fresh value, display-only
+   ([ADR 0022](0022-context-accounting-and-compaction.md) §2's exact
+   framing of that fallback). This is what the old `ctx` field showed, so
+   the moved field keeps its denominator-fill behavior (a catalog landing
+   mid-idle fills the percent in with no push needed).
+3. **Formatting, stated once.** Used and window go through
+   `State.humanize/1` (999 → `999`, 1_500 → `1.5k`, 1_048_576 → `1m`); the
+   percent is `Accounting.usage/3`'s one-decimal value with a trailing
+   `.0` trimmed — `humanize`'s own number rule: `4.2k/128k · 3.3%`,
+   `… · 5%`. With **no display window** the span shows the absolute total
+   alone (`4.2k`) — no slash, no percent
+   ([ADR 0022](0022-context-accounting-and-compaction.md) §2's
+   "absolute total alone" carries over).
+4. **No-frame / no-session state.** The span is **hidden** until the first
+   snapshot lands (nil `state.context` → no span, the rate-span's
+   omitted-until-it-exists pattern): a fresh session pre-first-turn shows
+   cwd · model only. The first snapshot rides the first prompt's persist —
+   before any usage frame exists it carries `anchor: nil`, and the span
+   shows the heuristic estimate ([ADR 0022](0022-context-accounting-and-compaction.md)
+   §1's nil-anchor rule), so frame-less providers still get a number.
+5. **What dies.** `status_widget/2`'s ctx group, `State.context_label/1`'s
+   banking form, and the `context_total`/`turn_total` stats machinery
+   (last-frame-wins banking at finalize). `{:usage, _}` frames still
+   reconcile the rate's token count; the percent and totals now come only
+   from the accounting API.

@@ -14,13 +14,10 @@ defmodule DashFloat.TUI.StateTest do
     |> State.new()
   end
 
-  # One completed stream turn carrying `usage` (banked at finalize).
-  defp bank_usage(state, usage) do
-    state
-    |> Map.put(:phase, :streaming)
-    |> State.stream_message({:usage, usage}, 1_000)
-    |> State.stream_message({:phase, :idle}, 2_000)
-  end
+  # Adopts the agent's context snapshot (ADR 0015 §2 amendment): the
+  # {messages, anchor} pair the footer's usage read computes from.
+  defp context_state(state, messages, anchor),
+    do: State.stream_message(state, {:context, %{messages: messages, anchor: anchor}}, 1_000)
 
   defp type(state, text) do
     points = String.codepoints(text)
@@ -81,16 +78,18 @@ defmodule DashFloat.TUI.StateTest do
       assert State.input_text(state) == ""
     end
 
-    test "stats start empty" do
-      assert new_state().stats == %{
+    test "stats start empty and no context snapshot exists yet" do
+      state = new_state()
+
+      assert state.stats == %{
                tokens: 0,
                first_token_at: nil,
                rate: nil,
                prompt_tokens: nil,
-               completion_tokens: nil,
-               context_total: 0,
-               turn_total: nil
+               completion_tokens: nil
              }
+
+      assert state.context == nil
     end
 
     test "mount opts carry the provider; the agent defaults to the name" do
@@ -197,29 +196,67 @@ defmodule DashFloat.TUI.StateTest do
       assert State.rate_label(ticked) == "9.9"
     end
 
-    test "no context before anything streamed" do
-      assert State.context_label(new_state()) == "—"
+    test "no context before the first snapshot lands" do
+      assert State.context_label(new_state()) == nil
     end
 
-    test "context total alone, then over the configured window" do
-      usage = %{prompt_tokens: 100, completion_tokens: 20, total_tokens: 4_100}
-      state = bank_usage(new_state(), usage)
-      assert State.context_label(state) == "4.1k"
+    test "tokens-used alone with no display window, over the window with one" do
+      messages = [%{role: "user", content: String.duplicate("a", 16_400)}]
 
-      base = bank_usage(new_state(provider: provider(128_000)), usage)
-      assert State.context_label(base) == "4.1k/128k"
+      no_window = context_state(new_state(), messages, nil)
+      assert State.context_label(no_window) == "4.1k"
+
+      windowed = context_state(new_state(provider: provider(128_000)), messages, nil)
+      assert State.context_label(windowed) == "4.1k/128k · 3.2%"
     end
 
-    test "context totals in the millions read as m, in the billions b" do
-      usage = %{prompt_tokens: 100, completion_tokens: 20, total_tokens: 4_100_000}
-      state = bank_usage(new_state(), usage)
+    test "an anchored snapshot reads the measurement, not the heuristic" do
+      messages = [
+        %{role: "user", content: String.duplicate("a", 400)},
+        %{role: "assistant", content: String.duplicate("b", 400)}
+      ]
+
+      # The anchor measured the whole list at 4_100; the estimate is exactly
+      # that (ADR 0022 §1).
+      state =
+        context_state(new_state(provider: provider(128_000)), messages, %{tokens: 4_100, index: 2})
+
+      assert State.context_label(state) == "4.1k/128k · 3.2%"
+    end
+
+    test "percent reads one decimal, trailing .0 trimmed" do
+      # 6_400 / 128_000 = 5.0% — trimmed; 65_000 / 128_000 = 50.8%.
+      one =
+        context_state(
+          new_state(provider: provider(128_000)),
+          [%{role: "user", content: String.duplicate("a", 25_600)}],
+          %{tokens: 6_400, index: 1}
+        )
+
+      assert State.context_label(one) =~ "5%"
+
+      two =
+        context_state(new_state(provider: provider(128_000)), [%{role: "user", content: "x"}], %{
+          tokens: 65_000,
+          index: 1
+        })
+
+      assert State.context_label(two) =~ "50.8%"
+    end
+
+    test "totals in the millions read as m, in the billions b" do
+      state =
+        context_state(new_state(), [%{role: "user", content: "x"}], %{
+          tokens: 4_100_000,
+          index: 1
+        })
+
       assert State.context_label(state) == "4.1m"
 
       big =
-        bank_usage(new_state(), %{
-          prompt_tokens: 1,
-          completion_tokens: 1,
-          total_tokens: 2_500_000_000
+        context_state(new_state(), [%{role: "user", content: "x"}], %{
+          tokens: 2_500_000_000,
+          index: 1
         })
 
       assert State.context_label(big) == "2.5b"
@@ -227,27 +264,27 @@ defmodule DashFloat.TUI.StateTest do
 
     test "humanize boundaries roll into the next unit" do
       # 999_999 rounds up and reads "1m", never "1000k".
-      assert new_state()
-             |> bank_usage(%{prompt_tokens: 1, completion_tokens: 1, total_tokens: 999_999})
-             |> State.context_label() ==
-               "1m"
+      state =
+        context_state(new_state(), [%{role: "user", content: "x"}], %{tokens: 999_999, index: 1})
 
-      assert new_state()
-             |> bank_usage(%{prompt_tokens: 1, completion_tokens: 1, total_tokens: 999})
-             |> State.context_label() ==
-               "999"
+      assert State.context_label(state) == "1m"
+
+      small =
+        context_state(new_state(), [%{role: "user", content: "x"}], %{tokens: 999, index: 1})
+
+      assert State.context_label(small) == "999"
     end
 
-    test "context total accumulates across turns" do
-      usage = %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 15}
+    test "a later snapshot wins — the count grows across turns" do
+      one = [%{role: "user", content: String.duplicate("a", 400)}]
+      two = one ++ [%{role: "assistant", content: String.duplicate("b", 8_000)}]
 
       state =
         new_state()
-        |> bank_usage(usage)
-        |> bank_usage(usage)
+        |> context_state(one, nil)
+        |> context_state(two, nil)
 
-      assert state.stats.context_total == 30
-      assert State.context_label(state) == "30"
+      assert State.context_label(state) == "2.1k"
     end
   end
 
@@ -1182,16 +1219,12 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.stats.prompt_tokens == 120
       assert state.stats.completion_tokens == 42
-      # The turn's total is banked, not yet accumulated — per-chunk usage
-      # reporters send running totals, so only the last frame may count.
-      assert state.stats.turn_total == 162
-      assert state.stats.context_total == 0
       # The estimate is reconciled to the provider's authoritative count.
       assert state.stats.tokens == 42
       assert state.phase == :streaming
     end
 
-    test "a later usage frame wins; the turn banks once at finalize, then accumulates" do
+    test "a later usage frame wins (per-chunk reporters send running totals)" do
       turn_one =
         new_state()
         |> Map.put(:phase, :streaming)
@@ -1203,14 +1236,12 @@ defmodule DashFloat.TUI.StateTest do
         )
 
       assert turn_one.stats.prompt_tokens == 20
-      assert turn_one.stats.turn_total == 28
+      assert turn_one.stats.completion_tokens == 8
+      assert turn_one.stats.tokens == 8
 
       idle = State.stream_message(turn_one, {:phase, :idle}, 3_000)
-      assert idle.stats.context_total == 28
-      assert idle.stats.turn_total == nil
+      assert idle.stats.prompt_tokens == 20
 
-      # The next turn adds its own final total, whatever its provider's
-      # reporting cadence.
       turn_two =
         idle
         |> Map.put(:phase, :streaming)
@@ -1218,7 +1249,7 @@ defmodule DashFloat.TUI.StateTest do
           {:usage, %{prompt_tokens: 30, completion_tokens: 10, total_tokens: 10}}
         )
 
-      assert State.stream_message(turn_two, {:phase, :idle}, 5_000).stats.context_total == 38
+      assert turn_two.stats.prompt_tokens == 30
     end
 
     test "a usage frame after the turn finalized is ignored" do
@@ -1237,8 +1268,24 @@ defmodule DashFloat.TUI.StateTest do
 
       # Nothing from the finished turn may poison the next one's rate math.
       assert late.stats.tokens == 0
-      assert late.stats.context_total == 0
-      assert late.stats.turn_total == nil
+      assert late.stats.prompt_tokens == nil
+    end
+  end
+
+  describe "context snapshots (ADR 0015 §2 amendment)" do
+    test "{:context, _} adopts the snapshot verbatim; a later snapshot wins" do
+      one = [%{role: "user", content: "hi"}]
+      two = one ++ [%{role: "assistant", content: "hello"}]
+
+      state =
+        new_state()
+        |> State.stream_message({:context, %{messages: one, anchor: nil}}, 1_000)
+        |> State.stream_message(
+          {:context, %{messages: two, anchor: %{tokens: 9, index: 2}}},
+          1_100
+        )
+
+      assert state.context == %{messages: two, anchor: %{tokens: 9, index: 2}}
     end
   end
 
@@ -1281,11 +1328,9 @@ defmodule DashFloat.TUI.StateTest do
         |> State.stream_message({:phase, :idle}, 2_000)
 
       assert State.rate_label(state) == "2.0"
-      assert state.stats.context_total == 5
 
       # A usage frame arriving after the turn ended belongs to nobody.
       late = State.stream_message(state, {:usage, usage}, 2_100)
-      assert late.stats.context_total == 5
       assert State.rate_label(late) == "2.0"
     end
 
@@ -1298,7 +1343,6 @@ defmodule DashFloat.TUI.StateTest do
 
       assert_in_delta state.stats.rate, 2.0, 0.0001
       assert state.stats.prompt_tokens == nil
-      assert state.stats.context_total == 0
       assert pairs(state) == [{:assistant, "partial"}]
     end
 
