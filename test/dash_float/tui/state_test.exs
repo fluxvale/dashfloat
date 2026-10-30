@@ -3261,6 +3261,18 @@ defmodule DashFloat.TUI.StateTest do
       assert alt_a.attach.draft == ""
     end
 
+    # crossterm reports an uppercase char as SHIFT-modified (delta review):
+    # shift-only must type — capital letters in paths are mainline input.
+    test "a shifted printable types its uppercase character" do
+      opened = press(new_state(), "o", ["ctrl"])
+
+      typed = press(opened, "P", ["shift"])
+      assert typed.attach.draft == "P"
+
+      more = press(typed, "I", ["shift"])
+      assert more.attach.draft == "PI"
+    end
+
     test "a paste feeds the prompt's draft, newlines stripped, composer untouched" do
       opened = press(new_state(), "o", ["ctrl"])
       pasted = State.attach_paste(opened, "/tmp/opencode/cat.png\r\n")

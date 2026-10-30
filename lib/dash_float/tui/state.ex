@@ -329,13 +329,11 @@ defmodule DashFloat.TUI.State do
   defp replay_message(%{"role" => "user", "content" => parts}, {state, names})
        when is_list(parts) do
     text =
-      parts
-      |> Enum.map_join(fn
+      Enum.map_join(parts, fn
         %{"type" => "text", "text" => t} -> t
         %{"type" => "image_url"} -> ""
         _other -> ""
       end)
-      |> String.trim_leading()
 
     indicator_rows = for _url <- image_parts(parts), do: replay_image_line()
     lines = Render.entry_lines(:user, text) ++ indicator_rows
@@ -810,7 +808,10 @@ defmodule DashFloat.TUI.State do
       code == "backspace" ->
         {%{state | attach: %{draft: String.slice(draft, 0..-2//1)}}, nil}
 
-      modifiers == [] and single_char?(code) and String.valid?(code) ->
+      # A shifted printable is an UPPERCASE character, not a chord: crossterm
+      # attaches SHIFT to every `is_uppercase` char (Caps Lock identically),
+      # so shift-only must type — ctrl/alt/super chords stay swallowed.
+      modifiers in [[], ["shift"]] and single_char?(code) and String.valid?(code) ->
         {%{state | attach: %{draft: draft <> code}}, nil}
 
       true ->
