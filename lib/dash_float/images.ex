@@ -36,7 +36,9 @@ defmodule DashFloat.Images do
   @spec check(Path.t()) :: {:ok, meta()} | {:error, String.t()}
   def check(path) do
     case validate(path) do
-      {:ok, %{size: size}} -> {:ok, %{name: Path.basename(path), kb: ceil(size / 1024)}}
+      # The KB display floors at 1 (a 0-byte image is degenerate but its
+      # indicator still reads honestly as a line, not "(0 KB)").
+      {:ok, %{size: size}} -> {:ok, %{name: Path.basename(path), kb: max(ceil(size / 1024), 1)}}
       {:error, _reason} = error -> error
     end
   end
@@ -95,7 +97,20 @@ defmodule DashFloat.Images do
   defp read(path) do
     case File.read(path) do
       {:ok, bytes} ->
-        {:ok, bytes}
+        # The size race (hostile review): a file grown or swapped between
+        # the stat and this read must not ride the wire over the cap —
+        # re-check the bytes themselves (ADR 0018 §3).
+        case cap(path, byte_size(bytes)) do
+          :ok ->
+            {:ok, bytes}
+
+          # coveralls-ignore-start
+          # Reachable only through a real stat/read race — a file that
+          # grows between the two calls — not a deterministic test.
+          {:error, _reason} = error ->
+            error
+            # coveralls-ignore-stop
+        end
 
       {:error, reason} ->
         {:error, "#{path}: #{:file.format_error(reason)}"}

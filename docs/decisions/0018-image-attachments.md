@@ -184,15 +184,31 @@ tolerance arm.
 ## Consequences
 
 - The fleet's image-capable models are opted in by hand in `settings.json5`
-  until a provider's `/models` grows a capability field (none today).
+  until a provider's `/models` grows a capability field (none today). A
+  runtime `/model` switch re-resolves the picked id against this menu by
+  id (a marked entry keeps its capability; a catalog-only id is not
+  capable) — the flag never carries over from the outgoing model.
 - Image turns re-send their base64 on every later episode of the session —
   larger requests and provider-side image-token billing per turn, the price
   of a truthful transcript.
+- An agent crash report may echo the message list — data URLs included —
+  through OTP's `State:` report, the one echo surface besides the session
+  file and request bodies where the base64 exists by design. Accepted for
+  now (the transcripts are local); redact via `format_status/2` if it ever
+  leaks somewhere it matters.
 - The 10 MiB cap bounds each file; a turn with many attachments still
-  multiplies (the request body carries all of them). Acceptable until a
-  real transcript hits it.
+  multiplies (the request body carries all of them). The read-side
+  re-check closes the stat/read race — a file grown between the two is
+  refused, never silently sent over the cap. Acceptable until a real
+  transcript hits the multiply.
+- The attach prompt's Tab completion may read one directory listing plus
+  probe completed candidates for directory-ness (`File.dir?/1`) — the
+  sanctioned exception's "one readdir and one stat" in spirit: bounded,
+  local, prompt-scoped.
 - ADR 0014 landed first; this lane widened its user-content validation to
-  parts, per §2.
+  parts, per §2 — and the TUI's transcript replay renders list-content
+  user turns (concatenated text plus one `📎` row per image part) instead
+  of crashing on them.
 - The composer gains its first file-reading surface; it stays scoped to
   completion and one `stat`, and the ADR 0002 process contract is otherwise
   untouched.

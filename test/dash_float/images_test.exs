@@ -25,6 +25,16 @@ defmodule DashFloat.ImagesTest do
       assert {:ok, %{name: "photo.png", kb: 1}} = Images.check(path)
     end
 
+    # A degenerate 0-byte image still passes the gates (the provider
+    # rejects the payload, visibly) — its KB display floors at 1 so the
+    # indicator reads as a row, never "(0 KB)".
+    test "a 0-byte image floors its KB at 1" do
+      path = tmp_path("empty.png")
+      File.write!(path, "")
+
+      assert {:ok, %{name: "empty.png", kb: 1}} = Images.check(path)
+    end
+
     test "a missing file is unreadable, naming the path" do
       path = tmp_path("gone.png")
 

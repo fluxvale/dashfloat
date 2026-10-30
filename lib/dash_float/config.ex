@@ -90,6 +90,11 @@ defmodule DashFloat.Config do
     :nickname,
     :profile,
     providers: [],
+    # The active provider's settings-side model menu (ADR 0018 §1): each
+    # parsed entry carries its own `images` flag, so the runtime /model
+    # switch can resolve the picked id's capability — catalog ids default
+    # to not capable.
+    model_menu: [],
     # The selected entry's image-capability flag (ADR 0018 §1): a strict
     # boolean — true means the model accepts image attachments.
     images: false
@@ -582,20 +587,32 @@ defmodule DashFloat.Config do
 
   defp build_result(_profiles, profile, keys, env, cli) do
     provider = select_provider(profile)
-    entry = select_entry(entry_menu(provider), profile.settings, cli)
+    menu = entry_menu(provider)
+    entry = select_entry(menu, profile.settings, cli)
     providers = resolved_providers(profile, keys, env, provider)
 
-    build(
-      effective(provider, entry, keys, profile, env),
-      context(env, entry),
-      entry && entry.images,
-      tri_state(env, @suggest_var, profile.settings, "suggest"),
-      tri_state(env, @auto_title_var, profile.settings, "autoTitle"),
-      entry && entry.nickname,
-      profile.name,
-      providers
-    )
+    built =
+      build(
+        effective(provider, entry, keys, profile, env),
+        context(env, entry),
+        entry && entry.images,
+        tri_state(env, @suggest_var, profile.settings, "suggest"),
+        tri_state(env, @auto_title_var, profile.settings, "autoTitle"),
+        entry && entry.nickname,
+        profile.name,
+        providers
+      )
+
+    with_model_menu(built, menu)
   end
+
+  # The active provider's parsed menu rides the config (ADR 0018 §1) for
+  # the runtime /model switch's capability re-resolution — set after the
+  # shared build so its signature stays at the settled arity.
+  defp with_model_menu({:ok, %__MODULE__{} = config}, menu),
+    do: {:ok, %{config | model_menu: menu}}
+
+  defp with_model_menu(error, _menu), do: error
 
   defp entry_menu(nil), do: []
 
@@ -1047,7 +1064,9 @@ defmodule DashFloat.Config do
   defp parse_images(nil), do: false
 
   defp parse_images(_other) do
-    Logger.warning("images is not a boolean — treating the model as not image-capable")
+    Logger.warning(
+      "#{@main_file}: images is not a boolean — treating the model as not image-capable"
+    )
 
     false
   end

@@ -322,7 +322,29 @@ defmodule DashFloat.TUI.State do
   defp resume_note(state, nil), do: state
   defp resume_note(state, note) when is_binary(note), do: append_entry(state, :system, note)
 
-  defp replay_message(%{"role" => "user", "content" => text}, {state, names}) do
+  # An image-bearing user turn (ADR 0018 §2) replays through the same
+  # shape the live submit renders: the concatenated text parts as the
+  # body, then one dim 📎 row per image part — the loaded part carries a
+  # data URL, not the display metadata, so the row counts, not names.
+  defp replay_message(%{"role" => "user", "content" => parts}, {state, names})
+       when is_list(parts) do
+    text =
+      parts
+      |> Enum.map_join(fn
+        %{"type" => "text", "text" => t} -> t
+        %{"type" => "image_url"} -> ""
+        _other -> ""
+      end)
+      |> String.trim_leading()
+
+    indicator_rows = for _url <- image_parts(parts), do: replay_image_line()
+    lines = Render.entry_lines(:user, text) ++ indicator_rows
+
+    {put_entry(state, :user, text, lines), names}
+  end
+
+  defp replay_message(%{"role" => "user", "content" => text}, {state, names})
+       when is_binary(text) do
     {append_entry(state, :user, text), names}
   end
 
@@ -374,6 +396,20 @@ defmodule DashFloat.TUI.State do
       _other -> nil
     end
   end
+
+  # The image parts of a loaded user turn (ADR 0018 §2): the exact
+  # image_url shapes the session validation admits.
+  defp image_parts(parts) do
+    Enum.filter(parts, fn
+      %{"type" => "image_url", "image_url" => %{"url" => url}} when is_binary(url) -> true
+      _other -> false
+    end)
+  end
+
+  # The replay's indicator row: the loaded part carries a data URL, not the
+  # live display metadata, so the row counts, not names.
+  defp replay_image_line,
+    do: Line.new([Span.new("📎 image", style: Theme.style(:dim))])
 
   # The stored result is the JSON the agent gave the model. A payload that
   # does not decode to a JSON object displays as an error row with no output —
@@ -766,14 +802,15 @@ defmodule DashFloat.TUI.State do
 
   # The draft's edit rules are the wizard's (ADR 0009) — Backspace slices
   # the last grapheme, single printable characters append — and every other
-  # key (arrows, mode cycling, the palette keys) is swallowed: the prompt is
-  # the whole input surface while it lives.
-  defp route_key(%{attach: %{draft: draft}} = state, code, _modifiers, _now) do
+  # key (arrows, chords, the mode cycling, the palette keys) is swallowed:
+  # the prompt is the whole input surface while it lives. A chord is not a
+  # printable key (ADR 0018 §5): only unmodified characters type.
+  defp route_key(%{attach: %{draft: draft}} = state, code, modifiers, _now) do
     cond do
       code == "backspace" ->
         {%{state | attach: %{draft: String.slice(draft, 0..-2//1)}}, nil}
 
-      single_char?(code) and String.valid?(code) ->
+      modifiers == [] and single_char?(code) and String.valid?(code) ->
         {%{state | attach: %{draft: draft <> code}}, nil}
 
       true ->
@@ -1100,6 +1137,11 @@ defmodule DashFloat.TUI.State do
   # model — then the stat-only path check, the refusal naming the path. A
   # refusal lands as the `[images: …]` system entry and keeps the prompt open
   # with the draft intact; success keeps only the display metadata and closes.
+  # Enter on an empty draft attaches nothing and refuses nothing — the
+  # prompt just stays open (an empty path is not a user intent to resolve).
+  # FIRST, before the capability gate: the no-op is provider-independent.
+  defp attach(state, ""), do: {state, nil}
+
   defp attach(
          %{provider: {:ok, %DashFloat.Config{images: false}} = classification} = state,
          _draft
@@ -1108,10 +1150,6 @@ defmodule DashFloat.TUI.State do
     entry = "[images: model #{image_model_name(config)} does not accept images — attach refused]"
     {append_entry(state, :system, entry), nil}
   end
-
-  # Enter on an empty draft attaches nothing and refuses nothing — the
-  # prompt just stays open (an empty path is not a user intent to resolve).
-  defp attach(state, ""), do: {state, nil}
 
   defp attach(state, draft) do
     case Images.check(draft) do
@@ -1303,20 +1341,35 @@ defmodule DashFloat.TUI.State do
 
   # The model picker's Enter: a catalog id has no nickname or configured
   # context — both nil out and the label/context denominator fall back to the
-  # catalog (ADR 0020). The switch lands on the NEXT request.
+  # catalog (ADR 0020). The images flag is NOT carried from the outgoing
+  # model: it re-resolves against the settings-side menu by id — a marked
+  # entry keeps its capability, a catalog-only id is not capable
+  # (ADR 0018 §1). The switch lands on the NEXT request.
   defp pick_model(
          %{provider: {:ok, %DashFloat.Config{} = config}} = state,
          %Palette{items: entries, selected: selected}
        ) do
+    picked = Enum.at(entries, selected).model
+
     switched =
       %DashFloat.Config{
         config
-        | model: Enum.at(entries, selected).model,
+        | model: picked,
           nickname: nil,
-          context_tokens: nil
+          context_tokens: nil,
+          images: menu_images(config.model_menu, picked)
       }
 
     {%{state | provider: {:ok, switched}, palette: nil}, {:switch_model, {:ok, switched}}}
+  end
+
+  # The menu entry for `id` decides (ADR 0018 §1); no entry — a catalog-only
+  # id — is not image-capable.
+  defp menu_images(menu, id) do
+    case Enum.find(menu, fn entry -> entry.model == id end) do
+      %{images: images} -> images || false
+      _no_entry -> false
+    end
   end
 
   @doc """

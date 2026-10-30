@@ -2413,6 +2413,47 @@ defmodule DashFloat.TUI.StateTest do
       assert state.entries == live.entries
     end
 
+    # ADR 0018 §2's persistence coordination: an image-bearing user turn
+    # loads as a parts list, and the replay must render it — the
+    # concatenated text parts as the body, one dim 📎 row per image part —
+    # never crash the render path (hostile review finding 1: a resumed
+    # image session must boot).
+    test "an image-bearing user turn replays with its indicator rows" do
+      image_turn = %{
+        "role" => "user",
+        "content" => [
+          %{"type" => "text", "text" => "what is this?"},
+          %{
+            "type" => "image_url",
+            "image_url" => %{"url" => "data:image/png;base64,aGVsbG8="}
+          }
+        ]
+      }
+
+      replayed =
+        new_state(transcript: [image_turn, %{"role" => "assistant", "content" => "a cat."}])
+
+      assert [
+               %{kind: :user, text: "what is this?"} = user,
+               %{kind: :assistant, text: "a cat."}
+             ] = replayed.entries
+
+      assert Enum.map_join(user.lines, "\n", &flatten/1) =~ "📎 image"
+    end
+
+    test "an image-only turn replays with an empty body and its indicator" do
+      image_only = %{
+        "role" => "user",
+        "content" => [
+          %{"type" => "image_url", "image_url" => %{"url" => "data:image/png;base64,aGVsbG8="}}
+        ]
+      }
+
+      replayed = new_state(transcript: [image_only])
+      assert [%{kind: :user} = user] = replayed.entries
+      assert Enum.map_join(user.lines, "\n", &flatten/1) =~ "📎 image"
+    end
+
     test "arguments that do not decode render the (invalid arguments) arm" do
       transcript = [
         %{
@@ -2823,6 +2864,68 @@ defmodule DashFloat.TUI.StateTest do
       assert picked.palette == nil
     end
 
+    # ADR 0018 §1 (hostile review finding 2): the images flag never carries
+    # over from the outgoing model — the picked id re-resolves against the
+    # settings-side menu, and a catalog-only id is not capable. Both
+    # directions: capable → plain, plain → marked.
+    test "the picker's Enter re-resolves the images flag from the model menu" do
+      menu = [
+        %{nickname: "Seer", model: "m9", context: nil, images: true},
+        %{nickname: "Plain", model: "m2", context: nil, images: false}
+      ]
+
+      base =
+        new_state(
+          provider:
+            {:ok,
+             %DashFloat.Config{
+               base_url: "http://x",
+               model: "m2",
+               api_key: "k",
+               images: false,
+               model_menu: menu
+             }}
+        )
+
+      base_catalog = %{
+        "http://x" => [%{model: "m2", context: nil}, %{model: "m9", context: 128_000}]
+      }
+
+      base_with_catalog = State.catalog_arrived(base, base_catalog)
+
+      # plain (selected 0) → marked m9: capable
+      {opened, nil} = enter_typed(base_with_catalog, "/model")
+      moved = press(opened, "down", [])
+      {_picked, {:switch_model, {:ok, capable}}} = State.handle_key(moved, "enter", [])
+
+      assert capable.model == "m9"
+      assert capable.images == true
+
+      # marked boot model → plain m2: not capable
+      booted_capable =
+        new_state(
+          provider:
+            {:ok,
+             %DashFloat.Config{
+               base_url: "http://x",
+               model: "m9",
+               api_key: "k",
+               images: true,
+               model_menu: menu
+             }}
+        )
+
+      booted_with_catalog = State.catalog_arrived(booted_capable, base_catalog)
+
+      {reopened, nil} = enter_typed(booted_with_catalog, "/model")
+      # preselected on m9 (index 1); up to m2
+      up = press(reopened, "up", [])
+      {_p2, {:switch_model, {:ok, plain}}} = State.handle_key(up, "enter", [])
+
+      assert plain.model == "m2"
+      assert plain.images == false
+    end
+
     test "/model with an empty catalog warns" do
       provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "m", api_key: "k"}}
       {state, nil} = enter_typed(new_state(provider: provider), "/model")
@@ -3122,6 +3225,40 @@ defmodule DashFloat.TUI.StateTest do
       assert entered.attach.draft == ""
       assert entered.attachments == []
       assert entered.entries == []
+    end
+
+    # The no-op is provider-independent (hostile review finding 6): an
+    # empty draft never reaches the capability gate, capable or not.
+    test "Enter on an empty draft is a no-op under an incapable provider too" do
+      incapable =
+        new_state(
+          provider:
+            {:ok,
+             %DashFloat.Config{base_url: "http://x", model: "m", api_key: "k", images: false}}
+        )
+
+      opened = press(incapable, "o", ["ctrl"])
+      entered = press(opened, "enter", [])
+
+      assert entered.attach.draft == ""
+      assert entered.entries == []
+    end
+
+    # A chord is not a printable key (ADR 0018 §5; hostile review finding
+    # 3): Ctrl+P must open nothing and type nothing while the prompt owns
+    # the input — the "p" stays out of the draft.
+    test "control chords are swallowed — they neither act nor type" do
+      opened = press(new_state(), "o", ["ctrl"])
+      typed = press(opened, "p", ["ctrl"])
+
+      assert typed.attach.draft == ""
+      assert typed.palette == nil
+
+      ctrl_u = press(typed, "u", ["ctrl"])
+      assert ctrl_u.attach.draft == ""
+
+      alt_a = press(ctrl_u, "a", ["alt"])
+      assert alt_a.attach.draft == ""
     end
 
     test "a paste feeds the prompt's draft, newlines stripped, composer untouched" do
