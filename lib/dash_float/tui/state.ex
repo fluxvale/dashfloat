@@ -16,6 +16,7 @@ defmodule DashFloat.TUI.State do
   """
 
   alias DashFloat.Accounting
+  alias DashFloat.Config
   alias DashFloat.Config.Onboarding
   alias DashFloat.Images
   alias DashFloat.Mode
@@ -568,25 +569,52 @@ defmodule DashFloat.TUI.State do
     %{state | catalog: catalog}
   end
 
-  @doc "The provider's context window, or the catalog's fresh value for the selected model when the config entry carried none (ADR 0009)."
+  @doc """
+  The provider's context window for the footer denominator (issue #111):
+  the explicit config value (`context` on the entry, or env) wins; else
+  the catalog's observed value for the selected model when the endpoint
+  carries metadata (observed beats the seed — provider truth over a
+  static table — but never an explicit user setting); else the resolved
+  chain's seed or documented default. Never nil on a resolved provider —
+  a stock config shows `used/window` from boot.
+  """
   @spec provider_context_tokens(t()) :: pos_integer() | nil
-  def provider_context_tokens(%__MODULE__{provider: {:ok, %{context_tokens: n}}})
-      when is_integer(n) and n > 0,
-      do: n
+  def provider_context_tokens(%__MODULE__{provider: {:ok, %{}}} = state),
+    do: elem(window(state), 0)
 
-  def provider_context_tokens(%__MODULE__{
-        provider: {:ok, %{context_tokens: nil, model: model, base_url: base_url}},
-        catalog: catalog
-      }) do
+  # No provider (the wizard phase) or an unresolved one: no window at all —
+  # there is no model to assume a window for.
+  def provider_context_tokens(%__MODULE__{}), do: nil
+
+  # The one footer resolution (issue #111): {window, source} with source
+  # :configured | :observed | :seeded | :default (:none with no provider —
+  # the wizard phase shows the absolute total alone; there is no model to
+  # assume a window for). The `~` marker keys on :default — the documented
+  # fallback is never silent.
+  defp window(%__MODULE__{provider: {:ok, config}, catalog: catalog}) do
+    explicit = config.context_tokens
+
+    if is_integer(explicit) and explicit > 0 do
+      {explicit, :configured}
+    else
+      observed = catalog_context(catalog, config.base_url, config.model)
+
+      if observed,
+        do: {observed, :observed},
+        else: Config.context_window(config)
+    end
+  end
+
+  defp window(%__MODULE__{}), do: {nil, :none}
+
+  defp catalog_context(catalog, base_url, model) when is_map(catalog) do
     case catalog do
       %{^base_url => entries} -> catalog_context(entries, model)
       _other -> nil
     end
   end
 
-  def provider_context_tokens(%__MODULE__{}), do: nil
-
-  defp catalog_context(entries, model) do
+  defp catalog_context(entries, model) when is_list(entries) do
     case Enum.find(entries, &(&1.model == model)) do
       %{context: context} when is_integer(context) and context > 0 -> context
       _other -> nil
@@ -641,23 +669,33 @@ defmodule DashFloat.TUI.State do
   @doc """
   The footer's context span (ADR 0015 §2 amendment, issue #67 stage 2):
   tokens-used and percent-of-context from the accounting API (ADR 0022 §7)
-  over the agent's snapshot — `4.2k/128k · 3.3%`, the absolute total alone
-  with no display window, `nil` before the first snapshot lands (the span is
-  hidden, the rate-span pattern). The denominator is the TUI's display
-  window (config, else the catalog fallback — display-only, ADR 0022 §2).
+  over the agent's snapshot — `4.2k/128k · 3.3%`, `nil` before the first
+  snapshot lands (the span is hidden, the rate-span pattern). The
+  denominator is the footer's resolution chain (issue #111: config, else
+  catalog-observed, else the presets' seed, else the documented default)
+  — a default denominator carries the `~` marker (`4.2k/~128k · 3.3%`):
+  the visible note that no source knows this model's window.
   """
   @spec context_label(t()) :: String.t() | nil
   def context_label(%__MODULE__{context: nil}), do: nil
 
   def context_label(%__MODULE__{context: %{messages: messages, anchor: anchor}} = state) do
-    case Accounting.usage(messages, anchor, provider_context_tokens(state)) do
+    {window, source} = window(state)
+
+    case Accounting.usage(messages, anchor, window) do
       %{used: used, window: nil} ->
         humanize(used)
 
       %{used: used, window: window, percent: percent} ->
-        humanize(used) <> "/" <> humanize(window) <> " · " <> percent_label(percent)
+        humanize(used) <> "/" <> window_label(window, source) <> " · " <> percent_label(percent)
     end
   end
+
+  # The default window's visible note (issue #111): `~` marks an assumed
+  # denominator. Configured, observed, and seeded windows state their
+  # number plain.
+  defp window_label(window, :default), do: "~" <> humanize(window)
+  defp window_label(window, _known), do: humanize(window)
 
   # One decimal, trailing `.0` trimmed — humanize/1's number rule, stated
   # once (ADR 0015 §2 amendment). The window arm guarantees a percent:
@@ -1340,12 +1378,16 @@ defmodule DashFloat.TUI.State do
 
   defp run_command(state, "profile", _rest), do: {state, :list_profiles}
 
-  # The model picker's Enter: a catalog id has no nickname or configured
-  # context — both nil out and the label/context denominator fall back to the
-  # catalog (ADR 0020). The images flag is NOT carried from the outgoing
-  # model: it re-resolves against the settings-side menu by id — a marked
-  # entry keeps its capability, a catalog-only id is not capable
-  # (ADR 0018 §1). The switch lands on the NEXT request.
+  # The model picker's Enter: a catalog id has no nickname — it nils out and
+  # the label falls back to the catalog (ADR 0020). The context window
+  # re-resolves for the PICKED id (issue #111, hostile review F2): its own
+  # settings-menu entry's `context` when one exists (an explicit user
+  # setting survives the switch), else nothing explicit and the
+  # seed/default chain takes over — never the outgoing model's number. The
+  # images flag is NOT carried from the outgoing model: it re-resolves
+  # against the settings-side menu by id — a marked entry keeps its
+  # capability, a catalog-only id is not capable (ADR 0018 §1). The switch
+  # lands on the NEXT request.
   defp pick_model(
          %{provider: {:ok, %DashFloat.Config{} = config}} = state,
          %Palette{items: entries, selected: selected}
@@ -1357,11 +1399,20 @@ defmodule DashFloat.TUI.State do
         config
         | model: picked,
           nickname: nil,
-          context_tokens: nil,
+          context_tokens: menu_context(config.model_menu, picked),
           images: menu_images(config.model_menu, picked)
       }
 
     {%{state | provider: {:ok, switched}, palette: nil}, {:switch_model, {:ok, switched}}}
+  end
+
+  # The menu entry for `id` decides (ADR 0018 §1's pattern, the context
+  # twin): no entry — a catalog-only id — carries no explicit window.
+  defp menu_context(menu, id) do
+    case Enum.find(menu, fn entry -> entry.model == id end) do
+      %{context: context} when is_integer(context) and context > 0 -> context
+      _no_entry -> nil
+    end
   end
 
   # The menu entry for `id` decides (ADR 0018 §1); no entry — a catalog-only

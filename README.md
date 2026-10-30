@@ -110,10 +110,19 @@ and ignored — never a fallback. The status bar names the active model
 `nickname (profile)`. Put your provider's own base URL in `baseUrl`;
 DashFloat appends `/chat/completions`. At startup DashFloat also refreshes
 the model catalog from each of the active profile's providers (`GET
-{baseUrl}/models`, fail-open, in-memory): its one visible effect today is
-the status bar's context denominator filling in for a selected model whose
-entry carried no `context` — fetched models are not added to your menus,
-and nothing is written back to your config.
+{baseUrl}/models`, fail-open, in-memory): a model's reported context window
+(`context_length`) refreshes the footer's denominator when your entry
+carried no `context` — fetched models are not added to your menus, and
+nothing is written back to your config.
+
+**The context window resolves itself** ([ADR 0022](docs/decisions/0022-context-accounting-and-compaction.md)'s
+#111 amendment): your entry's `context` (or `DASHFLOAT_CONTEXT_TOKENS`)
+wins; else the provider's `/models` metadata when it carries it; else the
+standard presets' seeded windows (the Z.AI GLM current generation's
+documented 1M windows, Synthetic's first-party catalog); else a documented
+128 Ki default — marked `~` in the footer (`1.2k/~131.1k · 0.9%`) and
+noted in `/compact`'s reply, naming the key to set. A stock config shows
+`used/window · percent` from boot; nothing is ever guessed silently.
 
 Profile settings also accept a `compaction` object (e.g.
 `settings: { compaction: { instructions: 'keep the design decisions' } }`) —

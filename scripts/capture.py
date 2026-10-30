@@ -250,16 +250,18 @@ def scratch_dir() -> str:
     return f"/tmp/opencode/dashfloat-capture-{os.getpid()}"
 
 
-def write_compact_fixture(scratch: str) -> str:
+def write_compact_fixture(scratch: str, turn_bytes: int = 20_000) -> str:
     """The compact-session fixture: a session file whose two user/assistant
-    turns carry ~20 KB messages (~5000 heuristic tokens each, bytes/4) and
-    no anchor. Resumed under a 20000-token window the estimate (~20000)
-    sits over the 80% trigger (16000) with two droppable turns — /compact
-    drops exactly the oldest one. Returns the session id."""
+    turns carry `turn_bytes`-sized messages (~bytes/4 heuristic tokens each)
+    and no anchor. Resumed under a 20000-token window the default fixture
+    (~20000 tokens) sits over the 80% trigger (16000) with two droppable
+    turns — /compact drops exactly the oldest one. `turn_bytes` >1.7 MiB
+    crosses the trigger of the SEEDED 1M window (issue #111's stock capture).
+    Returns the session id."""
     session_id = str(uuid.uuid4())
     messages = []
     for turn in ("one", "two"):
-        filler = f"turn {turn} filler " + "x" * 19985
+        filler = f"turn {turn} filler " + "x" * (turn_bytes - 15)
         messages.append({"role": "user", "content": filler})
         messages.append({"role": "assistant", "content": filler})
     sessions = f"{scratch}/dashfloat/sessions"
@@ -384,8 +386,15 @@ class MockHandler(BaseHTTPRequestHandler):
 class App:
     """The real TUI under a real pty, plus the capture operations."""
 
+    # The stock-config capture (issue #111) pins the REAL Z.AI preset URL:
+    # the seeded window keys on it, and the scenario makes no provider
+    # request (a resumed /compact is offline; the catalog refresh 401s
+    # fail-open with the fake key).
+    ZAI_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
+
     def __init__(self, mix_args=("run", "--no-halt"), no_ghost=False,
-                 context=524288, resume=None, images=False):
+                 context=524288, resume=None, images=False,
+                 base_url=None, model="glm-5.3"):
         self.sink = None  # callable(bytes) set during read loop
         self.screen = pyte.Screen(COLS, ROWS)
         self.stream = pyte.ByteStream(self.screen)
@@ -404,10 +413,13 @@ class App:
 
         scratch = scratch_dir()
         os.makedirs(f"{scratch}/dashfloat", exist_ok=True)
-        base = f"http://127.0.0.1:{port}/v1"
+        base = base_url or f"http://127.0.0.1:{port}/v1"
         # The images flag rides the models entry (ADR 0018 §1): the attach
         # scenarios pin it true (capable) or leave it off (incapable).
+        # context=None writes NO context field — the stock wizard shape
+        # whose window must resolve from seed/default (issue #111).
         images_field = ", images: true" if images else ""
+        context_field = f", context: {context}" if context is not None else ""
         with open(f"{scratch}/dashfloat/settings.json5", "w") as f:
             f.write(
                 "{\n"
@@ -420,8 +432,8 @@ class App:
                 "    providers: [{\n"
                 "      label: 'mock',\n"
                 f"      baseUrl: '{base}',\n"
-                f"      models: [{{ nickname: 'Sol', model: 'glm-5.3', "
-                f"context: {context}{images_field} }}],\n"
+                f"      models: [{{ nickname: 'Sol', model: '{model}'"
+                f"{context_field}{images_field} }}],\n"
                 "    }],\n"
                 "  }],\n"
                 "}\n"
@@ -440,6 +452,14 @@ class App:
             # Dev may recompile on entry; keep that noise out of the boot.
             "MIX_ENV": "dev",
         })
+        # The scenarios' premises (a stock config with NO context anywhere,
+        # a specific model id) are env-sensitive: an ambient DASHFLOAT_*
+        # pin in the operator's shell would silently reconfigure the
+        # capture (issue #111 review F4). Scrub the lot — the scratch
+        # settings and keys are the whole config.
+        for var in list(env):
+            if var.startswith("DASHFLOAT_"):
+                del env[var]
         if no_ghost:
             env["DASHFLOAT_SUGGEST"] = "false"
         if resume:
@@ -667,7 +687,9 @@ class App:
 
     # The `used/window · percent` portion of the footer row — the cwd's
     # slashes and the rate's decimals must not be able to satisfy a guard.
-    CONTEXT_SPAN = re.compile(r"[\d.]+[kmb]?/[\d.]+[kmb]? · [\d.]+%")
+    # `~` before the denominator marks the documented-default window
+    # (issue #111) — the visible note.
+    CONTEXT_SPAN = re.compile(r"[\d.]+[kmb]?/~?[\d.]+[kmb]? · [\d.]+%")
 
     def context_value(self) -> str:
         match = self.CONTEXT_SPAN.search(self.footer_span())
@@ -691,6 +713,42 @@ class App:
         self.send(b"\r")
         self.wait_for("dropped 1 oldest turn(s)")
         self.wait_quiet()              # the entry settled; composer empty
+
+    # The stock-config capture (issue #111): settings exactly as the wizard
+    # writes them (no `context` anywhere) against the REAL Z.AI preset URL,
+    # a resumed fixture whose two ~1.75 MiB turns sit over the seeded 1M
+    # window's 80% trigger. The seeded window must drive BOTH surfaces: the
+    # drop entry names 1048576 and the footer's denominator reads 1m — no
+    # 'no context window configured', no tokens-only degradation. Offline:
+    # /compact is a local pass; the catalog refresh 401s fail-open.
+    def scenario_stock_compact(self):
+        self.type("/compact")
+        self.send(b"\r")
+        self.wait_for("dropped 1 oldest turn(s)")
+        self.wait_for("of 1048576")
+        self.wait_quiet()
+        # The drop's persist pushes the context snapshot — the footer's
+        # first span on a resumed session — and its denominator must be the
+        # seeded window, not a degradation.
+        span = self.context_value()
+        assert "/1m" in span, \
+            f"the seeded 1M window never reached the footer: {span!r}"
+
+    # The documented-default capture (issue #111): a custom provider whose
+    # model no source knows (not configured, not in /models metadata, not
+    # seeded). The footer must show used/~window · pct — the visible note —
+    # and /compact's reply carries the note naming the remedy, never the
+    # bare refusal.
+    def scenario_default_window(self):
+        self.scenario_mid_session()
+        span = self.context_value()
+        assert "~131.1k" in span, \
+            f"the assumed-window marker never reached the footer: {span!r}"
+        self.type("/compact")
+        self.send(b"\r")
+        self.wait_for("window assumed")
+        self.wait_for("DASHFLOAT_CONTEXT_TOKENS")
+        self.wait_quiet()
 
     # The attach flow (ADR 0018 §5): Ctrl+O opens the one-line attach
     # prompt, the fixture's ABSOLUTE path is typed (the completion path is
@@ -776,6 +834,7 @@ def main():
     ap.add_argument("--scenario", default="first-run",
                     choices=["first-run", "mid-session", "ghost",
                              "growing-session", "compact-session",
+                             "stock-compact", "default-window",
                              "slash-autocomplete", "attach",
                              "attach-refusal"])
     ap.add_argument("--out", default=None)
@@ -799,16 +858,35 @@ def main():
 
     # The compact-session scenario boots from a fixture session file written
     # BEFORE the app starts: a 20000-token window whose trigger the resumed
-    # transcript (two ~20 KB turns, no anchor) sits over.
+    # transcript (two ~20 KB turns, no anchor) sits over. The stock-compact
+    # capture (issue #111) instead resumes turns sized past the SEEDED 1M
+    # window's trigger, under the real Z.AI preset URL with NO configured
+    # context — the wizard's exact output.
     resume = None
+    base_url = None
+    model = "glm-5.3"
+    context = args.context
     if args.scenario == "compact-session":
         resume = write_compact_fixture(scratch_dir())
+        context = context or 20000
+    elif args.scenario == "stock-compact":
+        base_url = App.ZAI_BASE_URL
+        model = "glm-5.3-flash"
+        context = context  # None unless pinned — the stock shape has none
+        # Turn bytes chosen so the two-turn total (est = turn_bytes) sits
+        # over the seeded window's trigger (838 860) while the single
+        # remaining turn (turn_bytes/2) lands under it: one clean drop,
+        # no oversize survivor.
+        resume = write_compact_fixture(scratch_dir(), turn_bytes=1_200_000)
+    elif args.scenario == "default-window":
+        model = "custom-unknown-model"
+        context = context  # None unless pinned
 
-    context = args.context or (
-        20000 if args.scenario == "compact-session" else 524288)
+    if context is None and args.scenario not in ("stock-compact", "default-window"):
+        context = 524288
     images = args.scenario == "attach"
     app = App(no_ghost=args.no_ghost, context=context, resume=resume,
-              images=images)
+              images=images, base_url=base_url, model=model)
     try:
         if args.mode == "probe":
             if args.after_exchange:
@@ -835,6 +913,10 @@ def main():
                     app.wait_for("at or under the 80% trigger")
                     app.wait_quiet()
                     app.screenshot(args.out2)
+            elif args.scenario == "stock-compact":
+                app.scenario_stock_compact()
+            elif args.scenario == "default-window":
+                app.scenario_default_window()
             elif args.scenario == "slash-autocomplete":
                 app.type("/")
                 time.sleep(0.4)        # the popup renders
@@ -884,6 +966,14 @@ def main():
             print(f"footer  turn1={seen[0]!r} turn2={seen[1]!r}")
             time.sleep(0.5)                # a settled beat on the final count
             app.gif(args.out, crop_rows=12, min_span=1.0)
+        elif args.scenario == "stock-compact":
+            # The stock /compact in motion: the command types in, the drop
+            # entry names the seeded 1M window, and the footer's span
+            # recomputes against 1m. 14 rows: log tail + composer + footer.
+            app._mark = time.monotonic()
+            app.scenario_stock_compact()
+            time.sleep(0.5)                # a settled beat on the final span
+            app.gif(args.out, crop_rows=14, min_span=1.5)
         else:
             app.type("what is elixir?")
             app.send(b"\r")
