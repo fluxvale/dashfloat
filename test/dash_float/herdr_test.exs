@@ -258,7 +258,7 @@ defmodule DashFloat.HerdrTest do
       assert next.seq == seq2
     end
 
-    test "a spawn failure leaves the signature uncommitted — the next event retries", ctx do
+    test "a spawn failure leaves the signature uncommitted — the next event retries" do
       # A supervisor name nothing answers to: the spawn exits, the caller
       # hears :error, and the SAME state must fire again on the next event
       # (ADR 0024 §4 — a transient failure is retried, not swallowed).

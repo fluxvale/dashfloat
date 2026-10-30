@@ -163,7 +163,8 @@ defmodule DashFloat.Herdr do
   snapshot names a session (ADR 0024 §4–5). Deduped: nothing fires while
   the signature — state, message, session, provider selection — is
   unchanged, so token spam never reaches Herdr. Fire-and-forget; returns
-  the context with its seq and signature advanced.
+  the context with its seq and signature advanced when delivery started,
+  unchanged when the task could not start (the next event retries).
 
   A named session sends TWO requests: the state report (which must hold the
   pane first), then `pane.report_agent_session` carrying the resume argv —
@@ -265,7 +266,8 @@ defmodule DashFloat.Herdr do
 
   # The test seam first: an injected runner hears each request inline; the
   # real path is one temporary task per report whose outcome nobody reads.
-  # Returns the last seq consumed by the request list.
+  # Returns {:ok, last-seq} when delivery started, :error when not even the
+  # task could start.
   defp fire(%__MODULE__{runner: runner, seq: last} = _herdr, requests)
        when is_function(runner, 1) do
     seq = Enum.reduce(requests, last, &max(&2, &1.params.seq))
@@ -296,9 +298,10 @@ defmodule DashFloat.Herdr do
 
   # Bounded: each request gets `timeout_ms` to connect, send, and hear one
   # reply line, on its own connection — a hung server never accumulates.
-  # Silenced: nothing is logged, nothing read beyond the reply line, and
-  # every failure is an error tuple — the task is fire-and-forget and
-  # unmonitored, so even a crash changes nothing for the caller.
+  # Silenced: nothing is logged and nothing is read beyond the reply line;
+  # the one rescue swallows the encoding/connect raises (an env value with
+  # invalid UTF-8, say) — a raised release must never block terminate/2's
+  # System.stop, and a raised report is a lost report, not a crash.
   defp run_now(%__MODULE__{runner: runner} = herdr, requests) when is_function(runner, 1) do
     Enum.each(requests, runner)
     herdr
@@ -330,5 +333,7 @@ defmodule DashFloat.Herdr do
       _connect_failed ->
         :ok
     end
+  rescue
+    _reason -> :ok
   end
 end
