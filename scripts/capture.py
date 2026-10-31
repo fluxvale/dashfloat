@@ -197,6 +197,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import itertools
 import json
 import os
 import pty
@@ -222,6 +223,20 @@ REPLY_TOKENS = (
     "Elixir ` processes ` run ` independently ` , ` supervised ` by ` the ` "
     "VM ` . ` A ` crash ` in ` one ` never ` touches ` the ` rest ` ."
 ).split(" ` ")
+
+
+def stock_closing(n: int) -> str:
+    """The n-th stock reply's closing word — the exact, exchange-unique
+    text that reply ends with. The stock reply's body is byte-identical
+    every exchange, so a reply-end needle drawn from the body ("rest")
+    is satisfied by ANY earlier exchange's stale output (#125, ADR 0029);
+    the numbered closing makes each exchange's end provable as its own."""
+    return f"turn-{n}."
+
+
+def stock_closing_tokens(n: int) -> list[str]:
+    """The closing as the reply's last dripped tokens."""
+    return ["—", stock_closing(n)]
 
 # The scripted thinking (issue #78): enough newline-separated lines to
 # overflow the block's 8-row window, dripped as reasoning_content deltas
@@ -704,6 +719,11 @@ class MockHandler(BaseHTTPRequestHandler):
     # instruction and answered with VET_REPLY (issue #135's still).
     EPISODES: list = []
     VET_REPLY = '{"decision":"confirm","reason":"deletes files outside the project"}'
+    # Stock replies are numbered per App run (App.__init__ resets this):
+    # the n-th streamed stock reply closes with stock_closing(n) (#125,
+    # ADR 0029). Episode replies carry their own unique text and take no
+    # number.
+    STOCK_REPLIES = itertools.count(1)
 
     def _json(self, payload, status=200):
         body = json.dumps(payload).encode()
@@ -770,7 +790,12 @@ class MockHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 time.sleep(0.09)
                 reasoning_deltas += 1
-        for token in REPLY_TOKENS:
+        # This connection's stock number (#125): the reply closes with it,
+        # making the exchange's end a unique needle. A future episode
+        # dispatch must pop EPISODES HERE and take no number for episode
+        # replies — their text is already unique.
+        n = next(MockHandler.STOCK_REPLIES)
+        for token in REPLY_TOKENS[:-1] + stock_closing_tokens(n):
             frame = {"choices": [{"delta": {"content": token + " "}}]}
             self.wfile.write(f"data: {json.dumps(frame)}\n\n".encode())
             self.wfile.flush()
@@ -788,7 +813,7 @@ class MockHandler(BaseHTTPRequestHandler):
                             for m in req.get("messages", [])) // 4
         usage = {"choices": [], "usage": {
             "prompt_tokens": prompt_tokens,
-            "completion_tokens": 34 + reasoning_deltas}}
+            "completion_tokens": 35 + reasoning_deltas}}
         self.wfile.write(f"data: {json.dumps(usage)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
@@ -832,6 +857,11 @@ class App:
         self._feed_lock = threading.Lock()
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
+        # Each run's mock numbers its stock replies from 1 (#125): the
+        # scenarios' closing sentinels count exchanges per APP run, so a
+        # second App in the same process (exit-print, reasoning-resume)
+        # starts a fresh count.
+        MockHandler.STOCK_REPLIES = itertools.count(1)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         port = self.server.server_address[1]
 
@@ -1001,6 +1031,12 @@ class App:
     def text(self) -> str:
         return "\n".join(row.rstrip() for row in self.screen.display)
 
+    def flat_text(self) -> str:
+        """The whole screen whitespace-collapsed to one line — a needle can
+        wrap across rows at any pty width and a reader still reads the
+        words as contiguous, so waits match what a reader sees (#125)."""
+        return re.sub(r"\s+", " ", self.text())
+
     def wait_gone(self, needle: str, timeout=30, hold=1.0):
         """The inverse of wait_for: block until `needle` has been off the
         screen for `hold` seconds — a single absent poll can race a row
@@ -1009,7 +1045,7 @@ class App:
         deadline = time.monotonic() + timeout
         gone_since = None
         while time.monotonic() < deadline:
-            if needle in self.text():
+            if needle in self.flat_text():
                 gone_since = None
             else:
                 gone_since = gone_since or time.monotonic()
@@ -1021,7 +1057,7 @@ class App:
     def wait_for(self, needle: str, timeout=30):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if needle in self.text():
+            if needle in self.flat_text():
                 return True
             time.sleep(0.1)
         raise TimeoutError(f"screen never showed {needle!r}")
@@ -1280,12 +1316,12 @@ class App:
 
     # Two completed exchanges so user and assistant rows alternate (#107).
     def scenario_reading_session(self):
-        for question in ("what is elixir?",
-                         "and how do supervisors keep it reliable?"):
+        for n, question in enumerate(("what is elixir?",
+                                       "and how do supervisors keep it reliable?"), 1):
             self.type(question)
             self.send(b"\r")
-            self.wait_for("rest")      # the scripted reply's last word
-            self.wait_quiet()          # the turn finalized
+            self.wait_for(stock_closing(n))  # THIS exchange's reply ended
+            self.wait_quiet()                # the turn finalized
 
     # The replay claim (#107): the fixture session booted with --resume;
     # the replayed log must show both roles before the styling is asserted.
@@ -1300,8 +1336,8 @@ class App:
     def scenario_mid_session(self):
         self.type("what is elixir?")
         self.send(b"\r")
-        self.wait_for("rest")          # the reply's last word landed
-        self.wait_quiet()              # the turn finalized; composer empty
+        self.wait_for(stock_closing(1))  # the reply's exchange-unique end
+        self.wait_quiet()                # the turn finalized; composer empty
 
     # Two completed exchanges over a small window: the footer's tokens-used
     # span grows across turns (issue #67 stage 2). Asserted on the CONTEXT
@@ -1312,15 +1348,15 @@ class App:
     # just the percent's decimal.
     def scenario_growing_session(self) -> list[str]:
         seen = []
-        for question in (
+        for n, question in enumerate((
             "what is elixir?",
             "and how do supervisors, links, and process registries fit "
             "together — please walk me through the whole supervision tree "
             "story in detail, from restart strategies to process isolation",
-        ):
+        ), 1):
             self.type(question)
             self.send(b"\r")
-            self.wait_for("rest")      # the scripted reply's last word
+            self.wait_for(stock_closing(n))  # THIS exchange's reply ended
             self.wait_quiet()
             seen.append(self.context_value())
         assert all(seen), \
@@ -1523,7 +1559,7 @@ class App:
                                "in the composer title")
         self.type("what is this?")
         self.send(b"\r")
-        self.wait_for("rest")          # the scripted reply's last word
+        self.wait_for(stock_closing(1))  # the scripted reply's end
         self.wait_quiet()
         assert "shot.png" in self.text(), \
             "the submitted turn's 📎 indicator line never rendered"
@@ -1587,7 +1623,7 @@ class App:
 
         self.type("what is this?")
         self.send(b"\r")
-        self.wait_for("rest")          # the scripted reply's last word
+        self.wait_for(stock_closing(1))  # the scripted reply's end
         self.wait_quiet()
         assert "shot.png" in self.text(), \
             "the submitted turn's 📎 indicator line never rendered"
@@ -1863,7 +1899,7 @@ class App:
         else:
             raise TimeoutError("Enter never re-pinned the log to the tail")
         self.wait_for("hi there")
-        self.wait_for("rest")
+        self.wait_for(stock_closing(1))
         self.wait_quiet()
 
     # A reply arriving while scrolled up must not yank the view either
@@ -1894,6 +1930,13 @@ class App:
             f"a streaming reply yanked the parked view: {span!r} -> {now!r}"
         assert re.search(r"ttft \d+(\.\d+)?s", self.footer_span()), \
             f"no ttft span while streaming: {self.footer_span()!r}"
+        # The no-yank asserts above are deliberately mid-stream. This
+        # scenario parks the view AWAY from the tail, so the reply's
+        # closing text is below the viewport by design — gate the turn's
+        # end on the activity row retiring instead (visible in every
+        # scroll state), never on the reply text (the #125 review).
+        self.wait_gone("Streaming")
+        self.wait_quiet()
 
     # The #130 footer, both cadences asserted before their stills: while
     # streaming ttft shows ALONE (no live tok/s — the owner's refinement),
@@ -1911,7 +1954,7 @@ class App:
             f"a live tok/s showed mid-stream (#130 violation): {footer!r}"
         self.screenshot(mid)
 
-        self.wait_for("rest")
+        self.wait_for(stock_closing(1))
         # The frozen average exists only once the agent's idle phase lands
         # (finalize freezes the rate) — the activity row retiring is the
         # visible edge of that.
@@ -2092,7 +2135,7 @@ class App:
             "the live block shows its head — the tail window broke"
         print("claim  live: tail window auto-follows the streaming thinking")
 
-        self.wait_for("rest")                      # the answer's last word
+        self.wait_for(stock_closing(1))            # the answer's end
         self.wait_gone("Streaming")
         self.wait_quiet()
         # Finalize collapsed the block to the one summary line.
@@ -2144,7 +2187,7 @@ class App:
         self.type("think about elixir")
         self.send(b"\r")
         self.wait_thinking()
-        self.wait_for("rest")
+        self.wait_for(stock_closing(1))
         self.wait_gone("Streaming")
         self.wait_quiet()
         row = self.thinking_row()
