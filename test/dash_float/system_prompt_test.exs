@@ -7,7 +7,72 @@ defmodule DashFloat.SystemPromptTest do
 
   use ExUnit.Case, async: true
 
+  alias DashFloat.Synthetic
   alias DashFloat.SystemPrompt
+  alias DashFloat.Tools
+
+  # The drift pin (#101, ADR 0030): the prose's tool enumeration is extracted
+  # from the rendered text and compared against the schema's advertised
+  # names — the prompt restates the catalogue by derivation, never by
+  # hardcoding, so the two cannot disagree.
+
+  # Parses "You have N tools: a, b, and c." into {n, [names]}.
+  defp enumerated(prompt) do
+    case Regex.run(~r/You have (\d+) tools?: ([^.]+)\./, prompt) do
+      [_match, count, list] ->
+        {String.to_integer(count), Regex.split(~r/, and | and |, /, list)}
+
+      nil ->
+        flunk("tool enumeration sentence missing from prompt")
+    end
+  end
+
+  # What the model is actually advertised for this ctx.
+  defp advertised(synthetic) do
+    schema = Tools.schema(synthetic)
+    Enum.map(schema, & &1["function"]["name"])
+  end
+
+  test "the tool enumeration is the registry's advertised set, never hardcoded" do
+    {base_count, base_names} = enumerated(SystemPrompt.build("/tmp/sysprompt-fixture"))
+    assert base_count == length(advertised(nil))
+    assert base_names == advertised(nil)
+
+    # A Synthetic ctx rides web_search into the schema — the prose follows.
+    prompt = SystemPrompt.build("/tmp/sysprompt-fixture", tools: advertised(%Synthetic{}))
+    {count, names} = enumerated(prompt)
+    assert count == length(advertised(%Synthetic{}))
+    assert names == advertised(%Synthetic{})
+    assert "web_search" in names
+  end
+
+  test "a registry addition flows into the prose with no other edit" do
+    names = advertised(nil) ++ ["hypothetical_tool"]
+    prompt = SystemPrompt.build("/tmp/sysprompt-fixture", tools: names)
+
+    {count, listed} = enumerated(prompt)
+    assert count == length(names)
+    assert listed == names
+  end
+
+  test "the approval grouping derives from the catalogue's risk classes" do
+    assert SystemPrompt.build("/tmp/sysprompt-fixture") =~
+             "read_file and list_directory run automatically. write_file, edit_file, and execute_command wait for the user's approval."
+
+    assert SystemPrompt.build("/tmp/sysprompt-fixture", tools: advertised(%Synthetic{})) =~
+             "read_file, list_directory, and web_search run automatically."
+  end
+
+  test "single- and two-tool catalogues render grammatical prose" do
+    one = SystemPrompt.build("/tmp/sysprompt-fixture", tools: ["read_file"])
+    assert one =~ "You have 1 tool: read_file."
+    assert one =~ "read_file runs automatically."
+    refute one =~ "wait for the user's approval"
+
+    two = SystemPrompt.build("/tmp/sysprompt-fixture", tools: ["read_file", "write_file"])
+    assert two =~ "You have 2 tools: read_file and write_file."
+    assert two =~ "read_file runs automatically. write_file waits for the user's approval."
+  end
 
   test "build carries identity, tool discipline, edit rules, and the cwd" do
     prompt = SystemPrompt.build("/tmp/sysprompt-fixture")

@@ -205,7 +205,7 @@ defmodule DashFloat.Agent do
        session_created_at: session_created_at,
        session_title: title || resumed_title,
        title_fetcher: title_fetcher,
-       messages: initial_messages(cwd, resume, messages),
+       messages: initial_messages(cwd, resume, messages, synthetic),
        anchor: anchor,
        compactions: compactions,
        mode: mode,
@@ -1449,16 +1449,22 @@ defmodule DashFloat.Agent do
   # A fresh session opens with the assembled system prompt as its first
   # message (ADR 0019); a resumed one adopts its transcript verbatim — the
   # persisted messages already carry the system message the original
-  # session start built.
-  defp initial_messages(cwd, nil, []),
-    do: [
+  # session start built. The tool prose enumerates the same registry slice
+  # the schema advertises for this session's Synthetic ctx (ADR 0030).
+  defp initial_messages(cwd, nil, [], synthetic) do
+    [
       %{
         role: "system",
-        content: SystemPrompt.build(cwd, project_instructions: ProjectInstructions.load(cwd))
+        content:
+          SystemPrompt.build(cwd,
+            tools: Tools.names(synthetic),
+            project_instructions: ProjectInstructions.load(cwd)
+          )
       }
     ]
+  end
 
-  defp initial_messages(_cwd, _resume, messages), do: messages
+  defp initial_messages(_cwd, _resume, messages, _synthetic), do: messages
 
   ## Session persistence
 

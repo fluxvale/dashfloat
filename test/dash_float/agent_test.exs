@@ -824,6 +824,20 @@ defmodule DashFloat.AgentTest do
              "web_search"
            ]
 
+    # The seeded system prompt enumerates the same registry slice the wire
+    # schema advertises — the agent seam of the #101 drift pin (ADR 0030):
+    # dropping the Tools.names(synthetic) pass-through here fails this.
+    [pinned_system | _rest] =
+      with_body
+      |> Jason.decode!()
+      |> Map.fetch!("messages")
+
+    assert pinned_system["role"] == "system"
+    assert pinned_system["content"] =~ "You have 7 tools"
+
+    assert pinned_system["content"] =~
+             "read_file, list_directory, and web_search run automatically"
+
     # No :synthetic opt: discovery finds nothing on a loopback host — the
     # advertised array stays the base six (the question tool rides every
     # mode, ADR 0028).
@@ -846,6 +860,17 @@ defmodule DashFloat.AgentTest do
              "list_directory",
              "question"
            ]
+
+    [plain_system | _rest] =
+      without_body
+      |> Jason.decode!()
+      |> Map.fetch!("messages")
+
+    assert plain_system["content"] =~ "You have 6 tools"
+
+    # "and web_search", not bare "web_search": this test's tmp-dir name
+    # contains the word and rides the prompt's Environment line.
+    refute plain_system["content"] =~ "and web_search"
 
     assert_receive {:phase, :idle}, 2_000
     assert_receive {:phase, :idle}, 2_000
