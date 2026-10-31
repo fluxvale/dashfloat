@@ -658,6 +658,15 @@ class MockHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # silence — the mock never talks over the capture
 
+    # The interaction-surface captures (issues #133/#134/#135): a FIFO of
+    # scripted episodes the _sse stream pops one per chat connection —
+    # ("tools", [(id, name, args_json), ...]) streams a tool-calling
+    # episode; ("text", "...") streams that prose. Empty: the stock reply.
+    # The vet's own fresh-context completion is detected by its
+    # instruction and answered with VET_REPLY (issue #135's still).
+    EPISODES: list = []
+    VET_REPLY = '{"decision":"confirm","reason":"deletes files outside the project"}'
+
     def _json(self, payload, status=200):
         body = json.dumps(payload).encode()
         self.send_response(status)
@@ -687,6 +696,15 @@ class MockHandler(BaseHTTPRequestHandler):
             self._json({"choices": [{"message": {"content": TITLE_TEXT}}]})
         else:
             self._json({"choices": [{"message": {"content": GHOST_TEXT}}]})
+
+    # The AUTO safety check (ADR 0016 §6): a fresh-context user message
+    # whose prose is the vetter's static instruction.
+    @staticmethod
+    def is_vet_request(req):
+        users = [m for m in req.get("messages", []) if m.get("role") == "user"]
+        if not users:
+            return False
+        return "safety check" in content_text(users[-1].get("content", ""))
 
     def _sse(self, req):
         self.send_response(200)
@@ -719,6 +737,25 @@ class MockHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(frame)}\n\n".encode())
             self.wfile.flush()
             time.sleep(0.13)
+        self._usage_and_done()
+
+    def _stream_tool_calls(self, calls):
+        for index, (call_id, name, args_json) in enumerate(calls):
+            opening = {"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": index, "id": call_id, "type": "function",
+                "function": {"name": name, "arguments": ""}}]}}]}
+            self.wfile.write(f"data: {json.dumps(opening)}\n\n".encode())
+            self.wfile.flush()
+            time.sleep(0.13)
+            fragment = {"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": index,
+                "function": {"arguments": args_json}}]}}]}
+            self.wfile.write(f"data: {json.dumps(fragment)}\n\n".encode())
+            self.wfile.flush()
+            time.sleep(0.13)
+        self._usage_and_done()
+
+    def _usage_and_done(self):
         # The usage frame mirrors what a real provider reports: the request's
         # own size in tokens (bytes/4 over the messages — the same heuristic
         # ADR 0022 §1 uses between frames), so the footer's tokens-used span
@@ -1497,6 +1534,129 @@ class App:
         assert "rest" not in self.text(), \
             "the refusal still streamed a reply — a request went out"
 
+    # -- the interaction surface (issues #133/#134/#135, ADR 0028) --------
+
+    # Enqueue the scripted episodes the mock pops one per chat connection
+    # (a tool-calling episode, then the post-answer reply).
+    def script(self, *episodes):
+        MockHandler.EPISODES.extend(episodes)
+
+    UP, DOWN, SPACE, ENTER, ESC = (b"\x1b[A", b"\x1b[B", b" ", b"\r", b"\x1b")
+
+    # The approval as a choice question (#133): the composer is replaced by
+    # "Approve write_file?" with [Approve, Reject] — the preview stays the
+    # evidence in the log — arrows move, Enter answers, the tool runs and
+    # the result rows in. Each act asserted before recording.
+    def scenario_approve_choice(self):
+        self.script(
+            ("tools", [("call_w", "write_file",
+                        json.dumps({"path": "tmp/capture-approve.txt",
+                                    "content": "approved by the choice widget\n"}))]),
+            ("text", "File written."))
+        self.type("add the capture fixture file")
+        self.send(b"\r")
+        self.wait_for("Approve write_file?", timeout=10)
+        assert self.find_row("❯ Approve") is not None, \
+            "the approval's Approve option never rendered"
+        assert self.find_row("  Reject") is not None, \
+            "the approval's Reject option never rendered"
+        self.wait_quiet()
+        # Move to Reject and back — the motion the GIF must show — then
+        # approve.
+        self.send(self.DOWN)
+        time.sleep(0.4)
+        assert self.find_row("❯ Reject") is not None, \
+            "Down never moved the approval's selection to Reject"
+        self.send(self.UP)
+        time.sleep(0.4)
+        self.send(self.ENTER)
+        self.wait_for("write_file → ok", timeout=10)
+        self.wait_for("File written.", timeout=10)
+        self.wait_quiet()
+
+    # The model's question, single-select (#134): the same widget asks the
+    # user, Enter returns the answer as the tool result, and the model acts
+    # on it in the next episode's reply.
+    def scenario_question_single(self):
+        self.script(
+            ("tools", [("call_q", "question", json.dumps({
+                "question": "Which database should the config target?",
+                "options": [{"label": "Postgres", "description": "the sturdy default"},
+                            {"label": "SQLite"}],
+                "multiple": False}))]),
+            ("text", "SQLite it is — minimal setup, one file."))
+        self.type("set up the database config for me")
+        self.send(b"\r")
+        self.wait_for("Which database should the config target?", timeout=10)
+        assert self.find_row("❯ Postgres") is not None, \
+            "the question's first option never rendered selected"
+        self.wait_quiet()
+        self.send(self.DOWN)
+        time.sleep(0.4)
+        self.send(self.ENTER)
+        self.wait_for("question → answered: SQLite", timeout=10)
+        self.wait_for("SQLite it is", timeout=10)
+        self.wait_quiet()
+
+    # The model's question, multi-select (#134): space toggles, Enter
+    # answers every checked label in option order.
+    def scenario_question_multi(self):
+        self.script(
+            ("tools", [("call_m", "question", json.dumps({
+                "question": "Which runtimes need setup docs?",
+                "options": [{"label": "Elixir"}, {"label": "Rust"},
+                            {"label": "Python"}],
+                "multiple": True}))]),
+            ("text", "Docs for Elixir and Python, coming up."))
+        self.type("write setup docs for the runtimes i use")
+        self.send(b"\r")
+        self.wait_for("Which runtimes need setup docs?", timeout=10)
+        assert self.find_row("[ ] Elixir") is not None, \
+            "the multi question's checkboxes never rendered"
+        self.wait_quiet()
+        self.send(self.SPACE)          # check Elixir
+        time.sleep(0.4)
+        assert self.find_row("[x] Elixir") is not None, \
+            "Space never checked Elixir"
+        self.send(self.DOWN)
+        time.sleep(0.3)
+        self.send(self.DOWN)
+        time.sleep(0.3)
+        self.send(self.SPACE)          # check Python
+        time.sleep(0.4)
+        assert self.find_row("[x] Python") is not None, \
+            "Space never checked Python"
+        self.send(self.ENTER)
+        self.wait_for("answered: Elixir, Python", timeout=10)
+        self.wait_for("Docs for Elixir and Python", timeout=10)
+        self.wait_quiet()
+
+    # AUTO never asks (#135): the dangerous call auto-rejects with the
+    # safety check's reason — the preview receipt, the [auto: rejected]
+    # entry, the tool-result row — and NO approval ever renders. Still
+    # capture (the transcript record, not motion).
+    def scenario_auto_reject(self):
+        self.script(
+            ("tools", [("call_x", "execute_command",
+                        json.dumps({"command": "rm -rf /tmp/precious"}))]),
+            ("text", "Understood — that command was refused. I will list what "
+                     "is safe to delete instead."))
+        self.type("/mode auto")
+        self.send(b"\r")
+        self.wait_for("[mode: Build → Auto]", timeout=10)
+        self.type("clean up the precious directory")
+        self.send(b"\r")
+        self.wait_for("[auto: rejected execute_command — deletes files "
+                      "outside the project]", timeout=15)
+        self.wait_for("auto-rejected: deletes files outside the project",
+                      timeout=10)
+        self.wait_for("Understood — that command", timeout=10)
+        assert self.find_row("Approve execute_command?") is None, \
+            "AUTO prompted an approval — the leak the issue reports"
+        assert self.find_row("Approve this change?") is None, \
+            "AUTO armed the confirming activity row"
+        self.wait_quiet()
+
     # The Tab-complete flow (issue #105; ADR 0020 amendment): "/mod" + Tab
     # completes to the highlighted head "/mode " (registry order — mode
     # precedes model; popup closes), then "/c" + down + Tab completes the
@@ -2238,6 +2398,12 @@ def main():
                 app.scenario_attach_refusal()
             elif args.scenario == "drop-refusal":
                 app.scenario_drop_refusal()
+            elif args.scenario == "auto-reject":
+                # The transcript record (#135): preview receipt, the
+                # [auto: rejected] entry with the check's reason, the
+                # auto-rejected result row, the model's adaptation — and
+                # the scenario itself asserts NO approval ever rendered.
+                app.scenario_auto_reject()
             elif args.scenario == "model-switch":
                 app.scenario_model_switch()
             elif args.scenario == "resume-picker":
@@ -2397,6 +2563,28 @@ def main():
             # streamed reply with its 📎 indicator rows. Full frame.
             app._mark = time.monotonic()
             app.scenario_drop_image()
+            time.sleep(0.5)
+            app.gif(args.out, crop_rows=24, min_span=1.0)
+        elif args.scenario == "approve-choice":
+            # The approval in motion (#133): the composer is replaced by
+            # the choice question, Down/Up move the selection, Enter
+            # approves and the tool's result rows in. Each act asserted by
+            # the scenario before the GIF is written. Full frame.
+            app._mark = time.monotonic()
+            app.scenario_approve_choice()
+            time.sleep(0.5)
+            app.gif(args.out, crop_rows=24, min_span=1.0)
+        elif args.scenario == "question-single":
+            # The model's question in motion, single-select (#134).
+            app._mark = time.monotonic()
+            app.scenario_question_single()
+            time.sleep(0.5)
+            app.gif(args.out, crop_rows=24, min_span=1.0)
+        elif args.scenario == "question-multi":
+            # The multi-select flow (#134): space toggles two answers,
+            # Enter returns both in option order, the model acts on them.
+            app._mark = time.monotonic()
+            app.scenario_question_multi()
             time.sleep(0.5)
             app.gif(args.out, crop_rows=24, min_span=1.0)
         elif args.scenario == "growing-session":
