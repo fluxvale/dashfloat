@@ -214,13 +214,16 @@ defmodule DashFloat.Update do
     end
   end
 
-  # A URL Req cannot build (no scheme, no host, a bad port) raises instead
-  # of answering; that is a failed request like any other — a refusal,
-  # never a crash out of the boot (the ADR 0011 rule).
+  # A URL Req cannot build (no scheme, no host, a null byte, an out-of-range
+  # port) raises — or exits from deep inside Mint — instead of answering;
+  # that is a failed request like any other: a refusal, never a crash out
+  # of the boot (the ADR 0011 rule).
   defp safe_get(url, opts) do
     Req.get(url, opts)
   rescue
     _reason -> {:error, :invalid_request}
+  catch
+    :exit, _reason -> {:error, :invalid_request}
   end
 
   # The file name in a URL, for refusal messages; a path-less or unparseable

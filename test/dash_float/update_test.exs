@@ -430,6 +430,36 @@ defmodule DashFloat.UpdateTest do
     assert current_points_at(home) == running
   end
 
+  # The exit-class arm (final delta review, PR #126): an out-of-range port
+  # makes Mint EXIT from inside the connect, which rescue cannot intercept —
+  # catch :exit is what keeps it a refusal.
+  @tag :tmp_dir
+  test "a URL with an out-of-range port refuses instead of exiting", ctx do
+    standin = standin()
+
+    UpdateStandin.set_release(standin, %{
+      "tag_name" => "v#{@latest}",
+      "assets" => [
+        %{
+          "name" => "dashfloat-#{@latest}-#{@target}.tar.gz",
+          "browser_download_url" => "http://127.0.0.1:99999/x"
+        },
+        %{
+          "name" => "dashfloat-#{@latest}-sha256sums.txt",
+          "browser_download_url" => "http://127.0.0.1:99999/y"
+        }
+      ]
+    })
+
+    {home, running, _new_dir} = script_home(ctx.tmp_dir)
+
+    {code, out} = run_captured(["update"], standin, root: running)
+
+    assert code == 1
+    assert out =~ "network error"
+    assert current_points_at(home) == running
+  end
+
   test "an API base Req cannot build refuses instead of crashing" do
     parent = self()
 
