@@ -2,7 +2,7 @@ defmodule Mix.Tasks.Lint.Workflows do
   @shortdoc "Lints GitHub workflow files and shell scripts (actionlint + shellcheck)"
 
   @moduledoc """
-  The repo-lint step of `mix ci` ([ADR 0030](../../../docs/decisions/0030-actionlint-inside-the-ci-gate.md)):
+  The repo-lint step of `mix ci` ([ADR 0031](../../../docs/decisions/0031-actionlint-inside-the-ci-gate.md)):
   actionlint over every workflow file under `.github/workflows` (`.yml` and
   `.yaml`) — with shellcheck integration on each `run:` block — and
   shellcheck over the repo's own scripts (`install.sh` and `scripts/*.sh`). Both binaries are pinned and

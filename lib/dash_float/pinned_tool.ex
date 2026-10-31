@@ -1,7 +1,7 @@
 defmodule DashFloat.PinnedTool do
   @moduledoc """
   Pin-loads the external lint binaries the `mix ci` gate shells out to
-  ([ADR 0030](../decisions/0030-actionlint-inside-the-ci-gate.md)).
+  ([ADR 0031](../decisions/0031-actionlint-inside-the-ci-gate.md)).
 
   `fetch/2` answers the absolute path to a tool's pinned version on this
   machine, downloading it from the tool's GitHub release on first use — the

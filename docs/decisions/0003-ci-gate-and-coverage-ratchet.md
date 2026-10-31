@@ -1,6 +1,6 @@
 # 0003 — CI gate and coverage ratchet
 
-- **Status:** Accepted (check list amended by [ADR 0030](0030-actionlint-inside-the-ci-gate.md))
+- **Status:** Accepted (check list amended by [ADR 0031](0031-actionlint-inside-the-ci-gate.md))
 - **Date:** 2026-10-23
 - **Implements:** [issue #5](https://github.com/fluxvale/dashfloat/issues/5).
 

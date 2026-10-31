@@ -82,7 +82,7 @@ defmodule DashFloat.MixProject do
   defp aliases do
     [
       # CI-grade gate: the one list CI and local devs run — no drift.
-      # lint.workflows pins and fetches its own binaries (ADR 0030).
+      # lint.workflows pins and fetches its own binaries (ADR 0031).
       ci: [
         "deps.get --check-locked",
         "lint.workflows",

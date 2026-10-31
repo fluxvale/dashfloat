@@ -1,4 +1,4 @@
-# 0030 — actionlint inside the mix ci gate
+# 0031 — actionlint inside the mix ci gate
 
 - **Status:** Accepted
 - **Date:** 2026-11-01

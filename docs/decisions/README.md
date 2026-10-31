@@ -52,3 +52,4 @@ their replacement.
 | [0028](0028-choice-widget-and-ask-user.md) | The choice widget: approvals as questions, the ask-user tool, AUTO's binary resolve | Accepted |
 | [0029](0029-rig-reply-end-needles-are-exchange-unique.md) | Capture-rig reply-end needles are exchange-unique: numbered stock replies, wrap-collapsed waits | Accepted |
 | [0030](0030-sysprompt-tool-prose-derives-from-the-registry.md) | The system prompt's tool prose derives from the tool registry: count, names, and approval grouping render from `Tools.names/1` | Accepted |
+| [0031](0031-actionlint-inside-the-ci-gate.md) | actionlint inside the `mix ci` gate: sha256-pinned binaries fetched by the gate itself, no PATH lookup, no skip | Accepted |
