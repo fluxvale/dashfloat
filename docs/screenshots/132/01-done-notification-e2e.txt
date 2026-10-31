@@ -1,0 +1,81 @@
+# Issue #132 — Herdr done-notification, live e2e evidence (2026-10-31)
+
+Rig: an isolated `herdr --session df132test` (nested herdr enabled) driven in
+a tmux pane; the REAL DashFloat TUI from this worktree (`mix run --no-halt`)
+launched inside the session's pane `w1:p1` (so the pane's foreground process
+is the app, as in the owner's setup), reporting through the production
+`DashFloat.Herdr` socket transport via a logging unix-socket proxy; provider
+is the repo mock (`scripts/capture.py` MockHandler). Herdr 0.9.5 client and
+server. Tab focus is driven through the TUI client itself (`prefix`+`2`),
+not the CLI, so the server's active tab is what the user sees.
+
+## 1. The owner's flow, toast delivery enabled (round 5)
+
+Config: stock + `[ui.toast] delivery = "herdr"` (in-frame toasts). Watch the
+DashFloat tab, submit a prompt, switch to tab 2 once `working` is confirmed
+server-side, let the turn finish in the background:
+
+    mounted:          {"focused_tab": "w1:t2", "df": [["idle", null]]}
+    watching t1:      {"focused_tab": "w1:t1", "df": [["idle", null]]}
+    working (watched):{"focused_tab": "w1:t1", "df": [["working", null]]}
+    switched away:    {"focused_tab": "w1:t2", "df": [["working", null]]}
+    settled:          {"focused_tab": "w1:t2", "df": [["done", 9]]}
+
+The client's rendered frame at completion (tmux capture-pane):
+
+    '│● dashfloat finished  │'
+
+`done` status, `completion_seq` set, and the notification toast itself.
+
+## 2. The owner's flow, the owner's own config (round 8)
+
+Config: a copy of `~/.config/herdr/config.toml` — `[ui.toast]` absent, so
+delivery is the default `off` (chime + badge only, no toast anywhere).
+Same flow (watch t1, submit, switch away mid-turn):
+
+    watching t1:       {"focused_tab": "w1:t1", "df": [["idle", 3]]}
+    working (watched): {"focused_tab": "w1:t1", "df": [["working", null]]}
+    switched away:     {"focused_tab": "w1:t2", "df": [["working", null]]}
+    settled:           {"focused_tab": "w1:t2", "df": [["done", 9]]}
+
+Sidebar workspace row at completion vs a settled-idle pane:
+
+    done:  ' ● ~ · 1'   (filled dot; `herdr agent list` → dashfloat done, completion_seq 9)
+    idle:  ' ○ ~ · 1'   (round 7's watched completion)
+
+## 3. The wire (logging proxy, round 3's turn)
+
+Every line DashFloat sent for one mount + one turn; strictly increasing seqs,
+state report first, session report behind:
+
+    16:03:22.575 REQ pane.report_agent         state=idle    seq=1793433802521
+    16:03:25.838 REQ pane.report_agent         state=working seq=1793433805837
+    16:03:25.856 REQ pane.report_agent         state=working seq=1793433805855
+    16:03:25.956 REQ pane.report_agent_session seq=1793433805856 id=01a190fc-…
+    16:03:28.363 REQ pane.report_agent         state=idle    seq=1793433808360
+    16:03:28.469 REQ pane.report_agent_session seq=1793433808361 id=01a190fc-…
+
+(The second `working` is the session-id mint: the id joins the report
+signature, so the pair re-fires — ADR 0024 §3. The turn-end pair carries the
+same session id.)
+
+## 4. Watched completions do not notify — Herdr's design (rounds 6/7)
+
+Same flow but the client stayed on DashFloat's tab past completion:
+
+    final: {"focused_tab": "w1:t1", "df": [["idle", 5]]}
+
+The completion registered (`completion_seq` advanced) but the pane is marked
+seen: status `idle`, no badge, no toast, and nothing re-fires when the user
+later switches away. Source (herdr 0.9.5, `src/app/actions.rs`):
+`active_tab_suppresses_notifications` suppresses the finished toast/sound for
+the active tab, and `apply_pane_state_change` marks the pane
+`seen = suppress_active_tab_notifications`. `done` is a derived view
+(`pane_agent_status`: idle+unseen), never a reportable state
+(`PaneAgentState` = idle|working|blocked|unknown in both the CLI and the
+socket schema).
+
+This — not a missing report — is what the v0.4.0 smoke test saw: the working
+indicator is visible from any tab, while the done notification is judged at
+the instant the `idle` report lands; a turn that finishes while the pane is
+being watched is silently idle, permanently.

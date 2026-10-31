@@ -14,6 +14,8 @@ when its tag is cut.
 
 ### Added
 
+- The Herdr done-notification is verified working and its semantics documented: DashFloat's existing working→idle reports already drive Herdr's derived `done` status (badge + chime, toast when `[ui.toast]` delivery is enabled); a completion that lands while DashFloat's tab is being watched never notifies — Herdr marks the pane seen by design — so short turns finish silently unless the user has switched away first (ADR 0024 §8, evidence in `docs/screenshots/132/`) (#132).
+
 - Quitting DashFloat with an ongoing session prints the command that reopens it — `dashfloat --resume <title-or-id>`, the title (shell-quoted) when one is set, else the UUIDv7 id; nothing prints when nothing persisted (#127).
 - `/resume` opens a keyboard-navigable picker over saved sessions — title or first-message preview, relative time, provider · model, most recent first; Enter switches in place, Esc cancels untouched (#128).
 - `dashfloat update` checks the latest GitHub release against the running version and updates the installation: install.sh installs are replaced in place (sha256-verified download, atomic swap, a start-up smoke of the new release, rollback on failure), Homebrew installs print the `brew upgrade dashfloat` handoff, and anything else refuses with both options (#122).

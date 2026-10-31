@@ -155,6 +155,44 @@ exit-release and session-switch stay disjoint events. See 0027 §3.)*
 `--source dashfloat --agent dashfloat` — our own name, never `herdr:`-prefixed
 (that prefix is reserved for Herdr's own integrations).
 
+### 8. Done-notification: derived by Herdr, verified live *(amended 2026-10-31, issue [#132](https://github.com/fluxvale/dashfloat/issues/132))*
+
+Owner smoke feedback on v0.4.0: "it doesn't send a notification that it's
+done. I do see the indicator when it's in the middle of working though."
+Investigated against Herdr 0.9.5; the finding changes no code.
+
+`done` is not reportable — `pane.report_agent` accepts
+`idle|working|blocked|unknown` (CLI and socket schema both). The API's
+`AgentStatus` adds `done` as a **derived** view: a `working → idle`
+transition on a pane that is not being watched marks the pane unseen,
+flips its status to `done` (the sidebar badge), and emits the finished
+notification (toast and/or chime per Herdr config). DashFloat's reports
+already produce that transition. Verified live end to end — the real TUI in
+a pane of an isolated `herdr --session`, one mock turn, the pane backgrounded
+mid-turn through the client's own tab switch: `working → done`
+(`completion_seq` set) and the `● dashfloat finished` toast rendered; with
+the owner's stock config the same flow yields the `done` badge. Evidence and
+wire capture in `docs/screenshots/132/`.
+
+Two Herdr-side semantics bound what any integration can get, both by design:
+
+- **Watched completions never notify.** The transition is judged at the
+  instant the `idle` report lands; if the pane's tab is the client's active
+  tab, the pane is marked seen — no badge, no toast, no chime — and nothing
+  re-fires when the user later switches away. A turn that finishes while
+  the user is still looking at the pane is silently idle. Short turns race
+  the user's switch-away; this, not a missing report, is what the smoke
+  test saw (the working indicator is visible from any tab, so "working but
+  never done" is exactly a watched completion).
+- **Toast delivery is config-gated; the badge and chime are not.** With the
+  default `[ui.toast] delivery = "off"` (the owner's config has no
+  `[ui.toast]` section), the done notification is chime + sidebar badge
+  only — no visible toast anywhere.
+
+No DashFloat change follows: the sanctioned transport already carries
+everything Herdr needs, and fabricating a `working` report to re-arm a
+watched completion would lie about state and corrupt `herdr agent wait`.
+
 ## Alternatives considered
 
 - **A GenServer reporter process** — rejected: nothing needs a mailbox or
@@ -164,6 +202,11 @@ exit-release and session-switch stay disjoint events. See 0027 §3.)*
   verification (§4): on Herdr 0.9.5 the CLI silently drops `pane
   report-agent` when spawned from inside a pane, while the socket API
   delivers. Revisit if Herdr fixes the CLI.
+- **Re-reporting `working` just before the turn-end `idle` so a watched
+  completion still notifies** — rejected (§8): it fabricates state (the
+  agent is not working), corrupts `herdr agent wait`, and fights Herdr's
+  seen semantics, which exist precisely because a watched pane needs no
+  notification.
 - **A client-side queue that drops older reports while one is in flight** —
   rejected: Herdr's seq guard already discards stale reports server-side.
   Reports fire as one task per change (state + session requests ordered
