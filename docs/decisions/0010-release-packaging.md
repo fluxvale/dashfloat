@@ -232,6 +232,9 @@ the notes cannot drift from the assets.
 - No Windows support in v0.1.0.
 - Upgrades are re-running the installer (or `brew upgrade`); there is no
   in-binary self-update. `dashfloat upgrade` can be a product feature later.
+  (*Amended by [ADR 0026](0026-update-command.md) — `dashfloat update` is
+  that feature, with a verified, atomic, rollback-protected replace for
+  install.sh installs and a printed handoff for Homebrew.*)
 - `--version` is a public CLI surface now, and it exercises the NIF.
 - The release workflow is the only place artifacts are produced, so packaging
   breakage surfaces on the tag rather than at user install time — and the

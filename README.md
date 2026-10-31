@@ -41,6 +41,14 @@ and names the package to install. Debian 11, Alpine/musl, Linux arm64, and
 Windows are not supported yet. Packaging details:
 [ADR 0010](docs/decisions/0010-release-packaging.md).
 
+Update with `dashfloat update`: it detects how this copy was installed — an
+installer layout is updated in place (checksum-verified download, atomic
+swap, the new release is smoke-tested and rolled back on failure), a
+Homebrew install prints the `brew upgrade dashfloat` handoff, and anything
+else refuses with both options. `dashfloat update --check` only reports the
+latest version (exit 0 current / 1 outdated / 2 unknown). Design:
+[ADR 0026](docs/decisions/0026-update-command.md).
+
 ## Run it
 
 Configure your providers — any OpenAI-compatible endpoints — in

@@ -40,6 +40,17 @@ defmodule DashFloat.CLITest do
     assert CLI.version?(["--profile", "work", "--version"])
   end
 
+  # ADR 0026: `update` is a subcommand — it must LEAD argv, so a stray
+  # "update" elsewhere stays what it always was (an unrecognized argument
+  # warning, not a subcommand).
+  test "update?/1 detects the update subcommand only as the first argument" do
+    assert CLI.update?(["update"])
+    assert CLI.update?(["update", "--check"])
+    refute CLI.update?([])
+    refute CLI.update?(["--profile", "work", "update"])
+    refute CLI.update?(["--version"])
+  end
+
   test "a version query is never parsed as a selection and never warns" do
     logs = capture_log(fn -> assert CLI.parse(["--version"]) == [] end)
     assert logs == ""

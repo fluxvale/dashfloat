@@ -12,6 +12,11 @@ when its tag is cut.
 
 ## [Unreleased]
 
+### Added
+
+- `dashfloat update` checks the latest GitHub release against the running version and updates the installation: install.sh installs are replaced in place (sha256-verified download, atomic swap, a start-up smoke of the new release, rollback on failure), Homebrew installs print the `brew upgrade dashfloat` handoff, and anything else refuses with both options (#122).
+- `dashfloat update --check` is the scriptable form — prints the latest version, exits 0 when current, 1 when outdated, 2 when the check itself failed (offline and rate-limited are visible refusals).
+
 ### Changed
 
 - Dependency bump: `ex_ratatui` 0.17.1 → 0.19.0 (`rustler_precompiled` rides to 0.10.1; OTP 29 now loads its own NIF-2.18 precompile instead of the 2.17 ABI build). Rendered output verified pixel-identical by frame-hash comparison of pty captures, and the idle cursor blink re-measured at its recorded 2.0 renders/s / ~50 B per frame.

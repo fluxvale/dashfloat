@@ -47,3 +47,4 @@ their replacement.
 | [0023](0023-session-titles-and-uuid-ids.md) | Session titles and UUID session ids: title normalization, uniqueness, resume by title, the auto-title nudge | Accepted |
 | [0024](0024-herdr-integration.md) | Herdr integration: state reporting, resume command, pane release | Accepted |
 | [0025](0025-test-sockets-own-their-directory.md) | Test-rig sockets own their directory: per-test unique, self-created | Accepted |
+| [0026](0026-update-command.md) | The update command: release check, method detection, verified self-replace | Accepted |
