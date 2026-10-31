@@ -166,7 +166,10 @@ is a two-rename swap. Step order is the safety claim —
 
 The staging directory is removed on every exit, success or refusal, and
 stale `current.new-*` links from a hard kill inside the two-rename window
-are swept on the next swap, so no leftovers accumulate.
+are swept on the next swap, so no leftovers accumulate. One `dashfloat
+update` at a time is the supported shape — concurrent updates race the
+staging and symlink steps against each other and are not supported (the
+same single-writer rule install.sh assumes when a user runs it once).
 
 **Replacing a running release is safe here because the command's own VM
 halts immediately after** (`handle_update` exits through the boot's halt

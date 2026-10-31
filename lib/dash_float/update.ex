@@ -186,7 +186,7 @@ defmodule DashFloat.Update do
     timeout = Keyword.get(opts, :timeout, @timeout_ms)
     url = base <> "/repos/#{@repo}/releases/latest"
 
-    case Req.get(url, headers: @accept, receive_timeout: timeout, retry: false) do
+    case safe_get(url, headers: @accept, receive_timeout: timeout, retry: false) do
       {:ok, %Req.Response{status: 200, body: body}} ->
         parse_release(body)
 
@@ -204,14 +204,32 @@ defmodule DashFloat.Update do
         {:error, {:http, status}}
 
       # Req hands back the JSON decoder's failure for a body that promised
-      # to be JSON; a transport error is every other shape (offline,
-      # refused, timed out).
+      # to be JSON; every other error — transport, or a URL Req cannot even
+      # build — is the offline class.
       {:error, %Jason.DecodeError{}} ->
         {:error, :bad_response}
 
-      {:error, %Req.TransportError{}} ->
+      {:error, _other} ->
         {:error, :offline}
     end
+  end
+
+  # A URL Req cannot build (no scheme, no host, a bad port) raises instead
+  # of answering; that is a failed request like any other — a refusal,
+  # never a crash out of the boot (the ADR 0011 rule).
+  defp safe_get(url, opts) do
+    Req.get(url, opts)
+  rescue
+    _reason -> {:error, :invalid_request}
+  end
+
+  # The file name in a URL, for refusal messages; a path-less or unparseable
+  # URL names no file and the empty name is honest.
+  defp url_name(url) do
+    path = URI.parse(url).path || ""
+    Path.basename(path)
+  rescue
+    _reason -> ""
   end
 
   # The API base: the test seam first, then the env override (install.sh's
@@ -428,12 +446,9 @@ defmodule DashFloat.Update do
 
   defp download(url, dest, opts) do
     timeout = Keyword.get(opts, :timeout, @timeout_ms)
-    # A path-less URL (query-only) names no file; the empty name is honest.
-    path = URI.parse(url).path || ""
+    name = url_name(url)
 
-    name = Path.basename(path)
-
-    case Req.get(url, into: File.stream!(dest), receive_timeout: timeout, retry: false) do
+    case safe_get(url, into: File.stream!(dest), receive_timeout: timeout, retry: false) do
       {:ok, %Req.Response{status: 200}} ->
         {:ok, dest}
 
@@ -591,7 +606,7 @@ defmodule DashFloat.Update do
           :error ->
             {:error,
              "the new release did not start correctly (#{reason}) and the previous link could not be restored - " <>
-               "re-run install.sh (or brew upgrade) to repair the installation."}
+               "re-run install.sh to repair the installation."}
         end
     end
   end

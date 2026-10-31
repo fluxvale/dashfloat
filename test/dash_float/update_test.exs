@@ -402,6 +402,47 @@ defmodule DashFloat.UpdateTest do
     assert current_points_at(home) == running
   end
 
+  # Delta-review finding 1 (PR #126): a URL Req cannot build must refuse,
+  # not raise out of the boot — a broken DASHFLOAT_UPDATE_API_BASE or a
+  # malformed asset URL is the offline class.
+  @tag :tmp_dir
+  test "a download URL Req cannot build refuses instead of crashing", ctx do
+    standin = standin()
+
+    UpdateStandin.set_release(standin, %{
+      "tag_name" => "v#{@latest}",
+      "assets" => [
+        %{
+          "name" => "dashfloat-#{@latest}-#{@target}.tar.gz",
+          "browser_download_url" => "not a url"
+        },
+        %{"name" => "dashfloat-#{@latest}-sha256sums.txt", "browser_download_url" => "::::"}
+      ]
+    })
+
+    {home, running, _new_dir} = script_home(ctx.tmp_dir)
+
+    {code, out} = run_captured(["update"], standin, root: running)
+
+    assert code == 1
+    assert out =~ "downloading"
+    assert out =~ "network error"
+    assert current_points_at(home) == running
+  end
+
+  test "an API base Req cannot build refuses instead of crashing" do
+    parent = self()
+
+    out =
+      capture_io(:stderr, fn ->
+        code = Update.run(["update", "--check"], api_base: "http://[", timeout: 500)
+        send(parent, {:code, code})
+      end)
+
+    assert_received {:code, 2}
+    assert out =~ "could not reach GitHub"
+  end
+
   test "asset entries that are not name/url maps are ignored" do
     standin = standin()
 
