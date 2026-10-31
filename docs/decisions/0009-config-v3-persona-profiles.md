@@ -641,13 +641,16 @@ the race. The user then picks a model the current provider does not serve.
 - **Mismatch policy — inert, not refetch, not a visible refusal.** A
   superseded generation's result is dropped; the wizard stays at
   `:fetching` and the CURRENT generation's own result decides the screen.
-  This is safe because delivery is guaranteed: `Catalog.fetch/3` never
-  raises (it rescues to an error class), and a failed task spawn — the
-  bare `Task.Supervisor.start_child` call could `:exit` on a dead
-  supervisor and strand the wizard at `:fetching` forever — now follows
-  `start_suggest`'s guarded form and delivers
+  This is safe because delivery is guaranteed for every failure class the
+  fetch layer can produce — `Catalog.fetch/3` returns an error tuple for
+  every HTTP/transport outcome and rescues internal raises — and a failed
+  task spawn — the bare `Task.Supervisor.start_child` call could `:exit`
+  on a dead supervisor and strand the wizard at `:fetching` forever — now
+  follows `start_suggest`'s guarded form and delivers
   `{:error, "could not start"}`, landing on the manual fallback with the
-  usual note. **Refetch was rejected** because a duplicate fetch is
+  usual note. (A raw `:throw`/`:exit` escaping the rescue would leave the
+  wizard waiting; esc-to-manual stays the escape — no known path produces
+  one.) **Refetch was rejected** because a duplicate fetch is
   already in flight — the current epoch's own HTTP request. **A visible
   refusal was rejected** because nothing is wrong and no remedy exists:
   the drop is invisible by design, and every generation's outcome

@@ -464,8 +464,8 @@ defmodule DashFloat.TUITest do
 
   test "a wrong-provider fetch result never populates the picker (issue #87)" do
     # The standin answers THIS provider's fetch; a second, stale delivery —
-    # byte-shape what a previous provider's still-live task sends today —
-    # races it. The stale list must never reach the picker.
+    # the identity-less shape pre-#87 tasks sent (and any foreign delivery
+    # of that shape) — races it. The stale list must never reach the picker.
     script = [http_ok(models_body(["glm-fresh"])), :close]
     {:ok, server} = SSEServer.start_link(script)
     on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
@@ -520,7 +520,17 @@ defmodule DashFloat.TUITest do
     for ch <- String.codepoints("k-1"), do: press(pid, ch)
     press(pid, "enter")
 
-    eventually(pid, fn s -> s.setup.step == :fetching and s.setup.fetch_epoch == 1 end)
+    fetching_k1 =
+      eventually(pid, fn s -> s.setup.step == :fetching and s.setup.fetch_epoch == 1 end)
+
+    assert fetching_k1.setup.pending.key == "k-1"
+
+    # Gate the re-key on the server having READ k1's request: connection
+    # scripts attach by accept order, and only the read proves conn-0 is
+    # k1's — so the refetch (issued after this point) can only ever be
+    # conn-1, whatever order the TCP connects raced in.
+    assert_receive {:sse_request, "GET", "/models", %{"authorization" => "Bearer k-1"}, _},
+                   1_000
 
     # Esc to manual, back to the key, and re-key as k-2: generation 2.
     press(pid, "esc")
@@ -538,10 +548,8 @@ defmodule DashFloat.TUITest do
 
     eventually(pid, fn s -> s.setup.step == :fetching and s.setup.fetch_epoch == 2 end)
 
-    # Both fetches really ran; the refetch carried the new key.
-    assert_receive {:sse_request, "GET", "/models", %{"authorization" => "Bearer k-1"}, _},
-                   1_000
-
+    # The refetch really ran, and carried the new key — on conn-1 (conn-0
+    # is still holding k1's slow answer).
     assert_receive {:sse_request, "GET", "/models", %{"authorization" => "Bearer k-2"}, _},
                    3_000
 
