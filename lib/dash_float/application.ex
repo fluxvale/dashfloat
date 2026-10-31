@@ -35,8 +35,10 @@ defmodule DashFloat.Application do
     halt = Keyword.get(args, :halt, &System.halt/1)
 
     # A version query must work with no TTY, no config, and no provider: the
-    # installer and CI smoke a downloaded artifact this way (ADR 0010).
-    if not test?, do: handle_version(argv, halt)
+    # installer and CI smoke a downloaded artifact this way (ADR 0010). The
+    # update subcommand rides the same early boundary — it needs neither
+    # config nor terminal, and its refusals exit cleanly (ADR 0026).
+    if not test?, do: handle_early(argv, halt, Keyword.get(args, :update))
 
     env = Keyword.get(args, :env, System.get_env())
     config_dir = Keyword.get(args, :config_dir, Config.config_dir())
@@ -105,6 +107,23 @@ defmodule DashFloat.Application do
       :ok = ExRatatui.Native.ensure_loaded()
       IO.binwrite(:stdio, "dashfloat #{DashFloat.version()}\n")
       halt.(0)
+    end
+  end
+
+  # The two boot-time exits share one boundary: `--version` first (ADR
+  # 0010), then the update subcommand (ADR 0026).
+  defp handle_early(argv, halt, update_opts) do
+    handle_version(argv, halt)
+    handle_update(argv, halt, update_opts)
+  end
+
+  # The update command runs to completion here and exits through the one
+  # halt seam (ADR 0026) — its refusals are stderr lines, never an error
+  # return OTP would treat as a crash (the ADR 0011 rule).
+  defp handle_update(argv, halt, opts) do
+    if DashFloat.CLI.update?(argv) do
+      code = DashFloat.Update.run(argv, opts || [])
+      halt.(code)
     end
   end
 

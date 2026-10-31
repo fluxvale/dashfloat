@@ -34,6 +34,16 @@ defmodule DashFloat.CLI do
   @spec version?([String.t()]) :: boolean()
   def version?(argv) when is_list(argv), do: "--version" in argv
 
+  @doc """
+  Whether argv asks for the update subcommand (`update` leading argv —
+  `dashfloat update [--check]`), which the boot runs and exits before
+  config loading or terminal setup, like `--version`
+  ([ADR 0026](../decisions/0026-update-command.md)).
+  """
+  @spec update?([String.t()]) :: boolean()
+  def update?(["update" | _rest]), do: true
+  def update?(_argv), do: false
+
   @doc "Parses argv into `[profile: name, model: name]`, warning and skipping what it does not recognize."
   @spec parse([String.t()]) :: keyword()
   def parse(argv) when is_list(argv) do

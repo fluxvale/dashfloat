@@ -101,8 +101,9 @@ defmodule DashFloat.MixProject do
   # The generated `bin/<name>` launcher is operator-shaped: every argument is
   # a release command, `start` drops its own arguments, and a bare invocation
   # prints a command list. DashFloat's binary is user-shaped: `dashfloat`
-  # starts the TUI, `dashfloat --version` answers, and the selection flags
-  # reach the app. Two text edits to Elixir's own launcher do that, with the
+  # starts the TUI, `dashfloat --version` answers, `dashfloat update` runs
+  # the update command (ADR 0026), and the selection flags reach the app.
+  # Two text edits to Elixir's own launcher do that, with the
   # build failing loudly if the template moves under us, instead of shipping a
   # binary that silently ignores what the user typed (ADR 0010).
   defp patch_launcher(release) do
@@ -126,7 +127,7 @@ defmodule DashFloat.MixProject do
         launcher,
         contents,
         ~s{case $1 in\n  start)},
-        ~s{case $1 in\n  "" | -*) set -- start "$@" ;;\nesac\n\ncase $1 in\n  start)}
+        ~s{case $1 in\n  "" | -* | update) set -- start "$@" ;;\nesac\n\ncase $1 in\n  start)}
       )
 
     File.write!(launcher, contents)

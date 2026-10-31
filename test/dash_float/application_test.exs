@@ -305,6 +305,110 @@ defmodule DashFloat.ApplicationTest do
     end
   end
 
+  # ADR 0026: `update` rides the same early boot boundary as `--version` —
+  # before config loading and terminal setup — and exits through the one
+  # halt seam with the command's own exit code. Hermetic through the
+  # `update:` seam, which threads DashFloat.Update's opts (the standin API
+  # base) the same way `halt:` threads the exit.
+  describe "the update subcommand at boot (ADR 0026)" do
+    test "update --check runs, reports, and halts with the command's code" do
+      {:ok, standin} = DashFloat.UpdateStandin.start_link()
+      DashFloat.UpdateStandin.set_release(standin, %{"tag_name" => "v9.9.9", "assets" => []})
+      parent = self()
+      halt = fn code -> send(parent, {:halted, code}) end
+
+      out =
+        capture_io(fn ->
+          capture_io(:stderr, fn ->
+            Application.start(:normal,
+              test?: false,
+              config_dir: "/nonexistent-dashfloat-update-#{System.unique_integer([:positive])}",
+              env: %{},
+              argv: ["update", "--check"],
+              interactive?: false,
+              halt: halt,
+              update: [api_base: DashFloat.UpdateStandin.base(standin), timeout: 2_000]
+            )
+          end)
+        end)
+
+      assert_received {:halted, 1}
+      assert out =~ "v9.9.9"
+    end
+
+    test "update --check on the current version halts 0" do
+      {:ok, standin} = DashFloat.UpdateStandin.start_link()
+
+      DashFloat.UpdateStandin.set_release(standin, %{
+        "tag_name" => "v#{DashFloat.version()}",
+        "assets" => []
+      })
+
+      parent = self()
+      halt = fn code -> send(parent, {:halted, code}) end
+
+      capture_io(fn ->
+        Application.start(:normal,
+          test?: false,
+          config_dir: "/nonexistent-dashfloat-update-#{System.unique_integer([:positive])}",
+          env: %{},
+          argv: ["update", "--check"],
+          interactive?: false,
+          halt: halt,
+          update: [api_base: DashFloat.UpdateStandin.base(standin), timeout: 2_000]
+        )
+      end)
+
+      assert_received {:halted, 0}
+    end
+
+    test "a plain update on an unknown layout refuses on stderr and halts 1" do
+      {:ok, standin} = DashFloat.UpdateStandin.start_link()
+      DashFloat.UpdateStandin.set_release(standin, %{"tag_name" => "v9.9.9", "assets" => []})
+      parent = self()
+      halt = fn code -> send(parent, {:halted, code}) end
+
+      stderr =
+        capture_io(:stderr, fn ->
+          capture_io(fn ->
+            Application.start(:normal,
+              test?: false,
+              config_dir: "/nonexistent-dashfloat-update-#{System.unique_integer([:positive])}",
+              env: %{},
+              argv: ["update"],
+              interactive?: false,
+              halt: halt,
+              update: [
+                api_base: DashFloat.UpdateStandin.base(standin),
+                timeout: 2_000,
+                root: "/nowhere/dashfloat"
+              ]
+            )
+          end)
+        end)
+
+      assert_received {:halted, 1}
+      assert stderr =~ "can't tell how this copy was installed"
+    end
+
+    test "no update subcommand means no halt and the normal boot proceeds" do
+      dir = v3_dir()
+      parent = self()
+      halt = fn code -> send(parent, {:halted, code}) end
+
+      Application.start(:normal,
+        test?: false,
+        config_dir: dir,
+        env: %{},
+        argv: ["--profile", "work"],
+        interactive?: true,
+        halt: halt
+      )
+
+      refute_received {:halted, _}
+    end
+  end
+
   # A release boots applications before Elixir parses `-extra` into
   # System.argv/0, so the plain init arguments are where the user's flags
   # actually appear (ADR 0010). Exercised through the plain_argv seam, which
