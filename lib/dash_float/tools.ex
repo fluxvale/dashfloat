@@ -129,6 +129,39 @@ defmodule DashFloat.Tools do
         default: "."
       }
     ],
+    "question" => [
+      %{
+        name: "question",
+        type: :string,
+        required: true,
+        nonempty: true,
+        description: "The question to show the user.",
+        minimum: nil,
+        maximum: nil,
+        default: :none
+      },
+      %{
+        name: "options",
+        type: :options,
+        required: true,
+        nonempty: false,
+        description:
+          "Answer options (1-10): objects with a nonempty label and an optional description.",
+        minimum: nil,
+        maximum: nil,
+        default: :none
+      },
+      %{
+        name: "multiple",
+        type: :boolean,
+        required: false,
+        nonempty: false,
+        description: "Allow multiple answers (the user toggles with space). Default false.",
+        minimum: nil,
+        maximum: nil,
+        default: false
+      }
+    ],
     "web_search" => [
       %{
         name: "query",
@@ -154,6 +187,8 @@ defmodule DashFloat.Tools do
       "Run a shell command line and return its combined output (stdout and stderr, capped). Prefer it for builds, tests, and searches. The user may confirm before it runs, depending on the session mode.",
     "list_directory" =>
       "List a directory's entries: directories first, then files, each alphabetical.",
+    "question" =>
+      "Ask the user a direct question and wait for their answer. The question renders as a choice list in the input field: the user picks with arrows and Enter (space toggles answers when multiple is true) or dismisses with Esc, which answers cancelled. Use it whenever a decision or preference belongs to the user — never guess when you can ask.",
     "web_search" =>
       "Search the web. Use this to find information you are not sure about, to look up documentation, or to find data created after your training knowledge cutoff. Returns a list of results with url, title, and highlights."
   }
@@ -164,6 +199,7 @@ defmodule DashFloat.Tools do
     "edit_file",
     "execute_command",
     "list_directory",
+    "question",
     "web_search"
   ]
 
@@ -173,11 +209,17 @@ defmodule DashFloat.Tools do
     "write_file" => :mutating,
     "edit_file" => :mutating,
     "execute_command" => :risky,
+    # The ask-user tool (#134, ADR 0028): asking is not an action — it is
+    # safe in every mode, and the agent intercepts it before the gate.
+    "question" => :safe,
     "web_search" => :safe
   }
 
   # Display excerpt for tool-result rows; the model gets the bounded full result.
   @display_lines 30
+  # The question tool's option-count cap (#134, ADR 0028): bounds the choice
+  # widget's height (the composer's replacement box).
+  @max_options 10
 
   @doc "Risk class per ADR 0016 §2. Unknown names are :risky (fail closed)."
   @spec class(String.t()) :: :safe | :mutating | :risky
@@ -186,7 +228,8 @@ defmodule DashFloat.Tools do
   @doc """
   The OpenAI `tools` array advertising the catalogue. web_search is
   advertised only when `synthetic` — the session's Synthetic context — is
-  present (ADR 0021 §6); without one the array is the base five-tool list.
+  present (ADR 0021 §6); without one the array is the base six-tool list
+  (the question tool rides every mode, ADR 0028).
   """
   @spec schema(term()) :: [map()]
   def schema(synthetic \\ nil) do
@@ -283,6 +326,27 @@ defmodule DashFloat.Tools do
     end
   end
 
+  # The question tool's options (#134, ADR 0028): 1-10 maps, each with a
+  # nonempty string label and an optional string description. Normalized to
+  # exactly those two keys (a nil description kept for uniform rendering).
+  defp check_value(tool, %{type: :options} = param, value)
+       when is_list(value) and length(value) <= @max_options do
+    if valid_options?(value) do
+      {:ok, Enum.map(value, &normalize_option/1)}
+    else
+      {:error, options_message(tool, param)}
+    end
+  end
+
+  defp check_value(tool, %{type: :options} = param, _value),
+    do: {:error, options_message(tool, param)}
+
+  defp check_value(_tool, %{type: :boolean}, value) when is_boolean(value),
+    do: {:ok, value}
+
+  defp check_value(tool, %{type: :boolean} = param, _value),
+    do: {:error, "#{tool}: #{param.name} must be a boolean"}
+
   defp check_value(tool, %{type: :string, nonempty: true} = param, ""),
     do: {:error, "#{tool}: #{param.name} must not be empty"}
 
@@ -291,6 +355,31 @@ defmodule DashFloat.Tools do
 
   defp check_value(tool, %{type: :string} = param, _value),
     do: {:error, "#{tool}: #{param.name} must be a string"}
+
+  defp valid_options?([]), do: false
+
+  defp valid_options?(options), do: Enum.all?(options, &valid_option/1)
+
+  # The description is optional throughout (a model omits it when an option
+  # needs no explaining) — Map.get, never a match.
+  defp valid_option(%{"label" => label} = option)
+       when is_binary(label) and label != "",
+       do:
+         match?(
+           description when is_binary(description) or is_nil(description),
+           option["description"]
+         )
+
+  defp valid_option(_other), do: false
+
+  defp normalize_option(%{"label" => label} = option) do
+    %{"label" => label, "description" => Map.get(option, "description")}
+  end
+
+  defp options_message(tool, param),
+    do:
+      "#{tool}: #{param.name} must be a list of 1-#{@max_options} objects, " <>
+        "each with a nonempty string label and an optional string description"
 
   defp property(param) do
     base = %{"type" => type_name(param.type), "description" => param.description}
@@ -312,6 +401,8 @@ defmodule DashFloat.Tools do
 
   defp type_name(:string), do: "string"
   defp type_name(:integer), do: "integer"
+  defp type_name(:boolean), do: "boolean"
+  defp type_name(:options), do: "array"
 
   ## Result display derivation
   #
@@ -324,13 +415,27 @@ defmodule DashFloat.Tools do
 
   @doc """
   The tool-result row's status word: `"rejected"`, `"cancelled"`,
-  `"proposed (plan)"`, `"ok"`, or `"error: …"` with the message capped at 160
-  characters.
+  `"proposed (plan)"`, `"auto-rejected: …"` (the AUTO safety check's binary
+  reject, ADR 0028), `"answered: …"` (the question tool), `"ok"`, or
+  `"error: …"` with the message capped at 160 characters.
   """
   @spec display_status(map()) :: String.t()
   def display_status(%{rejected: true}), do: "rejected"
   def display_status(%{cancelled: true}), do: "cancelled"
   def display_status(%{blocked: "plan"}), do: "proposed (plan)"
+
+  def display_status(%{blocked: "auto", reason: reason}) when is_binary(reason) and reason != "",
+    do: "auto-rejected: " <> String.slice(reason, 0, 160)
+
+  def display_status(%{blocked: "auto"}), do: "auto-rejected"
+
+  def display_status(%{ok: true, answers: answers}) when is_list(answers) do
+    answers
+    |> Enum.join(", ")
+    |> String.slice(0, 160)
+    |> then(&"answered: #{&1}")
+  end
+
   def display_status(%{ok: true}), do: "ok"
 
   def display_status(%{error: error}) when is_binary(error),

@@ -25,6 +25,10 @@
   and the footer gains `ttft` beside a whole-response `tok/s` average that
   is never live; see
   [Amendment (2026-10-31, issues #129 + #130): breathing gap, ttft, whole-response tok/s](#amendment-2026-10-31-issues-129--130-breathing-gap-ttft-whole-response-toks)
+  below); **amended again 2026-10-31**
+  ([ADR 0028](0028-choice-widget-and-ask-user.md), issues #133/#134 — the
+  composer may be temporarily replaced by the choice widget; see
+  [Amendment (2026-10-31, ADR 0028): the composer is replaceable](#amendment-2026-10-31-adr-0028-the-composer-is-replaceable)
   below).
 - **Date:** 2026-10-29
 - **Implements:** [issue #66](https://github.com/fluxvale/dashfloat/issues/66),
@@ -431,3 +435,31 @@ rule, #67 stage 2: `1.4`, `2`, `32`).
   never dropped, and the last resort keeps the rate alone and clips as
   the Paragraph always did. (The attach row's hints-drop is the
   precedent: drop what fits worst, keep the payload whole.)
+
+## Amendment (2026-10-31, ADR 0028): the composer is replaceable
+
+**Status:** Accepted. This ADR owns the composer's surface; [ADR
+0028](0028-choice-widget-and-ask-user.md) adds the one thing §1–§3 never
+contemplated: the composer can be **temporarily replaced** — while a
+pending choice (an approval question, #133, or the model's `question`
+tool, #134) owns the input, the input region renders the choice widget (a
+Paragraph in the composer's own bordered box) instead of the `Textarea`,
+and the region's height flows from the widget's rows, not the draft's.
+
+- **The draft is preserved by construction.** The textarea's state is
+  never touched while replaced — no save/restore dance, no cursor
+  restoration; the composer restores with whatever was in flight the
+  moment the choice resolves.
+- **The ghost is reaped on arm.** While replaced, the placeholder (ghost
+  or hint) can neither render nor land into a draft the user could
+  Tab-materialize, so arming a choice sets the dismiss/reap intent of §3:
+  the debounce dies, an in-flight task is killed, stragglers orphan on the
+  epoch. The next completed turn re-arms per §3's once-per-turn rule; Tab
+  is swallowed by the choice.
+- **The cursor does not blink while replaced** — there is no composer to
+  blink over; the selection marker is the choice widget's cursor. The
+  idle-blink timer's gate is unchanged (the choice arms a non-idle phase,
+  so `blinkable?` is already false).
+- **Attachment chips do not render while replaced** (they are the
+  composer title's chrome); the pending set is untouched underneath and
+  reappears with the restored composer.

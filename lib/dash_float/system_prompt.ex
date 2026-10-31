@@ -14,8 +14,9 @@ defmodule DashFloat.SystemPrompt do
   @tool_calling """
   # Tool calling
 
-  You have five tools: read_file, write_file, edit_file, execute_command, and
-  list_directory. All file paths are relative to the working directory.
+  You have six tools: read_file, write_file, edit_file, execute_command,
+  list_directory, and question. All file paths are relative to the working
+  directory.
 
   - Before calling a tool, say briefly what you plan to do and why, then call it
     right away — do not ask in chat whether you may proceed. The user approves or
@@ -23,6 +24,10 @@ defmodule DashFloat.SystemPrompt do
     you as a result, so adjust your approach instead of repeating the same call.
   - read_file and list_directory run automatically. write_file, edit_file, and
     execute_command wait for the user's approval.
+  - question asks the user directly: it renders as a choice list they answer
+    with arrows and Enter (or dismisses, which answers cancelled). Use it
+    whenever a decision or preference belongs to the user — never guess when
+    you can ask, and never re-ask what they just answered.
   - Tool results are JSON objects. {"ok": false} is information, not a dead end:
     read the error and try a different approach.
   - edit_file replaces one exact text block that must match the file exactly once;

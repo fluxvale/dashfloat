@@ -207,11 +207,104 @@ defmodule DashFloat.TUI.ViewTest do
             executing_tool: "Running tool",
             checking: "Checking",
             confirming: "Confirm",
+            asking: "Asking",
             idle: "Idle"
           ] do
         state = %{new_state() | phase: phase}
         assert status_text(state) =~ label
       end
+    end
+
+    test "a pending question's activity row names the wait and Esc's dismissal" do
+      state = asking_state()
+      assert activity_text(state) =~ "Waiting for your answer…"
+      assert activity_text(state) =~ "esc dismiss"
+    end
+
+    # The composer replacement (ADR 0028): while a choice is pending the
+    # input region carries a Paragraph (the question box), never the
+    # Textarea — and its rows carry the question, the options with their
+    # selection markers, and the hint.
+    test "a pending choice replaces the composer widget with the question box" do
+      state = asking_state()
+
+      widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+
+      assert [
+               {%ExRatatui.Widgets.Paragraph{}, _status},
+               {%ExRatatui.Widgets.Paragraph{}, _log},
+               {%ExRatatui.Widgets.Paragraph{}, _activity},
+               {%ExRatatui.Widgets.Paragraph{}, _input},
+               {%ExRatatui.Widgets.Paragraph{}, _footer}
+             ] = widgets
+
+      # The box sizes from the widget: question + blank + (Postgres 2:
+      # description) + SQLite + blank + hint = 7 rows, borders capped at a
+      # third of the frame.
+      assert State.input_line_count(state) == 7
+      regions = regions_of(state)
+      assert {:ok, input} = Map.fetch(regions, :input)
+      assert input.height == 6
+
+      text = input_text(state)
+      assert text =~ "Which database?"
+      assert text =~ "❯ Postgres"
+      assert text =~ "  SQLite"
+      assert text =~ "    sturdy default"
+      assert text =~ "↑↓ move · ⏎ answer · esc dismiss"
+    end
+
+    test "an approval renders its fixed two-choice set in the same box" do
+      ref = make_ref()
+
+      state =
+        State.stream_message(
+          new_state(),
+          {:confirm, ref, %{id: "c1", name: "write_file", args: %{}, lines: ["+ x"]}}
+        )
+
+      text = input_text(state)
+      assert text =~ "Approve write_file?"
+      assert text =~ "❯ Approve"
+      assert text =~ "  Reject"
+      assert text =~ "↑↓ move · ⏎ answer · esc reject"
+    end
+
+    test "a multi question shows checkboxes and the toggle hint" do
+      state =
+        State.stream_message(new_state(), {
+          :question,
+          make_ref(),
+          %{
+            question: "Pick any",
+            options: [%{"label" => "a"}, %{"label" => "b"}],
+            multiple: true
+          }
+        })
+
+      text = input_text(state)
+      assert text =~ "[ ] a"
+      assert text =~ "[ ] b"
+      assert text =~ "space toggle"
+    end
+
+    defp asking_state do
+      State.stream_message(new_state(), {
+        :question,
+        make_ref(),
+        %{
+          question: "Which database?",
+          options: [
+            %{"label" => "Postgres", "description" => "sturdy default"},
+            %{"label" => "SQLite"}
+          ],
+          multiple: false
+        }
+      })
+    end
+
+    defp regions_of(state) do
+      View.regions(state.size, State.input_line_count(state), State.overlay?(state))
     end
 
     test "the context span reads the accounting call over the agent's snapshot" do
@@ -928,6 +1021,31 @@ defmodule DashFloat.TUI.ViewTest do
       assert rest.content == "read_file lib/foo.ex"
       assert rest.style == Theme.style(:dim)
     end
+
+    # The question tool's row (#134, ADR 0028): the question IS the payload —
+    # one flattened line, capped with `…` when it runs long.
+    test "a question call row carries the question as its summary" do
+      {_text, [_blank, line]} = Render.tool_call("question", args("Which database?"))
+
+      [gear, rest] = line.spans
+      assert gear.content == "⚙ "
+      assert rest.content == "question Which database?"
+
+      long = String.duplicate("w", 80)
+      {_text, [_blank, long_line]} = Render.tool_call("question", args(long <> "\nnext"))
+
+      [^gear, long_rest] = long_line.spans
+      assert long_rest.content == "question " <> String.duplicate("w", 60) <> "…"
+    end
+
+    test "a question call with no question string renders bare, never crashes" do
+      {_text, [_blank, line]} = Render.tool_call("question", %{})
+
+      [_gear, rest] = line.spans
+      assert rest.content == "question"
+    end
+
+    defp args(question), do: %{"question" => question, "options" => [%{"label" => "a"}]}
 
     test "tool result output indents two spaces, dim, verbatim" do
       {_text, [_blank, first | output]} = Render.tool_result("read_file", "ok", "one\ntwo")
@@ -1716,6 +1834,13 @@ defmodule DashFloat.TUI.ViewTest do
     state
     |> View.render(%ExRatatui.Frame{width: 80, height: 24})
     |> Enum.at(3)
+  end
+
+  # The input region's flat text: the composer's placeholder/draft view, or
+  # the choice box's rows while a choice replaces it (ADR 0028).
+  defp input_text(state) do
+    {widget, _rect} = input(state)
+    Enum.map_join(widget.text, "\n", &flatten/1)
   end
 
   defp log_widget(state, w, h) do

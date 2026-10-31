@@ -1,6 +1,10 @@
 # ADR 0024: Herdr integration: state reporting, resume command, pane release
 
-- **Status**: Accepted
+- **Status**: Accepted; **amended 2026-10-31** ([ADR 0028](0028-choice-widget-and-ask-user.md),
+  issues #133/#134 — the blocked message carries the QUESTION TEXT itself, and the
+  `:asking` phase joins the blocked family; see
+  [Amendment (2026-10-31, ADR 0028): blocked-with-message carries the question text](#amendment-2026-10-31-adr-0028-blocked-with-message-carries-the-question-text)
+  below)
 - **Date**: 2026-10-31
 - **Issue**: [#113](https://github.com/fluxvale/dashfloat/issues/113)
 - **Supersedes**: none
@@ -42,7 +46,7 @@ promotions:
 | --- | --- | --- |
 | phase `:idle` (composer) | `idle` | — |
 | phase `:streaming`, `:executing_tool`, `:checking` | `working` | — |
-| phase `:confirming` (pending confirm) | `blocked` | `approve <tool>` |
+| phase `:confirming` (pending confirm) | `blocked` | `approve <tool>` *(superseded 2026-10-31, ADR 0028's amendment below: the question text itself)* |
 | exit prompt armed (double-Ctrl+C guard) | `blocked` | `exit? press Ctrl+C again` |
 | startup setup (forced selection or wizard) | `blocked` | `first-run setup: choose a provider` |
 
@@ -258,3 +262,19 @@ watched completion would lie about state and corrupt `herdr agent wait`.
   fallback — the request-building layer is transport-agnostic.
 - Provider restore fidelity is bounded by what argv flags can express
   (profile + model); env-pinned base URLs are the documented gap.
+
+## Amendment (2026-10-31, ADR 0028): blocked-with-message carries the question text
+
+**Status:** Accepted. The approval (#133) and the model's `question` tool
+(#134) both surface as the composer's choice widget ([ADR
+0028](0028-choice-widget-and-ask-user.md)); Herdr's sidebar should show
+the QUESTION, not a verb. The pending-confirm row of §2's table — `blocked`
+/ `approve <tool>` — becomes `blocked` / **the question text itself**:
+`Approve write_file?` for an approval (the widget's own question), the
+model's question verbatim for an ask (flattened to one line, capped at
+120 chars — the message must stay one sidebar row). `:asking` joins the
+phases that map to `blocked`, belt under the snapshot precedence, which
+becomes: pending question > exit prompt > setup > phase. The snapshot's
+`confirm` field (a tool name) is replaced by `question` (the text) — the
+signature dedup keys on the message, so a question change mid-prompt
+still re-reports exactly as a tool-name change did.

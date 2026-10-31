@@ -60,13 +60,15 @@ defmodule DashFloat.Herdr do
 
   @typedoc """
   What the TUI derives per event for `report/2` — the phase machine's phase,
-  the two non-phase prompts (a pending confirm's tool name, the armed exit
-  guard), the startup setup flag, and the resume identity (session id plus
-  the provider selection the boot does not restore on its own).
+  the pending decision's QUESTION TEXT (an approval's "Approve <tool>?" or
+  the model's question — ADR 0024's 2028 amendment: blocked-with-message
+  carries the question text itself), the armed exit guard, the startup setup
+  flag, and the resume identity (session id plus the provider selection the
+  boot does not restore on its own).
   """
   @type snapshot :: %{
           phase: State.phase(),
-          confirm: String.t() | nil,
+          question: String.t() | nil,
           exit_prompt: boolean(),
           setup: boolean(),
           session_id: String.t() | nil,
@@ -90,15 +92,16 @@ defmodule DashFloat.Herdr do
   end
 
   @doc """
-  The Herdr state for a snapshot (ADR 0024 §2): a pending confirm, the armed
-  exit guard, and the startup setup prompt all need the user — `blocked`,
-  with a message naming the decision; a busy agent is `working`; the idle
+  The Herdr state for a snapshot (ADR 0024 §2, amended by ADR 0028): a
+  pending question — an approval or a model ask — the armed exit guard, and
+  the startup setup prompt all need the user, `blocked`, with the message
+  carrying the QUESTION TEXT itself; a busy agent is `working`; the idle
   composer is `idle`.
   """
   @spec state_for(snapshot()) :: {agent_state(), String.t() | nil}
   def state_for(snapshot) do
     cond do
-      snapshot.confirm != nil -> {:blocked, "approve " <> snapshot.confirm}
+      snapshot.question != nil -> {:blocked, snapshot.question}
       snapshot.exit_prompt -> {:blocked, "exit? press Ctrl+C again"}
       snapshot.setup -> {:blocked, "first-run setup: choose a provider"}
       true -> {phase_state(snapshot.phase), nil}
@@ -112,6 +115,11 @@ defmodule DashFloat.Herdr do
   def phase_state(:executing_tool), do: :working
   def phase_state(:checking), do: :working
   def phase_state(:confirming), do: :blocked
+
+  # Belt under the snapshot precedence above: a bare :asking phase (a
+  # question armed without its snapshot field, or racing it) is still a
+  # pending decision — blocked.
+  def phase_state(:asking), do: :blocked
 
   @doc """
   The next seq (ADR 0024 §3): the wall clock in ms, forced strictly

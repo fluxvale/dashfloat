@@ -80,6 +80,8 @@ defmodule DashFloat.Agent do
     # | {:vetting, reference(), reference(), pid(), map(), map()} — the
     #   check ref the vetter's report must carry, then the monitor ref
     # | {:vetting_cancelled, reference(), reference(), pid(), map()}
+    # | {:asking, reference(), map()} — the question tool's pending ask
+    #   (#134, ADR 0028): the ref the decision must echo
     tool_slot: :none,
     # Context accounting (ADR 0022): the usage-frame anchor, the eviction
     # history, and the current episode's request message count — the count
@@ -349,6 +351,34 @@ defmodule DashFloat.Agent do
 
   # A stale decision (its confirmation was superseded) is ignored.
   def handle_info({:confirm_decision, _ref, _decision}, state), do: {:noreply, state}
+
+  # The question tool's answer (#134, ADR 0028): matched by the per-ask ref
+  # (the stale-decision discipline). An answer — including the explicit
+  # dismissed one — records the result and continues the batch; the model
+  # always receives an answer, never a silent drop.
+  def handle_info(
+        {:question_decision, ref, {:answered, labels}},
+        %__MODULE__{tool_slot: {:asking, ref, call}} = state
+      )
+      when is_list(labels) do
+    state = %{state | tool_slot: :none}
+    answered = %{ok: true, answers: labels}
+    display(state.ui, {:tool_result, tool_result_msg(call, answered)})
+    record_and_continue(state, call, answered)
+  end
+
+  def handle_info(
+        {:question_decision, ref, :dismissed},
+        %__MODULE__{tool_slot: {:asking, ref, call}} = state
+      ) do
+    state = %{state | tool_slot: :none}
+    dismissed = %{ok: false, cancelled: true}
+    display(state.ui, {:tool_result, tool_result_msg(call, dismissed)})
+    record_and_continue(state, call, dismissed)
+  end
+
+  # A stale question decision (its ask was superseded) is ignored.
+  def handle_info({:question_decision, _ref, _decision}, state), do: {:noreply, state}
 
   # Esc always interrupts (ADR 0007 §4). A running tool is CANCELLED BY
   # MESSAGE, not killed: the exec loop reaps the command's process group on
@@ -924,6 +954,12 @@ defmodule DashFloat.Agent do
   # Safe tools dispatch with no preview, ever; mutating and risky calls build
   # their preview first in every mode (ADR 0016 §4) and the gate outcome
   # decides what follows it.
+  #
+  # The question tool (#134, ADR 0028) is intercepted BEFORE the gate: it is
+  # not an action to gate but a question to ask — safe in every mode, and in
+  # AUTO precisely the sanctioned way the model reaches the human.
+  defp pre_tool_use(state, %{name: "question"} = call), do: ask_user(state, call)
+
   defp pre_tool_use(state, call) do
     class = Tools.class(call.name)
 
@@ -931,6 +967,24 @@ defmodule DashFloat.Agent do
       {:safe, :run} -> dispatch_runner(state, call)
       {_class, outcome} -> with_preview(state, call, outcome)
     end
+  end
+
+  # The ask-user seam (#134, ADR 0028): the choice widget replaces the
+  # composer (the {:confirm, _} arm's mirror — one widget, two askers), the
+  # slot parks on the asker's ref, and the batch waits for the decision.
+  # Herdr reports blocked with the question text (ADR 0024's amendment).
+  defp ask_user(state, call) do
+    %{"question" => question, "options" => options, "multiple" => multiple} = call.args
+    ref = make_ref()
+
+    display(state.ui, {:phase, :asking})
+
+    display(
+      state.ui,
+      {:question, ref, %{question: question, options: options, multiple: multiple}}
+    )
+
+    {:noreply, %{state | tool_slot: {:asking, ref, call}}}
   end
 
   defp with_preview(state, call, outcome) do
@@ -1038,34 +1092,62 @@ defmodule DashFloat.Agent do
       # exactly the plan path in resolve_gate (ADR 0016 §4).
       :propose -> resolve_gate(state, call, :propose, preview)
       # Switched to build mid-check: the confirm arms regardless of the
-      # verdict, with an entry truthful to what happened.
+      # verdict, with an entry truthful to what happened — the mode is BUILD
+      # now, so a prompt is correct (ADR 0016 §3's re-read rule).
       :confirm -> vet_confirm(state, call, preview, vet_entry(verdict))
-      # The gate is still :vet: the verdict decides (ADR 0016 §6).
+      # The gate is still :vet (AUTO): the verdict resolves binary —
+      # allow runs, everything else auto-rejects (ADR 0028's 0016 amendment).
       :vet -> resolve_verdict(state, call, preview, verdict)
     end
   end
 
-  defp resolve_verdict(state, call, preview, {:allow}) do
-    run_with_receipt(state, call, preview)
+  # AUTO resolves binary (#135, ADR 0016's 0028 amendment): an allow runs,
+  # everything else — an ask verdict, a failed check, an out-of-contract
+  # verdict — AUTO-REJECTS with a visible reason. No resolution of a live
+  # :vet gate may arm a prompt; the owner's spec is binary by construction.
+  defp resolve_verdict(state, call, preview, {:allow}), do: run_with_receipt(state, call, preview)
+
+  defp resolve_verdict(state, call, preview, {:ask, reason}),
+    do: auto_reject(state, call, preview, reason_text(reason))
+
+  defp resolve_verdict(state, call, preview, {:error, reason}),
+    do: auto_reject(state, call, preview, "safety check unavailable — " <> reason_text(reason))
+
+  defp resolve_verdict(state, call, preview, _out_of_contract),
+    do: auto_reject(state, call, preview, "safety check returned an unusable verdict")
+
+  # The vetter seam is injectable: a reason that is not a binary (or a
+  # verdict the contract never promised) must still render, never crash the
+  # GenServer mid-batch.
+  defp reason_text(reason) when is_binary(reason), do: reason
+  defp reason_text(other), do: inspect(other)
+
+  # The AUTO-reject (#135, ADR 0028): the preview lands as the receipt of
+  # what was refused, a system entry carries the reason, and the model
+  # receives `{"ok":false,"blocked":"auto","reason":…}` so it can adapt —
+  # recorded in the transcript (the tool message persists) and visible in
+  # the log, never a prompt.
+  defp auto_reject(state, call, preview, reason) do
+    display(state.ui, {:tool_preview, preview})
+    display(state.ui, {:entry, :system, "[auto: rejected #{call.name} — #{reason}]"})
+
+    rejected = %{ok: false, blocked: "auto", reason: reason}
+    display(state.ui, {:tool_result, tool_result_msg(call, rejected)})
+    record_and_continue(state, call, rejected)
   end
 
-  defp resolve_verdict(state, call, preview, verdict) do
-    vet_confirm(state, call, preview, vet_entry(verdict))
-  end
-
-  # The confirm-arming entry names what actually happened. An {:allow}
-  # reaches vet_entry only on a mid-check re-gate to :confirm — there it adds
-  # no safety-check line (nothing asked, nothing failed); under a live :vet
-  # gate an allow never reaches vet_entry at all (it runs with the receipt).
+  # The confirm-arming entry names what actually happened. These shapes are
+  # reachable ONLY on a mid-check re-gate to :confirm (the user switched to
+  # BUILD while the check was in flight — a prompt is correct there): under
+  # a live :vet gate every non-allow verdict takes auto_reject above.
   defp vet_entry({:allow}), do: nil
-  defp vet_entry({:ask}), do: "[safety check: needs confirmation]"
+  defp vet_entry({:ask, _reason}), do: "[safety check: needs confirmation]"
 
   defp vet_entry({:error, _reason}),
     do: "[safety check unavailable — confirming]"
 
-  # Fail-safe (ADR 0016 §6's fail-closed direction): any out-of-contract
-  # verdict — an injected or regressed vetter — confirms instead of crashing
-  # the batch mid-check.
+  # Fail-safe for an out-of-contract verdict — an injected or regressed
+  # vetter — confirms instead of crashing the batch mid-check.
   defp vet_entry(_other), do: "[safety check unavailable — confirming]"
 
   # Ask, failure, and a mid-check switch to build all arm BUILD's confirm on

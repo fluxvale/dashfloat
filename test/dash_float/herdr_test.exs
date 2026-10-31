@@ -31,7 +31,7 @@ defmodule DashFloat.HerdrTest do
     Map.merge(
       %{
         phase: :idle,
-        confirm: nil,
+        question: nil,
         exit_prompt: false,
         setup: false,
         session_id: nil,
@@ -89,11 +89,17 @@ defmodule DashFloat.HerdrTest do
       assert Herdr.state_for(checking) == {:working, nil}
     end
 
-    test "a pending confirm reports blocked, naming the tool decision" do
+    # ADR 0024's 0028 amendment: the blocked message carries the QUESTION
+    # TEXT itself — an approval's "Approve <tool>?" or the model's question.
+    test "a pending question reports blocked, carrying the question text" do
       assert Herdr.phase_state(:confirming) == :blocked
+      assert Herdr.phase_state(:asking) == :blocked
 
-      confirm = shot(phase: :confirming, confirm: "bash")
-      assert Herdr.state_for(confirm) == {:blocked, "approve bash"}
+      approve = shot(phase: :confirming, question: "Approve bash?")
+      assert Herdr.state_for(approve) == {:blocked, "Approve bash?"}
+
+      ask = shot(phase: :asking, question: "Which database?")
+      assert Herdr.state_for(ask) == {:blocked, "Which database?"}
     end
 
     test "the armed exit prompt reports blocked with its message" do
@@ -106,17 +112,22 @@ defmodule DashFloat.HerdrTest do
       assert {:blocked, "first-run setup: choose a provider"} = Herdr.state_for(setup)
     end
 
-    test "precedence: the pending confirm outranks the exit prompt and setup" do
-      pending = shot(phase: :confirming, confirm: "edit", exit_prompt: true, setup: true)
-      assert {:blocked, "approve edit"} = Herdr.state_for(pending)
+    test "precedence: the pending question outranks the exit prompt and setup" do
+      pending =
+        shot(phase: :confirming, question: "Approve edit?", exit_prompt: true, setup: true)
+
+      assert {:blocked, "Approve edit?"} = Herdr.state_for(pending)
 
       guard_only = shot(exit_prompt: true, setup: true)
       assert {:blocked, "exit? press Ctrl+C again"} = Herdr.state_for(guard_only)
     end
 
-    test "the post-decision confirming gap (no pending confirm) stays blocked for its blink" do
+    test "the post-decision confirming gap (no pending question) stays blocked for its blink" do
       gap = shot(phase: :confirming)
       assert Herdr.state_for(gap) == {:blocked, nil}
+
+      ask_gap = shot(phase: :asking)
+      assert Herdr.state_for(ask_gap) == {:blocked, nil}
     end
   end
 
@@ -207,11 +218,11 @@ defmodule DashFloat.HerdrTest do
     end
 
     test "the message rides the params" do
-      report_once(confirm: "bash")
+      report_once(question: "Approve bash?")
 
       assert_receive {:herdr, %{method: "pane.report_agent", params: params}}
       assert params.state == "blocked"
-      assert params.message == "approve bash"
+      assert params.message == "Approve bash?"
     end
 
     test "a named session follows with the resume command as its own request" do

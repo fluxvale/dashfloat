@@ -1,6 +1,6 @@
 # 0007 — Tool calls & execution: the agent loop, five tools, safety policy, confirmations
 
-- **Status:** Accepted (§4's confirmation lists are amended by [ADR 0016](0016-interaction-modes.md))
+- **Status:** Accepted (§4's confirmation lists are amended by [ADR 0016](0016-interaction-modes.md); the five-tool catalogue gains a sixth tool, `question`, amended 2026-10-31 by [ADR 0028](0028-choice-widget-and-ask-user.md))
 - **Date:** 2026-10-24
 - **Implements:** [issue #18](https://github.com/fluxvale/dashfloat/issues/18) — Phase 3 of the
   [ADR 0001](0001-founding-stack-and-architecture.md) roadmap.
@@ -35,6 +35,14 @@ plain message; a tool failure is a *result*, never a crash.
 | `edit_file` | `path`, `search_block`, `replace_block` (all required) — exact-string match, must match exactly once |
 | `execute_command` | `command` (required), `cwd` (default `"."`) — a shell command line, run with `sh -c` semantics |
 | `list_directory` | `path` (default `"."`) |
+
+*(Amended 2026-10-31, [ADR 0028](0028-choice-widget-and-ask-user.md): a sixth
+tool `question` — `question` (string, required), `options` (1–10 objects of
+nonempty `label` + optional `description`), `multiple` (boolean, default
+false) — lets the model ask the user a structured question. It is classed
+`:safe` and intercepted at the PreToolUse seam BEFORE the gate: asking is not
+an action to gate. ADR 0021 later added the synthetic-gated `web_search`
+beside these.)*
 
 Providers without tool support fail through ADR-0005's HTTP error taxonomy — a chat entry,
 not a crash.

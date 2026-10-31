@@ -17,6 +17,9 @@ when its tag is cut.
 - Model reasoning renders as a small collapsible block — Octofriend-style, thinking never floods the chat: the collapsed form is one summary line (`◔ Thinking · 342 tokens · 8.1s`), the expanded form an eight-row window over the full content, scrollable from the inside by keys (while focused) or the wheel (by position). While the model thinks the block grows live in a tail-following window, and a thinking turn's full reasoning persists in the transcript (`reasoning_content`) and replays on resume (ADR 0005 + ADR 0006 amendments) (#78).
 
 - The Herdr done-notification is verified working and its semantics documented: DashFloat's existing reports already drive Herdr's derived `done` status — the working→idle turn end (or a blocked→idle, which the exit-guard expiry also produces) on a pane the user isn't watching yields the badge + chime, and the toast when `[ui.toast]` delivery is enabled (the owner's stock config has it off); a completion that lands while DashFloat's tab is being watched never notifies — Herdr marks the pane seen by design — so short turns finish silently unless the user has switched away first (ADR 0024 §8, evidence in `docs/screenshots/132/`) (#132).
+- Approvals render as a multiple-choice question in the input field: the composer is temporarily replaced by `Approve <tool>?` with a fixed [Approve, Reject] choice set — arrows + Enter answer, Esc rejects — and any in-flight draft is preserved underneath and restored after (#133).
+- A `question` tool for the model: asks the user a direct question (labelled options, single- or multi-select with Space toggling) through the same choice widget; answers return to the model as the tool result so it acts on them, and Esc answers an explicit `cancelled` — never a silent drop (#134).
+- Auto mode never asks permission: safe calls execute silently; dangerous calls auto-reject with the safety check's reason, recorded in the transcript and returned to the model as `{"ok":false,"blocked":"auto","reason":…}` so it can adapt. A failed check rejects too — AUTO's gray default — instead of prompting (#135).
 
 - Quitting DashFloat with an ongoing session prints the command that reopens it — `dashfloat --resume <title-or-id>`, the title (shell-quoted) when one is set, else the UUIDv7 id; nothing prints when nothing persisted (#127).
 - `/resume` opens a keyboard-navigable picker over saved sessions — title or first-message preview, relative time, provider · model, most recent first; Enter switches in place, Esc cancels untouched (#128).
@@ -27,6 +30,7 @@ when its tag is cut.
 
 ### Changed
 
+- Herdr's blocked-with-message now carries the pending question's text itself — `Approve write_file?` for an approval, the model's question verbatim for an ask — instead of `approve <tool>` (#133 #134).
 - Dependency bump: `ex_ratatui` 0.17.1 → 0.19.0 (`rustler_precompiled` rides to 0.10.1; OTP 29 now loads its own NIF-2.18 precompile instead of the 2.17 ABI build). Rendered output verified pixel-identical by frame-hash comparison of pty captures, and the idle cursor blink re-measured at its recorded 2.0 renders/s / ~50 B per frame.
 - The transcript snaps to its tail only when a message is sent (Enter — messages and commands alike); typing, pasting, drops, chip pops, and completions leave the view exactly where the reader parked it, and a reply arriving while scrolled up never yanks it. Reverses #110's typing snap, with the owner's reasoning recorded in ADR 0006 (#131).
 

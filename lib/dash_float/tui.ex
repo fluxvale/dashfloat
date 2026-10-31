@@ -26,6 +26,7 @@ defmodule DashFloat.TUI do
   alias DashFloat.Config.Onboarding
   alias DashFloat.Herdr
   alias DashFloat.Session
+  alias DashFloat.TUI.Choice
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Suggest
@@ -156,9 +157,10 @@ defmodule DashFloat.TUI do
   def handle_event(%ExRatatui.Event.Mouse{}, state),
     do: {:noreply, state, %{render?: false}}
 
-  # Confirmation mode swallows pastes too — nothing may reach the draft
-  # mid-decision (ADR 0007).
-  def handle_event(%ExRatatui.Event.Paste{}, %{confirm: pending} = state) when pending != nil,
+  # A pending choice swallows pastes too — nothing may reach the draft while
+  # the composer is replaced (the confirm rule, ADR 0007 §4; ADR 0028 extends
+  # it to questions).
+  def handle_event(%ExRatatui.Event.Paste{}, %{choice: %Choice{}} = state),
     do: schedule(state)
 
   # The startup phase owns PASTE as well as keys (P1-2, hostile review): the
@@ -216,6 +218,20 @@ defmodule DashFloat.TUI do
 
   defp run_action({:submit, prompt, paths}, state), do: prompt_agent(prompt, paths, state)
   defp run_action({:confirm, decision}, state), do: confirm_decision(decision, state)
+
+  defp run_action({:question_answer, answer}, %{choice: %Choice{ref: ref}} = state) do
+    send(state.agent, {:question_decision, ref, answer})
+    State.question_decided(state)
+  end
+
+  # A race-belt: the answer's choice was already superseded by a phase
+  # message — nothing to echo, the composer is already restored.
+  # coveralls-ignore-start
+  # Unreachable in-process (the route that emits the action and the action
+  # read the same state within one event); the belt exists for the day the
+  # runner's action pipeline gains a defer point.
+  defp run_action({:question_answer, _answer}, state), do: state
+  # coveralls-ignore-stop
   defp run_action(:cancel, state), do: cancel_agent(state)
   defp run_action({:select_profile, name}, state), do: resolve_setup(state, name)
   defp run_action(:setup_finish, state), do: resolve_setup(state, nil)
@@ -408,6 +424,10 @@ defmodule DashFloat.TUI do
   def handle_info({:confirm, _ref, _payload} = msg, state),
     do: schedule(State.stream_message(state, msg))
 
+  # The ask-user seam (#134, ADR 0028): same shape as the confirm arm.
+  def handle_info({:question, _ref, _payload} = msg, state),
+    do: schedule(State.stream_message(state, msg))
+
   # A fresh session's id was minted at first save (ADR 0023/0024): the agent
   # is the single voice; the reporter re-reports with the resume command
   # attached once the id is known.
@@ -529,7 +549,10 @@ defmodule DashFloat.TUI do
 
     shot = %{
       phase: state.phase,
-      confirm: if(state.confirm, do: state.confirm.name),
+      # The pending decision's question text, whatever asked it (ADR 0024's
+      # amendment, ADR 0028): "Approve <tool>?" for an approval, the model's
+      # question verbatim for an ask.
+      question: pending_question(state),
       exit_prompt: state.exit_guard_at != nil,
       setup: state.setup != nil,
       session_id: state.session_id,
@@ -539,6 +562,18 @@ defmodule DashFloat.TUI do
 
     %{state | herdr: Herdr.report(state.herdr, shot)}
   end
+
+  # One flattened, capped line — the blocked message must stay one row of
+  # Herdr's sidebar (model-authored text can carry newlines).
+  @herdr_question_cap 120
+
+  defp pending_question(%State{choice: %Choice{question: question}}) do
+    question
+    |> String.replace("\n", " ")
+    |> String.slice(0, @herdr_question_cap)
+  end
+
+  defp pending_question(%State{}), do: nil
 
   defp schedule_tick(state) do
     cond do

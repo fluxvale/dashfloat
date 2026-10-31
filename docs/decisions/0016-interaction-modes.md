@@ -4,7 +4,12 @@
   PreToolUse addendum are folded in; renumbered from a draft "0014" by PA arbitration —
   0014 is session persistence, 0015 is reserved for the parked LSP lane and appears in
   the index when that lane merges; amended post-hostile-review Oct 29: gate re-read at
-  check resolution, fence-free byte-capped vet payload)
+  check resolution, fence-free byte-capped vet payload; **amended 2026-10-31 by
+  [ADR 0028](0028-choice-widget-and-ask-user.md)** (issues #133/#135): §6's vet
+  resolution becomes BINARY — ask and every check failure auto-reject, never confirm —
+  and the approval's choice set is recorded; see
+  [Amendment (2026-10-31, ADR 0028): AUTO resolves binary; approvals are a two-choice question](#amendment-2026-10-31-adr-0028-auto-resolves-binary-approvals-are-a-two-choice-question)
+  below)
 - **Date:** 2026-10-29
 - **Implements:** [issue #68](https://github.com/fluxvale/dashfloat/issues/68) — the owner's
   v0.1.1 test-drive feedback.
@@ -86,7 +91,9 @@ twelve cells:
 
 The bold build column is ADR 0007 §4 (the amendment is behavior-preserving in the
 default mode). `:vet` resolves dynamically (§6): **allow → run; ask, or any check
-failure → confirm.** `:plan` still runs safe tools — a planning model that cannot read
+failure → confirm.** *(Superseded 2026-10-31, ADR 0028's amendment below: a live
+`:vet` resolves binary — allow → run, everything else → auto-reject, never a
+prompt.)* `:plan` still runs safe tools — a planning model that cannot read
 cannot plan.
 
 The gate is read **per call at dispatch time** — and re-read when a deferred
@@ -198,7 +205,9 @@ ADRs 0012/0013 just de-raced.
 error, timeout, unparseable reply — resolves to **confirm**, with a dim system entry
 `[safety check unavailable — confirming]`. AUTO with a broken check degrades to BUILD
 for mutating/risky calls, never to UNCHAINED. A check that says ask gets
-`[safety check: needs confirmation]` and the standard confirm flow.
+`[safety check: needs confirmation]` and the standard confirm flow. *(Superseded
+2026-10-31 by the ADR 0028 amendment below: both arms — ask and every failure —
+auto-reject with a visible reason instead; AUTO never asks.)*
 
 **Lifecycle.** The vetter runs as a `restart: :temporary` task under the TaskSupervisor
 and reports `{:vet_done, check_ref, id, verdict}` — the check ref is minted at
@@ -364,3 +373,75 @@ moves. Specifically:
   Claude-Code-compatible, escalate-only ordering); building that system is out of scope
   here.
 - ADR 0007's interface freeze loses the private `automatic?/1` and gains the seam above.
+
+## Amendment (2026-10-31, ADR 0028): AUTO resolves binary; approvals are a two-choice question
+
+**Status:** Accepted. The owner's v0.4.0 smoke test
+([#135](https://github.com/fluxvale/dashfloat/issues/135)) reversed §6's
+v1 resolution rule: *"I noticed that the agent still asked for permission
+despite being on Auto mode. It shouldn't be asking permission in the first
+place. It should either just do the command or reject it automatically if
+it deems the command to be dangerous."* The leak was §6's own recorded
+design — "ask, or any check failure → confirm" — one class: **every
+`{:vet}` resolution except allow** armed the BUILD prompt. [#133](https://github.com/fluxvale/dashfloat/issues/133)
+simultaneously moved the approval UI into the composer as a choice
+question ([ADR 0028](0028-choice-widget-and-ask-user.md) is the widget's
+home). Supersedes:
+
+- §3's `:vet` resolution line — was "**allow → run; ask, or any check
+  failure → confirm.**" Now: **allow → run; everything else →
+  auto-reject.** No live-`:vet` resolution may arm a prompt.
+- §6's fallback paragraph — was "resolves to **confirm**, with a dim
+  system entry `[safety check unavailable — confirming]`. AUTO with a
+  broken check degrades to BUILD for mutating/risky calls." Now: resolves
+  to **auto-reject** — `[auto: rejected <tool> — safety check unavailable
+  — <reason>]`. AUTO with a broken check still never degrades to
+  UNCHAINED; it fails closed by refusing, not by asking.
+- §6's closing line — was "A check that says ask gets `[safety check:
+  needs confirmation]` and the standard confirm flow." Now: a check that
+  says ask auto-rejects **with the check's reason** (the vetter's
+  `"reason"` field, previously accepted and ignored, now surfaces — one
+  line, capped at 160).
+
+The binary spec, stated once:
+
+1. **Safe → execute silently.** Unchanged (§3's matrix: safe × any mode =
+   run; no preview, no check, no prompt).
+2. **Dangerous → auto-reject with a visible reason.** The dangerous
+   classification criteria ARE §6's rubric — destructive, irreversible,
+   outside the project, credentials or secrets, network mutation (push,
+   deploy), installing from the network, privilege escalation, force
+   operations → reject; routine, reversible, project-scoped work (builds,
+   tests, searches, in-project edits, lockfile-driven installs) → run.
+   The reject lands three places: the preview entry (the receipt of what
+   was refused), a system entry `[auto: rejected <tool> — <reason>]`, and
+   the model's result `{"ok":false,"blocked":"auto","reason":…}` — the
+   transcript's persisted tool message, so the model adapts and the
+   session file records it.
+3. **No gray-zone prompts; the gray default is reject.** Any check
+   failure — HTTP error, provider taxonomy error, timeout, unparseable
+   reply, a vetter death its body could not report, an out-of-contract
+   verdict — auto-rejects with an "unavailable" reason. The fail-safe
+   direction is unchanged (never UNCHAINED); only its expression moved
+   from confirm to reject, because AUTO's contract is that it never asks.
+
+Unchanged: the mid-check mode re-read (§3) — a switch mid-check to
+UNCHAINED runs, to PLAN proposes, to **BUILD arms the confirm** (the mode
+is BUILD then; prompting is what BUILD promises — the entries of the old
+`vet_confirm` path survive for exactly that arm). Also unchanged: the
+approval's arming seam — `{:confirm, ref, preview}` still arms
+`:confirming` in BUILD; the UI renders it as the choice question. **The
+approval's exact choice set** ([#133](https://github.com/fluxvale/dashfloat/issues/133)'s
+decide + record): **[Approve, Reject]** — single-select, arrows + Enter,
+Esc = Reject — identical for both prompt-bearing classes (`:mutating` and
+`:risky`, the only classes whose gate can be `:confirm`). A third
+"Always-allow-this-tool" choice stays deferred with this ADR's recorded
+alternative (per-call whitelisting is agent-side session state — a later
+lane). The AUTO side answers its own questions: the safety check plays
+the human on exactly the evidence the human sees, so AUTO needs no
+approval choice at all — that is the mode's point.
+
+One addition beside the matrix: the `question` tool (ADR 0028) is
+intercepted BEFORE the gate — safe in every mode, AUTO included, because
+asking the user a question is the one interaction AUTO cannot and should
+not suppress.

@@ -8,6 +8,7 @@ defmodule DashFloat.TUI.View do
 
   alias DashFloat.Config.Onboarding
   alias DashFloat.Mode
+  alias DashFloat.TUI.Choice
   alias DashFloat.TUI.Palette
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
@@ -28,7 +29,8 @@ defmodule DashFloat.TUI.View do
     streaming: {"Streaming", :status_busy},
     executing_tool: {"Running tool", :status_tool},
     checking: {"Checking", :status_tool},
-    confirming: {"Confirm", :status_tool}
+    confirming: {"Confirm", :status_tool},
+    asking: {"Asking", :status_tool}
   }
 
   # The mode span's role (ADR 0016 §8) — display truth, kept local to the
@@ -820,16 +822,38 @@ defmodule DashFloat.TUI.View do
   end
 
   defp activity_label(%{phase: :confirming}), do: "Approve this change?"
+  defp activity_label(%{phase: :asking}), do: "Waiting for your answer…"
   defp activity_label(%{phase: :executing_tool}), do: "Running tool…"
   defp activity_label(%{phase: :checking}), do: "Checking…"
   defp activity_label(%{stats: %{tokens: 0}}), do: "Thinking…"
   defp activity_label(_state), do: "Streaming…"
 
-  # The confirming decision replaces the interrupt hint (Esc rejects there).
+  # The confirming decision replaces the interrupt hint (Esc rejects there);
+  # so does a pending question (Esc dismisses — an explicit cancelled answer,
+  # never silent, ADR 0028).
   defp activity_hint(%{phase: :confirming}), do: "  ⏎ approve · esc reject"
+  defp activity_hint(%{phase: :asking}), do: "  esc dismiss"
   defp activity_hint(_state), do: "  esc interrupt"
 
   ## Input
+
+  # A pending choice (ADR 0028) temporarily REPLACES the composer: the same
+  # rounded box the textarea lives in carries the question, the options, and
+  # the answer hints instead. The textarea's own state is untouched
+  # underneath — the draft is preserved by construction and restores the
+  # moment the choice resolves.
+  defp input_widget(%State{choice: %Choice{} = choice} = _state) do
+    %Paragraph{
+      text: choice_lines(choice),
+      block: %Block{
+        title: Span.new("❯ ", style: Theme.style(:accent)),
+        borders: [:all],
+        border_type: :rounded,
+        border_style: Theme.style(:dim)
+      },
+      scroll: {0, 0}
+    }
+  end
 
   defp input_widget(state) do
     %Textarea{
@@ -876,6 +900,64 @@ defmodule DashFloat.TUI.View do
 
     Span.new("❯ " <> chips, style: Theme.style(:accent))
   end
+
+  # The choice widget's rows (ADR 0028), matching `Choice.height/1` exactly:
+  # the question, a blank, one row per option (two when it carries a
+  # description), a blank, and the hint row. Long labels and descriptions
+  # clip at the box's width — the height arithmetic stays count-based (the
+  # wizard's option-list vocabulary: ❯ selected, dim otherwise).
+  defp choice_lines(%Choice{} = choice) do
+    [
+      Line.new([Span.new(choice.question, style: Theme.style(:assistant))]),
+      Line.new([Span.new("")])
+    ] ++
+      option_rows(choice) ++
+      [Line.new([Span.new("")], style: Theme.style(:dim)), choice_hint(choice)]
+  end
+
+  defp option_rows(%Choice{} = choice) do
+    choice.options
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {option, index} -> option_row(choice, option, index) end)
+  end
+
+  defp option_row(%Choice{} = choice, option, index) do
+    marker = if index == choice.selected, do: "❯ ", else: "  "
+    box = if index in choice.checked, do: "[x] ", else: "[ ] "
+
+    label =
+      if choice.multi?,
+        do: marker <> box <> option.label,
+        else: marker <> option.label
+
+    row = Line.new([Span.new(label, style: option_style(choice, index))])
+
+    case option.description do
+      nil ->
+        [row]
+
+      description ->
+        [row, Line.new([Span.new("    " <> description, style: Theme.style(:dim))])]
+    end
+  end
+
+  defp option_style(%Choice{selected: selected}, index)
+       when index == selected,
+       do: Theme.style(:accent)
+
+  defp option_style(_choice, _index), do: Theme.style(:dim)
+
+  defp choice_hint(%Choice{kind: :approve}),
+    do: Line.new([Span.new("↑↓ move · ⏎ answer · esc reject", style: Theme.style(:hint))])
+
+  defp choice_hint(%Choice{multi?: true}),
+    do:
+      Line.new([
+        Span.new("↑↓ move · space toggle · ⏎ answer · esc dismiss", style: Theme.style(:hint))
+      ])
+
+  defp choice_hint(%Choice{}),
+    do: Line.new([Span.new("↑↓ move · ⏎ answer · esc dismiss", style: Theme.style(:hint))])
 
   # The composer's cursor artifact (ADR 0015 §1, amended by issue #104):
   # absent while the pane is unfocused, a 500 ms on/off blink while idle —
