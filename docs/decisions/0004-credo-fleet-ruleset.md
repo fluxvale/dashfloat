@@ -85,3 +85,31 @@ gain.
 check parameters cannot be scoped per file — 40 was chosen as the smallest
 whole number above the struct's actual size, so any future field creep past
 40 still fails the gate.
+
+**Rider (2026-10-30, [issue #67](https://github.com/fluxvale/dashfloat/issues/67)
+stage 2):** the gate fired exactly as designed — the footer's context
+snapshot carry ([ADR
+0015](0015-input-surface-cursor-stats-ghost.md) §2's stage-2 amendment)
+is field 41, same flat-struct rationale (pure data the render contract
+reads whole; nesting it into the numeric `stats` map would muddy that
+type). `max_fields` moves to 41 — again the smallest whole number above
+the actual size, so the creep gate stands.
+
+**Rider (2026-10-31, [issue #106](https://github.com/fluxvale/dashfloat/issues/106)):**
+the title and its dialog ([ADR
+0023](0023-session-titles-and-uuid-ids.md)'s 2026-10-31 amendment) are
+fields 44 and 45 — the dialog is the attach prompt's shape (a pure
+draft+error map the key router and the view read whole). `max_fields`
+moves to 45, again the smallest whole number above the actual size, so
+the creep gate stands.
+
+**Rider (2026-10-31, [issue #104](https://github.com/fluxvale/dashfloat/issues/104)):**
+the idle blink's phase/timer/cadence ([ADR
+0006](0006-ui-truth-and-rendering.md)'s 2026-10-31 blink amendment) are
+three more flat fields — the blink timer lives in the TUI process but its
+display phase and injected cadence are pure state the router, view, and
+schedule choke point read whole (the tick's `anim_step`/`tick_ref` pair is
+the direct precedent). Numbered against the #113 Herdr rider's landing
+between design and rebase, they are fields 48–50. `max_fields` moves to
+50, again the smallest whole number above the actual size, so the creep
+gate stands.

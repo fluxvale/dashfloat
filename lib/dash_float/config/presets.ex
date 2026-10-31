@@ -32,6 +32,25 @@ defmodule DashFloat.Config.Presets do
   @spec all() :: [preset()]
   def all, do: @presets
 
+  # The footer's provider labels (ADR 0015 §2's amendment, issue #109),
+  # keyed by base URL exactly like the suggest table: a preset URL ALWAYS
+  # reads its preset label, even when the settings entry carries a
+  # host-defaulted label — the presets are the first-class providers.
+  @labels Map.new(@presets, fn preset ->
+            {String.trim_trailing(preset.base_url, "/"), preset.label}
+          end)
+
+  @doc """
+  The provider's display label (issue #109), keyed by base URL; nil for
+  custom providers (the caller falls back to the settings label, then the
+  URL host). The URL is normalized like `suggest_model/1`'s (a trailing
+  slash is convention, not identity), so a preset URL pasted with one still
+  resolves.
+  """
+  @spec label(String.t()) :: String.t() | nil
+  def label(base_url),
+    do: Map.get(@labels, String.trim_trailing(base_url, "/"))
+
   # The provider→cheap-side-request-model table (ADR 0015 §3): the
   # officially supported presets ship one each — the owner's budget call
   # (cheap tier = low spend by default). A custom OpenAI-compatible provider
@@ -40,6 +59,56 @@ defmodule DashFloat.Config.Presets do
     "https://api.z.ai/api/coding/paas/v4" => "glm-5.3-flash",
     "https://api.synthetic.new/openai/v1" => "glm-4.7-flash"
   }
+
+  # The seeded per-model context windows (issue #111, ADR 0022 §2
+  # amendment): the standard presets' real windows, so a stock config —
+  # whose settings entries carry no `context` — works out of the box.
+  # Z.AI's numbers are the officially documented 1M-token windows of the
+  # current GLM generation (docs.z.ai, GLM-5.3 and GLM-5.2 model pages:
+  # "Context Length 1M"); the coding endpoint's `/models` carries no
+  # context metadata to discover them from. Synthetic's are its live
+  # catalog's `context_length` values (probed 2026-10-30); its endpoint
+  # DOES carry metadata, so observed values refresh past these at every
+  # startup. Older Z.AI ids (glm-4.x, glm-5.x < 5.2) are absent on
+  # purpose: unverified numbers are guesses, and the documented default
+  # with its visible note is the honest floor.
+  @context_windows %{
+    "https://api.z.ai/api/coding/paas/v4" => %{
+      "glm-5.2" => 1_048_576,
+      "glm-5.3" => 1_048_576,
+      "glm-5.3-flash" => 1_048_576,
+      "glm-5.3-flashx" => 1_048_576
+    },
+    "https://api.synthetic.new/openai/v1" => %{
+      "infinite:small:vision" => 524_288,
+      "syn:large:text" => 524_288,
+      "syn:large:vision" => 524_288,
+      "syn:small:text" => 196_608,
+      "syn:small:vision" => 524_288
+    }
+  }
+
+  # The documented fallback when no source knows the model (issue #111):
+  # 128 Ki — conservative for the current model generation — and always
+  # surfaced with the visible note, never silent.
+  @default_window 131_072
+
+  @doc """
+  The seeded context window for a preset provider's model (issue #111),
+  keyed by base URL (normalized like `suggest_model/1`); nil when either
+  side is unknown to the seed table.
+  """
+  @spec context_window(String.t(), String.t()) :: pos_integer() | nil
+  def context_window(base_url, model),
+    do: get_in(@context_windows, [String.trim_trailing(base_url, "/"), model])
+
+  @doc """
+  The documented fallback window (issue #111): what a model absent from
+  every source — config, `/models` metadata, the seed table — degrades to,
+  visibly (the `~` footer marker and the note in `/compact`'s reply).
+  """
+  @spec default_window() :: 131_072
+  def default_window, do: @default_window
 
   @doc """
   The provider's default cheap suggestion model (ADR 0015 §3), keyed by

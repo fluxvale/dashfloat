@@ -106,6 +106,29 @@ defmodule DashFloat.AccountingTest do
       assert Accounting.estimate([message], nil) == 1
     end
 
+    test "a list-content message weighs the sum of its parts (ADR 0018 §2)" do
+      message = %{
+        role: "user",
+        content: [
+          %{type: "text", text: pad(40)},
+          %{type: "image_url", image_url: %{url: pad(80)}}
+        ]
+      }
+
+      assert Accounting.estimate([message], nil) == div(40, 4) + div(80, 4)
+
+      # The string-keyed twin (a loaded transcript) weighs identically.
+      loaded = stringify([message])
+
+      assert Accounting.estimate(loaded, nil) == div(40, 4) + div(80, 4)
+    end
+
+    test "a part of unknown shape weighs 0" do
+      message = %{role: "user", content: [%{"nope" => true}]}
+
+      assert Accounting.estimate([message], nil) == 0
+    end
+
     test "atom-keyed and string-keyed twins estimate identically" do
       messages = [
         user(300),

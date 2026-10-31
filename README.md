@@ -32,7 +32,7 @@ No Erlang or Elixir toolchain needed: the release bundles ERTS. The installer
 verifies the tarball's sha256 before extracting, installs into
 `~/.local/share/dashfloat/versions/<version>` behind a `current` symlink, puts
 a shim in `~/.local/bin`, and prunes the previous version on upgrade. Pin a
-version with `DASHFLOAT_VERSION=0.2.0`. On macOS, Homebrew is the native path
+version with `DASHFLOAT_VERSION=0.4.0`. On macOS, Homebrew is the native path
 (`brew install fluxvale/tap/dashfloat`), and unsigned builds need a one-time
 right-click-open — see the [release notes](https://github.com/fluxvale/dashfloat/releases).
 Linux builds need glibc 2.34+ (Debian 12+, Ubuntu 22.04+), OpenSSL 3,
@@ -106,14 +106,25 @@ skippable, files written 0600 as you go.
 key is `DASHFLOAT_API_KEY`, else `keys[profile][baseUrl of the active
 provider]`); `--model <nickname>` selects a model within the active
 provider's menu. A stray inline `apiKey` in settings.json5 is warned about
-and ignored — never a fallback. The status bar names the active model
-`nickname (profile)`. Put your provider's own base URL in `baseUrl`;
+and ignored — never a fallback. The status footer names the active
+provider and model `provider - model` (preset URL → `zai`/`synthetic`,
+else the settings label, else the URL host). Put your provider's own base
+URL in `baseUrl`;
 DashFloat appends `/chat/completions`. At startup DashFloat also refreshes
 the model catalog from each of the active profile's providers (`GET
-{baseUrl}/models`, fail-open, in-memory): its one visible effect today is
-the status bar's context denominator filling in for a selected model whose
-entry carried no `context` — fetched models are not added to your menus,
-and nothing is written back to your config.
+{baseUrl}/models`, fail-open, in-memory): a model's reported context window
+(`context_length`) refreshes the footer's denominator when your entry
+carried no `context` — fetched models are not added to your menus, and
+nothing is written back to your config.
+
+**The context window resolves itself** ([ADR 0022](docs/decisions/0022-context-accounting-and-compaction.md)'s
+#111 amendment): your entry's `context` (or `DASHFLOAT_CONTEXT_TOKENS`)
+wins; else the provider's `/models` metadata when it carries it; else the
+standard presets' seeded windows (the Z.AI GLM current generation's
+documented 1M windows, Synthetic's first-party catalog); else a documented
+128 Ki default — marked `~` in the footer (`1.2k/~131.1k · 0.9%`) and
+noted in `/compact`'s reply, naming the key to set. A stock config shows
+`used/window · percent` from boot; nothing is ever guessed silently.
 
 Profile settings also accept a `compaction` object (e.g.
 `settings: { compaction: { instructions: 'keep the design decisions' } }`) —

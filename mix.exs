@@ -4,7 +4,7 @@ defmodule DashFloat.MixProject do
   def project do
     [
       app: :dash_float,
-      version: "0.2.0",
+      version: "0.4.0",
       elixir: "~> 1.20.0",
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
@@ -109,12 +109,16 @@ defmodule DashFloat.MixProject do
     launcher = Path.join(release.path, "bin/#{release.name}")
     contents = File.read!(launcher)
 
+    # User flags ride AFTER `--`: forwarded bare, Elixir's own CLI treats
+    # them as files to run once the apps are up ("No file named --resume",
+    # exit 1 — found by the Herdr restore dance, issue #113). Past `--`
+    # they are pure System.argv and the boot sees them whole.
     contents =
       replace_launcher!(
         launcher,
         contents,
         ~s{  start)\n    start "elixir" --no-halt\n},
-        ~s{  start)\n    shift\n    start "elixir" --no-halt "$@"\n}
+        ~s{  start)\n    shift\n    start "elixir" --no-halt -- "$@"\n}
       )
 
     contents =

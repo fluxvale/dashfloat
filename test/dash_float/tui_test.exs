@@ -3,7 +3,7 @@ defmodule DashFloat.TUITest do
   App-level tests under `test_mode`: supervised lifecycle, teardown paths
   (including crashes), the agent seam (fake agents are this test process or
   plain spawned processes — the TUI only ever sends
-  `{:prompt, ui, text}` / `{:confirm_decision, ref, decision}` / `{:cancel}` /
+  `{:prompt, ui, text, paths}` / `{:confirm_decision, ref, decision}` / `{:cancel}` /
   `{:set_mode, ui, mode}` / `{:set_title, ui, title}` / `{:set_provider, _}`
   and receives the frozen stream contract, ADR 0007),
   and the responsiveness proof. Not async: they measure timing, share
@@ -203,7 +203,11 @@ defmodule DashFloat.TUITest do
         s.setup != nil and s.setup.step == :model_pick
       end)
 
-    assert picker.setup.fetched == ["glm-loopback", "other-one"]
+    assert picker.setup.fetched == [
+             %{model: "glm-loopback", context: nil},
+             %{model: "other-one", context: nil}
+           ]
+
     press(pid, "down")
     press(pid, "enter")
 
@@ -541,7 +545,10 @@ defmodule DashFloat.TUITest do
     popped =
       eventually(pid, fn s ->
         s.setup.step == :model_pick and s.setup.providers == [] and
-          s.setup.fetched == ["glm-loopback", "other-one"]
+          s.setup.fetched == [
+            %{model: "glm-loopback", context: nil},
+            %{model: "other-one", context: nil}
+          ]
       end)
 
     assert popped.setup.pending.models == []
@@ -991,7 +998,7 @@ defmodule DashFloat.TUITest do
         s.setup != nil and s.setup.step == :model_pick
       end)
 
-    assert picker.setup.fetched == ["glm-env"]
+    assert picker.setup.fetched == [%{model: "glm-env", context: nil}]
 
     keys_file = Path.join(dir, "keys.json5")
     assert {:ok, keys} = JSON5.read_map(keys_file)
@@ -1192,7 +1199,7 @@ defmodule DashFloat.TUITest do
     press(pid, "enter")
 
     # Submit is a plain send to the agent with our pid as the reply address.
-    assert_receive {:prompt, ui_pid, "hello tui"}, 1_000
+    assert_receive {:prompt, ui_pid, "hello tui", []}, 1_000
     assert ui_pid == pid
 
     # Mid-stream: the reply grows in flight (one token per message) and is
@@ -1213,9 +1220,10 @@ defmodule DashFloat.TUITest do
     assert state.history == ["hello tui"]
     assert system_entries(state) == []
 
-    # The footer under the composer names the configured model (label
-    # fallback chain, ADR 0015 §2); the status bar keeps phase truth.
-    assert State.provider_label(state) == "test-model"
+    # The footer under the composer names provider and model (ADR 0015 §2's
+    # amendment: no settings entry matches, so the host degrades in); the
+    # status bar keeps phase truth.
+    assert State.provider_label(state) == "localhost - test-model"
     assert footer_text(state) =~ "test-model"
     refute status_text(state) =~ "test-model"
     assert status_text(state) =~ "Idle"
@@ -1225,7 +1233,7 @@ defmodule DashFloat.TUITest do
     {:ok, pid} = start_tui(provider: provider())
     submit(pid, "stream for the footer")
 
-    assert_receive {:prompt, ui_pid, "stream for the footer"}, 1_000
+    assert_receive {:prompt, ui_pid, "stream for the footer", []}, 1_000
     send(ui_pid, {:token, "x"})
     Process.sleep(20)
     send(ui_pid, {:token, "x"})
@@ -1254,11 +1262,58 @@ defmodule DashFloat.TUITest do
     eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
   end
 
+  test "the footer's context span populates from an agent snapshot and reaches the screen" do
+    provider =
+      {:ok,
+       %Config{
+         base_url: "http://localhost:1",
+         model: "test-model",
+         api_key: "test-key-123",
+         context_tokens: 128_000
+       }}
+
+    {:ok, pid} = start_tui(provider: provider)
+    submit(pid, "stream for the footer")
+
+    assert_receive {:prompt, ui_pid, "stream for the footer", []}, 1_000
+
+    # Pre-snapshot: the span is hidden — no ratio anywhere in the footer.
+    blank = get_state(pid)
+    refute footer_text(blank) =~ "128k"
+
+    send(
+      ui_pid,
+      {:context,
+       %{
+         messages: [%{role: "user", content: "stream for the footer"}],
+         anchor: %{tokens: 4_100, index: 1}
+       }}
+    )
+
+    send(ui_pid, {:token, "x"})
+
+    state =
+      eventually(pid, fn s -> s.context != nil and s.in_flight != nil end)
+
+    # (a) Render-output seam: the span carries tokens-used and percent.
+    assert footer_text(state) =~ "4.1k/128k · 3.2%"
+
+    # (b) Drawn-buffer probe: the span reaches the screen.
+    term = ExRatatui.init_test_terminal(80, 24)
+    widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+    assert :ok = ExRatatui.draw(term, widgets)
+    buffer = ExRatatui.get_buffer_content(term)
+    assert buffer =~ "4.1k/128k"
+
+    send(ui_pid, {:phase, :idle})
+    eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
+  end
+
   test "Esc during streaming sends {:cancel} to the agent and the agent's ack lands" do
     {:ok, pid} = start_tui()
     submit(pid, "cancel me")
 
-    assert_receive {:prompt, ui_pid, "cancel me"}, 1_000
+    assert_receive {:prompt, ui_pid, "cancel me", []}, 1_000
     send(ui_pid, {:token, "partial"})
     eventually(pid, fn s -> s.in_flight == "partial" end)
 
@@ -1278,7 +1333,7 @@ defmodule DashFloat.TUITest do
 
     # Input is usable again.
     submit(pid, "again")
-    assert_receive {:prompt, ^ui_pid, "again"}, 1_000
+    assert_receive {:prompt, ^ui_pid, "again", []}, 1_000
   end
 
   # Shift+Tab rides the agent seam (ADR 0016 §7): send, then the echo applies.
@@ -1301,14 +1356,17 @@ defmodule DashFloat.TUITest do
   ## and the picker state; /model is proven END TO END with a real agent and
   ## the loopback server — the switch must reach the NEXT request.
 
-  test "/title delivers the rename seam: the typed title, then the bare empty one" do
+  test "/title delivers the rename seam: the typed title, then the dialog's submit" do
     {:ok, pid} = start_tui()
 
     submit(pid, "/title fix the login")
     assert_receive {:set_title, ^pid, "fix the login"}, 1_000
 
-    # A command submit never flips the phase, so the bare form follows directly.
+    # Bare /title opens the dialog; Enter submits its draft through the same
+    # seam — the agent owns validation either way.
     submit(pid, "/title")
+    eventually(pid, fn s -> s.title_dialog != nil end)
+    press(pid, "enter")
     assert_receive {:set_title, ^pid, ""}, 1_000
   end
 
@@ -1351,6 +1409,88 @@ defmodule DashFloat.TUITest do
 
     press(pid, "esc")
     eventually(pid, fn s -> s.palette == nil end)
+  end
+
+  ## The /title dialog (issue #106) driven through the app: the default fake
+  ## agent (this test process) answers with the title pushes.
+
+  describe "the /title dialog" do
+    defp open_dialog(pid) do
+      submit(pid, "/title")
+      eventually(pid, fn s -> s.title_dialog != nil end)
+    end
+
+    test "bare /title opens the dialog pre-filled from the mount title" do
+      {:ok, pid} = start_tui(title: "Booted Title")
+
+      state = open_dialog(pid)
+
+      assert state.title_dialog == %{draft: "Booted Title", error: nil}
+    end
+
+    test "enter sends the draft; the agent's {:title, _} closes the dialog and updates" do
+      {:ok, pid} = start_tui(title: "Old")
+
+      open_dialog(pid)
+      type(pid, "Name")
+      press(pid, "enter")
+
+      assert_receive {:set_title, ^pid, "OldName"}, 1_000
+
+      # The dialog is still open, error cleared, until the agent's reply.
+      assert get_state(pid).title_dialog == %{draft: "OldName", error: nil}
+
+      send(pid, {:title, "OldName"})
+      state = eventually(pid, fn s -> s.title_dialog == nil end)
+      assert state.title == "OldName"
+    end
+
+    test "the agent's {:title_refused, _} errors the open dialog, draft kept" do
+      {:ok, pid} = start_tui()
+      open_dialog(pid)
+      type(pid, "Taken")
+      press(pid, "enter")
+
+      assert_receive {:set_title, ^pid, "Taken"}, 1_000
+
+      reason = ~s("Taken" is already taken by session 0192aa10-b002-7c00-8000-00000000000c)
+      send(pid, {:title_refused, reason})
+
+      state = eventually(pid, fn s -> s.title_dialog.error != nil end)
+      assert state.title_dialog == %{draft: "Taken", error: reason}
+    end
+
+    test "esc closes the dialog and nothing is sent" do
+      {:ok, pid} = start_tui()
+
+      open_dialog(pid)
+      press(pid, "esc")
+
+      eventually(pid, fn s -> s.title_dialog == nil end)
+      refute_received {:set_title, _, _}
+    end
+
+    test "a paste feeds the open dialog's draft, not the composer" do
+      {:ok, pid} = start_tui()
+      open_dialog(pid)
+
+      inject(pid, %ExRatatui.Event.Paste{content: "pasted name\r\n"})
+
+      state = eventually(pid, fn s -> s.title_dialog == %{draft: "pasted name", error: nil} end)
+      assert State.input_text(state) == ""
+    end
+
+    test "the agent's pushes reach the state with no dialog open" do
+      {:ok, pid} = start_tui()
+
+      send(pid, {:title, "Inline Title"})
+      assert eventually(pid, &(&1.title == "Inline Title")).title_dialog == nil
+
+      send(pid, {:title_refused, "may not be empty"})
+      state = eventually(pid, &(&1.title == "Inline Title"))
+      assert state.title_dialog == nil
+      assert state.entries == []
+    end
   end
 
   # A final-only episode: one content frame, then DONE — the agent returns to
@@ -1623,12 +1763,12 @@ defmodule DashFloat.TUITest do
     {:ok, pid} = start_tui()
 
     submit(pid, "first")
-    assert_receive {:prompt, ui_pid, "first"}, 1_000
+    assert_receive {:prompt, ui_pid, "first", []}, 1_000
     send(ui_pid, {:phase, :idle})
     eventually(pid, &(&1.phase == :idle))
 
     submit(pid, "second")
-    assert_receive {:prompt, ^ui_pid, "second"}, 1_000
+    assert_receive {:prompt, ^ui_pid, "second", []}, 1_000
     send(ui_pid, {:phase, :idle})
     eventually(pid, &(&1.phase == :idle))
 
@@ -1649,7 +1789,7 @@ defmodule DashFloat.TUITest do
     agent =
       spawn(fn ->
         receive do
-          {:prompt, ui, _text} -> send(ui, {:token, "slow"})
+          {:prompt, ui, _text, _paths} -> send(ui, {:token, "slow"})
         end
 
         # Park until the test kills this process.
@@ -1686,7 +1826,7 @@ defmodule DashFloat.TUITest do
     agent =
       spawn(fn ->
         receive do
-          {:prompt, ui, _text} ->
+          {:prompt, ui, _text, _paths} ->
             send(ui, {:token, "done"})
             send(ui, {:phase, :idle})
         end
@@ -1949,7 +2089,7 @@ defmodule DashFloat.TUITest do
     {:ok, pid} = start_tui()
 
     submit(pid, "seed")
-    assert_receive {:prompt, ui_pid, "seed"}, 1_000
+    assert_receive {:prompt, ui_pid, "seed", []}, 1_000
     send(ui_pid, {:phase, :idle})
     eventually(pid, &(&1.phase == :idle))
 
@@ -2005,7 +2145,7 @@ defmodule DashFloat.TUITest do
   test "the blink toggles over ticks while a turn is live and stops at idle" do
     {:ok, pid} = start_tui()
     submit(pid, "blink")
-    assert_receive {:prompt, ui_pid, "blink"}, 1_000
+    assert_receive {:prompt, ui_pid, "blink", []}, 1_000
 
     send(ui_pid, {:token, "x"})
     eventually(pid, fn s -> s.phase == :streaming and s.tick_ref != nil end)
@@ -2035,7 +2175,7 @@ defmodule DashFloat.TUITest do
     assert screen_text(get_state(pid)) =~ "ask anything"
 
     submit(pid, "first prompt")
-    assert_receive {:prompt, ui_pid, "first prompt"}, 1_000
+    assert_receive {:prompt, ui_pid, "first prompt", []}, 1_000
 
     # The turn finalizes (the in-flight tokens land as the assistant
     # entry); the draft is empty again — no placeholder now.
@@ -2190,7 +2330,7 @@ defmodule DashFloat.TUITest do
     {:ok, pid} = start_tui()
 
     submit(pid, "animate")
-    assert_receive {:prompt, ui_pid, "animate"}, 1_000
+    assert_receive {:prompt, ui_pid, "animate", []}, 1_000
 
     # While active there is always a tick pending and the frame counter climbs.
     eventually(pid, fn s -> s.phase == :streaming and s.tick_ref != nil end)
@@ -2212,12 +2352,103 @@ defmodule DashFloat.TUITest do
     assert Runtime.snapshot(pid).render_count == frozen
   end
 
+  # The idle cursor blink (issue #104; ADR 0006's 2026-10-31 amendment —
+  # sanctioned exception #5, the first REPEATING idle timer). The default
+  # suite stays hermetic: without an injected cadence the timer never arms
+  # (the suggest-arm pattern), so every flat-render assertion above holds.
+  # These tests opt IN through `blink_ms:` and watch the real wiring.
+  describe "the idle cursor blink (issue #104)" do
+    test "the timer arms at mount with an injected cadence and toggles the phase" do
+      {:ok, pid} = start_tui(blink_ms: 20, provider: provider())
+
+      # The phase flips on the timer: blink_on reaches false, then true…
+      eventually(pid, fn s -> s.blink_on == false end, 300)
+      toggled_back = eventually(pid, fn s -> s.blink_on == true end, 300)
+
+      # …exactly one timer stays pending the whole time, and each toggle
+      # drew a frame (the honest bounded cost — 2 renders/s at 500 ms).
+      assert toggled_back.blink_ref != nil
+      assert toggled_back.phase == :idle
+      assert Runtime.snapshot(pid).render_count > 1
+    end
+
+    test "leaving idle cancels the blink and resets the phase visible" do
+      {:ok, pid} = start_tui(blink_ms: 20, provider: provider())
+      eventually(pid, fn s -> s.blink_on == false end, 300)
+
+      submit(pid, "stream now")
+      assert_receive {:prompt, ui_pid, "stream now", []}, 1_000
+
+      active =
+        eventually(pid, fn s ->
+          s.phase == :streaming and s.tick_ref != nil and s.blink_ref == nil
+        end)
+
+      assert active.blink_on == true
+
+      send(ui_pid, {:phase, :idle})
+      back = eventually(pid, fn s -> s.phase == :idle and s.blink_ref != nil end)
+      assert back.blink_on == true
+    end
+
+    test "a stale blink message is dropped without a frame" do
+      idle = State.new(test_mode: {80, 24})
+      assert {:noreply, ^idle, %{render?: false}} = TUI.handle_info(:dashfloat_blink, idle)
+
+      # A blink whose tracked timer has not fired yet is stale — it belongs
+      # to a superseded arm; the live timer is left alone.
+      ref = Process.send_after(self(), :never, 10_000)
+      pending = %{idle | blink_ref: ref}
+
+      assert {:noreply, ^pending, %{render?: false}} = TUI.handle_info(:dashfloat_blink, pending)
+      assert is_integer(Process.read_timer(ref))
+      Process.cancel_timer(ref)
+    end
+
+    test "a fired blink toggles through the choke point and re-arms" do
+      armed = State.new(test_mode: {80, 24}, blink_ms: 20)
+      fired_ref = Process.send_after(self(), :dashfloat_blink, 1)
+      Process.sleep(5)
+
+      assert {:noreply, toggled} =
+               TUI.handle_info(:dashfloat_blink, %{armed | blink_ref: fired_ref})
+
+      assert toggled.blink_on == false
+      # The choke point re-armed exactly one fresh timer.
+      assert toggled.blink_ref != nil and toggled.blink_ref != fired_ref
+      Process.cancel_timer(toggled.blink_ref)
+
+      # The hermetic default (no injected cadence) never re-arms: the
+      # toggle is reset visible with no timer pending.
+      plain = State.new(test_mode: {80, 24})
+      stale_ref = Process.send_after(self(), :dashfloat_blink, 1)
+      Process.sleep(5)
+
+      assert {:noreply, reset} =
+               TUI.handle_info(:dashfloat_blink, %{plain | blink_ref: stale_ref})
+
+      assert reset.blink_on == true
+      assert reset.blink_ref == nil
+    end
+
+    test "the default suite never arms: renders stay flat at idle" do
+      {:ok, pid} = start_tui(provider: provider())
+      Process.sleep(50)
+
+      assert get_state(pid).blink_ref == nil
+
+      settled = Runtime.snapshot(pid).render_count
+      Process.sleep(300)
+      assert Runtime.snapshot(pid).render_count == settled
+    end
+  end
+
   test "the render counter is the metric of record: it ticks during activity only" do
     {:ok, pid} = start_tui()
 
     idle_before = Runtime.snapshot(pid).render_count
     submit(pid, "rate")
-    assert_receive {:prompt, ui_pid, "rate"}, 1_000
+    assert_receive {:prompt, ui_pid, "rate", []}, 1_000
     eventually(pid, fn s -> s.phase == :streaming end)
 
     # Sample across a quiet gap: the activity tick alone drives renders.
@@ -2239,17 +2470,26 @@ defmodule DashFloat.TUITest do
     :ok = Runtime.enable_trace(pid, limit: 500)
 
     submit(pid, "count me")
-    assert_receive {:prompt, ui_pid, "count me"}, 1_000
+    assert_receive {:prompt, ui_pid, "count me", []}, 1_000
 
     send(ui_pid, {:token, "Hello"})
     send(ui_pid, {:usage, %{prompt_tokens: 120, completion_tokens: 42, total_tokens: 162}})
+
+    send(
+      ui_pid,
+      {:context,
+       %{
+         messages: [%{role: "user", content: "count me"}, %{role: "assistant", content: "Hello"}],
+         anchor: %{tokens: 162, index: 2}
+       }}
+    )
+
     send(ui_pid, {:phase, :idle})
 
     state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
 
     assert state.stats.prompt_tokens == 120
     assert state.stats.completion_tokens == 42
-    assert state.stats.context_total == 162
     assert entry?(state, :assistant, "Hello")
 
     # Ordering proof: the usage message is handled before the idle phase.
@@ -2261,7 +2501,9 @@ defmodule DashFloat.TUITest do
     assert usage_at != nil and idle_at != nil
     assert usage_at < idle_at
 
-    assert status_text(state) =~ "ctx 162"
+    # The snapshot landed (stage-2 span truth) and the bar no longer carries ctx.
+    assert state.context.anchor == %{tokens: 162, index: 2}
+    refute status_text(state) =~ "ctx"
   end
 
   test "tool rows land in the log and the executing_tool phase names itself" do
@@ -2292,7 +2534,7 @@ defmodule DashFloat.TUITest do
   test "the full confirm round trip: preview, decision, and swallowed keys" do
     {:ok, pid} = start_tui()
     submit(pid, "edit that file")
-    assert_receive {:prompt, ui_pid, "edit that file"}, 1_000
+    assert_receive {:prompt, ui_pid, "edit that file", []}, 1_000
 
     ref = make_ref()
 
@@ -2392,7 +2634,7 @@ defmodule DashFloat.TUITest do
 
   defp tall_log(pid) do
     submit(pid, "first question")
-    assert_receive {:prompt, ui_pid, "first question"}, 1_000
+    assert_receive {:prompt, ui_pid, "first question", []}, 1_000
 
     for i <- 1..100, do: send(ui_pid, {:entry, :system, "line #{i}"})
     send(ui_pid, {:phase, :idle})
@@ -2502,15 +2744,17 @@ defmodule DashFloat.TUITest do
     assert bare.selection == nil
 
     # down at log row 1 ("selectable line 1"), drag to row 3, release.
-    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 3, y: 3})
+    # (16 lines in the 15-row idle viewport: follow pins the bottom, so the
+    # view sits at scroll 1 — screen row 3 is display row 1.)
+    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 4, y: 3})
     drag = eventually(pid, &(&1.selection != nil))
     assert drag.selection.anchor == {1, 2}
 
-    inject(pid, %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 5, y: 5})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 6, y: 5})
     extended = get_state(pid)
     assert extended.selection.head == {3, 4}
 
-    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 5, y: 5})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 6, y: 5})
     released = get_state(pid)
 
     # The highlight stays after the copy (terminal convention)…
@@ -2522,8 +2766,8 @@ defmodule DashFloat.TUITest do
     assert State.selection_text(released) == "lectable line 1\n\nselec"
 
     # Click-to-clear: a press+release without extension clears it.
-    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 3, y: 3})
-    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 3, y: 3})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 4, y: 3})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 4, y: 3})
     cleared = get_state(pid)
     assert cleared.selection == nil
   end
@@ -2544,9 +2788,9 @@ defmodule DashFloat.TUITest do
              threaded =
                Enum.reduce(
                  [
-                   %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3},
-                   %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 12, y: 3},
-                   %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 12, y: 3}
+                   %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 4},
+                   %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 13, y: 4},
+                   %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 13, y: 4}
                  ],
                  test_state,
                  fn event, acc ->
@@ -2569,8 +2813,8 @@ defmodule DashFloat.TUITest do
     dragging =
       Enum.reduce(
         [
-          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 3},
-          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 12, y: 3}
+          %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 1, y: 4},
+          %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 13, y: 4}
         ],
         live,
         fn event, acc ->
@@ -2579,7 +2823,7 @@ defmodule DashFloat.TUITest do
         end
       )
 
-    up = %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 12, y: 3}
+    up = %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 13, y: 4}
 
     output =
       ExUnit.CaptureIO.capture_io(fn ->
@@ -2812,7 +3056,7 @@ defmodule DashFloat.TUITest do
   # arms the one-shot ghost.
   defp complete_turn(pid) do
     submit(pid, "hi")
-    assert_receive {:prompt, ui, "hi"}, 1_000
+    assert_receive {:prompt, ui, "hi", []}, 1_000
     send(ui, {:token, "hello there"})
     send(ui, {:phase, :idle})
     eventually(pid, &(&1.entries != [] and &1.phase == :idle))
@@ -2981,7 +3225,7 @@ defmodule DashFloat.TUITest do
              |> State.input_text() == "tell me more!"
 
       press(pid, "enter")
-      assert_receive {:prompt, _ui, "tell me more!"}, 1_000
+      assert_receive {:prompt, _ui, "tell me more!", []}, 1_000
     end
 
     test "typing over a landed ghost dismisses it; the late response is dropped (epoch stale)" do
@@ -3140,6 +3384,364 @@ defmodule DashFloat.TUITest do
         assert {:noreply, ^state, %{render?: false}} =
                  TUI.handle_info({:suggestion, 5, ghost}, state)
       end
+    end
+  end
+
+  ## Image attachments (ADR 0018 §5/§6) — the prompt driven through the app.
+
+  describe "image attachments" do
+    defp images_dir do
+      dir =
+        Path.join("/tmp/opencode", "dashfloat-tui-attach-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+      dir
+    end
+
+    defp capable_provider do
+      {:ok,
+       %Config{
+         base_url: "http://localhost:1",
+         model: "test-model",
+         api_key: "test-key-123",
+         images: true
+       }}
+    end
+
+    defp composer_title(state) do
+      {widget, _rect} =
+        state
+        |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+        |> Enum.at(3)
+
+      widget.block.title.content
+    end
+
+    defp type_into_prompt(pid, text) do
+      for ch <- String.codepoints(text), do: press(pid, ch)
+    end
+
+    test "ctrl+o opens the prompt and the activity row renders it while idle" do
+      {:ok, pid} = start_tui(provider: provider())
+
+      press(pid, "o", ["ctrl"])
+
+      state = eventually(pid, fn s -> s.attach != nil end)
+      assert state.attach == %{draft: ""}
+      # the transient row is allocated at idle and carries the prompt
+      assert activity_text(state) =~ "Attach image: "
+
+      # a second ctrl+o closes it
+      press(pid, "o", ["ctrl"])
+      eventually(pid, fn s -> s.attach == nil end)
+    end
+
+    test "a paste feeds the open prompt's draft, not the composer" do
+      {:ok, pid} = start_tui(provider: provider())
+      press(pid, "o", ["ctrl"])
+      eventually(pid, fn s -> s.attach != nil end)
+
+      inject(pid, %ExRatatui.Event.Paste{content: "/tmp/opencode/cat.png\r\n"})
+
+      state = eventually(pid, fn s -> s.attach == %{draft: "/tmp/opencode/cat.png"} end)
+      assert State.input_text(state) == ""
+    end
+
+    test "enter attaches a checked path; the submit seam carries it; streaming clears" do
+      dir = images_dir()
+      path = Path.join(dir, "alpha.png")
+      File.write!(path, "12345678")
+
+      {:ok, pid} = start_tui(provider: capable_provider())
+
+      # open, type the path, attach
+      press(pid, "o", ["ctrl"])
+      eventually(pid, fn s -> s.attach != nil end)
+      type_into_prompt(pid, path)
+      press(pid, "enter")
+
+      attached = eventually(pid, fn s -> s.attachments != [] end)
+      assert attached.attachments == [%{path: path, name: "alpha.png", kb: 1}]
+      assert attached.attach == nil
+      # the chips ride the composer title (issue #112's numbering)
+      assert composer_title(attached) == "❯ [Image #1]"
+
+      # the turn submits with the attachment's path on the seam
+      submit(pid, "what is this?")
+
+      assert_receive {:prompt, ui_pid, "what is this?", [^path]}, 1_000
+
+      # the :user entry's text stays verbatim; the dim indicator rides the
+      # rendered lines (ADR 0006 / ADR 0018 §5)
+      submitted =
+        eventually(
+          pid,
+          fn s -> match?(%{kind: :user, text: "what is this?"}, List.last(s.entries)) end
+        )
+
+      entry = List.last(submitted.entries)
+      assert entry.text == "what is this?"
+      assert "📎 alpha.png (1 KB)" in flatten_lines(entry.lines)
+
+      # the agent's streaming echo clears the pending set (ADR 0018 §6)
+      send(ui_pid, {:phase, :streaming})
+      cleared = eventually(pid, fn s -> s.attachments == [] end)
+      refute composer_title(cleared) =~ "[Image"
+
+      send(ui_pid, {:phase, :idle})
+    end
+
+    test "an attach refusal lands in the log and keeps the prompt open" do
+      # a capable provider: the refusal below is the path check's, not the
+      # capability gate's
+      {:ok, pid} = start_tui(provider: capable_provider())
+
+      press(pid, "o", ["ctrl"])
+      eventually(pid, fn s -> s.attach != nil end)
+      type_into_prompt(pid, "/tmp/opencode/nope.png")
+      press(pid, "enter")
+
+      state =
+        eventually(pid, fn s ->
+          Enum.any?(s.entries, &(&1.kind == :system and &1.text =~ "nope.png"))
+        end)
+
+      # the refusal names the path and the prompt stays open, draft intact
+      assert state.attach == %{draft: "/tmp/opencode/nope.png"}
+      assert state.attachments == []
+      assert state.phase == :idle
+    end
+
+    # The drag-and-drop shape (issue #112; ADR 0018's 2026-10-31
+    # amendment): a bracketed paste of an existing image path attaches as a
+    # numbered chip — the path never types into the draft.
+    test "a bracketed-pasted image path becomes a numbered chip, not text" do
+      dir = images_dir()
+      path = Path.join(dir, "dropped.png")
+      File.write!(path, "12345678")
+
+      {:ok, pid} = start_tui(provider: capable_provider())
+
+      inject(pid, %ExRatatui.Event.Paste{content: path <> "\r\n"})
+
+      state = eventually(pid, fn s -> s.attachments != [] end)
+      assert state.attachments == [%{path: path, name: "dropped.png", kb: 1}]
+      assert State.input_text(state) == ""
+      assert composer_title(state) == "❯ [Image #1]"
+
+      # a second drop numbers on; Backspace on the empty draft pops the
+      # newest chip and renumbers
+      other = Path.join(dir, "second.jpg")
+      File.write!(other, "12345678")
+      inject(pid, %ExRatatui.Event.Paste{content: other})
+
+      two = eventually(pid, fn s -> length(s.attachments) == 2 end)
+      assert composer_title(two) == "❯ [Image #1] [Image #2]"
+
+      press(pid, "backspace")
+      popped = eventually(pid, fn s -> length(s.attachments) == 1 end)
+      assert Enum.map(popped.attachments, & &1.path) == [path]
+      assert composer_title(popped) == "❯ [Image #1]"
+
+      # the submit seam carries the queue; the streaming echo clears it
+      submit(pid, "what is this?")
+      assert_receive {:prompt, ui_pid, "what is this?", [^path]}, 1_000
+
+      send(ui_pid, {:phase, :streaming})
+      eventually(pid, fn s -> s.attachments == [] end)
+      send(ui_pid, {:phase, :idle})
+    end
+
+    test "a dropped image path on a non-capable model refuses visibly" do
+      dir = images_dir()
+      path = Path.join(dir, "dropped.png")
+      File.write!(path, "12345678")
+
+      {:ok, pid} = start_tui(provider: provider())
+
+      inject(pid, %ExRatatui.Event.Paste{content: path})
+
+      state =
+        eventually(pid, fn s ->
+          Enum.any?(s.entries, &(&1.kind == :system and &1.text =~ "[images:"))
+        end)
+
+      assert state.attachments == []
+      assert State.input_text(state) == ""
+
+      last = List.last(state.entries)
+      assert last.text =~ "model test-model does not accept images"
+    end
+  end
+
+  # The Herdr integration (ADR 0024): the reporter hooks are driven through
+  # the real TUI event loop — mount's first report, the phase transitions
+  # through the stream contract, the blocked prompts, the session-id
+  # landing, and release on quit. The injected runner is the test seam.
+  describe "herdr reporting (ADR 0024)" do
+    defp herdr_ctx do
+      test = self()
+
+      %DashFloat.Herdr{
+        pane: "wA:p1",
+        socket: "/tmp/opencode/herdr-tui.sock",
+        runner: fn request -> send(test, {:herdr, request}) end
+      }
+    end
+
+    defp herdr_state(%{params: params}), do: params.state
+
+    defp herdr_message(%{params: params}), do: params[:message]
+
+    test "mount holds the pane with the idle state" do
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
+
+      assert_receive {:herdr, %{method: "pane.report_agent", params: params}}, 1_000
+      seq = params.seq
+
+      assert params == %{
+               pane_id: "wA:p1",
+               source: "dashfloat",
+               agent: "dashfloat",
+               state: "idle",
+               seq: seq
+             }
+
+      assert seq > 0
+      assert get_state(pid).herdr.seq == seq
+    end
+
+    test "outside Herdr nothing reports and nothing breaks" do
+      {:ok, pid} = start_tui(provider: provider())
+
+      submit(pid, "hello")
+      assert_receive {:prompt, _ui, "hello", []}, 1_000
+      refute_receive {:herdr, _request}, 50
+      assert get_state(pid).herdr == nil
+    end
+
+    test "a turn reports working, then idle" do
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "idle"
+
+      submit(pid, "hello")
+      assert_receive {:prompt, ui, "hello", []}, 1_000
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "working"
+
+      send(ui, {:phase, :idle})
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "idle"
+    end
+
+    test "a confirm prompt reports blocked naming the decision" do
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
+      assert_receive {:herdr, _request}, 1_000
+
+      send(pid, {:confirm, make_ref(), %{id: "c1", name: "bash", args: %{}, lines: ["$ x"]}})
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "blocked"
+      assert herdr_message(request) == "approve bash"
+    end
+
+    test "the exit prompt reports blocked; its expiry returns to idle" do
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
+      assert_receive {:herdr, _request}, 1_000
+
+      press(pid, "c", ["ctrl"])
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "blocked"
+      assert herdr_message(request) == "exit? press Ctrl+C again"
+
+      # The guard's one-shot timer expiry (2 s) is the non-schedule return
+      # path that also carries the hook.
+      assert_receive {:herdr, request}, 3_000
+      assert herdr_state(request) == "idle"
+    end
+
+    test "the setup questions report blocked until the provider resolves" do
+      {:ok, pid} =
+        start_tui(
+          setup: {:select, ["work", "home"], 0},
+          resolve: fn "work" -> provider() end,
+          herdr: herdr_ctx()
+        )
+
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "blocked"
+      assert herdr_message(request) == "first-run setup: choose a provider"
+
+      press(pid, "enter")
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "idle"
+    end
+
+    test "the agent's session-id landing attaches the resume command" do
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
+      assert_receive {:herdr, _request}, 1_000
+
+      id = "01923f8e-6b1e-7abc-8def-123456789abc"
+      send(pid, {:session_id, id})
+
+      assert_receive {:herdr, %{method: "pane.report_agent_session", params: params}}, 1_000
+      assert params.agent_session_id == id
+      assert params.resume_argv == ["dashfloat", "--resume", id, "--model", "test-model"]
+      assert get_state(pid).session_id == id
+    end
+
+    test "a resumed boot reports the resume command from mount" do
+      id = "01923f8e-6b1e-7abc-8def-123456789abc"
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx(), session_id: id)
+
+      assert_receive {:herdr, %{method: "pane.report_agent_session", params: params}}, 1_000
+      assert params.resume_argv == ["dashfloat", "--resume", id, "--model", "test-model"]
+      assert get_state(pid).session_id == id
+    end
+
+    test "quit releases the pane on teardown" do
+      {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
+      assert_receive {:herdr, _request}, 1_000
+      ref = Process.monitor(pid)
+
+      press(pid, "q", ["ctrl"])
+
+      assert_receive {:herdr, %{method: "pane.release_agent", params: params}}, 2_000
+      assert params.pane_id == "wA:p1"
+      assert params.source == "dashfloat"
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 2_000
+    end
+
+    test "a /model switch re-reports the resume command under the new model" do
+      provider =
+        {:ok,
+         %Config{
+           base_url: "https://active.example/v1",
+           model: "m1",
+           api_key: "k",
+           providers: [%{label: "a", base_url: "https://active.example/v1", api_key: "k"}]
+         }}
+
+      {:ok, pid} =
+        start_tui(
+          provider: provider,
+          catalog_fetcher: fn "https://active.example/v1", "k" ->
+            {:ok, [%{model: "m2", context: 128_000}]}
+          end,
+          herdr: herdr_ctx(),
+          session_id: "01923f8e-6b1e-7abc-8def-123456789abc"
+        )
+
+      assert_receive {:herdr, %{method: "pane.report_agent_session", params: params}}, 1_000
+      assert List.last(params.resume_argv) == "m1"
+      eventually(pid, fn s -> s.catalog != %{} end)
+
+      submit(pid, "/model")
+      press(pid, "enter")
+
+      assert_receive {:herdr, %{method: "pane.report_agent_session", params: params}}, 1_000
+      assert List.last(params.resume_argv) == "m2"
     end
   end
 end

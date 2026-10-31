@@ -6,8 +6,10 @@ defmodule DashFloat.TUI do
   cancels, confirmation decisions, and mode switches (ADR 0016) are plain
   sends to the agent (ADR 0007) — the agent is the single voice streaming
   back into the UI, and this
-  process starts no tasks. The activity tick (ADR 0006) is the one timer this
-  process owns — scheduled only while work is in flight.
+  process starts no tasks. The activity tick (ADR 0006) and the idle
+  cursor blink (issue #104; ADR 0006's 2026-10-31 amendment — the first
+  sanctioned REPEATING idle timer) are the repeating timers this process
+  owns — the tick only while work is in flight, the blink only while idle.
 
   Run with `mix run --no-halt`. Quit with Ctrl+Q, or a double Ctrl+C: the
   first press shows a prompt, the second within two seconds exits
@@ -22,6 +24,7 @@ defmodule DashFloat.TUI do
   alias DashFloat.Config
   alias DashFloat.Config.Catalog
   alias DashFloat.Config.Onboarding
+  alias DashFloat.Herdr
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Suggest
@@ -31,6 +34,13 @@ defmodule DashFloat.TUI do
 
   @tick :dashfloat_tick
   @tick_ms 125
+  # The idle cursor blink (issue #104; ADR 0006's 2026-10-31 amendment):
+  # a dedicated slow timer — riding the 125 ms activity tick would draw
+  # 8 frames/s idle; this draws 2. Sanctioned exception #5, the first
+  # REPEATING idle timer: bounded, honest, and recorded in the ADR with
+  # its measured rate.
+  @blink :dashfloat_blink
+  @blink_ms 500
   @exit_guard :dashfloat_exit_guard
   @suggest :dashfloat_suggest
 
@@ -72,6 +82,8 @@ defmodule DashFloat.TUI do
     |> State.new()
     |> State.claim_agent()
     |> maybe_start_catalog()
+    |> herdr_report()
+    |> schedule_blink()
     |> then(&{:ok, &1})
   end
 
@@ -157,6 +169,16 @@ defmodule DashFloat.TUI do
       when setup != nil,
       do: schedule(State.setup_paste(state, content))
 
+  # The /title dialog (issue #106) takes pastes into its draft too — the
+  # attach prompt's rule (ADR 0018 §5); the composer stays untouched.
+  def handle_event(%ExRatatui.Event.Paste{content: content}, %State{title_dialog: %{}} = state),
+    do: schedule(State.title_paste(state, content))
+
+  # The attach prompt (ADR 0018 §5) takes pastes into its path draft too —
+  # a pasted path is the supported shape; the composer stays untouched.
+  def handle_event(%ExRatatui.Event.Paste{content: content}, %State{attach: %{}} = state),
+    do: schedule(State.attach_paste(state, content))
+
   def handle_event(%ExRatatui.Event.Paste{content: content}, state),
     do: schedule(State.paste(state, content))
 
@@ -190,7 +212,7 @@ defmodule DashFloat.TUI do
 
   defp setup_action(action, state), do: schedule(run_action(action, state))
 
-  defp run_action({:submit, prompt}, state), do: prompt_agent(prompt, state)
+  defp run_action({:submit, prompt, paths}, state), do: prompt_agent(prompt, paths, state)
   defp run_action({:confirm, decision}, state), do: confirm_decision(decision, state)
   defp run_action(:cancel, state), do: cancel_agent(state)
   defp run_action({:select_profile, name}, state), do: resolve_setup(state, name)
@@ -260,6 +282,22 @@ defmodule DashFloat.TUI do
     end
   end
 
+  # The idle cursor blink (issue #104; ADR 0006 amendment — sanctioned
+  # exception #5): staleness first (the tick's exact rule), then toggle and
+  # re-arm through the choke point — one frame per toggle, 2 frames/s at
+  # the 500 ms cadence, and nothing while active (the tick animates the
+  # active cursor) or in setup (no composer to blink over).
+  def handle_info(@blink, state) do
+    if stale_blink?(state) do
+      {:noreply, state, %{render?: false}}
+    else
+      state
+      |> State.blink()
+      |> Map.put(:blink_ref, nil)
+      |> schedule()
+    end
+  end
+
   # The exit-guard expiry (issue #28; ADR 0006 amendment — sanctioned
   # exception #3): a ONE-SHOT timer armed only by an explicit Ctrl+C. It
   # clears the transient prompt the moment the window dies — at most one
@@ -268,7 +306,9 @@ defmodule DashFloat.TUI do
     if stale_guard?(state) do
       {:noreply, state, %{render?: false}}
     else
-      {:noreply, %{state | exit_guard_at: nil, exit_guard_ref: nil}}
+      # The Herdr hook rides here too (ADR 0024): the prompt's expiry is a
+      # blocked→idle transition this path returns without passing schedule/1.
+      {:noreply, herdr_report(%{state | exit_guard_at: nil, exit_guard_ref: nil})}
     end
   end
 
@@ -311,11 +351,29 @@ defmodule DashFloat.TUI do
     do: schedule(State.stream_message(state, msg))
 
   def handle_info({kind, _payload} = msg, state)
-      when kind in [:token, :phase, :usage, :tool_call, :tool_result, :mode, :tool_preview],
+      when kind in [
+             :token,
+             :phase,
+             :usage,
+             :context,
+             :tool_call,
+             :tool_result,
+             :mode,
+             :tool_preview,
+             # The display-only title pushes (issue #106).
+             :title,
+             :title_refused
+           ],
       do: schedule(State.stream_message(state, msg))
 
   def handle_info({:confirm, _ref, _payload} = msg, state),
     do: schedule(State.stream_message(state, msg))
+
+  # A fresh session's id was minted at first save (ADR 0023/0024): the agent
+  # is the single voice; the reporter re-reports with the resume command
+  # attached once the id is known.
+  def handle_info({:session_id, id}, state) when is_binary(id),
+    do: schedule(%{state | session_id: id})
 
   # The standing catalog refresh landed (ADR 0009): in-memory merge, the
   # context denominator fills in, nothing else changes.
@@ -352,6 +410,13 @@ defmodule DashFloat.TUI do
   # from a cancelled or superseded timer must be inert.
   defp stale_suggest?(%{suggest_ref: nil}), do: true
   defp stale_suggest?(%{suggest_ref: ref}), do: Process.read_timer(ref) != false
+
+  # Same staleness rule for the blink timer (issue #104): no tracked
+  # timer, or one still pending, means the message is an orphan from a
+  # cancelled or superseded arm — dropped without a frame.
+  defp stale_blink?(%{blink_ref: nil}), do: true
+
+  defp stale_blink?(%{blink_ref: ref}), do: Process.read_timer(ref) != false
 
   # The debounce fired for real: clear the ref, then resolve the model
   # config and start the supervised side-request on the reply tail.
@@ -393,18 +458,47 @@ defmodule DashFloat.TUI do
   end
 
   # The single tick choke point (ADR 0006): any active phase keeps exactly one
-  # timer pending; idle always cancels it. Idle => no timers => no renders.
-  # The two sanctioned one-shot exceptions: the user-armed exit guard (issue
-  # #28) and the suggest debounce (sanctioned exception #4, ADR 0015 §3).
+  # timer pending; idle always cancels it — and, since issue #104, keeps
+  # exactly one blink timer pending instead (bounded, never both). The
+  # sanctioned one-shot exceptions: the user-armed exit guard (issue #28)
+  # and the suggest debounce (sanctioned exception #4, ADR 0015 §3).
   defp schedule(state) do
     state =
       state
       |> schedule_tick()
+      |> schedule_blink()
       |> schedule_guard(System.monotonic_time(:millisecond))
       |> suggest_reap()
       |> suggest_arm()
+      |> herdr_report()
 
     {:noreply, state}
+  end
+
+  # The Herdr reporter's choke point (ADR 0024): every event return threads
+  # through schedule/1, so one change-detected report here covers phase
+  # flips, confirm arms/clears, exit-guard arming, setup completion, and
+  # provider switches. nil context — outside Herdr — is the cheap no-op.
+  defp herdr_report(%State{herdr: nil} = state), do: state
+
+  defp herdr_report(%State{} = state) do
+    {profile, model} =
+      case state.provider do
+        {:ok, %Config{profile: p, model: m}} -> {p, m}
+        _unresolved -> {nil, nil}
+      end
+
+    shot = %{
+      phase: state.phase,
+      confirm: if(state.confirm, do: state.confirm.name),
+      exit_prompt: state.exit_guard_at != nil,
+      setup: state.setup != nil,
+      session_id: state.session_id,
+      profile: profile,
+      model: model
+    }
+
+    %{state | herdr: Herdr.report(state.herdr, shot)}
   end
 
   defp schedule_tick(state) do
@@ -420,6 +514,43 @@ defmodule DashFloat.TUI do
         state
     end
   end
+
+  # The idle blink's arm (issue #104; ADR 0006 amendment — sanctioned
+  # exception #5): exactly one pending timer while the chat UI is idle —
+  # cancelled on every exit from idle (the active cursor rides the tick),
+  # re-armed on every return, the phase reset visible so the first idle
+  # frame always draws the cursor. Arming is live-only by default: the
+  # hermetic suite never arms one (the suggest-arm pattern); an injected
+  # `blink_ms:` opts a test in at its own cadence. A fired-but-undrained
+  # timer is left alone — its message drains through the staleness check.
+  defp schedule_blink(%{blink_ref: nil} = state) do
+    if blinkable?(state), do: arm_blink(state), else: reset_blink(state)
+  end
+
+  defp schedule_blink(%{blink_ref: ref} = state) when is_reference(ref) do
+    if blinkable?(state) do
+      # Pending or fired-but-not-yet-drained: either way the tracked arm
+      # owns the next toggle (a fired one's message drains through the
+      # staleness check) — leave it exactly as it is.
+      state
+    else
+      Process.cancel_timer(ref)
+      reset_blink(%{state | blink_ref: nil})
+    end
+  end
+
+  defp blinkable?(%{live?: false, blink_ms: nil}), do: false
+
+  defp blinkable?(%{setup: nil, phase: :idle}), do: true
+
+  defp blinkable?(_state), do: false
+
+  defp arm_blink(%{blink_ms: ms} = state),
+    do: %{state | blink_ref: Process.send_after(self(), @blink, ms || @blink_ms)}
+
+  defp reset_blink(%{blink_on: true} = state), do: state
+
+  defp reset_blink(state), do: %{state | blink_on: true}
 
   # Exactly one expiry timer per armed window: disarm cancels a pending
   # timer, arming schedules one when none is live, a fired-but-undrained
@@ -499,7 +630,12 @@ defmodule DashFloat.TUI do
     # the TUI quits so the shell prompt comes back. Only an explicit quit is a
     # success — a supervisor-driven or failing shutdown reports 1 (ADR 0002).
     # Test-mode instances own no real terminal and must not stop the test VM.
+    # The Herdr release is the one synchronous report (ADR 0024 §6): every
+    # deliberate exit funnels here, and the release must land before the VM
+    # stops — Herdr's idle-prompt self-clear is only the safety net.
+    _released = Herdr.release(state.herdr)
     code = exit_code(reason)
+
     if state.live?, do: System.stop(code)
 
     :ok
@@ -514,9 +650,10 @@ defmodule DashFloat.TUI do
   def exit_code(_reason), do: 1
 
   # The agent seam (ADR 0007): plain sends, both directions — fake agents in
-  # tests are plain processes receiving these.
-  defp prompt_agent(prompt, state) do
-    send(state.agent, {:prompt, self(), prompt})
+  # tests are plain processes receiving these. `paths` carries the pending
+  # attachments (ADR 0018 §6); the agent owns the bytes.
+  defp prompt_agent(prompt, paths, state) do
+    send(state.agent, {:prompt, self(), prompt, paths})
     state
   end
 

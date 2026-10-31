@@ -2,7 +2,11 @@
 
 - **Status:** Accepted (designed Oct 29 and parked; resumed Oct 30 with
   `/mode` and `/title` folded in — the modes and titles lanes merged while
-  this lane parked, leaving the seams this registry maps onto)
+  this lane parked, leaving the seams this registry maps onto);
+  **amended 2026-10-31** ([issue #105](https://github.com/fluxvale/dashfloat/issues/105) —
+  Tab completes the highlighted filter match; see
+  [Amendment (2026-10-31, issue #105)](#amendment-2026-10-31-issue-105-tab-completes-the-highlighted-filter-match)
+  below)
 - **Date:** 2026-10-29
 - **Implements:** [issue #69](https://github.com/fluxvale/dashfloat/issues/69).
 - **Extends:** [ADR 0015](0015-input-surface-cursor-stats-ghost.md) (the
@@ -111,6 +115,8 @@ PageUp/PageDown stay log-scroll; inside a modal palette they are swallowed.
   `{:set_title, ui, title}`. The agent owns normalization, uniqueness, and
   persistence; its system entries (`[session titled: T]`, the refusal
   reasons) are the whole UI — the TUI adds no title validation of its own.
+  Bare `/title` opens the input dialog — see [ADR 0023](0023-session-titles-and-uuid-ids.md)'s
+  2026-10-31 amendment.
 - Unknown command — a `:system` warning entry naming the offender and
   `/help`.
 
@@ -155,3 +161,26 @@ Styles come from `Theme.style/1` roles only (ADR 0006).
 - `/model` mid-stream is allowed from the picker only while idle (palette
   opens are idle-gated like submit), so the "next request" boundary is the
   only seam to reason about.
+
+## Amendment (2026-10-31, issue #105): Tab completes the highlighted filter match
+
+**Status:** Accepted. The owner's v0.3.0 smoke test (Oct 31): pressing Tab
+while a slash autocomplete popup is open should complete the command.
+Extends the `:filter` mode's key set; nothing else moves.
+
+- **The rule:** while the filter popup is open (matches exist), plain Tab
+  completes the draft to **the highlighted match** — `"/" <> name <> " "` —
+  not the common prefix. The highlighted row is the popup's one selection
+  model: arrows move it, Enter runs it, Tab completes it; a common-prefix
+  rule would invent a second, weaker affordance (and "/mode" for "/mod" —
+  registry order puts `mode` ahead of `model` — is a complete command,
+  never a truncation artifact). The trailing space closes the popup (args
+  may follow) and leaves the cursor at the end, editable. Shift+Tab keeps
+  its swallow while the popup is open; BackTab never completes.
+- **No fight with the ghost (ADR 0015 §3):** the suggester arms only at a
+  finalize with an EMPTY draft and lands only into an empty draft — a
+  `/`-prefixed draft is non-empty by construction, so no ghost ever sits
+  beside a filter popup. Verified, not suppressed: nothing needed to change
+  in the suggest path. The filter Tab clause sits above the ghost-Tab
+  clause in routing, so even a hypothetical stale ghost could not win a
+  `/`-draft. Elsewhere Tab's ghost-materialization is untouched.

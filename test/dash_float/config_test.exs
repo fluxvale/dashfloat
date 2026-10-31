@@ -658,6 +658,85 @@ defmodule DashFloat.ConfigTest do
     end
   end
 
+  describe "context_window/1 — the resolution chain (issue #111)" do
+    test "an explicit context (entry or env) is :configured" do
+      assert {:ok, config} = Config.load(fleet_dir(), %{}, [])
+      assert Config.context_window(config) == {196_608, :configured}
+
+      assert {:ok, env_pinned} =
+               Config.load(fleet_dir(), %{"DASHFLOAT_CONTEXT_TOKENS" => "64000"}, [])
+
+      assert Config.context_window(env_pinned) == {64_000, :configured}
+    end
+
+    test "a stock Z.AI config (no context anywhere) resolves the seeded 1M window" do
+      dir = tmp_dir()
+
+      write!(dir, """
+      {
+        configVersion: 3,
+        defaultProfile: 'stock',
+        profiles: [
+          {
+            name: 'stock',
+            providers: [
+              {
+                baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+                models: [{ model: 'glm-5.3-flash' }],
+              },
+            ],
+          },
+        ],
+      }
+      """)
+
+      write_keys!(dir, """
+      {
+        stock: { 'https://api.z.ai/api/coding/paas/v4': 'PLACEHOLDER-stock-key' },
+      }
+      """)
+
+      assert {:ok, %Config{context_tokens: nil} = config} = Config.load(dir, %{}, [])
+      assert Config.context_window(config) == {1_048_576, :seeded}
+    end
+
+    test "a model no source knows degrades to the documented default, visibly" do
+      # A hand-built config with no model at all (the nameless shapes tests
+      # build): nothing is knowable — the documented default, visibly.
+      assert Config.context_window(%Config{base_url: @base_url, api_key: "k"}) ==
+               {131_072, :default}
+
+      dir = tmp_dir()
+
+      write!(dir, """
+      {
+        configVersion: 3,
+        defaultProfile: 'custom',
+        profiles: [
+          {
+            name: 'custom',
+            providers: [
+              {
+                baseUrl: '#{@base_url}',
+                models: [{ model: 'mystery-model' }],
+              },
+            ],
+          },
+        ],
+      }
+      """)
+
+      write_keys!(dir, """
+      {
+        custom: { '#{@base_url}': 'PLACEHOLDER-custom-key' },
+      }
+      """)
+
+      assert {:ok, config} = Config.load(dir, %{}, [])
+      assert Config.context_window(config) == {131_072, :default}
+    end
+  end
+
   # A minimal one-profile layout whose settings map the test varies.
   defp settings_dir(settings) do
     dir = tmp_dir()
@@ -908,6 +987,126 @@ defmodule DashFloat.ConfigTest do
       assert {:ok, with_key} = Config.load(dir, %{}, [])
       assert {:ok, without} = Config.load(plain, %{}, [])
       assert with_key == without
+    end
+  end
+
+  describe "images flag on the models entry (ADR 0018 §1)" do
+    test "images: true on the selected entry parses to a capable config" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{
+              baseUrl: '#{@base_url}',
+              models: [
+                { model: 'm1' },
+                { model: 'vision', images: true },
+              ],
+            }],
+            settings: { defaultModel: 'vision' },
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      assert {:ok, %Config{model: "vision", images: true}} = Config.load(dir, %{}, [])
+    end
+
+    test "absent or false means not image-capable" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{
+              baseUrl: '#{@base_url}',
+              models: [
+                { model: 'plain' },
+                { model: 'off', images: false },
+              ],
+            }],
+            settings: { defaultModel: 'off' },
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      assert {:ok, %Config{model: "off", images: false}} = Config.load(dir, %{}, [])
+    end
+
+    test "junk warns naming the field and means not image-capable" do
+      for junk <- ["'yes'", "1"] do
+        dir = tmp_dir()
+
+        write!(
+          dir,
+          """
+          {
+            configVersion: 3,
+            defaultProfile: 'work',
+            profiles: [{
+              name: 'work',
+              providers: [{
+                baseUrl: '#{@base_url}',
+                models: [{ model: 'm1', images: #{junk} }],
+              }],
+            }],
+          }
+          """
+        )
+
+        write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+        logs =
+          capture_log(fn ->
+            assert {:ok, %Config{model: "m1", images: false}} = Config.load(dir, %{}, [])
+          end)
+
+        assert logs =~ "images is not a boolean — treating the model as not image-capable"
+      end
+    end
+
+    test "the flag rides the selected entry only: a capable sibling leaves the default incapable" do
+      dir = tmp_dir()
+
+      write!(
+        dir,
+        """
+        {
+          configVersion: 3,
+          defaultProfile: 'work',
+          profiles: [{
+            name: 'work',
+            providers: [{
+              baseUrl: '#{@base_url}',
+              models: [
+                { model: 'plain' },
+                { model: 'vision', images: true },
+              ],
+            }],
+          }],
+        }
+        """
+      )
+
+      write_keys!(dir, "{work: {'#{@base_url}': 'PLACEHOLDER-work-key'}}")
+
+      assert {:ok, %Config{model: "plain", images: false}} = Config.load(dir, %{}, [])
     end
   end
 

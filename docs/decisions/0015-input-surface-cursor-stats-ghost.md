@@ -5,6 +5,19 @@
   cursor carries an explicit bright fg+bg pair, and the placeholder rule is
   tightened; see
   [Amendment (2026-10-30, issue #91)](#amendment-2026-10-30-issue-91-cursor-prominence-placeholder-rule)
+  below); **amended again 2026-10-30**
+  ([issue #67](https://github.com/fluxvale/dashfloat/issues/67) stage 2 —
+  the footer gains tokens-used + percent-of-context from the accounting API
+  and the top bar's `ctx` field is deleted; see
+  [Amendment (2026-10-30, issue #67 stage 2)](#amendment-2026-10-30-issue-67-stage-2-tokens-used--percent-of-context)
+  below); **amended again 2026-10-31**
+  ([issue #109](https://github.com/fluxvale/dashfloat/issues/109) — the
+  footer's model span becomes `provider - model`; see
+  [Amendment (2026-10-31, issue #109)](#amendment-2026-10-31-issue-109-the-footers-model-span-becomes-provider---model)
+  below); **amended again 2026-10-31**
+  ([issue #104](https://github.com/fluxvale/dashfloat/issues/104) — the
+  idle cursor now blinks; see
+  [Amendment (2026-10-31, issue #104): the idle cursor blinks](#amendment-2026-10-31-issue-104-the-idle-cursor-blinks)
   below).
 - **Date:** 2026-10-29
 - **Implements:** [issue #66](https://github.com/fluxvale/dashfloat/issues/66),
@@ -216,3 +229,115 @@ same dim family as the placeholder. Two changes, both style/data only —
      resume note all make the session underway, and a mid-session hint
      ("feels patronizing" — the owner's refinement, Oct 30) renders no
      placeholder.
+
+## Amendment (2026-10-30, issue #67 stage 2): tokens-used + percent-of-context
+
+**Status:** Accepted. The binding this ADR's §2 froze ("stage 2 is bound,
+not built") is now built, against [ADR 0022](0022-context-accounting-and-compaction.md)
+§7's API exactly as PR #81 specced. The footer grows a fourth span and the
+top status bar's banked `ctx` field is **deleted** — the affordance moves,
+its source is replaced: `Accounting.usage/3` (the usage-frame-anchored
+estimate), not the last-frame-wins `context_total` banking, which is
+deleted with the field. The footer reads, left to right:
+`❯ <cwd> · <model> · <used>/<window> · <percent>% · <rate> tok/s`.
+
+1. **Carry and cadence.** The agent owns the message list and the anchor,
+   so it pushes a `{:context, %{messages:, anchor:}}` snapshot to the UI at
+   every **transcript mutation** — the persist seam, which every mutation
+   already passes through (prompt append + compaction, tool batch, tool
+   flush, finalize, cancel fill), persistence on or off — and at each
+   **usage frame** (the anchor's own refresh, mid-episode). The span itself
+   recomputes at render time: `footer_widget/1` reads
+   `Accounting.usage(messages, anchor, window)` per frame. The read walks
+   the whole message list (the viewport only renders visible rows — this
+   is O(messages), not O(viewport)) but each step is an O(1) `byte_size`
+   or map read, so it is microseconds against a frame's milliseconds — and
+   it happens exactly when frames happen: **never while idle** (no new
+   timers; the idle 0-render discipline is untouched by construction), at
+   most the 8 fps budget while active. In-flight deltas are deliberately
+   not counted — the usage frame is the only ground truth ([ADR
+   0022](0022-context-accounting-and-compaction.md)
+   §1); the span moves at frames and mutation pushes, not per stream tick.
+2. **Window.** The denominator is the TUI's **display window** —
+   `provider_context_tokens/1`: the configured per-model `context` (env
+   override), else the standing catalog's fresh value, display-only
+   ([ADR 0022](0022-context-accounting-and-compaction.md) §2's exact
+   framing of that fallback). This is what the old `ctx` field showed, so
+   the moved field keeps its denominator-fill behavior (a catalog landing
+   mid-idle fills the percent in with no push needed).
+3. **Formatting, stated once.** Used and window go through
+   `State.humanize/1` (999 → `999`, 1_500 → `1.5k`, 1_048_576 → `1m`); the
+   percent is `Accounting.usage/3`'s one-decimal value with a trailing
+   `.0` trimmed — `humanize`'s own number rule: `4.2k/128k · 3.3%`,
+   `… · 5%`. With **no display window** the span shows the absolute total
+   alone (`4.2k`) — no slash, no percent
+   ([ADR 0022](0022-context-accounting-and-compaction.md) §2's
+   "absolute total alone" carries over).
+4. **No-frame / no-session state.** The span is **hidden** until the first
+   snapshot lands (nil `state.context` → no span, the rate-span's
+   omitted-until-it-exists pattern): a fresh session pre-first-turn shows
+   cwd · model only. The first snapshot rides the first prompt's persist —
+   before any usage frame exists it carries `anchor: nil`, and the span
+   shows the heuristic estimate ([ADR 0022](0022-context-accounting-and-compaction.md)
+   §1's nil-anchor rule), so frame-less providers still get a number.
+5. **What dies.** `status_widget/2`'s ctx group, `State.context_label/1`'s
+   banking form, and the `context_total`/`turn_total` stats machinery
+   (last-frame-wins banking at finalize). `{:usage, _}` frames still
+   reconcile the rate's token count; the percent and totals now come only
+   from the accounting API.
+
+## Amendment (2026-10-31, issue #109): the footer's model span becomes provider - model
+
+The owner's smoke test found the footer naming the model but not **which
+provider it sits under** — the profile identifies the config, not the
+endpoint. This amendment supersedes the span-composition line of §2 and of
+the [stage-2 amendment](#amendment-2026-10-30-issue-67-stage-2-tokens-used--percent-of-context)
+in one respect: the model span `<model>` becomes
+`<provider> - <model>`, so the footer reads
+`❯ <cwd> · <provider> - <model> · <used>/<window> · <percent>% · <rate> tok/s`.
+Still one compact span — never the full base_url, never a second span.
+
+1. **The provider ladder**, resolved at render time from the resolved
+   config, in precedence order (stated once, here):
+   - **(a) Preset match** — the base_url's entry in
+     `DashFloat.Config.Presets.label/1` ("zai" / "synthetic",
+     trailing-slash-insensitive like `suggest_model/1`). A preset URL
+     **always** reads its preset label, even when the settings entry
+     carries a (host-defaulted) label: the presets are the first-class
+     providers and the owner's examples use those names.
+   - **(b) Settings label** — the active profile's `providers` entry whose
+     `baseUrl` equals the config's (trailing slashes trimmed on both
+     sides), by its `label` — already explicit-or-host at parse time
+     ([ADR 0008](0008-config-layout-profiles-json5.md)). An explicitly
+     labeled custom URL shows that label.
+   - **(c) Host degrade** — no matching entry (env-only boots,
+     `providers: []`): the base_url's `URI.parse` host, else the raw
+     string. An unlabeled custom URL degrades here the same way.
+2. **The model part** is `nickname || model` — the issue's own examples:
+   `zai - glm-5.3` (id), `synthetic - fixer` (nickname).
+3. **The profile suffix moves out.** ADR 0008's `"nickname (profile)"`
+   footer form is retired — the issue asks for provider + model, not
+   profile; the profile stays reachable via `/profile`
+   ([ADR 0020](0020-command-surface.md)). nil still only when nothing
+   resolves (no provider classification) — the footer's "—" arm.
+4. **Cadence unchanged.** The span stays a render-time read of
+   `State.provider_label/1`, so `/model` and `/profile` switches show on
+   the next frame exactly as the model span always did — nothing new at
+   any agent seam ([ADR 0007](0007-tool-calls-and-execution.md)).
+
+## Amendment (2026-10-31, issue #104): the idle cursor blinks
+
+**Status:** Accepted. Supersedes the "focused + idle" bullet of §1 above —
+its "costing **zero new timers** (ADR 0006's idle ⇒ no timers ⇒ no renders
+stands untouched)" parenthetical AND its "static bright reversed" wording —
+which the owner's smoke test
+([issue #104](https://github.com/fluxvale/dashfloat/issues/104)) reversed.
+Everything else in §1 stands: the focus gate (unfocused shows no cursor,
+still zero extra renders), the explicit bright pair, and the active-phase
+blink riding the 125 ms tick. The idle blink is a dedicated 500 ms timer —
+**measured 2.0 renders/s while idle** — owned, costed, and recorded by
+[ADR 0006](0006-ui-truth-and-rendering.md)'s 2026-10-31 blink amendment
+(exception #5); this note only keeps §1's record coherent. The Tab rule in
+§3 is untouched: the ghost arms and lands only on an EMPTY draft, so a
+`/`-prefixed draft never carries a ghost, and the filter popup's Tab
+(issue #105, ADR 0020's amendment) cannot fight Tab-the-ghost.

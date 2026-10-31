@@ -142,7 +142,10 @@ parser is strictly better); Jason (no JSON5 support — the whole point).
   omitted), `model` (required), `context` (optional positive integer;
   unusable values are nil, never errors — ADR 0006 rule), and free-form extras
   (octofriend files carry `modalities`, `reasoning`, `type`) which are
-  tolerated silently for forward compatibility.
+  tolerated silently for forward compatibility. (Amended by
+  [ADR 0018](0018-image-attachments.md): the entry may also carry `images:
+  true` — a strict boolean flag marking the model image-capable; absent,
+  `false`, or junk-with-warning means not.)
 - `yourName` is parsed by nothing yet — storage shape.
 - `configVersion` of this layout is `1`. A *newer* version warns and the load
   proceeds best-effort; an older/absent one is tolerated.
@@ -266,6 +269,12 @@ status-bar field (ADR 0006's model slot): `"nickname (profile)"` — e.g.
 `Sol (work)` — falling back to the bare nickname when no profile resolved,
 then the model id, then `—` (view fallback unchanged). The context-usage
 denominator still reads `context_tokens` off the provider.
+
+**Superseded:** the field moved to the footer in
+[ADR 0015](0015-input-surface-cursor-stats-ghost.md) §2 (issue #67) and its
+shape became `provider - model` in
+[ADR 0015](0015-input-surface-cursor-stats-ghost.md)'s 2026-10-31 amendment
+(issue #109).
 
 ## Alternatives considered
 

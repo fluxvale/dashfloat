@@ -12,6 +12,8 @@ defmodule DashFloat.Agent do
 
   alias DashFloat.Accounting
   alias DashFloat.Config
+  alias DashFloat.Config.Presets
+  alias DashFloat.Images
   alias DashFloat.LLM.ChatStream
   alias DashFloat.Mode
   alias DashFloat.ProjectInstructions
@@ -210,49 +212,60 @@ defmodule DashFloat.Agent do
   ## UI messages (plain sends; the UI process is the sender)
 
   @impl GenServer
-  def handle_info({:prompt, ui, text}, %__MODULE__{status: :idle} = state)
-      when is_pid(ui) and is_binary(text) do
+  def handle_info({:prompt, ui, text, paths}, %__MODULE__{status: :idle} = state)
+      when is_pid(ui) and is_binary(text) and is_list(paths) do
     case state.provider do
       {:error, message} ->
         display(ui, {:entry, :system, no_provider_text(message)})
         display(ui, {:phase, :idle})
         {:noreply, state}
 
-      {:ok, _config} ->
-        state = %{state | ui: ui, messages: state.messages ++ [%{role: "user", content: text}]}
+      {:ok, config} ->
+        case user_message(config, text, paths) do
+          {:ok, message} ->
+            state = %{state | ui: ui, messages: state.messages ++ [message]}
 
-        # Compact and persist before the episode starts: a kill mid-stream
-        # must lose at most the reply, never the question (ADR 0014 §5), and
-        # compaction rides the same seam — after the append, before the
-        # episode, the one point every request passes through (ADR 0022 §5).
-        # One persist per prompt, so a failed save shows one notice (m4).
-        state = maybe_compact(state)
-        start_episode(state)
+            # Compact and persist before the episode starts: a kill mid-stream
+            # must lose at most the reply, never the question (ADR 0014 §5), and
+            # compaction rides the same seam — after the append, before the
+            # episode, the one point every request passes through (ADR 0022 §5).
+            # One persist per prompt, so a failed save shows one notice (m4).
+            state = maybe_compact(state)
+            start_episode(state)
+
+          {:error, refusal} ->
+            # The image gate's visible refusal (ADR 0018 §4): nothing is
+            # appended, nothing is sent, and the UI returns to idle.
+            display(ui, {:entry, :system, refusal})
+            display(ui, {:phase, :idle})
+            {:noreply, state}
+        end
     end
   end
 
   # A prompt while busy is a UI bug (the UI gates on phase): ignore, never crash.
-  def handle_info({:prompt, _ui, _text}, state), do: {:noreply, state}
+  def handle_info({:prompt, _ui, _text, _paths}, state), do: {:noreply, state}
 
   # /compact (issue #92; ADR 0022's amendment): the same eviction the
   # prompt-time hook runs, on demand — never a second implementation. The
   # same ~80% trigger governs: below it the command is a no-op that reports
   # where the estimate stands, because drop-oldest below the trigger
-  # discards context nothing is at risk to reclaim.
+  # discards context nothing is at risk to reclaim. The window is the
+  # resolved chain (issue #111: configured, else seeded, else the
+  # documented default WITH the note naming the remedy — never a bare
+  # refusal and never silent).
   def handle_info(
         {:compact, ui},
-        %__MODULE__{status: :idle, provider: {:ok, %Config{context_tokens: window}}} = state
+        %__MODULE__{status: :idle, provider: {:ok, %Config{} = config}} = state
       )
-      when is_pid(ui) and is_integer(window) and window > 0 do
-    case eviction_pass(%{state | ui: ui}, window) do
+      when is_pid(ui) do
+    {window, source} = Config.context_window(config)
+
+    case eviction_pass(%{state | ui: ui}, window, source) do
       {state, nil} ->
         usage = Accounting.usage(state.messages, state.anchor, window)
 
-        display(
-          ui,
-          {:entry, :system,
-           "[context: at or under the 80% trigger — nothing to compact (est #{usage.used} of #{usage.window}, #{usage.percent}%)]"}
-        )
+        display(ui, {:entry, :system, below_trigger_text(usage, source)})
 
         {:noreply, state}
 
@@ -261,10 +274,16 @@ defmodule DashFloat.Agent do
     end
   end
 
-  # No configured window (or no resolved provider): nothing compacts and
-  # nothing is guessed (ADR 0022 §2) — the command says so, never silence.
+  # No resolved provider: nothing compacts and nothing is guessed (ADR 0022
+  # §2) — the command says so, naming the remedy (issue #111), never silence.
   def handle_info({:compact, ui}, %__MODULE__{status: :idle} = state) when is_pid(ui) do
-    display(ui, {:entry, :system, "[context: no context window configured — nothing to compact]"})
+    display(
+      ui,
+      {:entry, :system,
+       "[context: no context window resolved — nothing to compact; " <>
+         "set context on the model's entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS]"}
+    )
+
     {:noreply, state}
   end
 
@@ -368,15 +387,17 @@ defmodule DashFloat.Agent do
   # The episode's usage frame completes the anchor minted at episode start
   # (ADR 0022 §1): its prompt_tokens measured over the request's message
   # count. Display forwarding of pending_usage is unchanged (last frame wins
-  # at turn end, ADR 0007 §5).
+  # at turn end, ADR 0007 §5). The refreshed anchor rides a context push —
+  # the footer's span re-reads the measured estimate (ADR 0015 §2
+  # amendment).
   def handle_info({:usage, usage}, %__MODULE__{status: :streaming} = state),
     do:
       {:noreply,
-       %{
+       push_context(%{
          state
          | pending_usage: usage,
            anchor: %{tokens: usage.prompt_tokens, index: state.request_len}
-       }}
+       })}
 
   def handle_info({:usage, _usage}, state), do: {:noreply, state}
 
@@ -502,14 +523,19 @@ defmodule DashFloat.Agent do
         resolve_title(%{state | ui: ui}, cleaned)
 
       {:error, :empty} ->
+        # The refusal rides the dialog too (issue #106): the display-only
+        # push and the entry carry the same human text.
+        display(ui, {:title_refused, "may not be empty"})
         display(ui, {:entry, :system, "[title not set: may not be empty]"})
         {:noreply, state}
 
       {:error, :too_long} ->
+        display(ui, {:title_refused, "may not exceed 80 characters"})
         display(ui, {:entry, :system, "[title not set: may not exceed 80 characters]"})
         {:noreply, state}
 
       {:error, :reserved} ->
+        display(ui, {:title_refused, "may not look like a session id"})
         display(ui, {:entry, :system, "[title not set: may not look like a session id]"})
         {:noreply, state}
     end
@@ -606,6 +632,44 @@ defmodule DashFloat.Agent do
   end
 
   def handle_info({:DOWN, _ref, :process, _pid, _reason}, state), do: {:noreply, state}
+
+  ## The prompt's image gate (ADR 0018 §4/§6)
+
+  # The submit-time user message (ADR 0018 §2): a plain turn keeps the string
+  # content; a turn carrying paths is gated on the selected model's capability
+  # and on re-reading each file — the agent owns the bytes at submit. A
+  # refusal names the model or the path and lands as an `[images: …]` entry.
+  defp user_message(_config, text, []), do: {:ok, %{role: "user", content: text}}
+
+  defp user_message(%Config{images: false} = config, _text, _paths) do
+    {:error, "[images: model #{model_name(config)} does not accept images — attach refused]"}
+  end
+
+  defp user_message(_config, text, paths) do
+    with {:ok, urls} <- data_urls(paths) do
+      {:ok, %{role: "user", content: text_parts(text) ++ image_parts(urls)}}
+    end
+  end
+
+  defp data_urls(paths) do
+    Enum.reduce_while(paths, {:ok, []}, fn path, {:ok, urls} ->
+      case Images.data_url(path) do
+        {:ok, url} -> {:cont, {:ok, urls ++ [url]}}
+        {:error, reason} -> {:halt, {:error, "[images: " <> reason <> "]"}}
+      end
+    end)
+  end
+
+  # The text part leads, omitted when the prompt is empty — an image-only
+  # turn is a legal submit (ADR 0018 §2).
+  defp text_parts(""), do: []
+  defp text_parts(text), do: [%{type: "text", text: text}]
+
+  defp image_parts(urls), do: Enum.map(urls, &%{type: "image_url", image_url: %{url: &1}})
+
+  # The refusal names the model — the nickname, else the id (ADR 0018 §4).
+  defp model_name(%Config{nickname: nil, model: model}), do: model
+  defp model_name(%Config{nickname: nickname}), do: nickname
 
   ## Episode loop
 
@@ -1091,20 +1155,44 @@ defmodule DashFloat.Agent do
   ## Context accounting (ADR 0022)
 
   # The compaction hook (ADR 0022 §5): prompt time, after the user message is
-  # appended, before the episode starts. Only a configured window compacts —
-  # nil (or non-positive) persists the question and returns (§2, nothing is
-  # guessed). One persist per prompt either way, so a failed save shows one
-  # notice (m4): the pass persists when it dropped turns, this hook when it
-  # did not — the just-appended question must land, oversize warning or not.
-  defp maybe_compact(%__MODULE__{provider: {:ok, %Config{context_tokens: window}}} = state)
-       when is_integer(window) and window > 0 do
-    case eviction_pass(state, window) do
+  # appended, before the episode starts. The window is the resolved chain
+  # (issue #111: configured, else seeded, else the documented default) —
+  # only an unresolved provider skips the pass. One persist per prompt
+  # either way, so a failed save shows one notice (m4): the pass persists
+  # when it dropped turns, this hook when it did not — the just-appended
+  # question must land, oversize warning or not.
+  defp maybe_compact(%__MODULE__{provider: {:ok, %Config{} = config}} = state) do
+    {window, source} = Config.context_window(config)
+
+    case eviction_pass(state, window, source) do
       {state, %{dropped: dropped}} when dropped > 0 -> state
       {state, _no_drop} -> persist(state)
     end
   end
 
-  defp maybe_compact(state), do: persist(state)
+  # The below-trigger no-op's reply (issue #92's amendment): where the
+  # estimate stands, with the window's origin (issue #111) — a window no
+  # source knows is the documented default, and the note names the remedy
+  # instead of refusing.
+  defp below_trigger_text(usage, :default) do
+    "[context: at or under the 80% trigger — nothing to compact " <>
+      "(est #{usage.used} of #{usage.window}, #{usage.percent}%) — window assumed: no source " <>
+      "knows this model, using the #{Presets.default_window()}-token default; set context on " <>
+      "the model's entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS to override]"
+  end
+
+  defp below_trigger_text(usage, _known_window) do
+    "[context: at or under the 80% trigger — nothing to compact (est #{usage.used} of #{usage.window}, #{usage.percent}%)]"
+  end
+
+  # The drop entry's assumption suffix (issue #111, hostile review F1): the
+  # most destructive action must disclose the most — dropping turns against
+  # the documented default names the assumption like every other surface.
+  defp assumed_suffix(:default),
+    do:
+      " — window assumed, set context on the model's entry in settings.json5 or DASHFLOAT_CONTEXT_TOKENS"
+
+  defp assumed_suffix(_known_window), do: ""
 
   # The eviction both entry points run (ADR 0022 §4-§6; the /compact
   # amendment, issue #92): plan the drop; when something changes, mutate,
@@ -1114,7 +1202,7 @@ defmodule DashFloat.Agent do
   # the question; /compact saves nothing (the amendment's §3, no phantom
   # mint). Returns {state, plan}; a nil plan means the estimate sat at or
   # under the trigger with no oversize survivor — nothing changed.
-  defp eviction_pass(state, window) do
+  defp eviction_pass(state, window, source) do
     plan = Accounting.compact(state.messages, state.anchor, window)
 
     if plan.dropped == 0 and not plan.oversize do
@@ -1138,7 +1226,7 @@ defmodule DashFloat.Agent do
         display(
           state.ui,
           {:entry, :system,
-           "[context: dropped #{plan.dropped} oldest turn(s) — est #{before}→#{after_estimate} of #{window}]"}
+           "[context: dropped #{plan.dropped} oldest turn(s) — est #{before}→#{after_estimate} of #{window}#{assumed_suffix(source)}]"}
         )
       end
 
@@ -1311,6 +1399,7 @@ defmodule DashFloat.Agent do
       n ->
         title = candidate(proposal, n)
         new_state = persist(%{state | session_title: title, title_ref: nil})
+        display(new_state.ui, {:title, title})
         display(new_state.ui, {:entry, :system, "[session titled: #{title}]"})
         {:noreply, new_state}
     end
@@ -1329,6 +1418,7 @@ defmodule DashFloat.Agent do
   # sets, and confirms; persist just has no file to rewrite.
   defp resolve_title(%__MODULE__{session_dir: nil} = state, cleaned) do
     new_state = persist_if_started(%{state | session_title: cleaned})
+    display(state.ui, {:title, cleaned})
     display(state.ui, {:entry, :system, "[session titled: #{cleaned}]"})
     {:noreply, new_state}
   end
@@ -1337,10 +1427,16 @@ defmodule DashFloat.Agent do
     case Title.title_holder(dir, cleaned, id) do
       nil ->
         new_state = persist_if_started(%{state | session_title: cleaned})
+        display(state.ui, {:title, cleaned})
         display(state.ui, {:entry, :system, "[session titled: #{cleaned}]"})
         {:noreply, new_state}
 
       holder ->
+        display(
+          state.ui,
+          {:title_refused, ~s("#{cleaned}" is already taken by session #{holder})}
+        )
+
         display(
           state.ui,
           {:entry, :system,
@@ -1361,27 +1457,41 @@ defmodule DashFloat.Agent do
   # :session_dir — the nil default keeps tests and embedded starters off the
   # user's XDG dir. A failed save degrades to a warning plus one system
   # entry; the turn continues — persistence never joins the episode loop
-  # (ADR 0014 §5).
-  defp persist(%__MODULE__{session_dir: nil} = state), do: state
+  # (ADR 0014 §5). The context push rides the same seam: every transcript
+  # mutation passes through here (title adoptions ride along too — one
+  # idempotent push on a user-paced rename), and the footer's span re-reads
+  # off the snapshot even with persistence off (ADR 0015 §2 amendment).
+  defp persist(state), do: write_session(push_context(state))
 
-  # Id, pin, and created_at are minted once, at the first save. An error
-  # provider never reaches a persist (the prompt arm guards it), so the pin
-  # always reads off an {:ok, config}.
-  defp persist(%__MODULE__{session_id: nil} = state) do
-    persist(%{
-      state
-      | session_id: Session.new_id(),
-        session_created_at: now_iso8601_utc(),
-        session_pin: session_pin(state.provider)
-    })
+  defp write_session(%__MODULE__{session_dir: nil} = state), do: state
+
+  defp write_session(%__MODULE__{session_id: nil} = state) do
+    id = Session.new_id()
+
+    # Recurse through write_session, not persist: the minted-id rewrite is
+    # the same transcript mutation the outer persist already pushed for.
+    # The id is announced to the UI only once the save attempt has run —
+    # the Herdr reporter publishes a resume command off it (ADR 0024 §5);
+    # a first save that fails leaves no file, and the announcement still
+    # fires because a later turn retries under the SAME in-memory id.
+    saved =
+      write_session(%{
+        state
+        | session_id: id,
+          session_created_at: now_iso8601_utc(),
+          session_pin: session_pin(state.provider)
+      })
+
+    display(state.ui, {:session_id, id})
+    saved
   end
 
   # A hand-built resume map may carry no created_at; the first save stamps it.
-  defp persist(%__MODULE__{session_created_at: nil} = state) do
-    persist(%{state | session_created_at: now_iso8601_utc()})
+  defp write_session(%__MODULE__{session_created_at: nil} = state) do
+    write_session(%{state | session_created_at: now_iso8601_utc()})
   end
 
-  defp persist(
+  defp write_session(
          %__MODULE__{
            ui: ui,
            session_dir: dir,
@@ -1454,6 +1564,16 @@ defmodule DashFloat.Agent do
   ## Display helpers
 
   defp display(ui, message) when is_pid(ui), do: send(ui, message)
+
+  # The stage-2 footer seam (ADR 0022 §7 binding, ADR 0015 §2 amendment):
+  # the {messages, anchor} snapshot the footer's Accounting.usage/3 read
+  # computes from, pushed at every transcript mutation (persist) and at each
+  # usage frame (the anchor's own refresh). Pure data — the TUI owns the
+  # display window and the render-time read.
+  defp push_context(%__MODULE__{ui: ui} = state) do
+    display(ui, {:context, %{messages: state.messages, anchor: state.anchor}})
+    state
+  end
 
   defp tool_result_msg(call, result) do
     %{

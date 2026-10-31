@@ -40,21 +40,29 @@ defmodule DashFloat.TUI.View do
     unchained: :error
   }
 
-  # One cell of padding on every side of the chrome (issue #28; ADR 0006
-  # amendment): text never hugs a screen edge, and the log rect's width —
-  # which IS the wrap width — shrinks with it.
-  @margin 1
+  # Two cells of padding on every side of the chrome (issues #28 and #108;
+  # ADR 0006 amendment): text never hugs a screen edge, and the log rect's
+  # width — which IS the wrap width — shrinks with it.
+  @margin 2
 
   # The composer's placeholder, shown ONLY before the session's first
   # exchange (ADR 0015 §3, amended #91). The key map lives in /help.
   @input_hint "ask anything"
 
+  # The attach prompt's one activity line (ADR 0018 §5): label, draft, and
+  # the dim key hints.
+  @attach_label "Attach image: "
+  @attach_hint "  ⏎ attach · tab complete · esc keep · ^o close · ^d clear"
+
+  # The /title dialog's hint line (issue #106).
+  @title_dialog_hint "⏎ rename · esc cancel"
+
   @doc """
   Splits `width` x `height` into status (1 row), log (rest), activity
-  (1 row while an overlay exists — an active phase or the exit prompt —
-  else 0), input (`2 + input_lines` rows, clamped to a third of the
-  frame), and the permanent stats footer (1 row, ADR 0015) — the whole
-  chrome inset by one cell per side.
+  (1 row while an overlay exists — an active phase, the exit prompt, or the
+  open attach prompt — else 0), input (`2 + input_lines` rows, clamped to a
+  third of the frame), and the permanent stats footer (1 row, ADR 0015) —
+  the whole chrome inset by two cells per side.
   """
   @spec regions({integer(), integer()}, integer(), boolean()) :: %{
           status: Rect.t(),
@@ -128,6 +136,7 @@ defmodule DashFloat.TUI.View do
     # The transient row exists for an active phase OR an armed exit guard
     # (issue #28; ADR 0006 amendment) — even while idle.
     regions = regions({width, height}, State.input_line_count(state), State.overlay?(state))
+    area = inset_area(width, height)
 
     [
       {status_widget(state, regions.log.height), regions.status},
@@ -135,7 +144,7 @@ defmodule DashFloat.TUI.View do
       {activity_widget(state), regions.activity},
       {input_widget(state), regions.input},
       {footer_widget(state), regions.footer}
-    ] ++ palette_widgets(state, inset_area(width, height))
+    ] ++ palette_widgets(state, area) ++ title_dialog_widgets(state, area)
   end
 
   ## Setup screens (ADR 0009: forced selection + onboarding wizard)
@@ -358,7 +367,7 @@ defmodule DashFloat.TUI.View do
   defp provider_option(_wizard, :skip),
     do: "Skip — configure later"
 
-  defp model_pick_option(_wizard, {:model, id}), do: id
+  defp model_pick_option(_wizard, {:model, %{model: id}}), do: id
 
   defp model_pick_option(_wizard, :manual), do: "Type a model id"
 
@@ -396,7 +405,7 @@ defmodule DashFloat.TUI.View do
   # is silently clipped mid-token (issue #42).
   defp error_lines(message, width) do
     message
-    |> wrap_remedy(max(width - 4, 1))
+    |> wrap_remedy(max(width - 2 * @margin - 2, 1))
     |> Enum.map(&{&1, :error})
   end
 
@@ -405,7 +414,7 @@ defmodule DashFloat.TUI.View do
   # error.
   defp note_lines(message, width) do
     message
-    |> wrap_remedy(max(width - 4, 1))
+    |> wrap_remedy(max(width - 2 * @margin - 2, 1))
     |> Enum.map(&{&1, :dim})
   end
 
@@ -425,10 +434,11 @@ defmodule DashFloat.TUI.View do
 
   ## Status bar
 
-  # One left-flowing line: mode, context, phase, log position — non-empty
-  # groups joined with a separator BETWEEN them, so a fresh session opens
-  # with the phase dot, never a dangling leading separator. cwd, model, and
-  # rate moved to the stats footer (ADR 0015 §2) — moved, not duplicated.
+  # One left-flowing line: mode, phase, log position — non-empty groups
+  # joined with a separator BETWEEN them, so a fresh session opens with the
+  # phase dot, never a dangling leading separator. cwd, model, and rate
+  # moved to the stats footer (ADR 0015 §2), and ctx followed them in stage
+  # 2 (ADR 0015 §2 amendment) — moved, not duplicated.
   # The mode span leads (ADR 0016 §7): it is session state, always shown.
   defp status_widget(state, log_height) do
     {label, role} = Map.fetch!(@phases, state.phase)
@@ -436,7 +446,6 @@ defmodule DashFloat.TUI.View do
     spans =
       [
         mode_spans(state),
-        context_spans(state),
         phase_spans(label, role),
         position_spans(state, log_height)
       ]
@@ -448,10 +457,18 @@ defmodule DashFloat.TUI.View do
   end
 
   # The stats footer under the composer (ADR 0015 §2): cwd, model, live
-  # tok/s in the old status-bar span vocabulary. Static data read at render
-  # time — live while streaming because the tick recomputes the rate; the
-  # rate span is omitted entirely until a rate exists.
+  # tok/s in the old status-bar span vocabulary, plus the stage-2
+  # tokens-used + percent-of-context span (ADR 0015 §2 amendment). Static
+  # data read at render time — live while streaming because the tick
+  # recomputes the rate; the rate and context spans are omitted entirely
+  # until one exists.
   defp footer_widget(state) do
+    context_spans =
+      case State.context_label(state) do
+        nil -> []
+        label -> [separator(), Span.new(label, style: Theme.style(:dim))]
+      end
+
     rate_spans =
       case State.rate_label(state) do
         nil -> []
@@ -465,10 +482,18 @@ defmodule DashFloat.TUI.View do
             [
               separator(),
               Span.new(State.provider_label(state) || "—", style: Theme.style(:assistant))
-            ] ++ rate_spans
+            ] ++ images_spans(state) ++ context_spans ++ rate_spans
         )
       ]
     }
+  end
+
+  # The capability glyph (ADR 0018 §1): 📎 beside the model label while the
+  # selected model accepts images — visible before any attach attempt.
+  defp images_spans(%State{} = state) do
+    if State.provider_images?(state),
+      do: [Span.new(" 📎", style: Theme.style(:dim))],
+      else: []
   end
 
   # The mode group is bare — the bar intersperses separators between groups
@@ -478,12 +503,6 @@ defmodule DashFloat.TUI.View do
     label = Mode.label(state.mode)
 
     [Span.new(label, style: Theme.style(role))]
-  end
-
-  defp context_spans(%{stats: %{context_total: 0}}), do: []
-
-  defp context_spans(state) do
-    [Span.new("ctx " <> State.context_label(state), style: Theme.style(:dim))]
   end
 
   defp phase_spans(label, role) do
@@ -613,6 +632,30 @@ defmodule DashFloat.TUI.View do
     }
   end
 
+  # The open attach prompt (ADR 0018 §5) replaces the phase labels — one
+  # line like the exit guard: accent label, the draft with the composer's
+  # block cursor, and the dim key hints. The DRAFT owns the row (§4's
+  # "fix the path and retry" UX — the path being edited is the payload):
+  # the hints show only when everything fits beside them, and when they
+  # drop the draft's TAIL extends into the freed space, `…` marking the
+  # clipped head (completion and editing work at the end).
+  defp activity_widget(%State{attach: %{draft: draft}} = state) do
+    width = content_width(elem(state.size, 0))
+    {draft_shown, hint} = attach_layout(draft, width, String.length(@attach_label))
+
+    %Paragraph{
+      text: [
+        Line.new(
+          [
+            Span.new(@attach_label, style: Theme.style(:accent)),
+            Span.new(draft_shown <> "█", style: Theme.style(:assistant))
+          ] ++ hint_spans(hint)
+        )
+      ],
+      scroll: {0, 0}
+    }
+  end
+
   defp activity_widget(%{phase: :idle}) do
     %Paragraph{text: [], scroll: {0, 0}}
   end
@@ -630,6 +673,28 @@ defmodule DashFloat.TUI.View do
       scroll: {0, 0}
     }
   end
+
+  # Everything fits — the full draft plus the hints. Anything else drops
+  # the hints and tail-shows the draft into the whole remaining row.
+  defp attach_layout(draft, width, label_len) do
+    if label_len + String.length(draft) + 1 + String.length(@attach_hint) <= width do
+      {draft, @attach_hint}
+    else
+      budget = max(width - label_len - 1, 1)
+
+      shown =
+        if String.length(draft) >= budget,
+          do: "…" <> String.slice(draft, String.length(draft) - budget + 1, budget),
+          else: draft
+
+      {shown, ""}
+    end
+  end
+
+  defp hint_spans(""), do: []
+
+  defp hint_spans(hint),
+    do: [Span.new(hint, style: Theme.style(:hint))]
 
   defp spinner_frame(state) do
     frames = Theme.spinner_frames()
@@ -652,7 +717,7 @@ defmodule DashFloat.TUI.View do
     %Textarea{
       state: state.input,
       block: %Block{
-        title: Span.new("❯ ", style: Theme.style(:accent)),
+        title: input_title(state),
         borders: [:all],
         border_type: :rounded,
         border_style: Theme.style(:dim)
@@ -677,11 +742,33 @@ defmodule DashFloat.TUI.View do
   defp placeholder(%State{entries: []}), do: @input_hint
   defp placeholder(%State{}), do: nil
 
-  # The composer's cursor artifact (ADR 0015 §1): absent while the pane is
-  # unfocused, static bright reversed while idle (zero timers — ADR 0006's
-  # idle discipline stands), and a 500 ms on/off blink in active phases riding
-  # the existing 125 ms tick — 4 anim_steps on, 4 off at the 8 Hz budget.
+  # The composer's title (ADR 0018's 2026-10-31 amendment): pending
+  # attachments render as numbered chips — `[Image #1] [Image #2]` — in
+  # queue order beside the prompt glyph; the number is the queue position
+  # (re-derived on every pop), the whole row accent like the glyph it
+  # extends. Supersedes the `📎 n` count.
+  defp input_title(%State{attachments: []}),
+    do: Span.new("❯ ", style: Theme.style(:accent))
+
+  defp input_title(%State{attachments: attachments}) do
+    chips =
+      attachments
+      |> Enum.with_index(1)
+      |> Enum.map_join(" ", fn {_attachment, n} -> "[Image ##{n}]" end)
+
+    Span.new("❯ " <> chips, style: Theme.style(:accent))
+  end
+
+  # The composer's cursor artifact (ADR 0015 §1, amended by issue #104):
+  # absent while the pane is unfocused, a 500 ms on/off blink while idle —
+  # the dedicated blink timer toggles `blink_on` (ADR 0006's 2026-10-31
+  # amendment; 2 frames/s, the honest recorded cost) — and the same 500 ms
+  # blink in active phases riding the existing 125 ms tick: 4 anim_steps
+  # on, 4 off at the 8 Hz budget.
   defp cursor_style(%State{focused?: false}), do: %Style{}
+
+  defp cursor_style(%State{phase: :idle, blink_on: false}), do: %Style{}
+
   defp cursor_style(%State{phase: :idle}), do: Theme.style(:cursor)
 
   defp cursor_style(%State{anim_step: step}) do
@@ -707,9 +794,16 @@ defmodule DashFloat.TUI.View do
          %State{palette: %Palette{kind: :commands, items: items, selected: selected}},
          area
        ) do
+    # percent_width 70 (hostile review F1): at 80 cols the inset area is 76
+    # wide, so the popup's inner width is 51 — every registry description
+    # fits whole. The widget's default 50 clipped the longest rows
+    # mid-word even before the margin (37 inner cols), and margin 2 made it
+    # one column worse; the issue's done-when demands no palette regression
+    # at 80.
     SlashCommands.render_autocomplete(items,
       area: area,
       selected: selected,
+      percent_width: 70,
       highlight_style: Theme.style(:accent),
       style: Theme.style(:dim)
     )
@@ -760,6 +854,70 @@ defmodule DashFloat.TUI.View do
        },
        percent_width: 50,
        percent_height: 40
+     }, area}
+  end
+
+  ## Title dialog (issue #106; ADR 0023's 2026-10-31 amendment)
+
+  # Rendered last — on top of every region (and any palette; the two are
+  # mutually exclusive, the dialog only opens from an idle bare /title).
+  defp title_dialog_widgets(%State{title_dialog: nil}, _area), do: []
+
+  defp title_dialog_widgets(%State{title_dialog: %{draft: draft, error: error}}, area) do
+    # The refusal wraps to the box's inner width (60% of the area, minus the
+    # borders) so the holder id never clips — wrap_remedy's semantics.
+    inner = max(div(area.width * 60, 100) - 2, 1)
+
+    lines =
+      [
+        # The attach prompt's row shape: accent prompt glyph, the draft with
+        # the block cursor (ADR 0018 §5) — and its tail-showing rule: an
+        # over-long draft head-clips with `…` (titles run to 80 chars, the
+        # box is narrower, and the cursor must stay visible — the dialog's
+        # whole job is editing that string; hostile review F2).
+        Line.new([
+          Span.new("❯ ", style: Theme.style(:accent)),
+          Span.new(dialog_draft(draft, inner) <> "█", style: Theme.style(:assistant))
+        ]),
+        Line.new([Span.new(@title_dialog_hint, style: Theme.style(:hint))])
+      ] ++ refusal_lines(error, inner)
+
+    [title_dialog_box(lines, area)]
+  end
+
+  # The attach row's own solution (attach_layout): the TAIL shows — the
+  # cursor rides at the end, where editing happens — into the row's budget
+  # after the `❯ ` prefix AND the cursor's own cell, `…` marking the
+  # clipped head.
+  defp dialog_draft(draft, inner) do
+    budget = max(inner - String.length("❯ ") - 1, 1)
+
+    if String.length(draft) < budget,
+      do: draft,
+      else: "…" <> String.slice(draft, String.length(draft) - budget + 1, budget)
+  end
+
+  defp refusal_lines(nil, _width), do: []
+
+  defp refusal_lines(error, width) do
+    for text <- wrap_remedy(error, width),
+        do: Line.new([Span.new(text, style: Theme.style(:error))])
+  end
+
+  defp title_dialog_box(lines, area) do
+    {%Popup{
+       content: %Paragraph{
+         text: lines,
+         block: %Block{
+           title: Span.new(" Session title ", style: Theme.style(:accent)),
+           borders: [:all],
+           border_type: :rounded,
+           border_style: Theme.style(:dim)
+         },
+         scroll: {0, 0}
+       },
+       percent_width: 60,
+       percent_height: 35
      }, area}
   end
 end

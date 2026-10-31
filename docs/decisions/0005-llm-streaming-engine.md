@@ -144,6 +144,11 @@ as mount opts (`provider:`), keeping file I/O out of the UI process. Without a
 usable provider the TUI still runs; submitting degrades to a system entry with
 setup instructions. The endpoint is one OpenAI-compatible URL:
 `base_url <> "/chat/completions"`, `stream: true`, `Authorization: Bearer`.
+(The outbound message shape is amended by
+[ADR 0018](0018-image-attachments.md): a user turn with image attachments
+carries OpenAI content parts — a text part first, then `image_url` data-URL
+parts — and only for image-capable models; every other message shape
+stands.)
 
 *(This section's file layout and precedence are superseded by
 [ADR 0008](0008-config-layout-profiles-json5.md) — octofriend-style JSON5

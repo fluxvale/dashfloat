@@ -32,8 +32,8 @@ defmodule DashFloat.Config do
   `DashFloat.Application` and rides into the TUI as a mount opt; the UI
   process performs no file I/O (ADR 0005's contract, unchanged — the
   startup wizard/modal is the sanctioned exception, ADR 0009). The status
-  bar shows the selected entry's nickname and profile via
-  `DashFloat.TUI.State.provider_label/1`.
+  footer names the provider and model via
+  `DashFloat.TUI.State.provider_label/1` (ADR 0015 §2's amendment).
 
   Malformed config degrades to the least-surprising working state with a
   warning naming the field or profile — never a crash, never silent
@@ -44,6 +44,7 @@ defmodule DashFloat.Config do
   alias DashFloat.Config.JSON5
   alias DashFloat.Config.Migration
   alias DashFloat.Config.Posture
+  alias DashFloat.Config.Presets
 
   require Logger
 
@@ -89,7 +90,15 @@ defmodule DashFloat.Config do
     :auto_title,
     :nickname,
     :profile,
-    providers: []
+    providers: [],
+    # The active provider's settings-side model menu (ADR 0018 §1): each
+    # parsed entry carries its own `images` flag, so the runtime /model
+    # switch can resolve the picked id's capability — catalog ids default
+    # to not capable.
+    model_menu: [],
+    # The selected entry's image-capability flag (ADR 0018 §1): a strict
+    # boolean — true means the model accepts image attachments.
+    images: false
   ]
 
   @type provider :: %{
@@ -103,6 +112,7 @@ defmodule DashFloat.Config do
           model: String.t(),
           api_key: String.t(),
           context_tokens: pos_integer() | nil,
+          images: boolean(),
           suggest: false | String.t() | nil,
           auto_title: false | String.t() | nil,
           nickname: String.t() | nil,
@@ -133,6 +143,33 @@ defmodule DashFloat.Config do
   def config_dir do
     :filename.basedir(:user_config, "dashfloat")
   end
+
+  @doc """
+  The context window and its source (issue #111, ADR 0022 §2 amendment):
+  the explicit value (`context_tokens` — env or the entry's `context`)
+  wins; else the standard presets' seeded window for this base URL + model
+  id; else the documented 128 Ki default. Never nil on a resolved config —
+  a `:default` result must be surfaced with the visible note (`~` footer
+  marker, the note in `/compact`'s reply), never silently. The `/models`
+  observed layer sits BETWEEN explicit and seed and lives in the TUI
+  (`State.provider_context_tokens/1`), which is where the catalog lands.
+  """
+  @spec context_window(t()) :: {pos_integer(), :configured | :seeded | :default}
+  def context_window(%__MODULE__{context_tokens: n}) when is_integer(n) and n > 0,
+    do: {n, :configured}
+
+  def context_window(%__MODULE__{base_url: base_url, model: model})
+      when is_binary(base_url) and is_binary(model) do
+    case Presets.context_window(base_url, model) do
+      nil -> {Presets.default_window(), :default}
+      seeded -> {seeded, :seeded}
+    end
+  end
+
+  # A hand-built config with no usable base URL or model (test scaffolding,
+  # the Accounting.trust precedent): nothing is knowable — the documented
+  # default, visibly.
+  def context_window(%__MODULE__{}), do: {Presets.default_window(), :default}
 
   ## Onboarding writes (ADR 0009: the startup wizard's sanctioned writers)
 
@@ -299,6 +336,8 @@ defmodule DashFloat.Config do
   (ADR 0006). `suggest` (ADR 0015) and `autoTitle` (#80) flow the same way:
   `false` opts the side-request out, a string pins that model id, and absent
   or unusable is nil — the provider's default cheap model, never an error.
+  `images` (ADR 0018) rides the selected entry: a strict boolean, absent or
+  unusable means not image-capable — warned, never an error.
   """
   @spec load(Path.t(), map(), keyword()) :: classification()
   def load(dir, env, cli) when is_binary(dir) and is_map(env) and is_list(cli) do
@@ -565,6 +604,7 @@ defmodule DashFloat.Config do
     build(
       effective(nil, nil, nil, nil, env),
       context(env, entry),
+      false,
       tri_state(env, @suggest_var, nil, "suggest"),
       tri_state(env, @auto_title_var, nil, "autoTitle"),
       nil,
@@ -575,19 +615,32 @@ defmodule DashFloat.Config do
 
   defp build_result(_profiles, profile, keys, env, cli) do
     provider = select_provider(profile)
-    entry = select_entry(entry_menu(provider), profile.settings, cli)
+    menu = entry_menu(provider)
+    entry = select_entry(menu, profile.settings, cli)
     providers = resolved_providers(profile, keys, env, provider)
 
-    build(
-      effective(provider, entry, keys, profile, env),
-      context(env, entry),
-      tri_state(env, @suggest_var, profile.settings, "suggest"),
-      tri_state(env, @auto_title_var, profile.settings, "autoTitle"),
-      entry && entry.nickname,
-      profile.name,
-      providers
-    )
+    built =
+      build(
+        effective(provider, entry, keys, profile, env),
+        context(env, entry),
+        entry && entry.images,
+        tri_state(env, @suggest_var, profile.settings, "suggest"),
+        tri_state(env, @auto_title_var, profile.settings, "autoTitle"),
+        entry && entry.nickname,
+        profile.name,
+        providers
+      )
+
+    with_model_menu(built, menu)
   end
+
+  # The active provider's parsed menu rides the config (ADR 0018 §1) for
+  # the runtime /model switch's capability re-resolution — set after the
+  # shared build so its signature stays at the settled arity.
+  defp with_model_menu({:ok, %__MODULE__{} = config}, menu),
+    do: {:ok, %{config | model_menu: menu}}
+
+  defp with_model_menu(error, _menu), do: error
 
   defp entry_menu(nil), do: []
 
@@ -770,7 +823,7 @@ defmodule DashFloat.Config do
     nil
   end
 
-  defp build(values, context_tokens, suggest, auto_title, nickname, profile, providers) do
+  defp build(values, context_tokens, images, suggest, auto_title, nickname, profile, providers) do
     case Enum.reject(@fields, fn {field, _var} -> value(values[field]) end) do
       [] ->
         config =
@@ -783,6 +836,8 @@ defmodule DashFloat.Config do
          %{
            config
            | context_tokens: context_tokens,
+             # nil (no selected entry) is not capable (ADR 0018 §1).
+             images: images || false,
              suggest: suggest,
              auto_title: auto_title,
              nickname: value(nickname),
@@ -986,7 +1041,13 @@ defmodule DashFloat.Config do
     nil
   end
 
-  defp host_label(base_url) do
+  @doc """
+  The URL's host as a label — `URI.parse`'s host, else the raw string. The
+  settings label default (ADR 0009) and the footer's host degrade (ADR 0015
+  §2's amendment, issue #109) share this one rule.
+  """
+  @spec host_label(String.t()) :: String.t()
+  def host_label(base_url) do
     case URI.parse(base_url) do
       %URI{host: nil} -> base_url
       %URI{host: host} -> host
@@ -1018,7 +1079,8 @@ defmodule DashFloat.Config do
         %{
           nickname: value(entry["nickname"]) || model,
           model: model,
-          context: entry["context"]
+          context: entry["context"],
+          images: parse_images(entry["images"])
         }
     end
   end
@@ -1026,6 +1088,21 @@ defmodule DashFloat.Config do
   defp parse_model(_other) do
     Logger.warning("#{@main_file}: a models entry that is not an object is ignored")
     nil
+  end
+
+  # The image-capability flag is a strict boolean (ADR 0018 §1): true means
+  # capable, absent or false means not; anything else warns naming the field
+  # and means not — ADR 0009's tolerance principle, the context shape.
+  defp parse_images(true), do: true
+  defp parse_images(false), do: false
+  defp parse_images(nil), do: false
+
+  defp parse_images(_other) do
+    Logger.warning(
+      "#{@main_file}: images is not a boolean — treating the model as not image-capable"
+    )
+
+    false
   end
 
   # MCP entries are storage shape only (no client yet, ADR 0009): name and

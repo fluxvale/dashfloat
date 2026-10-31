@@ -6,6 +6,7 @@ defmodule DashFloat.TUI.StateTest do
   alias DashFloat.Tools
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.State
+  alias DashFloat.TUI.Theme
   alias DashFloat.TUI.View
 
   defp new_state(opts \\ []) do
@@ -14,13 +15,10 @@ defmodule DashFloat.TUI.StateTest do
     |> State.new()
   end
 
-  # One completed stream turn carrying `usage` (banked at finalize).
-  defp bank_usage(state, usage) do
-    state
-    |> Map.put(:phase, :streaming)
-    |> State.stream_message({:usage, usage}, 1_000)
-    |> State.stream_message({:phase, :idle}, 2_000)
-  end
+  # Adopts the agent's context snapshot (ADR 0015 §2 amendment): the
+  # {messages, anchor} pair the footer's usage read computes from.
+  defp context_state(state, messages, anchor),
+    do: State.stream_message(state, {:context, %{messages: messages, anchor: anchor}}, 1_000)
 
   defp type(state, text) do
     points = String.codepoints(text)
@@ -45,7 +43,7 @@ defmodule DashFloat.TUI.StateTest do
       |> type(text)
       |> State.handle_key("enter", [])
 
-    assert {:submit, ^text} = action
+    assert {:submit, ^text, []} = action
     Map.put(state, :phase, :idle)
   end
 
@@ -81,16 +79,18 @@ defmodule DashFloat.TUI.StateTest do
       assert State.input_text(state) == ""
     end
 
-    test "stats start empty" do
-      assert new_state().stats == %{
+    test "stats start empty and no context snapshot exists yet" do
+      state = new_state()
+
+      assert state.stats == %{
                tokens: 0,
                first_token_at: nil,
                rate: nil,
                prompt_tokens: nil,
-               completion_tokens: nil,
-               context_total: 0,
-               turn_total: nil
+               completion_tokens: nil
              }
+
+      assert state.context == nil
     end
 
     test "mount opts carry the provider; the agent defaults to the name" do
@@ -127,42 +127,126 @@ defmodule DashFloat.TUI.StateTest do
   end
 
   describe "provider_label/1" do
-    test "nickname and profile compose as \"nickname (profile)\"" do
-      provider =
+    # The footer label is "<provider> - <model>" (ADR 0015 §2's amendment,
+    # issue #109); the profile suffix is gone from the footer entirely.
+    test "a preset base_url names the preset — zai with a nickname, synthetic with one too" do
+      zai =
         {:ok,
          %DashFloat.Config{
-           base_url: "http://x",
+           base_url: "https://api.z.ai/api/coding/paas/v4",
            model: "glm-5.3",
            api_key: "k",
            nickname: "Sol",
-           profile: "work"
+           profile: "demo"
          }}
 
-      state = new_state(provider: provider)
-      assert State.provider_label(state) == "Sol (work)"
-    end
-
-    test "falls back to the bare nickname without a profile, then the model id" do
-      nickname_only =
+      synthetic =
         {:ok,
-         %DashFloat.Config{base_url: "http://x", model: "glm-5.3", api_key: "k", nickname: "Sol"}}
+         %DashFloat.Config{
+           base_url: "https://api.synthetic.new/openai/v1",
+           model: "glm-4.7",
+           api_key: "k",
+           nickname: "Sol"
+         }}
 
-      model_only = {:ok, %DashFloat.Config{base_url: "http://x", model: "glm-5.3", api_key: "k"}}
-
-      nickname_state = new_state(provider: nickname_only)
-      model_state = new_state(provider: model_only)
-      assert State.provider_label(nickname_state) == "Sol"
-      assert State.provider_label(model_state) == "glm-5.3"
+      zai_state = new_state(provider: zai)
+      synthetic_state = new_state(provider: synthetic)
+      assert State.provider_label(zai_state) == "zai - Sol"
+      assert State.provider_label(synthetic_state) == "synthetic - Sol"
     end
 
-    test "nil for an error provider, no provider, or a provider with no names" do
+    test "a preset match survives a trailing slash and beats a settings label" do
+      slashed =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "https://api.z.ai/api/coding/paas/v4/",
+           model: "glm-5.3",
+           api_key: "k",
+           nickname: "Sol",
+           # The settings entry's host-defaulted label loses to the preset:
+           # the presets are the first-class providers (ADR 0015 §2).
+           providers: [
+             %{
+               label: "api.z.ai",
+               base_url: "https://api.z.ai/api/coding/paas/v4",
+               api_key: "k"
+             }
+           ]
+         }}
+
+      slashed_state = new_state(provider: slashed)
+      assert State.provider_label(slashed_state) == "zai - Sol"
+    end
+
+    test "a custom provider shows the settings label, trailing slashes trimmed on both sides" do
+      custom =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "http://localhost:8080/v1/",
+           model: "llama",
+           api_key: "k",
+           nickname: "Sol",
+           providers: [
+             %{label: "homelab", base_url: "http://localhost:8080/v1", api_key: "k"}
+           ]
+         }}
+
+      mirrored =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "http://localhost:8080/v1",
+           model: "llama",
+           api_key: "k",
+           nickname: "Sol",
+           providers: [
+             %{label: "homelab", base_url: "http://localhost:8080/v1/", api_key: "k"}
+           ]
+         }}
+
+      custom_state = new_state(provider: custom)
+      mirrored_state = new_state(provider: mirrored)
+      assert State.provider_label(custom_state) == "homelab - Sol"
+      assert State.provider_label(mirrored_state) == "homelab - Sol"
+    end
+
+    test "an unlabeled custom provider (env-only boots: providers []) degrades to the URL host" do
+      unlabeled =
+        {:ok,
+         %DashFloat.Config{base_url: "http://127.0.0.1:8080/v1", model: "llama", api_key: "k"}}
+
+      host_only =
+        {:ok,
+         %DashFloat.Config{base_url: "not a url", model: "llama", api_key: "k", nickname: "Sol"}}
+
+      unlabeled_state = new_state(provider: unlabeled)
+      host_only_state = new_state(provider: host_only)
+      assert State.provider_label(unlabeled_state) == "127.0.0.1 - llama"
+      assert State.provider_label(host_only_state) == "not a url - Sol"
+    end
+
+    test "nil for an error provider, no provider, no base_url, or no model part" do
       error_state = new_state(provider: {:error, "nope"})
       blank_state = new_state()
+      # No base_url — nothing to classify the provider from (the settings
+      # scan still compares each entry against a nil url harmlessly).
+      no_url =
+        new_state(
+          provider:
+            {:ok,
+             %DashFloat.Config{
+               model: "glm-5.3",
+               api_key: "k",
+               providers: [%{label: "kept", base_url: "http://x", models: []}]
+             }}
+        )
+
       # A Config with neither nickname nor model (hand-made, e.g. an
       # env-only shape) has no label — the view's placeholder takes over.
       nameless = new_state(provider: {:ok, %DashFloat.Config{base_url: "http://x", api_key: "k"}})
+
       assert State.provider_label(error_state) == nil
       assert State.provider_label(blank_state) == nil
+      assert State.provider_label(no_url) == nil
       assert State.provider_label(nameless) == nil
     end
   end
@@ -197,29 +281,135 @@ defmodule DashFloat.TUI.StateTest do
       assert State.rate_label(ticked) == "9.9"
     end
 
-    test "no context before anything streamed" do
-      assert State.context_label(new_state()) == "—"
+    test "no context before the first snapshot lands" do
+      assert State.context_label(new_state()) == nil
     end
 
-    test "context total alone, then over the configured window" do
-      usage = %{prompt_tokens: 100, completion_tokens: 20, total_tokens: 4_100}
-      state = bank_usage(new_state(), usage)
-      assert State.context_label(state) == "4.1k"
+    test "tokens-used alone with no display window, over the window with one" do
+      messages = [%{role: "user", content: String.duplicate("a", 16_400)}]
 
-      base = bank_usage(new_state(provider: provider(128_000)), usage)
-      assert State.context_label(base) == "4.1k/128k"
+      no_window = context_state(new_state(), messages, nil)
+      assert State.context_label(no_window) == "4.1k"
+
+      windowed = context_state(new_state(provider: provider(128_000)), messages, nil)
+      assert State.context_label(windowed) == "4.1k/128k · 3.2%"
     end
 
-    test "context totals in the millions read as m, in the billions b" do
-      usage = %{prompt_tokens: 100, completion_tokens: 20, total_tokens: 4_100_000}
-      state = bank_usage(new_state(), usage)
+    test "a stock config's window resolves without a configured context (issue #111)" do
+      messages = [%{role: "user", content: String.duplicate("a", 16_400)}]
+
+      # Seeded (Z.AI GLM stock shape): the real 1M window, stated plain.
+      seeded =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "https://api.z.ai/api/coding/paas/v4",
+           model: "glm-5.3-flash",
+           api_key: "k"
+         }}
+
+      state = context_state(new_state(provider: seeded), messages, nil)
+      assert State.provider_context_tokens(state) == 1_048_576
+      assert State.context_label(state) == "4.1k/1m · 0.4%"
+
+      # A model absent from every source: the documented default, marked.
+      assumed =
+        {:ok,
+         %DashFloat.Config{
+           base_url: "https://api.z.ai/api/coding/paas/v4",
+           model: "glm-4.5",
+           api_key: "k"
+         }}
+
+      assumed_state = context_state(new_state(provider: assumed), messages, nil)
+      assert State.provider_context_tokens(assumed_state) == 131_072
+      assert State.context_label(assumed_state) == "4.1k/~131.1k · 3.1%"
+    end
+
+    test "observed catalog metadata beats the seed, never an explicit config (issue #111)" do
+      messages = [%{role: "user", content: String.duplicate("a", 16_400)}]
+      base = "https://api.synthetic.new/openai/v1"
+
+      seeded =
+        {:ok, %DashFloat.Config{base_url: base, model: "syn:small:text", api_key: "k"}}
+
+      # Before the sweep lands: the seed's 196_608.
+      state = context_state(new_state(provider: seeded), messages, nil)
+      assert State.provider_context_tokens(state) == 196_608
+
+      # The sweep lands with a fresher truth: observed wins, unmarked.
+      landed =
+        State.catalog_arrived(state, %{base => [%{model: "syn:small:text", context: 262_144}]})
+
+      assert State.provider_context_tokens(landed) == 262_144
+      assert State.context_label(landed) == "4.1k/262.1k · 1.6%"
+
+      # An explicit context always beats the catalog.
+      explicit =
+        {:ok,
+         %DashFloat.Config{
+           base_url: base,
+           model: "syn:small:text",
+           api_key: "k",
+           context_tokens: 64_000
+         }}
+
+      explicit_state = context_state(new_state(provider: explicit), messages, nil)
+
+      configured =
+        State.catalog_arrived(explicit_state, %{
+          base => [%{model: "syn:small:text", context: 262_144}]
+        })
+
+      assert State.provider_context_tokens(configured) == 64_000
+    end
+
+    test "an anchored snapshot reads the measurement, not the heuristic" do
+      messages = [
+        %{role: "user", content: String.duplicate("a", 400)},
+        %{role: "assistant", content: String.duplicate("b", 400)}
+      ]
+
+      # The anchor measured the whole list at 4_100; the estimate is exactly
+      # that (ADR 0022 §1).
+      state =
+        context_state(new_state(provider: provider(128_000)), messages, %{tokens: 4_100, index: 2})
+
+      assert State.context_label(state) == "4.1k/128k · 3.2%"
+    end
+
+    test "percent reads one decimal, trailing .0 trimmed" do
+      # 6_400 / 128_000 = 5.0% — trimmed; 65_000 / 128_000 = 50.8%.
+      one =
+        context_state(
+          new_state(provider: provider(128_000)),
+          [%{role: "user", content: String.duplicate("a", 25_600)}],
+          %{tokens: 6_400, index: 1}
+        )
+
+      assert State.context_label(one) =~ "5%"
+
+      two =
+        context_state(new_state(provider: provider(128_000)), [%{role: "user", content: "x"}], %{
+          tokens: 65_000,
+          index: 1
+        })
+
+      assert State.context_label(two) =~ "50.8%"
+    end
+
+    test "totals in the millions read as m, in the billions b" do
+      state =
+        context_state(new_state(), [%{role: "user", content: "x"}], %{
+          tokens: 4_100_000,
+          index: 1
+        })
+
       assert State.context_label(state) == "4.1m"
 
       big =
-        bank_usage(new_state(), %{
-          prompt_tokens: 1,
-          completion_tokens: 1,
-          total_tokens: 2_500_000_000
+        context_state(new_state(), [%{role: "user", content: "x"}], %{
+          tokens: 2_500_000_000,
+          index: 1
         })
 
       assert State.context_label(big) == "2.5b"
@@ -227,27 +417,27 @@ defmodule DashFloat.TUI.StateTest do
 
     test "humanize boundaries roll into the next unit" do
       # 999_999 rounds up and reads "1m", never "1000k".
-      assert new_state()
-             |> bank_usage(%{prompt_tokens: 1, completion_tokens: 1, total_tokens: 999_999})
-             |> State.context_label() ==
-               "1m"
+      state =
+        context_state(new_state(), [%{role: "user", content: "x"}], %{tokens: 999_999, index: 1})
 
-      assert new_state()
-             |> bank_usage(%{prompt_tokens: 1, completion_tokens: 1, total_tokens: 999})
-             |> State.context_label() ==
-               "999"
+      assert State.context_label(state) == "1m"
+
+      small =
+        context_state(new_state(), [%{role: "user", content: "x"}], %{tokens: 999, index: 1})
+
+      assert State.context_label(small) == "999"
     end
 
-    test "context total accumulates across turns" do
-      usage = %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 15}
+    test "a later snapshot wins — the count grows across turns" do
+      one = [%{role: "user", content: String.duplicate("a", 400)}]
+      two = one ++ [%{role: "assistant", content: String.duplicate("b", 8_000)}]
 
       state =
         new_state()
-        |> bank_usage(usage)
-        |> bank_usage(usage)
+        |> context_state(one, nil)
+        |> context_state(two, nil)
 
-      assert state.stats.context_total == 30
-      assert State.context_label(state) == "30"
+      assert State.context_label(state) == "2.1k"
     end
   end
 
@@ -285,24 +475,24 @@ defmodule DashFloat.TUI.StateTest do
     test "down anchors, drag extends, up copies; click-to-clear" do
       state = selected_state()
 
-      {anchored, nil} = State.select_mouse(state, "down", 1, 3)
+      {anchored, nil} = State.select_mouse(state, "down", 1, 4)
       assert anchored.selection.anchor == {1, 0}
       # The gesture snapshots the entries' display-row count as its base —
       # the finalize boundary (review P1).
       assert anchored.selection.base_rows == 4
       assert anchored.selection.head == {1, 0}
 
-      {extended, nil} = State.select_mouse(anchored, "drag", 6, 5)
+      {extended, nil} = State.select_mouse(anchored, "drag", 7, 6)
       assert extended.selection.head == {3, 5}
 
-      {released, {:copy, text}} = State.select_mouse(extended, "up", 6, 5)
+      {released, {:copy, text}} = State.select_mouse(extended, "up", 7, 6)
       assert match?(%{head: _}, released.selection)
       # Last row slices through col 5's cell ("beta l" — the pointed cell
       # is included; review P2a).
       assert text == "alpha line\n\nbeta l"
 
       # Press+release without extension clears…
-      {cleared, nil} = State.select_mouse(anchored, "up", 1, 3)
+      {cleared, nil} = State.select_mouse(anchored, "up", 1, 4)
       assert cleared.selection == nil
       # …and an empty selection copies nothing (the nil clause's contract).
       assert State.selection_text(cleared) == ""
@@ -324,15 +514,15 @@ defmodule DashFloat.TUI.StateTest do
       # Below the log (over the input box): clamps to the last row, and the
       # column clamps to the padded width (one past the last column).
       {below, nil} = State.select_mouse(selected_state(), "down", 999, 23)
-      assert below.selection.anchor == {3, 78}
+      assert below.selection.anchor == {3, 76}
     end
 
     test "a blank-only selection copies nothing and clears" do
       # An empty entry renders as blank separator + empty line: rows 0-1.
       state = State.stream_message(new_state(), {:entry, :system, ""})
 
-      {anchored, nil} = State.select_mouse(state, "down", 1, 2)
-      {released, action} = State.select_mouse(anchored, "up", 1, 3)
+      {anchored, nil} = State.select_mouse(state, "down", 3, 3)
+      {released, action} = State.select_mouse(anchored, "up", 3, 4)
 
       assert action == nil
       assert released.selection == nil
@@ -371,7 +561,7 @@ defmodule DashFloat.TUI.StateTest do
 
       scrolled = State.wheel_scroll(state, :up)
       refute scrolled.follow?
-      top = State.effective_scroll(scrolled, 17)
+      top = State.effective_scroll(scrolled, 15)
       assert top > 0
 
       # Click on the status bar (screen row 0): anchors the viewport's
@@ -380,10 +570,10 @@ defmodule DashFloat.TUI.StateTest do
       assert above.selection.anchor == {top, 0}
 
       # Drag into the input pane (screen row 23): the viewport's last
-      # visible row (17-row idle viewport, ADR 0015's footer: rows
-      # top..top + 16).
+      # visible row (15-row idle viewport, issues #28 + #108: rows
+      # top..top + 14).
       {below, _nil} = State.select_mouse(scrolled, "down", 1, 23)
-      assert below.selection.anchor == {top + 16, 0}
+      assert below.selection.anchor == {top + 14, 0}
     end
 
     test "click jitter below the drag threshold clears instead of copying" do
@@ -392,20 +582,20 @@ defmodule DashFloat.TUI.StateTest do
       state = selected_state()
 
       # Same cell (1-cell extent): a plain click.
-      {anchored, _nil} = State.select_mouse(state, "down", 1, 3)
-      {same, action} = State.select_mouse(anchored, "up", 1, 3)
+      {anchored, _nil} = State.select_mouse(state, "down", 2, 4)
+      {same, action} = State.select_mouse(anchored, "up", 2, 4)
       assert action == nil
       assert same.selection == nil
 
       # Adjacent cell (2-cell extent): still wobble.
-      {anchored2, _nil} = State.select_mouse(state, "down", 1, 3)
-      {wobbled, action2} = State.select_mouse(anchored2, "up", 2, 3)
+      {anchored2, _nil} = State.select_mouse(state, "down", 2, 4)
+      {wobbled, action2} = State.select_mouse(anchored2, "up", 3, 4)
       assert action2 == nil
       assert wobbled.selection == nil
 
       # Two cells away (3-cell extent): a deliberate selection — copies.
-      {anchored3, _nil} = State.select_mouse(state, "down", 1, 3)
-      {dragged3, {:copy, text}} = State.select_mouse(anchored3, "up", 3, 3)
+      {anchored3, _nil} = State.select_mouse(state, "down", 2, 4)
+      {dragged3, {:copy, text}} = State.select_mouse(anchored3, "up", 4, 4)
       assert match?(%{head: _}, dragged3.selection)
       assert text == "alp"
     end
@@ -503,8 +693,8 @@ defmodule DashFloat.TUI.StateTest do
 
       # Select into the live reply (rows 0-1; the base is 0 — no entries).
       {anchored, _nil} = State.select_mouse(ticked, "down", 1, 2)
-      {dragged, _nil} = State.select_mouse(anchored, "drag", 10, 3)
-      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 10, 3)
+      {dragged, _nil} = State.select_mouse(anchored, "drag", 10, 4)
+      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 10, 4)
       assert selected.selection.base_rows == 0
 
       cancelled =
@@ -542,7 +732,9 @@ defmodule DashFloat.TUI.StateTest do
       # after the last tick) and equal in count while differing in
       # content, so row counts cannot decide — the guard is positional.
       # Display rows: 0 blank, 1 "warm", then the reply's rows from 2.
-      warm = new_state(test_mode: {20, 24})
+      # 22 cols → content 18: "one two three" AND "one two three four"
+      # each fit one padded row (the equal-count premise below).
+      warm = new_state(test_mode: {22, 24})
 
       base = State.stream_message(warm, {:entry, :system, "warm"})
 
@@ -558,9 +750,9 @@ defmodule DashFloat.TUI.StateTest do
 
       # Above the reply (row 1): a real drag within "warm" that survives
       # the finalize untouched.
-      {anchored, _no_copy} = State.select_mouse(dirty, "down", 1, 3)
-      {dragged, _no_copy} = State.select_mouse(anchored, "drag", 4, 3)
-      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 4, 3)
+      {anchored, _no_copy} = State.select_mouse(dirty, "down", 1, 4)
+      {dragged, _no_copy} = State.select_mouse(anchored, "drag", 4, 4)
+      {selected, {:copy, _text}} = State.select_mouse(dragged, "up", 4, 4)
 
       finalized = State.stream_message(selected, {:phase, :idle}, 1_300)
       assert finalized.selection != nil
@@ -574,9 +766,9 @@ defmodule DashFloat.TUI.StateTest do
 
       # Reaching into the reply (row 2, the reply's blank separator row)
       # clears even at that equal count.
-      {into, _no_copy} = State.select_mouse(dirty, "down", 1, 4)
-      {into_drag, _no_copy} = State.select_mouse(into, "drag", 6, 5)
-      {into_selected, {:copy, _reply_text}} = State.select_mouse(into_drag, "up", 6, 5)
+      {into, _no_copy} = State.select_mouse(dirty, "down", 1, 5)
+      {into_drag, _no_copy} = State.select_mouse(into, "drag", 6, 6)
+      {into_selected, {:copy, _reply_text}} = State.select_mouse(into_drag, "up", 6, 6)
       assert match?(%{head: _}, into_selected.selection)
 
       replaced = State.stream_message(into_selected, {:phase, :idle}, 1_400)
@@ -658,7 +850,7 @@ defmodule DashFloat.TUI.StateTest do
         |> type("hello")
         |> State.handle_key("enter", [])
 
-      assert {:submit, "hello"} = action
+      assert {:submit, "hello", []} = action
       assert State.input_text(state) == ""
       assert pairs(state) == [{:user, "hello"}]
       assert state.phase == :streaming
@@ -668,7 +860,7 @@ defmodule DashFloat.TUI.StateTest do
     test "Ctrl+Enter also submits" do
       state = type(new_state(), "hi")
       {_state, action} = State.handle_key(state, "enter", ["ctrl"])
-      assert {:submit, "hi"} = action
+      assert {:submit, "hi", []} = action
     end
 
     test "Shift+Enter and Alt+Enter insert newlines" do
@@ -1182,16 +1374,12 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.stats.prompt_tokens == 120
       assert state.stats.completion_tokens == 42
-      # The turn's total is banked, not yet accumulated — per-chunk usage
-      # reporters send running totals, so only the last frame may count.
-      assert state.stats.turn_total == 162
-      assert state.stats.context_total == 0
       # The estimate is reconciled to the provider's authoritative count.
       assert state.stats.tokens == 42
       assert state.phase == :streaming
     end
 
-    test "a later usage frame wins; the turn banks once at finalize, then accumulates" do
+    test "a later usage frame wins (per-chunk reporters send running totals)" do
       turn_one =
         new_state()
         |> Map.put(:phase, :streaming)
@@ -1203,14 +1391,12 @@ defmodule DashFloat.TUI.StateTest do
         )
 
       assert turn_one.stats.prompt_tokens == 20
-      assert turn_one.stats.turn_total == 28
+      assert turn_one.stats.completion_tokens == 8
+      assert turn_one.stats.tokens == 8
 
       idle = State.stream_message(turn_one, {:phase, :idle}, 3_000)
-      assert idle.stats.context_total == 28
-      assert idle.stats.turn_total == nil
+      assert idle.stats.prompt_tokens == 20
 
-      # The next turn adds its own final total, whatever its provider's
-      # reporting cadence.
       turn_two =
         idle
         |> Map.put(:phase, :streaming)
@@ -1218,7 +1404,7 @@ defmodule DashFloat.TUI.StateTest do
           {:usage, %{prompt_tokens: 30, completion_tokens: 10, total_tokens: 10}}
         )
 
-      assert State.stream_message(turn_two, {:phase, :idle}, 5_000).stats.context_total == 38
+      assert turn_two.stats.prompt_tokens == 30
     end
 
     test "a usage frame after the turn finalized is ignored" do
@@ -1237,8 +1423,24 @@ defmodule DashFloat.TUI.StateTest do
 
       # Nothing from the finished turn may poison the next one's rate math.
       assert late.stats.tokens == 0
-      assert late.stats.context_total == 0
-      assert late.stats.turn_total == nil
+      assert late.stats.prompt_tokens == nil
+    end
+  end
+
+  describe "context snapshots (ADR 0015 §2 amendment)" do
+    test "{:context, _} adopts the snapshot verbatim; a later snapshot wins" do
+      one = [%{role: "user", content: "hi"}]
+      two = one ++ [%{role: "assistant", content: "hello"}]
+
+      state =
+        new_state()
+        |> State.stream_message({:context, %{messages: one, anchor: nil}}, 1_000)
+        |> State.stream_message(
+          {:context, %{messages: two, anchor: %{tokens: 9, index: 2}}},
+          1_100
+        )
+
+      assert state.context == %{messages: two, anchor: %{tokens: 9, index: 2}}
     end
   end
 
@@ -1281,11 +1483,9 @@ defmodule DashFloat.TUI.StateTest do
         |> State.stream_message({:phase, :idle}, 2_000)
 
       assert State.rate_label(state) == "2.0"
-      assert state.stats.context_total == 5
 
       # A usage frame arriving after the turn ended belongs to nobody.
       late = State.stream_message(state, {:usage, usage}, 2_100)
-      assert late.stats.context_total == 5
       assert State.rate_label(late) == "2.0"
     end
 
@@ -1298,7 +1498,6 @@ defmodule DashFloat.TUI.StateTest do
 
       assert_in_delta state.stats.rate, 2.0, 0.0001
       assert state.stats.prompt_tokens == nil
-      assert state.stats.context_total == 0
       assert pairs(state) == [{:assistant, "partial"}]
     end
 
@@ -1369,9 +1568,9 @@ defmodule DashFloat.TUI.StateTest do
       final = State.stream_message(over, {:phase, :idle}, 1_300)
       [entry] = final.entries
       assert entry.text == over_cap
-      # blank separator + 64 KiB + 1 of x's at 78 columns (the padded width)
-      # = 841 display rows
-      assert length(entry.lines) == 1 + div(64 * 1024, 78) + 1
+      # blank separator + 64 KiB + 1 of x's at 76 columns (the padded width)
+      # = 864 display rows
+      assert length(entry.lines) == 1 + div(64 * 1024, 76) + 1
     end
 
     test "needs_tick?/1 is true only while active and unscheduled" do
@@ -1456,15 +1655,15 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up on a viewport-fitting log is a no-op (stays pinned)" do
-      # The real idle viewport at 80x24 is 17 rows with the margin (issue
-      # #28; ADR 0015's footer took one more row); 8 entries = blank + line
-      # each fit inside one viewport.
-      base = full_state(8)
-      assert State.log_line_count(base) == 16
+      # The real idle viewport at 80x24 is 15 rows with the margin (issues
+      # #28 + #108; ADR 0015's footer took one more row); 7 entries = blank
+      # + line each fit inside one viewport.
+      base = full_state(7)
+      assert State.log_line_count(base) == 14
 
       {paged, nil} = State.handle_key(base, "page_up", [])
       assert paged.follow?
-      assert State.effective_scroll(paged, 17) == 0
+      assert State.effective_scroll(paged, 15) == 0
     end
 
     test "submit re-pins the log so the new reply is visible" do
@@ -1478,6 +1677,58 @@ defmodule DashFloat.TUI.StateTest do
       assert State.effective_scroll(state, 20) == 182
     end
 
+    # Typing snaps the transcript to the tail (issue #110): any composer
+    # EDIT while the view rests above the bottom re-pins immediately — the
+    # keystroke is the requirement, not focus, and no timer rides this.
+    test "a draft-editing keystroke re-pins the log to the tail" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      refute paged.follow?
+
+      {typed, nil} = State.handle_key(paged, "h", [])
+      assert typed.follow?
+      assert typed.scroll == 0
+      assert State.effective_scroll(typed, 20) == 180
+      assert State.input_text(typed) == "h"
+    end
+
+    test "backspace editing an existing draft re-pins too" do
+      base = full_state(100)
+      {drafted, nil} = State.handle_key(base, "a", [])
+      {paged, nil} = State.handle_key(drafted, "page_up", [])
+      refute paged.follow?
+
+      {edited, nil} = State.handle_key(paged, "backspace", [])
+      assert edited.follow?
+      assert State.input_text(edited) == ""
+    end
+
+    test "a paste re-pins the log to the tail" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      refute paged.follow?
+
+      pasted = State.paste(paged, "pasted text")
+      assert pasted.follow?
+      assert State.input_text(pasted) == "pasted text"
+    end
+
+    # The negative space, recorded (issue #110's decision): cursor-only
+    # keys and history navigation are not "entering text" — the view stays
+    # where the reader put it.
+    test "cursor-only keys and history navigation do NOT re-pin" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      refute paged.follow?
+
+      {moved, nil} = State.handle_key(paged, "left", [])
+      refute moved.follow?
+
+      with_history = %{paged | history: ["old"]}
+      {recalled, nil} = State.handle_key(with_history, "up", [])
+      refute recalled.follow?
+    end
+
     test "follow pins to the bottom as content grows" do
       state = full_state(50)
       assert State.effective_scroll(state, 20) == 80
@@ -1486,47 +1737,47 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up unfollows and pages back; page_down re-pins at the bottom" do
-      # 200 lines, 17-row viewport (the padded 80x24 layout with ADR 0015's
-      # footer) → bottom 183.
+      # 200 lines, 15-row viewport (the padded 80x24 layout with ADR 0015's
+      # footer) → bottom 185.
       base = full_state(100)
       {up_one, nil} = State.handle_key(base, "page_up", [])
       refute up_one.follow?
-      assert State.effective_scroll(up_one, 17) == 166
+      assert State.effective_scroll(up_one, 15) == 170
 
       {up_two, nil} = State.handle_key(up_one, "page_up", [])
-      assert State.effective_scroll(up_two, 17) == 149
+      assert State.effective_scroll(up_two, 15) == 155
 
       {down_one, nil} = State.handle_key(up_two, "page_down", [])
-      assert State.effective_scroll(down_one, 17) == 166
+      assert State.effective_scroll(down_one, 15) == 170
 
       {down_two, nil} = State.handle_key(down_one, "page_down", [])
       assert down_two.follow?
-      assert State.effective_scroll(down_two, 17) == 183
+      assert State.effective_scroll(down_two, 15) == 185
     end
 
     test "wheel_scroll: one notch is three lines; up unfollows, down re-pins at the bottom" do
       base = full_state(100)
-      assert State.effective_scroll(base, 17) == 183
+      assert State.effective_scroll(base, 15) == 185
 
       wheeled = State.wheel_scroll(base, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 17) == 180
+      assert State.effective_scroll(wheeled, 15) == 182
 
       again = State.wheel_scroll(wheeled, :up)
-      assert State.effective_scroll(again, 17) == 177
+      assert State.effective_scroll(again, 15) == 179
 
       down = State.wheel_scroll(again, :down)
       refute down.follow?
-      assert State.effective_scroll(down, 17) == 180
+      assert State.effective_scroll(down, 15) == 182
 
       pinned = State.wheel_scroll(down, :down)
       assert pinned.follow?
-      assert State.effective_scroll(pinned, 17) == 183
+      assert State.effective_scroll(pinned, 15) == 185
     end
 
     test "wheel up on a viewport-fitting log is a no-op (stays pinned)" do
-      base = full_state(8)
-      assert State.log_line_count(base) == 16
+      base = full_state(7)
+      assert State.log_line_count(base) == 14
       assert State.wheel_scroll(base, :up) == base
     end
 
@@ -1541,12 +1792,12 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.phase == :confirming
 
-      # The activity row is up while confirming: the viewport is 16 rows
+      # The activity row is up while confirming: the viewport is 14 rows
       # (ADR 0015's footer took one from the log).
-      bottom = State.effective_scroll(state, 16)
+      bottom = State.effective_scroll(state, 14)
       wheeled = State.wheel_scroll(state, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 16) == bottom - 3
+      assert State.effective_scroll(wheeled, 14) == bottom - 3
     end
 
     test "new content does not move an unfollowed view, but clamping still holds" do
@@ -2055,10 +2306,14 @@ defmodule DashFloat.TUI.StateTest do
       }
 
       state = setup_state(provider: {:ok, config})
-      assert State.provider_context_tokens(state) == nil
+      # No catalog yet and the model is absent from the seed table: the
+      # documented default stands in (issue #111) — the footer always has a
+      # denominator on a resolved provider.
+      assert State.provider_context_tokens(state) == 131_072
 
       landed = State.catalog_arrived(state, %{base => [%{model: "glm-5.3", context: 128_000}]})
 
+      # Observed metadata beats the default assumption (issue #111).
       assert State.provider_context_tokens(landed) == 128_000
       assert landed.catalog == %{base => [%{model: "glm-5.3", context: 128_000}]}
 
@@ -2070,7 +2325,8 @@ defmodule DashFloat.TUI.StateTest do
 
       assert State.provider_context_tokens(filled) == 64_000
 
-      # A catalog entry without usable context leaves the fallback nil.
+      # A catalog entry without usable context falls to the documented
+      # default (issue #111) — an unusable observed value assumes nothing.
       bare = setup_state(provider: {:ok, config})
 
       contextless =
@@ -2078,7 +2334,7 @@ defmodule DashFloat.TUI.StateTest do
           base => [%{model: "glm-5.3", context: nil}]
         })
 
-      assert State.provider_context_tokens(contextless) == nil
+      assert State.provider_context_tokens(contextless) == 131_072
     end
   end
 
@@ -2213,7 +2469,7 @@ defmodule DashFloat.TUI.StateTest do
       ghosted = %{new_state(provider: @provider) | suggestion: "tell me more"}
       typed = type(ghosted, "q")
 
-      {state, {:submit, "q"}} = State.handle_key(typed, "enter", [])
+      {state, {:submit, "q", []}} = State.handle_key(typed, "enter", [])
 
       assert state.suggestion == nil
       assert state.suggest_reap == true
@@ -2346,6 +2602,18 @@ defmodule DashFloat.TUI.StateTest do
       assert replayed.entries == live_state().entries
     end
 
+    test "the stored system message replays as nothing — the prompt is re-derived at boot (ADR 0019)" do
+      # A session saved since ADR 0019 always carries the system message
+      # first; a resume of one crashed at mount until the skip landed
+      # (issue #113's restore dance).
+      replayed =
+        new_state(
+          transcript: [%{"role" => "system", "content" => "You are DashFloat."} | transcript()]
+        )
+
+      assert pairs(replayed) == pairs(live_state())
+    end
+
     test "entries wrap at the construction width, exactly like live entries" do
       wide = new_state(transcript: transcript())
       narrow = new_state(test_mode: {20, 24}, transcript: transcript())
@@ -2366,6 +2634,77 @@ defmodule DashFloat.TUI.StateTest do
         |> State.stream_message({:phase, :idle}, 1_100)
 
       assert state.entries == live.entries
+    end
+
+    # ADR 0018 §2's persistence coordination: an image-bearing user turn
+    # loads as a parts list, and the replay must render it — the
+    # concatenated text parts as the body, one dim 📎 row per image part —
+    # never crash the render path (hostile review finding 1: a resumed
+    # image session must boot).
+    test "an image-bearing user turn replays with its indicator rows" do
+      image_turn = %{
+        "role" => "user",
+        "content" => [
+          %{"type" => "text", "text" => "what is this?"},
+          %{
+            "type" => "image_url",
+            "image_url" => %{"url" => "data:image/png;base64,aGVsbG8="}
+          }
+        ]
+      }
+
+      replayed =
+        new_state(transcript: [image_turn, %{"role" => "assistant", "content" => "a cat."}])
+
+      assert [
+               %{kind: :user, text: "what is this?"} = user,
+               %{kind: :assistant, text: "a cat."}
+             ] = replayed.entries
+
+      assert Enum.map_join(user.lines, "\n", &flatten/1) =~ "📎 image"
+    end
+
+    test "an image-only turn replays with an empty body and its indicator" do
+      image_only = %{
+        "role" => "user",
+        "content" => [
+          %{"type" => "image_url", "image_url" => %{"url" => "data:image/png;base64,aGVsbG8="}}
+        ]
+      }
+
+      replayed = new_state(transcript: [image_only])
+      assert [%{kind: :user} = user] = replayed.entries
+      assert Enum.map_join(user.lines, "\n", &flatten/1) =~ "📎 image"
+    end
+
+    # Issue #107: the resumed log keeps the user/assistant distinction —
+    # replay rides Render.entry_lines/2 (the one styler), so the replayed
+    # user rows carry the bold :user role and the accent ❯ prefix, while
+    # the assistant rows stay plain.
+    test "a replayed user turn keeps the bold :user style and the accent prefix" do
+      transcript = [
+        %{"role" => "user", "content" => "first question"},
+        %{"role" => "assistant", "content" => "an answer."}
+      ]
+
+      assert [%{kind: :user} = user, %{kind: :assistant} = assistant] =
+               new_state(transcript: transcript).entries
+
+      user_style = Theme.style(:user)
+      accent_bold = %{Theme.style(:accent) | modifiers: [:bold]}
+
+      [_sep, first | rest] = user.lines
+
+      assert [%ExRatatui.Text.Span{content: "❯ ", style: ^accent_bold}, %{style: ^user_style}] =
+               first.spans
+
+      assert Enum.all?(rest, fn line ->
+               Enum.all?(line.spans, &(&1.style == user_style))
+             end)
+
+      assert Enum.all?(assistant.lines, fn line ->
+               Enum.all?(line.spans, &(&1.style == %ExRatatui.Style{}))
+             end)
     end
 
     test "arguments that do not decode render the (invalid arguments) arm" do
@@ -2577,6 +2916,46 @@ defmodule DashFloat.TUI.StateTest do
       assert back == typed
     end
 
+    # Tab completes to the SELECTED match (issue #105; ADR 0020's
+    # 2026-10-31 amendment): "/name " — trailing space closes the popup and
+    # leaves room for args; the cursor lands at the end, editable.
+    test "tab completes the draft to the highlighted match with a trailing space" do
+      typed = type(new_state(), "/mod")
+
+      assert Enum.map(typed.palette.items, & &1.name) == ["mode", "model"]
+
+      {completed, nil} = State.handle_key(typed, "tab", [])
+
+      assert State.input_text(completed) == "/mode "
+      assert completed.palette == nil
+    end
+
+    test "tab honors the arrow-key selection, not just the head of the list" do
+      state =
+        new_state()
+        |> type("/mod")
+        |> press("down", [])
+
+      assert state.palette.selected == 1
+
+      {completed, nil} = State.handle_key(state, "tab", [])
+
+      assert State.input_text(completed) == "/model "
+      assert completed.palette == nil
+    end
+
+    test "a completion from a history-recalled draft leaves history" do
+      recalled = press(%{new_state() | history: ["/mode"]}, "up", [])
+
+      assert recalled.history_index == 0
+      assert %{mode: :filter} = recalled.palette
+
+      {completed, nil} = State.handle_key(recalled, "tab", [])
+
+      assert completed.history_index == nil
+      assert State.input_text(completed) == "/mode "
+    end
+
     test "up/down move the popup selection and never touch history" do
       moved =
         new_state()
@@ -2743,8 +3122,11 @@ defmodule DashFloat.TUI.StateTest do
       assert State.input_text(state) == ""
     end
 
-    test "a bare /title sends the empty title — the agent owns validation" do
-      assert {_state, {:set_title, ""}} = enter_typed(new_state(), "/title ")
+    test "a bare /title opens the dialog pre-filled with the current title" do
+      titled = Map.put(new_state(), :title, "Fix the login")
+      {state, nil} = enter_typed(titled, "/title ")
+
+      assert state.title_dialog == %{draft: "Fix the login", error: nil}
     end
 
     test "/compact returns the action; trailing text is ignored" do
@@ -2772,10 +3154,113 @@ defmodule DashFloat.TUI.StateTest do
 
       assert config.model == "m3"
       assert config.nickname == nil
+      # m3 is catalog-only (no settings menu entry): no explicit window —
+      # the observed/seeded/default chain takes over, never the outgoing
+      # model's 1_000.
       assert config.context_tokens == nil
       assert config.base_url == "http://x"
       assert picked.provider == {:ok, config}
       assert picked.palette == nil
+    end
+
+    # Issue #111 (hostile review F2): a settings-menu entry's explicit
+    # context survives the switch to its own id — the window re-resolves
+    # for the PICKED model, and the user's number is never silently
+    # displaced by observed/seed/default.
+    test "the picker's Enter re-resolves the window from the picked id's menu entry" do
+      menu = [
+        %{nickname: "Seer", model: "m9", context: 262_144, images: false},
+        %{nickname: "Plain", model: "m2", context: nil, images: false}
+      ]
+
+      base =
+        new_state(
+          provider:
+            {:ok,
+             %DashFloat.Config{
+               base_url: "http://x",
+               model: "m2",
+               api_key: "k",
+               context_tokens: 1_000,
+               model_menu: menu
+             }}
+        )
+
+      with_catalog =
+        State.catalog_arrived(base, %{
+          "http://x" => [%{model: "m2", context: nil}, %{model: "m9", context: 128_000}]
+        })
+
+      {opened, nil} = enter_typed(with_catalog, "/model")
+      moved = press(opened, "down", [])
+      {_picked, {:switch_model, {:ok, switched}}} = State.handle_key(moved, "enter", [])
+
+      assert switched.model == "m9"
+      # The menu entry's 262_144 — NOT the outgoing 1_000, NOT the
+      # catalog's observed 128_000 (which loses to an explicit entry).
+      assert switched.context_tokens == 262_144
+    end
+
+    # ADR 0018 §1 (hostile review finding 2): the images flag never carries
+    # over from the outgoing model — the picked id re-resolves against the
+    # settings-side menu, and a catalog-only id is not capable. Both
+    # directions: capable → plain, plain → marked.
+    test "the picker's Enter re-resolves the images flag from the model menu" do
+      menu = [
+        %{nickname: "Seer", model: "m9", context: nil, images: true},
+        %{nickname: "Plain", model: "m2", context: nil, images: false}
+      ]
+
+      base =
+        new_state(
+          provider:
+            {:ok,
+             %DashFloat.Config{
+               base_url: "http://x",
+               model: "m2",
+               api_key: "k",
+               images: false,
+               model_menu: menu
+             }}
+        )
+
+      base_catalog = %{
+        "http://x" => [%{model: "m2", context: nil}, %{model: "m9", context: 128_000}]
+      }
+
+      base_with_catalog = State.catalog_arrived(base, base_catalog)
+
+      # plain (selected 0) → marked m9: capable
+      {opened, nil} = enter_typed(base_with_catalog, "/model")
+      moved = press(opened, "down", [])
+      {_picked, {:switch_model, {:ok, capable}}} = State.handle_key(moved, "enter", [])
+
+      assert capable.model == "m9"
+      assert capable.images == true
+
+      # marked boot model → plain m2: not capable
+      booted_capable =
+        new_state(
+          provider:
+            {:ok,
+             %DashFloat.Config{
+               base_url: "http://x",
+               model: "m9",
+               api_key: "k",
+               images: true,
+               model_menu: menu
+             }}
+        )
+
+      booted_with_catalog = State.catalog_arrived(booted_capable, base_catalog)
+
+      {reopened, nil} = enter_typed(booted_with_catalog, "/model")
+      # preselected on m9 (index 1); up to m2
+      up = press(reopened, "up", [])
+      {_p2, {:switch_model, {:ok, plain}}} = State.handle_key(up, "enter", [])
+
+      assert plain.model == "m2"
+      assert plain.images == false
     end
 
     test "/model with an empty catalog warns" do
@@ -2840,7 +3325,7 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "slash text with an argument is an ordinary message — the escape hatch" do
-      {state, {:submit, "/etc/hosts is weird"}} =
+      {state, {:submit, "/etc/hosts is weird", []}} =
         enter_typed(new_state(), "/etc/hosts is weird")
 
       assert [{:user, "/etc/hosts is weird"}] = pairs(state)
@@ -2957,6 +3442,665 @@ defmodule DashFloat.TUI.StateTest do
 
       assert swallowed.palette == nil
       assert swallowed.confirm != nil
+    end
+  end
+
+  ## Image attachments (ADR 0018 §5/§6)
+
+  describe "image attachments (ADR 0018 §5)" do
+    @capable {:ok,
+              %DashFloat.Config{
+                base_url: "http://x",
+                model: "m",
+                api_key: "k",
+                images: true
+              }}
+
+    @incapable {:ok,
+                %DashFloat.Config{
+                  base_url: "http://x",
+                  model: "m",
+                  api_key: "k",
+                  nickname: "Sol"
+                }}
+
+    defp images_dir do
+      dir =
+        Path.join(
+          "/tmp/opencode",
+          "dashfloat-tui-state-images-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+      dir
+    end
+
+    defp write_image(dir, name) do
+      path = Path.join(dir, name)
+      File.write!(path, "12345678")
+      path
+    end
+
+    # A successful attach to reuse in the flow tests: the prompt was opened,
+    # the path typed, and Enter landed the metadata.
+    defp attached(path) do
+      fresh = new_state(provider: @capable)
+
+      fresh
+      |> press("o", ["ctrl"])
+      |> type(path)
+      |> State.handle_key("enter", [])
+      |> elem(0)
+    end
+
+    defp logical_text(entry), do: Enum.map_join(entry.logical, "\n", &flatten_entry_line/1)
+
+    defp flatten_entry_line(line), do: Enum.map_join(line.spans, "", & &1.content)
+
+    test "provider_images? reads the resolved provider's flag" do
+      capable = new_state(provider: @capable)
+      incapable = new_state(provider: @incapable)
+      unresolved = new_state(provider: {:error, "no provider"})
+
+      assert State.provider_images?(capable)
+      refute State.provider_images?(incapable)
+      refute State.provider_images?(new_state())
+      refute State.provider_images?(unresolved)
+    end
+
+    # The drag-and-drop shape (issue #112; ADR 0018's 2026-10-31
+    # amendment): a bracketed paste whose whole content is a path to an
+    # existing image file becomes a pending chip — never literal path text.
+    test "a pasted image path attaches instead of typing" do
+      dir = images_dir()
+      path = write_image(dir, "dropped.png")
+
+      fresh = new_state(provider: @capable)
+      state = State.paste(fresh, path <> "\r\n")
+
+      assert state.attachments == [%{path: path, name: "dropped.png", kb: 1}]
+      assert State.input_text(state) == ""
+      assert state.entries == []
+    end
+
+    test "two drops number per queue order; a pop renumbers" do
+      dir = images_dir()
+      one = write_image(dir, "one.png")
+      two = write_image(dir, "two.png")
+
+      fresh = new_state(provider: @capable)
+
+      state =
+        fresh
+        |> State.paste(one)
+        |> then(&State.paste(&1, two))
+
+      assert Enum.map(state.attachments, & &1.path) == [one, two]
+
+      {popped, nil} = State.handle_key(state, "backspace", [])
+      assert Enum.map(popped.attachments, & &1.path) == [one]
+      assert State.input_text(popped) == ""
+    end
+
+    test "backspace with draft text edits the draft, not the chips" do
+      dir = images_dir()
+      path = write_image(dir, "dropped.png")
+
+      fresh = new_state(provider: @capable)
+
+      state =
+        fresh
+        |> State.paste(path)
+        |> then(&type(&1, "hi"))
+
+      {edited, nil} = State.handle_key(state, "backspace", [])
+      assert edited.attachments == [%{path: path, name: "dropped.png", kb: 1}]
+      assert State.input_text(edited) == "h"
+    end
+
+    test "a non-image paste stays ordinary text — even a path" do
+      dir = images_dir()
+      missing = Path.join(dir, "nope.png")
+      text = State.paste(new_state(), missing)
+
+      assert text.attachments == []
+      assert State.input_text(text) == missing
+
+      prose = State.paste(new_state(), "hello world")
+      assert prose.attachments == []
+      assert State.input_text(prose) == "hello world"
+
+      multi = State.paste(new_state(), "#{write_image(dir, "a.png")} and more")
+      assert multi.attachments == []
+      assert State.input_text(multi) == "#{Path.join(dir, "a.png")} and more"
+    end
+
+    test "a drop on a non-capable model refuses visibly; nothing typed" do
+      dir = images_dir()
+      path = write_image(dir, "dropped.png")
+
+      fresh = new_state(provider: @incapable)
+      state = State.paste(fresh, path)
+
+      assert state.attachments == []
+      assert State.input_text(state) == ""
+      assert [{:system, entry}] = pairs(state)
+      assert entry =~ "[images: model Sol does not accept images"
+    end
+
+    test "an empty paste stays ordinary (nothing to drop)" do
+      fresh = new_state(provider: @capable)
+      state = State.paste(fresh, "")
+      assert state.attachments == []
+      assert State.input_text(state) == ""
+    end
+
+    test "an over-cap dropped image refuses visibly through the shared check" do
+      dir = images_dir()
+      path = write_image(dir, "huge.png")
+      File.write!(path, :binary.copy("x", 10 * 1024 * 1024 + 1))
+
+      fresh = new_state(provider: @capable)
+      state = State.paste(fresh, path)
+
+      assert state.attachments == []
+      assert State.input_text(state) == ""
+      assert [{:system, entry}] = pairs(state)
+      assert entry =~ "exceeds the 10 MiB image cap"
+    end
+
+    test "a drop works mid-stream too — the queue only rides a submit" do
+      dir = images_dir()
+      path = write_image(dir, "dropped.png")
+
+      state = State.paste(%{new_state(provider: @capable) | phase: :streaming}, path)
+
+      assert Enum.map(state.attachments, & &1.path) == [path]
+      assert State.input_text(state) == ""
+    end
+
+    test "ctrl+o opens the prompt while idle; a second ctrl+o closes it" do
+      fresh = new_state(provider: @capable)
+      {opened, nil} = State.handle_key(fresh, "o", ["ctrl"])
+      assert opened.attach == %{draft: ""}
+
+      # printable keys feed the open prompt's draft
+      typed = type(opened, "/tmp/opencode/a")
+      assert typed.attach == %{draft: "/tmp/opencode/a"}
+
+      {closed, nil} = State.handle_key(typed, "o", ["ctrl"])
+      assert closed.attach == nil
+    end
+
+    test "ctrl+o is inert while streaming, under a palette, and under a pending confirm" do
+      # streaming: the key falls through to the (unaffected) composer, the
+      # prompt never opens
+      {streaming, nil} = State.handle_key(%{new_state() | phase: :streaming}, "o", ["ctrl"])
+      assert streaming.attach == nil
+
+      paletted = press(new_state(), "p", ["ctrl"])
+      {kept, nil} = State.handle_key(paletted, "o", ["ctrl"])
+      assert kept.attach == nil
+      assert kept.palette != nil
+
+      {confirming_state, _ref} = confirming()
+      {swallowed, nil} = State.handle_key(confirming_state, "o", ["ctrl"])
+      assert swallowed.attach == nil
+      assert swallowed.confirm != nil
+    end
+
+    test "typing and backspace edit the draft grapheme-wise" do
+      opened = press(new_state(), "o", ["ctrl"])
+      state = type(opened, "café.png")
+      assert state.attach.draft == "café.png"
+
+      edited = press(state, "backspace", [])
+      assert edited.attach.draft == "café.pn"
+
+      # backspacing past the start is a no-op
+      emptied =
+        Enum.reduce(1..9, edited, fn _n, acc -> press(acc, "backspace", []) end)
+
+      assert emptied.attach.draft == ""
+    end
+
+    test "Enter on an empty draft is a no-op — no refusal, prompt stays open" do
+      opened = press(new_state(), "o", ["ctrl"])
+      entered = press(opened, "enter", [])
+
+      assert entered.attach != nil
+      assert entered.attach.draft == ""
+      assert entered.attachments == []
+      assert entered.entries == []
+    end
+
+    # The no-op is provider-independent (hostile review finding 6): an
+    # empty draft never reaches the capability gate, capable or not.
+    test "Enter on an empty draft is a no-op under an incapable provider too" do
+      incapable =
+        new_state(
+          provider:
+            {:ok,
+             %DashFloat.Config{base_url: "http://x", model: "m", api_key: "k", images: false}}
+        )
+
+      opened = press(incapable, "o", ["ctrl"])
+      entered = press(opened, "enter", [])
+
+      assert entered.attach.draft == ""
+      assert entered.entries == []
+    end
+
+    # A chord is not a printable key (ADR 0018 §5; hostile review finding
+    # 3): Ctrl+P must open nothing and type nothing while the prompt owns
+    # the input — the "p" stays out of the draft.
+    test "control chords are swallowed — they neither act nor type" do
+      opened = press(new_state(), "o", ["ctrl"])
+      typed = press(opened, "p", ["ctrl"])
+
+      assert typed.attach.draft == ""
+      assert typed.palette == nil
+
+      ctrl_u = press(typed, "u", ["ctrl"])
+      assert ctrl_u.attach.draft == ""
+
+      alt_a = press(ctrl_u, "a", ["alt"])
+      assert alt_a.attach.draft == ""
+    end
+
+    # crossterm reports an uppercase char as SHIFT-modified (delta review):
+    # shift-only must type — capital letters in paths are mainline input.
+    test "a shifted printable types its uppercase character" do
+      opened = press(new_state(), "o", ["ctrl"])
+
+      typed = press(opened, "P", ["shift"])
+      assert typed.attach.draft == "P"
+
+      more = press(typed, "I", ["shift"])
+      assert more.attach.draft == "PI"
+    end
+
+    test "a paste feeds the prompt's draft, newlines stripped, composer untouched" do
+      opened = press(new_state(), "o", ["ctrl"])
+      pasted = State.attach_paste(opened, "/tmp/opencode/cat.png\r\n")
+
+      assert pasted.attach.draft == "/tmp/opencode/cat.png"
+      assert State.input_text(pasted) == ""
+    end
+
+    test "overlay? is true with the prompt open, allocating the one activity row" do
+      opened = press(new_state(), "o", ["ctrl"])
+      assert State.overlay?(opened)
+
+      regions = View.regions({80, 24}, State.input_line_count(opened), State.overlay?(opened))
+      assert regions.activity.height == 1
+    end
+
+    test "tab completes the last segment to the longest common prefix, then the extension" do
+      dir = images_dir()
+      write_image(dir, "alpha.png")
+      write_image(dir, "alphabet.jpg")
+      write_image(dir, "beta.gif")
+
+      state =
+        new_state()
+        |> press("o", ["ctrl"])
+        |> type(dir <> "/alp")
+        |> press("tab", [])
+
+      # alpha.png / alphabet.jpg share only "alpha" — no trailing slash
+      assert state.attach.draft == dir <> "/alpha"
+
+      # the further dot completes the extension: alpha. → alpha.png
+      completed =
+        state
+        |> type(".")
+        |> press("tab", [])
+
+      assert completed.attach.draft == dir <> "/alpha.png"
+
+      # a fully-completed name re-tabs as a no-op
+      re_tapped = press(completed, "tab", [])
+      assert re_tapped.attach.draft == dir <> "/alpha.png"
+    end
+
+    test "tab completes a directory with a trailing slash; no match is a no-op" do
+      dir = images_dir()
+      delta = Path.join(dir, "delta")
+      File.mkdir!(delta)
+
+      state =
+        new_state()
+        |> press("o", ["ctrl"])
+        |> type(dir <> "/del")
+        |> press("tab", [])
+
+      assert state.attach.draft == dir <> "/delta/"
+
+      # no matches at all — the draft is untouched
+      stale =
+        new_state()
+        |> press("o", ["ctrl"])
+        |> type(dir <> "/zz")
+        |> press("tab", [])
+
+      assert stale.attach.draft == dir <> "/zz"
+    end
+
+    test "dotfile entries complete only after the typed segment starts with a dot" do
+      dir = images_dir()
+      write_image(dir, ".hidden.png")
+      write_image(dir, "readme.txt")
+
+      # segment "": the dotfile is invisible, the plain file completes
+      plain =
+        new_state()
+        |> press("o", ["ctrl"])
+        |> type(dir <> "/")
+        |> press("tab", [])
+
+      assert plain.attach.draft == dir <> "/readme.txt"
+
+      # segment ".": the dotfile surfaces
+      dotted =
+        new_state()
+        |> press("o", ["ctrl"])
+        |> type(dir <> "/.")
+        |> press("tab", [])
+
+      assert dotted.attach.draft == dir <> "/.hidden.png"
+    end
+
+    test "enter on a valid path attaches the metadata and closes the prompt" do
+      dir = images_dir()
+      alpha = write_image(dir, "alpha.png")
+      alphabet = write_image(dir, "alphabet.jpg")
+
+      first = attached(alpha)
+
+      # success logs nothing — the chip is the only trace
+      assert first.attach == nil
+      assert first.attachments == [%{path: alpha, name: "alpha.png", kb: 1}]
+      assert pairs(first) == []
+
+      # a second attach accumulates
+      second =
+        first
+        |> press("o", ["ctrl"])
+        |> type(alphabet)
+        |> State.handle_key("enter", [])
+        |> elem(0)
+
+      assert Enum.map(second.attachments, & &1.name) == ["alpha.png", "alphabet.jpg"]
+    end
+
+    test "enter under an incapable provider refuses naming the model and keeps the draft" do
+      fresh = new_state(provider: @incapable)
+      opened = press(fresh, "o", ["ctrl"])
+      typed = type(opened, "/tmp/opencode/cat.png")
+
+      {refused, nil} = State.handle_key(typed, "enter", [])
+
+      assert refused.attach == %{draft: "/tmp/opencode/cat.png"}
+      assert refused.attachments == []
+
+      assert pairs(refused) == [
+               {:system, "[images: model Sol does not accept images — attach refused]"}
+             ]
+    end
+
+    test "the capability refusal names the bare model id without a nickname" do
+      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "glm", api_key: "k"}}
+      fresh = new_state(provider: provider)
+      opened = press(fresh, "o", ["ctrl"])
+      typed = type(opened, "/tmp/opencode/cat.png")
+
+      {refused, nil} = State.handle_key(typed, "enter", [])
+
+      assert pairs(refused) == [
+               {:system, "[images: model glm does not accept images — attach refused]"}
+             ]
+    end
+
+    test "enter on a bad path refuses naming the path and keeps the draft" do
+      dir = images_dir()
+      notes = Path.join(dir, "notes.txt")
+      File.write!(notes, "x")
+
+      refusals = [
+        {Path.join(dir, "nope.png"), Path.join(dir, "nope.png") <> ": no such file or directory"},
+        {Path.join(dir, "notes.txt"),
+         Path.join(dir, "notes.txt") <>
+           ": not an image extension (one of .png .jpg .jpeg .gif .webp)"}
+      ]
+
+      for {draft, reason} <- refusals do
+        fresh = new_state(provider: @capable)
+        opened = press(fresh, "o", ["ctrl"])
+        typed = type(opened, draft)
+        {refused, nil} = State.handle_key(typed, "enter", [])
+
+        # the prompt stays open with the draft intact — fix the path, retry
+        assert refused.attach == %{draft: draft}
+        assert refused.attachments == []
+        assert pairs(refused) == [{:system, "[images: " <> reason <> "]"}]
+      end
+    end
+
+    test "esc closes the prompt keeping pending attachments; ctrl+d clears them" do
+      alpha = write_image(images_dir(), "alpha.png")
+      attached_state = attached(alpha)
+
+      reopened = press(attached_state, "o", ["ctrl"])
+      closed = press(reopened, "esc", [])
+      assert closed.attach == nil
+      assert length(closed.attachments) == 1
+
+      # ctrl+d clears all — and closes the prompt it was open with
+      again = press(closed, "o", ["ctrl"])
+      cleared = press(again, "d", ["ctrl"])
+      assert cleared.attach == nil
+      assert cleared.attachments == []
+    end
+
+    test "submit with text and an attachment sends the paths and renders the indicators" do
+      alpha = write_image(images_dir(), "alpha.png")
+      attached_state = attached(alpha)
+      typed = type(attached_state, "what is this?")
+
+      {state, {:submit, "what is this?", [^alpha]}} = State.handle_key(typed, "enter", [])
+
+      # the attachment survives until the agent's streaming echo (ADR 0018 §6)
+      assert state.phase == :streaming
+      assert length(state.attachments) == 1
+
+      # entry text verbatim (ADR 0006); the rendered lines gain the dim
+      # indicator under the prompt text (ADR 0018 §5)
+      [entry] = for(%{kind: :user} = e <- state.entries, do: e)
+      assert entry.text == "what is this?"
+      assert logical_text(entry) == "\n❯ what is this?\n📎 alpha.png (1 KB)"
+      assert hd(List.last(entry.logical).spans).style == Theme.style(:dim)
+    end
+
+    test "submit with a blank draft but pending attachments is the image-only turn" do
+      alpha = write_image(images_dir(), "alpha.png")
+      attached_state = attached(alpha)
+
+      {state, {:submit, "", [^alpha]}} = State.handle_key(attached_state, "enter", [])
+
+      [entry] = for(%{kind: :user} = e <- state.entries, do: e)
+      assert entry.text == ""
+      assert logical_text(entry) == "\n❯ \n📎 alpha.png (1 KB)"
+    end
+
+    test "a command submit leaves pending attachments untouched" do
+      alpha = write_image(images_dir(), "alpha.png")
+      attached_state = attached(alpha)
+      typed = type(attached_state, "/help")
+
+      {state, nil} = State.handle_key(typed, "enter", [])
+
+      assert state.phase == :idle
+      assert length(state.attachments) == 1
+    end
+
+    test "the streaming echo clears pending attachments; a refusal flow does not" do
+      pending = %{new_state() | attachments: [%{path: "/p/a.png", name: "a.png", kb: 1}]}
+
+      cleared = State.stream_message(pending, {:phase, :streaming}, 1_000)
+      assert cleared.attachments == []
+
+      # repeated tool-loop episodes clear an already-empty list — a no-op
+      assert State.stream_message(cleared, {:phase, :streaming}, 1_000).attachments == []
+
+      # the submit-time refusal never echoes streaming: the set survives
+      refused =
+        pending
+        |> State.stream_message(
+          {:entry, :system, "[images: /p/a.png: no such file or directory]"},
+          1_000
+        )
+        |> State.stream_message({:phase, :idle}, 1_000)
+
+      assert length(refused.attachments) == 1
+    end
+  end
+
+  ## The /title dialog (issue #106; ADR 0023's 2026-10-31 amendment)
+
+  describe "the /title dialog" do
+    # The dialog as bare /title opens it: idle, pre-filled, no error.
+    defp dialog_open(opts \\ []) do
+      opts
+      |> new_state()
+      |> enter_typed("/title ")
+      |> elem(0)
+    end
+
+    test "bare /title with no current title opens with an empty draft" do
+      assert dialog_open().title_dialog == %{draft: "", error: nil}
+    end
+
+    test "a paste with no dialog open is a no-op (the TUI clause guards the open state)" do
+      closed = new_state(title: "Kept")
+
+      pasted = State.title_paste(closed, "pasted title\n")
+
+      assert pasted.title_dialog == nil
+      assert pasted.title == "Kept"
+    end
+
+    test "bare /title via the filter palette's Enter opens the same dialog" do
+      # No trailing space: Enter executes the SELECTED match, which lands on
+      # run_command(state, "title", "") — the dialog clause, not the inline.
+      {state, nil} = enter_typed(new_state(title: "Via Palette"), "/title")
+
+      assert state.title_dialog == %{draft: "Via Palette", error: nil}
+    end
+
+    test "typing appends, a shifted printable uppercases, backspace slices the last grapheme" do
+      state =
+        dialog_open()
+        |> press("f", [])
+        |> press("i", [])
+        |> press("x", [])
+        |> press("I", ["shift"])
+        |> press("t", [])
+        |> press("backspace", [])
+
+      assert state.title_dialog.draft == "fixI"
+
+      # backspacing past the start is a no-op
+      emptied =
+        Enum.reduce(1..9, state, fn _n, acc -> press(acc, "backspace", []) end)
+
+      assert emptied.title_dialog.draft == ""
+    end
+
+    test "a paste appends newline-stripped; the composer stays untouched" do
+      state = State.title_paste(dialog_open(), "fix it\r\n")
+
+      assert state.title_dialog.draft == "fix it"
+      assert State.input_text(state) == ""
+    end
+
+    test "enter returns {:set_title, draft} and keeps the dialog open, error reset" do
+      state = %{dialog_open() | title_dialog: %{draft: "fix it", error: "stale refusal"}}
+
+      {submitted, {:set_title, "fix it"}} = State.handle_key(state, "enter", [])
+
+      # The dialog stays open: the agent's {:title, _} closes it or
+      # {:title_refused, _} errors it.
+      assert submitted.title_dialog == %{draft: "fix it", error: nil}
+    end
+
+    test "enter accepts the ctrl modifier; esc closes" do
+      state = dialog_open()
+      {sent, {:set_title, ""}} = State.handle_key(state, "enter", ["ctrl"])
+      assert sent.title_dialog != nil
+
+      {closed, nil} = State.handle_key(state, "esc", [])
+      assert closed.title_dialog == nil
+    end
+
+    test "{:title, t} sets the title and closes an open dialog" do
+      opened = dialog_open(title: "Old")
+      titled = State.stream_message(opened, {:title, "New"}, 1_000)
+
+      assert titled.title == "New"
+      assert titled.title_dialog == nil
+    end
+
+    test "{:title_refused, r} errors the open dialog, keeping the draft" do
+      reason = ~s("x" is already taken by session 0192aa10-b002-7c00-8000-00000000000c)
+      typed = press(dialog_open(title: "Old"), "x", [])
+
+      refused = State.stream_message(typed, {:title_refused, reason}, 1_000)
+
+      assert refused.title_dialog == %{draft: "Oldx", error: reason}
+    end
+
+    test "{:title_refused, r} with no dialog open is a no-op" do
+      state = State.stream_message(new_state(), {:title_refused, "may not be empty"}, 1_000)
+
+      assert state.title_dialog == nil
+      assert state.entries == []
+    end
+
+    test "the open dialog swallows up/down/tab/page keys — no history, no mode cycle, no palette" do
+      state =
+        dialog_open()
+        |> Map.put(:history, ["/old"])
+        |> Map.put(:suggestion, "ghost")
+        |> press("up", [])
+        |> press("down", [])
+        |> press("tab", [])
+        |> press("page_up", [])
+        |> press("back_tab", [])
+        |> press("p", ["ctrl"])
+        |> press("u", ["ctrl"])
+
+      assert state.title_dialog.draft == ""
+      assert state.history == ["/old"]
+      assert state.mode == :build
+      assert state.palette == nil
+      assert state.suggestion == "ghost"
+    end
+
+    test "the global quits still work while the dialog is open" do
+      state = dialog_open()
+      assert {^state, :quit} = State.handle_key(state, "q", ["ctrl"])
+
+      {armed, nil} = State.handle_key(state, "c", ["ctrl"], 1_000)
+      assert armed.exit_guard_at == 1_000
+    end
+
+    test "the inline form is unchanged: /title <name> returns {:set_title, name}" do
+      {state, {:set_title, "fix the login"}} = enter_typed(new_state(), "/title fix the login")
+
+      assert state.title_dialog == nil
+      assert State.input_text(state) == ""
     end
   end
 end

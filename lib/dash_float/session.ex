@@ -377,7 +377,7 @@ defmodule DashFloat.Session do
   end
 
   defp check_message(path, index, %{"role" => "user"} = message, batch) do
-    with :ok <- check_string(path, index, "content", Map.get(message, "content")) do
+    with :ok <- check_user_content(path, index, Map.get(message, "content")) do
       {:ok, close_block(batch)}
     end
   end
@@ -420,6 +420,35 @@ defmodule DashFloat.Session do
 
   defp check_string(path, index, field, _value),
     do: {:error, "#{path}: message #{index} field \"#{field}\" must be a string"}
+
+  # User content is a string — or, with image attachments (ADR 0018 §2), a
+  # list of content parts, each exactly a text part or an image_url part.
+  # Anything else refuses naming the index and the expected shape.
+  defp check_user_content(_path, _index, content) when is_binary(content), do: :ok
+
+  defp check_user_content(path, index, content) when is_list(content) do
+    if Enum.all?(content, &part?/1) do
+      :ok
+    else
+      {:error,
+       "#{path}: message #{index} field \"content\" must be a list of parts — each " <>
+         ~s({"type": "text", "text": string}) <>
+         " or " <>
+         ~s({"type": "image_url", "image_url": {"url": string}})}
+    end
+  end
+
+  defp check_user_content(path, index, _other),
+    do:
+      {:error,
+       "#{path}: message #{index} field \"content\" must be a string or a list of content parts"}
+
+  defp part?(%{"type" => "text", "text" => text}) when is_binary(text), do: true
+
+  defp part?(%{"type" => "image_url", "image_url" => %{"url" => url}}) when is_binary(url),
+    do: true
+
+  defp part?(_other), do: false
 
   defp check_tool_calls(_path, _index, nil), do: :ok
 

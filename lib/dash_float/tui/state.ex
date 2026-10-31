@@ -7,7 +7,7 @@ defmodule DashFloat.TUI.State do
   at mount so the monitor lives there). The input draft lives in the
   textarea's Rust-side state, reached through its synchronous in-memory API.
   Transitions return `{state, action}` where `action` is `:quit`,
-  `{:submit, prompt}`, `{:confirm, decision}`, `:cancel`, `{:set_mode, mode}`,
+  `{:submit, prompt, paths}`, `{:confirm, decision}`, `:cancel`, `{:set_mode, mode}`,
   the command actions (`{:set_title, title}`, `{:switch_model, _}`,
   `:list_profiles`, `:compact` — ADR 0020), `nil`, or one of the setup actions; the TUI
   interprets actions. The one clock is injectable (`now` arguments,
@@ -15,15 +15,22 @@ defmodule DashFloat.TUI.State do
   pure. See ADRs 0002, 0006, and 0007.
   """
 
+  alias DashFloat.Accounting
+  alias DashFloat.Config
   alias DashFloat.Config.Onboarding
+  alias DashFloat.Config.Presets
+  alias DashFloat.Images
   alias DashFloat.Mode
   alias DashFloat.Tools
   alias DashFloat.TUI.Commands
   alias DashFloat.TUI.Palette
   alias DashFloat.TUI.Render
   alias DashFloat.TUI.Selection
+  alias DashFloat.TUI.Theme
   alias DashFloat.TUI.View
   alias DashFloat.TUI.Wrap
+  alias ExRatatui.Text.Line
+  alias ExRatatui.Text.Span
 
   @type phase :: :idle | :streaming | :executing_tool | :checking | :confirming
   @type entry_kind :: :user | :assistant | :tool | :system
@@ -35,6 +42,18 @@ defmodule DashFloat.TUI.State do
           lines: [ExRatatui.Text.Line.t()]
         }
   @type confirm :: %{ref: term(), id: term(), name: String.t()}
+
+  @typedoc "One pending attachment's display metadata — never the bytes (ADR 0018 §6)."
+  @type attachment :: %{path: String.t(), name: String.t(), kb: pos_integer()}
+
+  @typedoc "The open attach prompt's editable path draft (ADR 0018 §5)."
+  @type attach_prompt :: %{draft: String.t()}
+
+  @typedoc """
+  The bare /title dialog (ADR 0023's 2026-10-31 amendment): the editable
+  draft and the last rename refusal, nil closed.
+  """
+  @type title_dialog :: %{draft: String.t(), error: String.t() | nil}
 
   @typedoc """
   One keypress's outcome. The chat actions are ADR 0002/0006/0007; the mode
@@ -48,7 +67,7 @@ defmodule DashFloat.TUI.State do
   """
   @type action ::
           :quit
-          | {:submit, String.t()}
+          | {:submit, String.t(), [String.t()]}
           | {:confirm, :approved | :rejected}
           | :cancel
           | {:set_mode, Mode.mode()}
@@ -69,9 +88,7 @@ defmodule DashFloat.TUI.State do
           first_token_at: integer() | nil,
           rate: float() | nil,
           prompt_tokens: non_neg_integer() | nil,
-          completion_tokens: non_neg_integer() | nil,
-          context_total: non_neg_integer(),
-          turn_total: non_neg_integer() | nil
+          completion_tokens: non_neg_integer() | nil
         }
 
   @max_history 500
@@ -83,7 +100,7 @@ defmodule DashFloat.TUI.State do
   @exit_window_ms 2_000
   # /help's key hints (ADR 0020) — the composer's static hints plus the
   # palette and mode keys.
-  @key_hints "Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit · Ctrl+P commands · Shift+Tab mode"
+  @key_hints "Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit · Ctrl+P commands · Ctrl+O attach · Shift+Tab mode"
 
   @enforce_keys [:input]
 
@@ -115,6 +132,14 @@ defmodule DashFloat.TUI.State do
     in_flight_dirty: false,
     anim_step: 0,
     tick_ref: nil,
+    # The idle cursor blink (issue #104; ADR 0006's 2026-10-31 amendment):
+    # `blink_on` is the display phase (true = cursor cell drawn), `blink_ref`
+    # the pending timer (owned by the TUI process), `blink_ms` the injectable
+    # cadence — nil means "live runs blink at the TUI's default; the
+    # hermetic suite never arms one" (the suggest-arm pattern).
+    blink_on: true,
+    blink_ref: nil,
+    blink_ms: nil,
     exit_guard_at: nil,
     exit_guard_ref: nil,
     stats: %{
@@ -122,10 +147,13 @@ defmodule DashFloat.TUI.State do
       first_token_at: nil,
       rate: nil,
       prompt_tokens: nil,
-      completion_tokens: nil,
-      context_total: 0,
-      turn_total: nil
+      completion_tokens: nil
     },
+    # The stage-2 context snapshot (ADR 0015 §2 amendment): the agent's
+    # {messages, anchor} pair, pushed at every transcript mutation and each
+    # usage frame — what the footer's Accounting.usage/3 read computes from.
+    # nil until the first push (the span is hidden, the rate-span pattern).
+    context: nil,
     scroll: 0,
     follow?: true,
     # Terminal-pane focus (ADR 0015 §1): gates the composer's cursor
@@ -156,7 +184,23 @@ defmodule DashFloat.TUI.State do
     suggest_debounce_ms: 600,
     # The command palette (ADR 0020): nil closed; :filter is the composer's
     # derived slash autocomplete, :modal is Ctrl+P or a picker.
-    palette: nil
+    palette: nil,
+    # Image attachments (ADR 0018 §5): `attachments` is the pending set —
+    # display metadata only, never bytes (the agent reads at submit); `attach`
+    # is the open attach prompt's path draft, nil closed.
+    attachments: [],
+    attach: nil,
+    # The session title (ADR 0023): the boot/resume mount value, kept current
+    # by the agent's {:title, _} push (issue #106); pre-fills the dialog.
+    title: nil,
+    # The bare /title dialog (issue #106), nil closed.
+    title_dialog: nil,
+    # The Herdr integration (ADR 0024): nil outside Herdr — every hook is a
+    # no-op then. `session_id` is the resume identity the reporter reports;
+    # set at mount for a resumed boot, or on the agent's `{:session_id, _}`
+    # when a fresh session's id is minted at first save.
+    herdr: nil,
+    session_id: nil
   ]
 
   @type t :: %__MODULE__{
@@ -172,7 +216,11 @@ defmodule DashFloat.TUI.State do
           in_flight_dirty: boolean(),
           anim_step: non_neg_integer(),
           tick_ref: reference() | nil,
+          blink_on: boolean(),
+          blink_ref: reference() | nil,
+          blink_ms: non_neg_integer() | nil,
           stats: stats(),
+          context: %{messages: [map()], anchor: Accounting.anchor()} | nil,
           scroll: non_neg_integer(),
           follow?: boolean(),
           focused?: boolean(),
@@ -204,7 +252,13 @@ defmodule DashFloat.TUI.State do
             | {module(), atom()}
             | nil,
           suggest_debounce_ms: non_neg_integer(),
-          palette: Palette.t() | nil
+          palette: Palette.t() | nil,
+          attachments: [attachment()],
+          attach: attach_prompt() | nil,
+          title: String.t() | nil,
+          title_dialog: title_dialog() | nil,
+          herdr: DashFloat.Herdr.t() | nil,
+          session_id: String.t() | nil
         }
 
   @typedoc """
@@ -216,7 +270,8 @@ defmodule DashFloat.TUI.State do
   @typedoc """
   One message of the stream contract (see `stream_message/2` and ADR 0002 /
   0006 / 0007). The agent is the single voice; the tool messages are ADR 0007,
-  the mode messages ADR 0016.
+  the mode messages ADR 0016, the title messages ADR 0023's 2026-10-31
+  amendment.
   """
   @type stream_msg ::
           {:token, String.t()}
@@ -226,6 +281,7 @@ defmodule DashFloat.TUI.State do
                completion_tokens: non_neg_integer(),
                total_tokens: non_neg_integer()
              }}
+          | {:context, %{messages: [map()], anchor: Accounting.anchor()}}
           | {:phase, :streaming}
           | {:phase, :executing_tool | :checking | :idle}
           | {:tool_call, tool_call_msg()}
@@ -234,6 +290,8 @@ defmodule DashFloat.TUI.State do
           | {:entry, :tool | :system, String.t()}
           | {:mode, Mode.mode()}
           | {:tool_preview, confirm_msg()}
+          | {:title, String.t()}
+          | {:title_refused, String.t()}
 
   @typep tool_call_msg :: %{id: term(), name: String.t(), args: map()}
 
@@ -281,7 +339,18 @@ defmodule DashFloat.TUI.State do
       # fetcher gates the runner's arm (the default suite stays hermetic)
       # and the debounce delay is injectable for the timing tests.
       suggest_fetcher: Keyword.get(opts, :suggest_fetcher),
-      suggest_debounce_ms: Keyword.get(opts, :suggest_debounce_ms, 600)
+      suggest_debounce_ms: Keyword.get(opts, :suggest_debounce_ms, 600),
+      # The idle blink's injectable cadence (issue #104): present only when
+      # a test opts in — its presence is what un-hermetically-gates the
+      # timer arm (the suggest_fetcher pattern); live runs use the default.
+      blink_ms: Keyword.get(opts, :blink_ms),
+      # The session title (ADR 0023): the boot --title or the resumed file's
+      # title — the dialog's prefill (issue #106).
+      title: Keyword.get(opts, :title),
+      # The Herdr reporter's seams (ADR 0024): the detected context (nil
+      # outside Herdr — inert) and the resumed boot's session id.
+      herdr: Keyword.get(opts, :herdr),
+      session_id: Keyword.get(opts, :session_id)
     }
 
     replay(state, Keyword.get(opts, :transcript, []), Keyword.get(opts, :resume_note))
@@ -301,7 +370,33 @@ defmodule DashFloat.TUI.State do
   defp resume_note(state, nil), do: state
   defp resume_note(state, note) when is_binary(note), do: append_entry(state, :system, note)
 
-  defp replay_message(%{"role" => "user", "content" => text}, {state, names}) do
+  # An image-bearing user turn (ADR 0018 §2) replays through the same
+  # shape the live submit renders: the concatenated text parts as the
+  # body, then one dim 📎 row per image part — the loaded part carries a
+  # data URL, not the display metadata, so the row counts, not names.
+  # The transcript's system message (ADR 0019) is not chat-log content: the
+  # prompt is re-derived at every boot, so replay skips the role instead of
+  # rendering it. Without this clause a resume of any system-bearing session
+  # crashes at mount (found by the Herdr restore dance, issue #113).
+  defp replay_message(%{"role" => "system"}, acc), do: acc
+
+  defp replay_message(%{"role" => "user", "content" => parts}, {state, names})
+       when is_list(parts) do
+    text =
+      Enum.map_join(parts, fn
+        %{"type" => "text", "text" => t} -> t
+        %{"type" => "image_url"} -> ""
+        _other -> ""
+      end)
+
+    indicator_rows = for _url <- image_parts(parts), do: replay_image_line()
+    lines = Render.entry_lines(:user, text) ++ indicator_rows
+
+    {put_entry(state, :user, text, lines), names}
+  end
+
+  defp replay_message(%{"role" => "user", "content" => text}, {state, names})
+       when is_binary(text) do
     {append_entry(state, :user, text), names}
   end
 
@@ -354,6 +449,20 @@ defmodule DashFloat.TUI.State do
     end
   end
 
+  # The image parts of a loaded user turn (ADR 0018 §2): the exact
+  # image_url shapes the session validation admits.
+  defp image_parts(parts) do
+    Enum.filter(parts, fn
+      %{"type" => "image_url", "image_url" => %{"url" => url}} when is_binary(url) -> true
+      _other -> false
+    end)
+  end
+
+  # The replay's indicator row: the loaded part carries a data URL, not the
+  # live display metadata, so the row counts, not names.
+  defp replay_image_line,
+    do: Line.new([Span.new("📎 image", style: Theme.style(:dim))])
+
   # The stored result is the JSON the agent gave the model. A payload that
   # does not decode to a JSON object displays as an error row with no output —
   # never a crash. Its keys are our own closed result shape, so the known
@@ -378,22 +487,56 @@ defmodule DashFloat.TUI.State do
   end
 
   @doc """
-  The status bar's model label ([ADR 0008](../../docs/decisions/0008-config-layout-profiles-json5.md)):
-  `"nickname (profile)"`, falling back to the bare nickname, then the model id.
+  The status footer's model label as `"<provider> - <model>"` — the provider
+  ladder and the dropped profile suffix are ADR 0015 §2's amendment (issue
+  #109): the base_url's preset label ([`DashFloat.Config.Presets.label/1`]),
+  else the active provider's settings label, else the URL host; the model
+  part is the nickname, else the id. nil only when nothing resolves — the
+  footer's "—" arm.
   """
   @spec provider_label(t()) :: String.t() | nil
   def provider_label(%__MODULE__{provider: {:ok, provider}}), do: label(provider)
   def provider_label(%__MODULE__{}), do: nil
 
-  defp label(%DashFloat.Config{nickname: nickname, profile: profile})
-       when is_binary(nickname) and is_binary(profile),
-       do: "#{nickname} (#{profile})"
+  defp label(%DashFloat.Config{nickname: nickname, model: model} = config) do
+    with model when is_binary(model) <- nickname || model,
+         provider when is_binary(provider) <- provider_name(config) do
+      "#{provider} - #{model}"
+    else
+      _missing -> nil
+    end
+  end
 
-  defp label(%DashFloat.Config{nickname: nickname}) when is_binary(nickname),
-    do: nickname
+  # The provider half of the footer label, in ADR 0015 §2's ladder order:
+  # (a) the base_url's preset ("zai" / "synthetic") — first-class, always
+  # ahead of the settings entry's (possibly host-defaulted) label; (b) the
+  # active provider's settings label; (c) the URL host (env-only boots,
+  # providers []). No base_url — nothing to classify.
+  defp provider_name(%DashFloat.Config{base_url: nil}), do: nil
 
-  defp label(%DashFloat.Config{model: model}) when is_binary(model), do: model
-  defp label(_other), do: nil
+  defp provider_name(%DashFloat.Config{base_url: base_url, providers: providers}) do
+    Presets.label(base_url) || settings_label(base_url, providers) ||
+      DashFloat.Config.host_label(base_url)
+  end
+
+  defp settings_label(base_url, providers) do
+    case Enum.find(providers, fn provider ->
+           trim_slash(provider.base_url) == trim_slash(base_url)
+         end) do
+      nil -> nil
+      provider -> provider.label
+    end
+  end
+
+  # The caller (provider_name's ladder) guards base_url nil above; the
+  # settings entries always carry a base_url (parse_provider ignores the
+  # baseUrl-less).
+  defp trim_slash(url), do: String.trim_trailing(url, "/")
+
+  @doc "The selected model's image capability (ADR 0018 §1): true only for a resolved provider carrying `images: true`."
+  @spec provider_images?(t()) :: boolean()
+  def provider_images?(%__MODULE__{provider: {:ok, %DashFloat.Config{images: true}}}), do: true
+  def provider_images?(%__MODULE__{}), do: false
 
   # The startup phase (ADR 0009) owns every key until it clears: the wizard
   # or the forced-selection modal replaces the chat UI. The global Ctrl+C /
@@ -508,25 +651,52 @@ defmodule DashFloat.TUI.State do
     %{state | catalog: catalog}
   end
 
-  @doc "The provider's context window, or the catalog's fresh value for the selected model when the config entry carried none (ADR 0009)."
+  @doc """
+  The provider's context window for the footer denominator (issue #111):
+  the explicit config value (`context` on the entry, or env) wins; else
+  the catalog's observed value for the selected model when the endpoint
+  carries metadata (observed beats the seed — provider truth over a
+  static table — but never an explicit user setting); else the resolved
+  chain's seed or documented default. Never nil on a resolved provider —
+  a stock config shows `used/window` from boot.
+  """
   @spec provider_context_tokens(t()) :: pos_integer() | nil
-  def provider_context_tokens(%__MODULE__{provider: {:ok, %{context_tokens: n}}})
-      when is_integer(n) and n > 0,
-      do: n
+  def provider_context_tokens(%__MODULE__{provider: {:ok, %{}}} = state),
+    do: elem(window(state), 0)
 
-  def provider_context_tokens(%__MODULE__{
-        provider: {:ok, %{context_tokens: nil, model: model, base_url: base_url}},
-        catalog: catalog
-      }) do
+  # No provider (the wizard phase) or an unresolved one: no window at all —
+  # there is no model to assume a window for.
+  def provider_context_tokens(%__MODULE__{}), do: nil
+
+  # The one footer resolution (issue #111): {window, source} with source
+  # :configured | :observed | :seeded | :default (:none with no provider —
+  # the wizard phase shows the absolute total alone; there is no model to
+  # assume a window for). The `~` marker keys on :default — the documented
+  # fallback is never silent.
+  defp window(%__MODULE__{provider: {:ok, config}, catalog: catalog}) do
+    explicit = config.context_tokens
+
+    if is_integer(explicit) and explicit > 0 do
+      {explicit, :configured}
+    else
+      observed = catalog_context(catalog, config.base_url, config.model)
+
+      if observed,
+        do: {observed, :observed},
+        else: Config.context_window(config)
+    end
+  end
+
+  defp window(%__MODULE__{}), do: {nil, :none}
+
+  defp catalog_context(catalog, base_url, model) when is_map(catalog) do
     case catalog do
       %{^base_url => entries} -> catalog_context(entries, model)
       _other -> nil
     end
   end
 
-  def provider_context_tokens(%__MODULE__{}), do: nil
-
-  defp catalog_context(entries, model) do
+  defp catalog_context(entries, model) when is_list(entries) do
     case Enum.find(entries, &(&1.model == model)) do
       %{context: context} when is_integer(context) and context > 0 -> context
       _other -> nil
@@ -579,18 +749,40 @@ defmodule DashFloat.TUI.State do
     do: :erlang.float_to_binary(rate, decimals: 1)
 
   @doc """
-  Context usage, `4.1k` or `4.1k/128k` when a provider window is configured;
-  `—` until something has streamed.
+  The footer's context span (ADR 0015 §2 amendment, issue #67 stage 2):
+  tokens-used and percent-of-context from the accounting API (ADR 0022 §7)
+  over the agent's snapshot — `4.2k/128k · 3.3%`, `nil` before the first
+  snapshot lands (the span is hidden, the rate-span pattern). The
+  denominator is the footer's resolution chain (issue #111: config, else
+  catalog-observed, else the presets' seed, else the documented default)
+  — a default denominator carries the `~` marker (`4.2k/~128k · 3.3%`):
+  the visible note that no source knows this model's window.
   """
-  @spec context_label(t()) :: String.t()
-  def context_label(%__MODULE__{stats: %{context_total: 0}}), do: "—"
+  @spec context_label(t()) :: String.t() | nil
+  def context_label(%__MODULE__{context: nil}), do: nil
 
-  def context_label(%__MODULE__{stats: %{context_total: total}} = state) do
-    case provider_context_tokens(state) do
-      nil -> humanize(total)
-      window -> humanize(total) <> "/" <> humanize(window)
+  def context_label(%__MODULE__{context: %{messages: messages, anchor: anchor}} = state) do
+    {window, source} = window(state)
+
+    case Accounting.usage(messages, anchor, window) do
+      %{used: used, window: nil} ->
+        humanize(used)
+
+      %{used: used, window: window, percent: percent} ->
+        humanize(used) <> "/" <> window_label(window, source) <> " · " <> percent_label(percent)
     end
   end
+
+  # The default window's visible note (issue #111): `~` marks an assumed
+  # denominator. Configured, observed, and seeded windows state their
+  # number plain.
+  defp window_label(window, :default), do: "~" <> humanize(window)
+  defp window_label(window, _known), do: humanize(window)
+
+  # One decimal, trailing `.0` trimmed — humanize/1's number rule, stated
+  # once (ADR 0015 §2 amendment). The window arm guarantees a percent:
+  # Accounting.usage/3 returns nil only with no window.
+  defp percent_label(percent), do: trim_zero(percent) <> "%"
 
   @doc "Token counts for humans: 999 reads 999, 1_500 1.5k, 1_048_576 1m."
   @spec humanize(integer()) :: String.t()
@@ -616,11 +808,115 @@ defmodule DashFloat.TUI.State do
   @spec input_line_count(t()) :: non_neg_integer()
   def input_line_count(%__MODULE__{input: input}), do: ExRatatui.textarea_line_count(input)
 
-  @doc "Inserts pasted text at the cursor (bracketed paste), normalizing CRLF and CR."
+  @doc """
+  Inserts pasted text at the cursor (bracketed paste), normalizing CRLF and
+  CR. A paste whose ENTIRE content is a path to an existing image file
+  converts to an attachment instead — the drag-and-drop shape (issue #112;
+  ADR 0018's 2026-10-31 amendment): terminals paste a dropped file's path,
+  and the composer answers with a chip, never literal path text. Refusals
+  follow the attach prompt's visible-entry rule. Either way the composer
+  was edited: the log re-pins to the tail (issue #110).
+  """
   @spec paste(t(), String.t()) :: t()
-  def paste(%__MODULE__{input: input} = state, content) when is_binary(content) do
-    ExRatatui.textarea_insert_str(input, normalize_newlines(content))
-    refresh_palette(dismiss_suggestion(leave_history(state)))
+  def paste(%__MODULE__{} = state, content) when is_binary(content) do
+    normalized = normalize_newlines(content)
+
+    case dropped_image(state, normalized) do
+      nil ->
+        ExRatatui.textarea_insert_str(state.input, normalized)
+        follow_tail(refresh_palette(dismiss_suggestion(leave_history(state))))
+
+      attached ->
+        attached
+    end
+  end
+
+  # The drop test (ADR 0018 amendment): the whole paste — surrounding
+  # whitespace and the trailing newline terminals add stripped, nothing
+  # else — must be a single whitespace-free path naming an existing
+  # regular image file. A
+  # paste with interior newlines, spaces, or a path that is not an image
+  # file is ordinary text (a pasted path as prose keeps its Ctrl+O).
+  # Detection is paste-only by design: typed paths can never accidentally
+  # convert (recorded in the amendment).
+  defp dropped_image(%__MODULE__{} = state, normalized) do
+    candidate = String.trim(normalized)
+
+    if drop_shaped?(candidate) and Images.image_file?(candidate) do
+      {:ok, state} = drop_attach(state, candidate)
+      state
+    else
+      nil
+    end
+  end
+
+  defp drop_shaped?(""), do: false
+
+  defp drop_shaped?(candidate) do
+    not (candidate =~ ~r/\s/) and candidate =~ ~r/\.(png|jpe?g|gif|webp)$/i
+  end
+
+  # The drop's gates mirror the attach prompt's Enter (ADR 0018 §4): the
+  # capability refusal names the model and keeps the paste out of the
+  # draft; a capable model runs the shared path check (an over-cap image
+  # refuses visibly — never a silent drop); success appends the pending
+  # chip. Any phase may drop — the composer owns pastes whenever no other
+  # input mode does, and the queue only rides a submit.
+  defp drop_attach(%__MODULE__{provider: {:ok, %DashFloat.Config{images: false}}} = state, _path) do
+    {:ok, config} = state.provider
+
+    refusal =
+      "[images: model #{image_model_name(config)} does not accept images — attach refused]"
+
+    {:ok, follow_tail(append_entry(state, :system, refusal))}
+  end
+
+  defp drop_attach(%__MODULE__{} = state, path) do
+    case Images.check(path) do
+      {:ok, meta} ->
+        {:ok,
+         follow_tail(%{state | attachments: state.attachments ++ [Map.put(meta, :path, path)]})}
+
+      {:error, reason} ->
+        {:ok, follow_tail(append_entry(state, :system, "[images: " <> reason <> "]"))}
+    end
+  end
+
+  # Any composer edit re-pins the log to its tail (issue #110): the user
+  # extending the conversation watches it grow. Scrolling, cursor-only
+  # keys, and history navigation do not ride this — entering text does.
+  defp follow_tail(%__MODULE__{} = state), do: %{state | scroll: 0, follow?: true}
+
+  @doc """
+  A paste while the attach prompt is open (ADR 0018 §5): bracketed paste
+  appends to the path draft, newlines normalized out — a pasted path with a
+  trailing newline is the common terminal shape. The composer is never
+  touched while the prompt owns the input.
+  """
+  @spec attach_paste(t(), String.t()) :: t()
+  def attach_paste(%__MODULE__{attach: %{draft: draft}} = state, content)
+      when is_binary(content),
+      do: %{state | attach: %{draft: draft <> strip_newlines(content)}}
+
+  def attach_paste(%__MODULE__{} = state, _content), do: state
+
+  @doc """
+  A paste while the /title dialog is open (issue #106): bracketed paste
+  appends to the draft, newlines normalized out — the attach prompt's rule
+  (ADR 0018 §5). The composer is never touched while the dialog owns the input.
+  """
+  @spec title_paste(t(), String.t()) :: t()
+  def title_paste(%__MODULE__{title_dialog: %{draft: draft} = dialog} = state, content)
+      when is_binary(content),
+      do: %{state | title_dialog: %{dialog | draft: draft <> strip_newlines(content)}}
+
+  def title_paste(%__MODULE__{} = state, _content), do: state
+
+  defp strip_newlines(content) do
+    content
+    |> String.replace("\r\n", "")
+    |> String.replace("\r", "")
+    |> String.replace("\n", "")
   end
 
   defp normalize_newlines(content) do
@@ -681,6 +977,80 @@ defmodule DashFloat.TUI.State do
   defp route_key(%{confirm: pending} = state, _code, _modifiers, _now) when pending != nil,
     do: {state, nil}
 
+  # The /title dialog (issue #106) is a key mode like the attach prompt
+  # (ADR 0018 §5): while open it swallows every key but the global quits
+  # above — printable characters and Backspace edit the draft, Enter submits
+  # through the UNCHANGED rename seam (the agent's reply closes the dialog or
+  # errors it), Esc cancels. No history, no mode cycle, no palette mid-dialog.
+  defp route_key(%{title_dialog: %{draft: draft}} = state, "enter", mods, _now)
+       when mods in [[], ["ctrl"]],
+       do: {%{state | title_dialog: %{draft: draft, error: nil}}, {:set_title, draft}}
+
+  defp route_key(%{title_dialog: %{}} = state, "esc", _modifiers, _now),
+    do: {%{state | title_dialog: nil}, nil}
+
+  # The draft's edit rules are the attach prompt's: Backspace slices the last
+  # grapheme, single printable characters append (a shifted printable is an
+  # UPPERCASE character, not a chord), and every other key is swallowed.
+  defp route_key(%{title_dialog: %{draft: draft} = dialog} = state, code, modifiers, _now) do
+    cond do
+      code == "backspace" ->
+        {%{state | title_dialog: %{dialog | draft: String.slice(draft, 0..-2//1)}}, nil}
+
+      modifiers in [[], ["shift"]] and single_char?(code) and String.valid?(code) ->
+        {%{state | title_dialog: %{dialog | draft: draft <> code}}, nil}
+
+      true ->
+        {state, nil}
+    end
+  end
+
+  # The attach prompt (ADR 0018 §5) is a key mode like confirmation mode:
+  # while open it swallows every key but the global quits above — printable
+  # characters and Backspace edit the path draft, Tab completes against the
+  # filesystem, Enter attaches, Esc closes (pending attachments kept), Ctrl+D
+  # clears them, and a second Ctrl+O closes. It only opens while idle with no
+  # other mode open, so it never fights the phase keys below.
+  defp route_key(%{attach: nil, phase: :idle, palette: nil} = state, "o", ["ctrl"], _now),
+    do: {%{state | attach: %{draft: ""}}, nil}
+
+  defp route_key(%{attach: %{}} = state, "o", ["ctrl"], _now),
+    do: {%{state | attach: nil}, nil}
+
+  defp route_key(%{attach: %{draft: draft}} = state, "enter", mods, _now)
+       when mods in [[], ["ctrl"]],
+       do: attach(state, draft)
+
+  defp route_key(%{attach: %{}} = state, "esc", _modifiers, _now),
+    do: {%{state | attach: nil}, nil}
+
+  defp route_key(%{attach: %{}} = state, "d", ["ctrl"], _now),
+    do: {%{state | attach: nil, attachments: []}, nil}
+
+  defp route_key(%{attach: %{draft: draft}} = state, "tab", _modifiers, _now),
+    do: {%{state | attach: %{draft: complete_path(draft)}}, nil}
+
+  # The draft's edit rules are the wizard's (ADR 0009) — Backspace slices
+  # the last grapheme, single printable characters append — and every other
+  # key (arrows, chords, the mode cycling, the palette keys) is swallowed:
+  # the prompt is the whole input surface while it lives. A chord is not a
+  # printable key (ADR 0018 §5): only unmodified characters type.
+  defp route_key(%{attach: %{draft: draft}} = state, code, modifiers, _now) do
+    cond do
+      code == "backspace" ->
+        {%{state | attach: %{draft: String.slice(draft, 0..-2//1)}}, nil}
+
+      # A shifted printable is an UPPERCASE character, not a chord: crossterm
+      # attaches SHIFT to every `is_uppercase` char (Caps Lock identically),
+      # so shift-only must type — ctrl/alt/super chords stay swallowed.
+      modifiers in [[], ["shift"]] and single_char?(code) and String.valid?(code) ->
+        {%{state | attach: %{draft: draft <> code}}, nil}
+
+      true ->
+        {state, nil}
+    end
+  end
+
   # The command palette (ADR 0020). Ctrl+P toggles: open from idle, close
   # whatever kind is open. A modal palette swallows every key but
   # Up/Down/Enter/Esc — the mode cycle included — while the global quits and
@@ -718,6 +1088,27 @@ defmodule DashFloat.TUI.State do
        when mods in [[], ["ctrl"]] do
     command = Enum.at(palette.items, palette.selected)
     run_submitted_command(state, input_text(state), command.name, "")
+  end
+
+  # Filter Tab COMPLETES to the selected match (issue #105; ADR 0020's
+  # 2026-10-31 amendment): the draft becomes "/<name> " — the trailing
+  # space closes the popup (args may follow) and leaves the cursor at the
+  # end, editable. The selection is the popup's own highlighted row — the
+  # same one arrows move and Enter runs, one selection model. Plain Tab
+  # only: shift+tab keeps its swallow above the mode cycle, real terminals
+  # emit BackTab. The clause sits above the ghost-text Tab: a slash draft
+  # is never empty, so the ghost never arms beside it (ADR 0015 §3 arms
+  # and lands on an empty draft only) — the two Tab rules cannot fight.
+  defp route_key(%{palette: %Palette{mode: :filter} = palette} = state, "tab", [], _now) do
+    command = Enum.at(palette.items, palette.selected)
+
+    state
+    |> leave_history()
+    |> set_draft("/" <> command.name <> " ")
+    |> refresh_palette()
+    |> dismiss_suggestion()
+    |> follow_tail()
+    |> then(&{&1, nil})
   end
 
   # Esc dismisses either palette; the filter's dismissal survives until the
@@ -772,6 +1163,20 @@ defmodule DashFloat.TUI.State do
     if on_last_row?(state), do: {history_next(state), nil}, else: forward(state, "down", [])
   end
 
+  # A chip pops before the draft loses its last grapheme (issue #112; ADR
+  # 0018 amendment): Backspace on an empty draft — the cursor sits at the
+  # chips' boundary, the chip row renders ahead of the draft — removes the
+  # NEWEST pending attachment; numbering re-derives from the queue. With
+  # draft text, Backspace keeps its ordinary edit (the chip is not "over"
+  # the cursor until the draft is empty).
+  defp route_key(%{attachments: [_chip | _rest]} = state, "backspace", [], _now) do
+    if input_text(state) == "" do
+      {follow_tail(%{state | attachments: Enum.drop(state.attachments, -1)}), nil}
+    else
+      forward(state, "backspace", [])
+    end
+  end
+
   # Tab materializes the ghost (ADR 0015 §3): the draft becomes the landed
   # suggestion (editable, cursor at end). No ghost — or a non-empty draft —
   # falls through to the textarea unchanged.
@@ -782,6 +1187,7 @@ defmodule DashFloat.TUI.State do
       |> set_draft(suggestion)
       |> refresh_palette()
       |> dismiss_suggestion()
+      |> follow_tail()
       |> then(&{&1, nil})
     else
       forward(state, "tab", [])
@@ -798,14 +1204,18 @@ defmodule DashFloat.TUI.State do
     # Editing while browsing history keeps the edited text: it becomes the
     # live draft (no longer restorable by navigating down). The filter
     # palette re-derives only when the draft actually changed — Esc's
-    # dismissal survives cursor-only keys (ADR 0020).
+    # dismissal survives cursor-only keys (ADR 0020) — and a real edit
+    # re-pins the log to its tail (issue #110): keystrokes, not focus.
     edited = dismiss_suggestion(leave_history(state))
 
     state =
-      if input_text(edited) == before, do: edited, else: refresh_palette(edited)
+      if input_text(edited) == before, do: edited, else: follow_tail(refresh_palette(edited))
 
     {state, nil}
   end
+
+  # The attach draft's printable-key test — the wizard's edit rule (ADR 0009).
+  defp single_char?(code), do: String.length(code) == 1
 
   ## Filter palette (ADR 0020)
 
@@ -871,11 +1281,12 @@ defmodule DashFloat.TUI.State do
 
   @doc """
   True when a transient row sits between log and input: an active phase
-  (ADR 0006) or the armed exit-guard prompt (issue #28). The view's layout
-  and the scroll viewport both read this — one predicate, one height.
+  (ADR 0006), the armed exit-guard prompt (issue #28), or the open attach
+  prompt (ADR 0018 §5). The view's layout and the scroll viewport both read
+  this — one predicate, one height.
   """
   @spec overlay?(t()) :: boolean()
-  def overlay?(%__MODULE__{phase: :idle, exit_guard_at: nil}), do: false
+  def overlay?(%__MODULE__{phase: :idle, exit_guard_at: nil, attach: nil}), do: false
   def overlay?(%__MODULE__{}), do: true
 
   # Only for actual editing keys; history_prev/next call the textarea API
@@ -900,18 +1311,20 @@ defmodule DashFloat.TUI.State do
 
   @doc """
   Submits the draft: appends a `:user` entry, pushes history, clears the
-  draft, and flips the phase to `:streaming`. A command-shaped draft (ADR
-  0020) runs the command instead — no `:user` entry, no phase flip; a bare
-  unknown `/foo` warns; other slash text submits as an ordinary message. The
-  command paths keep submit's idle gate and bookkeeping. Returns `{state,
-  nil}` when the draft is blank or a request is already in flight (one at a
-  time; queueing is Phase 2).
+  draft, and flips the phase to `:streaming`. A blank draft still submits
+  when attachments are pending — the image-only turn (ADR 0018 §5). A
+  command-shaped draft (ADR 0020) runs the command instead — no `:user`
+  entry, no phase flip, pending attachments untouched; a bare unknown `/foo`
+  warns; other slash text submits as an ordinary message. The command paths
+  keep submit's idle gate and bookkeeping. Returns `{state, nil}` when
+  nothing is submittable — a blank draft and no pending attachments — or a
+  request is already in flight (one at a time; queueing is Phase 2).
   """
   @spec submit(t()) :: {t(), action()}
   def submit(%__MODULE__{} = state) do
     text = input_text(state)
 
-    if state.phase == :idle and text != "" and String.trim(text) != "" do
+    if state.phase == :idle and (String.trim(text) != "" or state.attachments != []) do
       dispatch_submit(state, text)
     else
       {state, nil}
@@ -930,16 +1343,23 @@ defmodule DashFloat.TUI.State do
   defp plain_or_unknown(state, text, trimmed) do
     case bare_slash_prefix(trimmed) do
       nil ->
+        # The pending attachments ride the plain path only (ADR 0018 §5):
+        # the entry's text stays verbatim (ADR 0006) and its rendered lines
+        # gain one indicator per image; clearing waits for the agent's
+        # streaming echo (§6), so a submit-time refusal keeps the set.
+        paths = Enum.map(state.attachments, & &1.path)
+        entry_lines = Render.entry_lines(:user, text) ++ indicator_lines(state.attachments)
+
         state
         |> push_history(text)
-        |> append_entry(:user, text)
+        |> put_entry(:user, text, entry_lines)
         |> clear_input()
         |> Map.put(:phase, :streaming)
         # A new question re-pins the log: the user wants to watch its answer
         # arrive even if they had paged up first.
         |> Map.put(:follow?, true)
         |> dismiss_suggestion()
-        |> then(&{&1, {:submit, text}})
+        |> then(&{&1, {:submit, text, paths}})
 
       # A bare token that is not a registry name can never be an ordinary
       # message — warn instead (ADR 0020).
@@ -979,6 +1399,114 @@ defmodule DashFloat.TUI.State do
     ExRatatui.textarea_set_value(state.input, "")
     state
   end
+
+  ## Attach prompt (ADR 0018 §5)
+
+  # Enter in the attach prompt (ADR 0018 §4): the capability gate first —
+  # the same predicate the agent re-checks at submit, the refusal naming the
+  # model — then the stat-only path check, the refusal naming the path. A
+  # refusal lands as the `[images: …]` system entry and keeps the prompt open
+  # with the draft intact; success keeps only the display metadata and closes.
+  # Enter on an empty draft attaches nothing and refuses nothing — the
+  # prompt just stays open (an empty path is not a user intent to resolve).
+  # FIRST, before the capability gate: the no-op is provider-independent.
+  defp attach(state, ""), do: {state, nil}
+
+  defp attach(
+         %{provider: {:ok, %DashFloat.Config{images: false}} = classification} = state,
+         _draft
+       ) do
+    {:ok, config} = classification
+    entry = "[images: model #{image_model_name(config)} does not accept images — attach refused]"
+    {append_entry(state, :system, entry), nil}
+  end
+
+  defp attach(state, draft) do
+    case Images.check(draft) do
+      {:ok, meta} ->
+        {%{state | attachments: state.attachments ++ [Map.put(meta, :path, draft)], attach: nil},
+         nil}
+
+      {:error, reason} ->
+        {append_entry(state, :system, "[images: " <> reason <> "]"), nil}
+    end
+  end
+
+  # The refusal names the model — the nickname, else the id (ADR 0018 §4);
+  # the agent's own rule, mirrored for the attach-time gate.
+  defp image_model_name(%DashFloat.Config{nickname: nil, model: model}), do: model
+  defp image_model_name(%DashFloat.Config{nickname: nickname}), do: nickname
+
+  # Tab completion (ADR 0018 §5 — the sanctioned UI-process read): one
+  # readdir of the draft's directory completes its last path segment to the
+  # longest common prefix of the visible matches; a completion that lands a
+  # directory gains a trailing "/", dotfile entries only surface once the
+  # typed segment starts with ".", and no matches is a no-op.
+  defp complete_path(draft) do
+    segment =
+      draft
+      |> String.split("/")
+      |> List.last()
+
+    prefix = String.replace_suffix(draft, segment, "")
+    dir = dir_for(prefix)
+
+    case File.ls(dir) do
+      {:ok, entries} ->
+        matches = Enum.filter(entries, &segment_match?(&1, segment))
+        completed(prefix, draft, matches)
+
+      {:error, _reason} ->
+        draft
+    end
+  end
+
+  # A bare segment reads relative to the cwd — the same shape the draft's
+  # prefix keeps when completed.
+  defp dir_for(""), do: "."
+  defp dir_for(prefix), do: prefix
+
+  defp segment_match?(name, segment) do
+    String.starts_with?(name, segment) and
+      (not String.starts_with?(name, ".") or String.starts_with?(segment, "."))
+  end
+
+  defp completed(_prefix, draft, []), do: draft
+
+  defp completed(prefix, draft, matches) do
+    name = Enum.reduce(matches, &shared_prefix/2)
+    candidate = prefix <> name
+
+    cond do
+      candidate == draft ->
+        draft
+
+      name in matches and File.dir?(candidate) ->
+        candidate <> "/"
+
+      true ->
+        candidate
+    end
+  end
+
+  defp shared_prefix(a, b) do
+    a
+    |> String.graphemes()
+    |> Enum.zip(String.graphemes(b))
+    |> Enum.take_while(fn {x, y} -> x == y end)
+    |> Enum.map_join(&elem(&1, 0))
+  end
+
+  # The :user entry's indicator lines (ADR 0018 §5): one dim 📎 row per
+  # attachment under the prompt text — display only, the entry's text stays
+  # the persistence truth (ADR 0006).
+  defp indicator_lines([]), do: []
+
+  defp indicator_lines(attachments),
+    do:
+      Enum.map(attachments, fn %{name: name, kb: kb} ->
+        Line.new([Span.new("📎 #{name} (#{kb} KB)", style: Theme.style(:dim))])
+      end)
 
   ## Slash commands (ADR 0020 — the registry is data; transitions live here)
 
@@ -1052,8 +1580,14 @@ defmodule DashFloat.TUI.State do
     end
   end
 
-  # The agent owns title normalization, uniqueness, and validation — even ""
-  # goes through (ADR 0023 §7's rename seam).
+  # Bare /title opens the dialog pre-filled with the current title
+  # (issue #106); /title <name> keeps the inline path — the agent owns title
+  # normalization, uniqueness, and validation either way (ADR 0023 §7's
+  # rename seam).
+  defp run_command(state, "title", "") do
+    {%{state | title_dialog: %{draft: state.title || "", error: nil}}, nil}
+  end
+
   defp run_command(state, "title", rest), do: {state, {:set_title, rest}}
 
   # /compact rides ADR 0022's eviction on demand (issue #92): the agent
@@ -1081,22 +1615,50 @@ defmodule DashFloat.TUI.State do
 
   defp run_command(state, "profile", _rest), do: {state, :list_profiles}
 
-  # The model picker's Enter: a catalog id has no nickname or configured
-  # context — both nil out and the label/context denominator fall back to the
-  # catalog (ADR 0020). The switch lands on the NEXT request.
+  # The model picker's Enter: a catalog id has no nickname — it nils out and
+  # the label falls back to the catalog (ADR 0020). The context window
+  # re-resolves for the PICKED id (issue #111, hostile review F2): its own
+  # settings-menu entry's `context` when one exists (an explicit user
+  # setting survives the switch), else nothing explicit and the
+  # seed/default chain takes over — never the outgoing model's number. The
+  # images flag is NOT carried from the outgoing model: it re-resolves
+  # against the settings-side menu by id — a marked entry keeps its
+  # capability, a catalog-only id is not capable (ADR 0018 §1). The switch
+  # lands on the NEXT request.
   defp pick_model(
          %{provider: {:ok, %DashFloat.Config{} = config}} = state,
          %Palette{items: entries, selected: selected}
        ) do
+    picked = Enum.at(entries, selected).model
+
     switched =
       %DashFloat.Config{
         config
-        | model: Enum.at(entries, selected).model,
+        | model: picked,
           nickname: nil,
-          context_tokens: nil
+          context_tokens: menu_context(config.model_menu, picked),
+          images: menu_images(config.model_menu, picked)
       }
 
     {%{state | provider: {:ok, switched}, palette: nil}, {:switch_model, {:ok, switched}}}
+  end
+
+  # The menu entry for `id` decides (ADR 0018 §1's pattern, the context
+  # twin): no entry — a catalog-only id — carries no explicit window.
+  defp menu_context(menu, id) do
+    case Enum.find(menu, fn entry -> entry.model == id end) do
+      %{context: context} when is_integer(context) and context > 0 -> context
+      _no_entry -> nil
+    end
+  end
+
+  # The menu entry for `id` decides (ADR 0018 §1); no entry — a catalog-only
+  # id — is not image-capable.
+  defp menu_images(menu, id) do
+    case Enum.find(menu, fn entry -> entry.model == id end) do
+      %{images: images} -> images || false
+      _no_entry -> false
+    end
   end
 
   @doc """
@@ -1119,9 +1681,13 @@ defmodule DashFloat.TUI.State do
 
     * `{:token, text}` — append to the in-flight entry verbatim, count it, start
       the rate clock on the first token, mark the live lines stale
-    * `{:usage, map}` — reconcile prompt/completion tokens, add the frame's
-      total to the context accumulator; no phase change
-    * `{:phase, :streaming}` — set the phase only; re-announcing streaming
+    * `{:usage, map}` — reconcile prompt/completion tokens; no phase change
+    * `{:context, snapshot}` — adopt the agent's context snapshot (the
+      footer's tokens-used source, ADR 0015 §2 amendment); no phase change
+    * `{:phase, :streaming}` — set the phase and clear the pending
+      attachments (ADR 0018 §6: the turn's images ride the request; a
+      submit-time refusal never echoes this phase, so the refused set
+      survives); re-announcing streaming
       never finalizes (a producer resuming after a tool interlude must not
       fragment its reply)
     * `{:phase, :executing_tool | :checking | :idle}` — set the phase and
@@ -1136,6 +1702,12 @@ defmodule DashFloat.TUI.State do
       phase change (ADR 0016)
     * `{:tool_preview, request}` — append the preview entry built by
       `Render.confirm_preview/1` without arming `state.confirm` (ADR 0016)
+    * `{:title, title}` — the display-only title push (ADR 0023's
+      2026-10-31 amendment): set the title and close an open dialog —
+      the rename succeeded
+    * `{:title_refused, reason}` — set the open dialog's error (draft kept);
+      a no-op with no dialog open — the agent's system entry is the log
+      record for the inline form
     * `{:entry, kind, text}` — append a complete entry
 
   `now` is monotonic milliseconds (injectable so the rate math is testable).
@@ -1172,36 +1744,41 @@ defmodule DashFloat.TUI.State do
   def stream_message(%{phase: :idle} = state, {:usage, _usage}, _now), do: state
 
   def stream_message(state, {:usage, usage}, _now) when is_map(usage) do
-    %{
-      prompt_tokens: prompt,
-      completion_tokens: completion,
-      total_tokens: total
-    } = usage
+    %{prompt_tokens: prompt, completion_tokens: completion} = usage
 
-    # Usage frames carry the turn's running total — single-frame providers
+    # Usage frames carry the turn's running count — single-frame providers
     # send it once, per-chunk reporters on every frame. The turn's truth is
-    # the LAST frame, banked once at finalize (ADR 0006); summing every frame
-    # would inflate the context on per-chunk providers.
+    # the LAST frame (the same last-frame-wins rule as the agent's
+    # pending_usage, ADR 0007 §5); the count feeds the rate math only —
+    # the footer's tokens-used comes from the context snapshot's
+    # Accounting.usage/3 read (ADR 0015 §2 amendment).
     stats = %{
       state.stats
       | prompt_tokens: prompt,
         completion_tokens: completion,
         # The usage frame is the authoritative count: the per-delta estimate is
         # reconciled here, so the frozen rate is computed from real tokens.
-        tokens: completion,
-        turn_total: total
+        tokens: completion
     }
 
     %{state | stats: stats}
   end
 
+  # The stage-2 context snapshot (ADR 0015 §2 amendment): pure data in, pure
+  # data stored — the footer's usage read happens at render.
+  def stream_message(state, {:context, %{messages: messages, anchor: anchor}}, _now)
+      when is_list(messages),
+      do: %{state | context: %{messages: messages, anchor: anchor}}
+
   # Any phase message supersedes a pending confirm: the agent is the single
   # voice, and a confirm the UI never decided must not outlive the turn it
   # belonged to (agent death included — agent_down routes through here).
   # A new turn also kills the old ghost — the reap intent rides the
-  # resulting state (ADR 0015 §3).
+  # resulting state (ADR 0015 §3) — and clears the pending attachments
+  # (ADR 0018 §6): the turn's images are on the wire now. Clearing an
+  # already-empty list is a no-op, so repeated tool-loop episodes are safe.
   def stream_message(state, {:phase, :streaming}, _now),
-    do: dismiss_suggestion(%{state | phase: :streaming, confirm: nil})
+    do: dismiss_suggestion(%{state | phase: :streaming, confirm: nil, attachments: []})
 
   def stream_message(state, {:phase, :idle}, now) do
     # Arm only when THIS transition actually finalized an assistant reply:
@@ -1230,6 +1807,22 @@ defmodule DashFloat.TUI.State do
   # separately as {:entry, :system, _}. The agent validates the mode at its
   # seam, so the echo — like every stream message — is trusted agent voice.
   def stream_message(state, {:mode, mode}, _now), do: %{state | mode: mode}
+
+  # The display-only title push (issue #106): the dialog's prefill and the
+  # footer-adjacent state stay current, and an open dialog closes — the rename
+  # succeeded, nothing left to show.
+  def stream_message(state, {:title, title}, _now) when is_binary(title),
+    do: %{state | title: title, title_dialog: nil}
+
+  # The rename refusal lands IN the open dialog (draft kept, issue #106);
+  # with no dialog open it is a no-op — the inline form's log record is the
+  # agent's own system entry.
+  def stream_message(state, {:title_refused, reason}, _now) when is_binary(reason) do
+    case state.title_dialog do
+      nil -> state
+      dialog -> %{state | title_dialog: %{dialog | error: reason}}
+    end
+  end
 
   # A proposal or execution receipt (ADR 0016 §4): the preview rows a human
   # would confirm, landed without arming the decision.
@@ -1344,21 +1937,15 @@ defmodule DashFloat.TUI.State do
     if to_row >= base, do: %{state | selection: nil}, else: state
   end
 
-  # The turn's banked usage total joins the conversation accumulator exactly
-  # once, here (ADR 0006). Phase 3 caveat: a producer that emits the tool
-  # transition before flushing usage would fold that episode's total into the
-  # next episode's banking slot — producers must send usage before each phase
-  # change (the in-contract order).
+  # The turn's rate freezes here (ADR 0006); the context total is NOT banked
+  # anymore — the footer's tokens-used span reads Accounting.usage/3 off the
+  # agent's context snapshot (ADR 0015 §2 amendment, issue #67 stage 2).
   defp frozen(%{stats: stats}, now) do
     %{
       stats
       | rate: rate(stats.tokens, stats.first_token_at, now) || stats.rate,
         tokens: 0,
-        first_token_at: nil,
-        # The turn's banked usage total joins the conversation accumulator
-        # exactly once, here (ADR 0006).
-        context_total: stats.context_total + (stats.turn_total || 0),
-        turn_total: nil
+        first_token_at: nil
     }
   end
 
@@ -1416,6 +2003,16 @@ defmodule DashFloat.TUI.State do
 
     {state, :cont}
   end
+
+  @doc """
+  Toggles the idle cursor's blink phase (issue #104; ADR 0006's 2026-10-31
+  amendment) — one state flip, drawn by the TUI's blink timer frame. Pure;
+  the timer lives in the TUI process. Entering an active phase resets the
+  phase to visible (`true`) so the first idle frame always shows the
+  cursor.
+  """
+  @spec blink(t()) :: t()
+  def blink(%__MODULE__{} = state), do: %{state | blink_on: not state.blink_on}
 
   defp refresh_in_flight(%{in_flight_dirty: false} = state), do: state
 
