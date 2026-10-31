@@ -39,7 +39,10 @@ One subcommand, `dashfloat update`, with a scriptable check-only form
 `--version` ([ADR 0010](0010-release-packaging.md)): before config loading
 and terminal setup, needing neither, exiting through the one halt seam.
 `update` must **lead** argv (`dashfloat update [--check]`); elsewhere it is
-what it always was — an unrecognized-argument warning.
+what it always was — an unrecognized-argument warning. A `--version`
+anywhere in argv still wins over a leading `update` (the version check runs
+first and `--version` matches by membership) — `dashfloat update --check
+--version` answers the version and exits 0.
 
 ### 1. The check
 
@@ -99,7 +102,10 @@ owns. Detection reads the running release's root (`:code.root_dir()`):
 install.sh records no marker file today, and none is added: its directory
 shape is deterministic and self-describing, and a marker file could disagree
 with the tree it sits in (a version-skew bug incubator). The layout *is* the
-marker.
+marker. The collision risk is accepted: a path that merely *looks* like the
+layout (a manual unpack beside another tool's `current`) would be treated as
+script-managed — the same trust install.sh itself extends to a user-run
+shell script.
 
 - **Homebrew**: print the handoff — `brew upgrade dashfloat` — and do
   nothing else. brew owns that binary; the command never shells out to brew
@@ -125,7 +131,11 @@ is a two-rename swap. Step order is the safety claim —
    the asset's checksums line. A mismatch — corruption, truncation, a swapped
    asset — prints both hashes and refuses: **the installation is
    byte-identical; nothing was swapped.** A checksums file without the
-   asset's line refuses the same way.
+   asset's line refuses the same way. The residual risk is stated plainly:
+   the checksums file comes from the same release as the tarball, so this
+   detects corruption and truncation — it is not a signature against a
+   compromised release, exactly the trust install.sh and the Homebrew
+   formula already extend.
 4. Extract with `:erl_tar` into the staging directory and assert
    `bin/dashfloat` exists. Both failures refuse; nothing was swapped.
 5. **Swap atomically**: `rename(staging → versions/<new>)`, then create
@@ -137,15 +147,26 @@ is a two-rename swap. Step order is the safety claim —
    bounded port (15 s; a hung child is killed, a non-executable one is a
    failed smoke, not a crash) and require it to answer the new version —
    the same smoke the release pipeline runs on every artifact (ADR 0010).
+   The child runs with the parent's `RELEASE_*` context cleared: a running
+   release exports the whole suite and the generated launcher honors
+   `RELEASE_SYS_CONFIG`/`RELEASE_VSN` over its own tree, so an inherited
+   context boots the OLD release's code and answers the old version (found
+   on the real-artifact e2e — a test VM carries no `RELEASE_*` environment,
+   so the standin suite alone could not catch it).
    On failure: **roll back** — `current` is repointed to its previous
    target (the old link's stored value, verbatim, so relative and absolute
-   links both round-trip) and the new tree is removed.
+   links both round-trip), and only then is the new tree removed. A
+   rollback that cannot repoint (an unwritable home, say) keeps the new
+   tree — `current` still resolves into it — and refuses naming the repair
+   (`re-run install.sh`), never a message claiming a rollback that did not
+   land.
 7. **Prune**: only after the smoke passes, everything else under `versions/`
    goes — ADR 0010's one-version rule, now held *behind* the rollback window
    it lacked.
 
-The staging directory is removed on every exit, success or refusal, so no
-`.update-*` leftovers survive.
+The staging directory is removed on every exit, success or refusal, and
+stale `current.new-*` links from a hard kill inside the two-rename window
+are swept on the next swap, so no leftovers accumulate.
 
 **Replacing a running release is safe here because the command's own VM
 halts immediately after** (`handle_update` exits through the boot's halt

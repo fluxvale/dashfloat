@@ -223,7 +223,9 @@ defmodule DashFloat.Update do
     Keyword.get(opts, :api_base) || env["DASHFLOAT_UPDATE_API_BASE"] || @api_base
   end
 
-  defp parse_release(%{"tag_name" => tag} = body) when is_map(body) do
+  # A tag must be a binary to be a version; anything else is the same
+  # format-mismatch refusal as an undecodable body.
+  defp parse_release(%{"tag_name" => tag} = body) when is_map(body) and is_binary(tag) do
     assets =
       body
       |> Map.get("assets", [])
@@ -239,8 +241,12 @@ defmodule DashFloat.Update do
 
   defp parse_release(_other), do: {:error, :bad_response}
 
-  defp asset_name_url(%{"name" => name, "browser_download_url" => url}) when is_binary(name),
-    do: [{name, url}]
+  # Name/url pairs only: an asset entry without both, or with an empty url,
+  # is not an installable asset (it reads back as missing below, never a
+  # crash in URI parsing).
+  defp asset_name_url(%{"name" => name, "browser_download_url" => url})
+       when is_binary(name) and is_binary(url) and url != "",
+       do: [{name, url}]
 
   defp asset_name_url(_other), do: []
 
@@ -422,12 +428,10 @@ defmodule DashFloat.Update do
 
   defp download(url, dest, opts) do
     timeout = Keyword.get(opts, :timeout, @timeout_ms)
+    # A path-less URL (query-only) names no file; the empty name is honest.
+    path = URI.parse(url).path || ""
 
-    name =
-      url
-      |> URI.parse()
-      |> Map.get(:path)
-      |> Path.basename()
+    name = Path.basename(path)
 
     case Req.get(url, into: File.stream!(dest), receive_timeout: timeout, retry: false) do
       {:ok, %Req.Response{status: 200}} ->
@@ -523,6 +527,11 @@ defmodule DashFloat.Update do
     target_dir = Path.join(versions_dir, version)
     current = Path.join(home, "current")
 
+    # A hard kill inside relink/2's two-rename window can leave a stale
+    # current.new-<unique> link; sweep them so nothing accumulates.
+    stale_links = Path.wildcard("#{current}.new-*")
+    Enum.each(stale_links, &File.rm/1)
+
     previous =
       case File.read_link(current) do
         {:ok, target} -> {:ok, target}
@@ -570,10 +579,20 @@ defmodule DashFloat.Update do
         :ok
 
       {:error, reason} ->
-        rollback(home, previous, target_dir)
+        # The rollback's own outcome changes the honest message: restored
+        # means the installation is exactly as it was; NOT restored means
+        # `current` still resolves into the (kept) new tree and the user
+        # needs the installer to repair.
+        case rollback(home, previous, target_dir) do
+          :ok ->
+            {:error,
+             "the new release did not start correctly (#{reason}) - rolled back; the previous installation is unchanged."}
 
-        {:error,
-         "the new release did not start correctly (#{reason}) - rolled back; the previous installation is unchanged."}
+          :error ->
+            {:error,
+             "the new release did not start correctly (#{reason}) and the previous link could not be restored - " <>
+               "re-run install.sh (or brew upgrade) to repair the installation."}
+        end
     end
   end
 
@@ -650,16 +669,22 @@ defmodule DashFloat.Update do
     end
   end
 
-  # Restores the previous `current` link verbatim and removes the new tree.
+  # Restores the previous `current` link verbatim and removes the new tree —
+  # IN THAT ORDER, and only removes the new tree when the link actually
+  # moved back. A rollback that could not repoint (an unwritable home, say)
+  # must leave the new tree in place: `current` still resolves into it, and
+  # deleting it would dangle the entrypoint the rollback exists to protect.
   defp rollback(home, previous, target_dir) do
     current = Path.join(home, "current")
 
-    case previous do
-      {:ok, target} -> relink(current, target)
-      :none -> File.rm(current)
-    end
+    restored =
+      case previous do
+        {:ok, target} -> relink(current, target) == :ok
+        :none -> File.rm(current) == :ok
+      end
 
-    File.rm_rf(target_dir)
+    if restored, do: File.rm_rf(target_dir)
+    if restored, do: :ok, else: :error
   end
 
   # ADR 0010's one-version rule: everything under versions/ except the new

@@ -358,6 +358,50 @@ defmodule DashFloat.UpdateTest do
     assert out =~ "release record"
   end
 
+  # Review finding 2 (PR #126): decodable-but-wrong shapes must refuse, not
+  # crash the boot (ADR 0011's rule).
+  test "a non-binary tag_name refuses instead of crashing" do
+    standin = standin()
+    UpdateStandin.set_release(standin, %{"tag_name" => 42, "assets" => []})
+
+    {code, out} = run_captured(["update"], standin)
+
+    assert code == 1
+    assert out =~ "release record"
+  end
+
+  test "a missing tag_name refuses instead of crashing" do
+    standin = standin()
+    UpdateStandin.set_release(standin, %{"assets" => []})
+
+    {code, out} = run_captured(["update"], standin)
+
+    assert code == 1
+    assert out =~ "release record"
+  end
+
+  @tag :tmp_dir
+  test "asset urls that are empty or not strings read as missing assets", ctx do
+    standin = standin()
+    base = UpdateStandin.base(standin)
+
+    UpdateStandin.set_release(standin, %{
+      "tag_name" => "v#{@latest}",
+      "assets" => [
+        %{"name" => "dashfloat-#{@latest}-#{@target}.tar.gz", "browser_download_url" => ""},
+        %{"name" => "dashfloat-#{@latest}-sha256sums.txt", "browser_download_url" => 123}
+      ]
+    })
+
+    {home, running, _new_dir} = script_home(ctx.tmp_dir)
+
+    {code, out} = run_captured(["update"], standin, root: running)
+
+    assert code == 1
+    assert out =~ "has no dashfloat-#{@latest}-#{@target}.tar.gz asset"
+    assert current_points_at(home) == running
+  end
+
   test "asset entries that are not name/url maps are ignored" do
     standin = standin()
 
@@ -572,32 +616,60 @@ defmodule DashFloat.UpdateTest do
     refute File.exists?(new_dir)
   end
 
-  # The regression for the e2e find (issue #122): a running release exports
-  # the RELEASE_* suite, and an inherited context makes the new launcher
-  # boot the OLD release's code. The stub answers the OLD version when it
-  # sees the inherited variable — with the parent env set, only the smoke's
-  # context cleanup keeps the update green.
+  # The rollback's own failure (review finding 1, PR #126): a home that
+  # turns unwritable during the smoke window means the repoint cannot land.
+  # The new tree must SURVIVE (current still resolves into it) and the
+  # refusal must say the rollback failed, not claim success. The stub is the
+  # saboteur: it chmods the home read-only from inside the smoke.
   @tag :tmp_dir
-  test "the smoke ignores an inherited RELEASE_* context", ctx do
+  test "a rollback that cannot repoint keeps the new tree and says so", ctx do
     standin = standin()
-
-    leaky =
-      "#!/bin/sh\nif [ -n \"$RELEASE_VSN\" ]; then echo dashfloat $RELEASE_VSN; else echo dashfloat #{@latest}; fi\n"
-
-    arm_release(standin, "v#{@latest}", ctx.tmp_dir, script: leaky)
     {home, running, new_dir} = script_home(ctx.tmp_dir)
+    sabotage = "#!/bin/sh\nchmod 555 #{home}\necho dashfloat 0.0.1\n"
+    arm_release(standin, "v#{@latest}", ctx.tmp_dir, script: sabotage)
 
-    System.put_env("RELEASE_VSN", "0.4.0")
-
-    {code, _out} =
+    {code, out} =
       try do
         run_captured(["update"], standin, root: running, smoke_timeout: 2_000)
       after
-        System.delete_env("RELEASE_VSN")
+        File.chmod!(home, 0o755)
       end
 
-    assert code == 0
+    assert code == 1
+    assert out =~ "could not be restored"
+    assert out =~ "re-run install.sh"
+    # current still resolves into the kept new tree; the old one too.
     assert current_points_at(home) == new_dir
+
+    new_bin = Path.join([new_dir, "bin", "dashfloat"])
+    assert File.exists?(new_bin)
+    assert File.exists?(running)
+  end
+
+  @tag :tmp_dir
+  test "a failed rollback over a regular-file current keeps the new tree", ctx do
+    standin = standin()
+    {home, running, new_dir} = script_home(ctx.tmp_dir)
+    sabotage = "#!/bin/sh\nchmod 555 #{home}\necho dashfloat 0.0.1\n"
+    arm_release(standin, "v#{@latest}", ctx.tmp_dir, script: sabotage)
+
+    current = Path.join(home, "current")
+    File.rm!(current)
+    File.write!(current, "not a symlink")
+
+    {code, out} =
+      try do
+        run_captured(["update"], standin, root: running, smoke_timeout: 2_000)
+      after
+        File.chmod!(home, 0o755)
+      end
+
+    assert code == 1
+    assert out =~ "could not be restored"
+    assert File.exists?(current)
+
+    new_bin = Path.join([new_dir, "bin", "dashfloat"])
+    assert File.exists?(new_bin)
   end
 
   # A `current` that is a regular file (not a symlink) still satisfies the
