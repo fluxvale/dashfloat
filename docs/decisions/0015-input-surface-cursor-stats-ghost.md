@@ -483,8 +483,11 @@ imprecision from #137's audit).
   about how many cells a string occupies. No second width classifier
   exists in the TUI; the footer's approximation is deleted, not kept
   alongside. (The attach row's and the rename dialog's naive
-  `String.length` accounting is the same bug class and survives this
-  amendment — filed as #144, not settled here.)
+  `String.length` accounting is the same bug class and survived this
+  amendment — filed as #144, not settled here. Settled by #144: both
+  surfaces, plus the resume picker's preview cap, now measure through
+  `Wrap` — the "no second classifier" claim holds with no exceptions
+  left.)
 - **The drop ladder's arithmetic is cell-accurate for wide glyphs.** The
   #130 rung order is untouched; only its measurements improve. At 80 cols
   a CJK cwd drops exactly when its measured width (two cells per Han

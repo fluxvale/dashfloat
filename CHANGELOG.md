@@ -41,6 +41,7 @@ when its tag is cut.
 ### Fixed
 
 - The stats footer measures every span's display width with the transcript renderer's own width classifier (`Wrap.width`) instead of a private grapheme-count approximation, so BMP-wide glyphs — a CJK cwd or model name — count two cells apiece: the drop ladder lands cell-accurately at every width, and a wide-glyph footer can no longer clip a span the math believed already fit (ADR 0015 amendment) (#139).
+- The last `String.length`-as-display-width sites join the #139 class fix: the attach row's fit test and tail-slice, the /title dialog's draft budget, and the /resume picker's preview cap all measure through `Wrap` (`width/1` plus new public `fit_head/fit_tail` — one classifier, and the fit arithmetic beside it). A CJK image path yields the attach hints at the honest cell instead of clipping the row; a CJK or emoji title tail-fits the dialog's box whole clusters only (the cursor never rides off-screen); a wide preview caps at 40 columns, no longer cutting its glyphs mid-cluster at the picker popup's edge (#144).
 
 ## [0.4.0] - 2026-10-31
 

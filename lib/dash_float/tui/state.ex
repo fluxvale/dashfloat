@@ -1957,20 +1957,19 @@ defmodule DashFloat.TUI.State do
   defp preview_label(nil, preview), do: cap_preview(preview)
   defp preview_label(title, _preview), do: cap_preview(title)
 
-  # One flat line, capped at @preview_cap graphemes with `…` marking the
-  # cut; newlines flatten to spaces, other control characters (verbatim
-  # user text) never reach the row.
+  # One flat line, capped at @preview_cap display columns with `…` marking
+  # the cut — Wrap.fit_head (#144, the #139 class), because the picker
+  # popup clips rather than wraps: 40 Han graphemes are 80 columns, and a
+  # grapheme-count cap would push the row's metadata past the popup edge.
+  # Newlines flatten to spaces, other control characters (verbatim user
+  # text) never reach the row.
   defp cap_preview(text) do
     flat =
       text
       |> String.replace("\n", " ")
       |> String.replace(~r/[\x00-\x1F\x7F]/, "")
 
-    if String.length(flat) <= @preview_cap do
-      flat
-    else
-      String.slice(flat, 0, @preview_cap) <> "…"
-    end
+    Wrap.fit_head(flat, @preview_cap)
   end
 
   # Relative time: `now`, `Nm`, `Nh`, `Nd`, then the plain date once the
