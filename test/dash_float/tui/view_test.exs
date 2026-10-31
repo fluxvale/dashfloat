@@ -812,27 +812,7 @@ defmodule DashFloat.TUI.ViewTest do
       # A PINNED cwd label (the state stores the FORMATTED label — State.new
       # runs format_cwd): the ladder's arithmetic must not depend on where
       # the suite happens to check out (32 display cells).
-      base = new_state(provider: provider(128_000))
-
-      full =
-        base
-        |> Map.put(:cwd, "~/FluxVale/dashfloat-129-surface")
-        |> Map.put(:phase, :streaming)
-        |> State.stream_message({:token, "a"}, 1_400)
-        |> State.stream_message({:token, "b"}, 1_500)
-        |> State.stream_message(
-          {:context,
-           %{messages: [%{role: "user", content: "ab"}], anchor: %{tokens: 4_100, index: 1}}}
-        )
-        |> Map.put(:stats, %{
-          new_state().stats
-          | sent_at: 0,
-            ttft_ms: 1_400,
-            rate: 32.0,
-            tokens: 0,
-            first_token_at: nil,
-            last_token_at: nil
-        })
+      full = ladder_state("~/FluxVale/dashfloat-129-surface")
 
       # Everything fits at a wide footer (rect = frame − 4; the full row
       # is 93 cells).
@@ -879,6 +859,58 @@ defmodule DashFloat.TUI.ViewTest do
       assert footer_text(state, 51) =~ "x - glm 📎"
       refute footer_text(state, 50) =~ "~/FluxVale"
       assert footer_text(state, 50) =~ "❯ · x - glm 📎"
+    end
+
+    # BMP-wide glyphs (issue #139): every Han grapheme is two display
+    # cells, and the ladder measures with the transcript renderer's own
+    # classifier (Wrap.width) — String.length counts a Han grapheme one,
+    # undercounts the row by a cell per glyph, and a boundary-fit
+    # candidate ships clipped. The exact-equality pins the arithmetic to
+    # the cell AND the spacing: the row lands whole or the cwd yields.
+    test "the ladder counts BMP-wide cwd glyphs at two cells" do
+      state = Map.put(new_state(provider: provider(nil)), :cwd, "~/项目/中文目录")
+
+      # The full row is 34 display cells: ❯-head (17 — "❯ " plus the
+      # 15-cell cwd, every Han grapheme two) + " · " (3) + model (14).
+      # At rect 34 the cwd rides whole; at 33 — one cell under its
+      # measured width — it must already be gone.
+      assert footer_text(state, 38) == "❯ ~/项目/中文目录 · x - test-model"
+      assert footer_text(state, 37) == "❯ · x - test-model"
+    end
+
+    # The other wide-glyph span in the vocabulary (issue #139's realistic
+    # trigger): a CJK model name. The model label is never dropped above
+    # the degenerate rung, so its hidden second cells must count too.
+    test "the ladder counts BMP-wide model-name glyphs at two cells" do
+      cjk_model =
+        {:ok, %DashFloat.Config{base_url: "http://x", model: "汉语模型", api_key: "k"}}
+
+      state = Map.put(new_state(provider: cjk_model), :cwd, "~/a")
+
+      # "x - 汉语模型" is 12 display cells (4 ASCII + four Han pairs);
+      # the full row is 5 + 3 + 12 = 20. At rect 20 it lands whole; at 19
+      # the cwd yields — never a mid-glyph clip of the model label.
+      assert footer_text(state, 24) == "❯ ~/a · x - 汉语模型"
+      assert footer_text(state, 23) == "❯ · x - 汉语模型"
+    end
+
+    # Issue #139 at the rung the owner named: 80 cols. Every Han glyph
+    # makes the full row two cells wider than its grapheme count, so the
+    # drop point shifts cell-accurately — here the whole row is exactly 80
+    # cells. At 80 cols (rect 76) the CJK cwd yields and everything behind
+    # it lands WHOLE; the old grapheme-count math thought the row 72, kept
+    # the cwd, and clipped the never-drop rate at the rect edge.
+    test "wide cwd glyphs don't break the ladder: at 80 cols the cwd drops and the rest lands whole" do
+      full = ladder_state("~/项目/对话记录存档")
+
+      at_80 = footer_text(full, 80)
+      refute at_80 =~ "~/项目"
+      assert at_80 == "❯ · x - test-model · 4.1k/128k · 3.2% · ttft 1.4s · 32 tok/s"
+
+      # The exact fit sits one cell above the drop: rect 80 (frame 84)
+      # keeps the cwd; rect 79 (frame 83) drops it.
+      assert footer_text(full, 84) =~ "~/项目/对话记录存档"
+      refute footer_text(full, 83) =~ "~/项目"
     end
 
     # The width math never raises on hostile input (delta review N2): an
@@ -1953,6 +1985,30 @@ defmodule DashFloat.TUI.ViewTest do
        api_key: "k",
        context_tokens: context_tokens
      }}
+  end
+
+  # The ladder tests' fixture: a pinned cwd label (the state stores the
+  # FORMATTED label — State.new runs format_cwd) on a state carrying every
+  # footer group — model, context snapshot, ttft, and a frozen rate.
+  defp ladder_state(cwd) do
+    new_state(provider: provider(128_000))
+    |> Map.put(:cwd, cwd)
+    |> Map.put(:phase, :streaming)
+    |> State.stream_message({:token, "a"}, 1_400)
+    |> State.stream_message({:token, "b"}, 1_500)
+    |> State.stream_message(
+      {:context,
+       %{messages: [%{role: "user", content: "ab"}], anchor: %{tokens: 4_100, index: 1}}}
+    )
+    |> Map.put(:stats, %{
+      new_state().stats
+      | sent_at: 0,
+        ttft_ms: 1_400,
+        rate: 32.0,
+        tokens: 0,
+        first_token_at: nil,
+        last_token_at: nil
+    })
   end
 
   defp status_text(state), do: status_text_at(state, 80, 24)
