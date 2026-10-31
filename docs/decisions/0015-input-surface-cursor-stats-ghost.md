@@ -575,21 +575,23 @@ by the same fit).
   clipping `List`, one cut, no span ladder.
 - **The wider-percent alternative was rejected.** The session picker
   took 85% because its four-group rows run long on typical rows; the
-  model/profile row is one label whose typical form fits the 36-cell
-  inner at 80 cols, and the fit makes any width safe — the cut, not the
-  clip, is what matters. No evidence in hand demands more cells; the
-  historical 50% stands.
+  model/profile row is one label, and even where a date-suffixed id
+  plus detail and marker overflows the 36-cell inner at 80 cols, what
+  drops first is the scaffolding (marker, then detail) — the id rides
+  whole. The drop order, not the width, carries the payload, and the
+  fit makes any width safe — the cut, not the clip, is what matters.
+  The historical 50% stands.
 - **The class sweep's fourth surface: the choice widget's rows.** ADR
   0028 recorded that long option labels and descriptions "clip at the
   box's width" — model-authored and unbounded, the exact class. The
   question, each option label, and each description now head-fit at the
   composer box's render-time inner width (minus the marker/checkbox or
   indent cells, which survive the cut), `Wrap.fit_head` by cells — the
-  silently eaten tail becomes an honest `…`, and the count-based height
-  arithmetic gains a guarantee it never had (a fitted row can never wrap
-  past its counted row). Motion captures for this surface wait on the
-  rig's episode queue (issue #143); the fit is pinned by cell-level
-  tests.
+  silently eaten tail becomes an honest `…`. The count-based height
+  arithmetic is untouched and was never at wrap risk (the box's
+  Paragraph clips, `wrap` false by default); the fit's gain is honesty,
+  not height. Motion captures for this surface wait on the rig's
+  episode queue (issue #143); the fit is pinned by cell-level tests.
 - **The sweep itself** (grep for the pre-#148 naive-width patterns plus
   a read of every row/label surface): no other uncapped surface
   remains. The surviving `String.length`/`String.slice` sites are

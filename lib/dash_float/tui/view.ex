@@ -1081,8 +1081,9 @@ defmodule DashFloat.TUI.View do
   # is measured against the popup the renderer actually draws (50% of
   # the inset area, truncating division, minus borders — 36 cells at 80
   # cols). The wider-percent alternative (the session picker's 85%) was
-  # weighed in the issue and rejected: typical rows fit, and the fit
-  # makes any width safe.
+  # weighed in the issue and rejected: when the row overflows it is the
+  # scaffolding that drops and the id rides whole, so the drop order,
+  # not the width, carries the payload — the fit makes any width safe.
   defp render_palette(
          %State{
            palette: %Palette{kind: :models, items: entries, selected: selected},
@@ -1090,10 +1091,14 @@ defmodule DashFloat.TUI.View do
          },
          area
        ) do
-    inner = max(div(area.width * @picker_pct, 100) - 2, 1)
-
     items =
-      Enum.map(entries, &Wrap.fit_head(model_item(&1.model, &1.context, config.model), inner))
+      Enum.map(
+        entries,
+        &Wrap.fit_head(
+          model_item(&1.model, &1.context, config.model),
+          picker_inner(area.width, @picker_pct)
+        )
+      )
 
     [picker("Models", items, selected, area)]
   end
@@ -1105,9 +1110,14 @@ defmodule DashFloat.TUI.View do
          %State{palette: %Palette{kind: :profiles, items: names, selected: selected}},
          area
        ) do
-    inner = max(div(area.width * @picker_pct, 100) - 2, 1)
-
-    [picker("Profiles", Enum.map(names, &Wrap.fit_head(&1, inner)), selected, area)]
+    [
+      picker(
+        "Profiles",
+        Enum.map(names, &Wrap.fit_head(&1, picker_inner(area.width, @picker_pct))),
+        selected,
+        area
+      )
+    ]
   end
 
   # The session picker (issue #128): rows run long (preview · time ·
@@ -1128,14 +1138,23 @@ defmodule DashFloat.TUI.View do
          %State{palette: %Palette{kind: :sessions, items: rows, selected: selected}},
          area
        ) do
-    inner = max(div(area.width * @session_picker_pct, 100) - 2, 1)
-
     [
-      picker("Sessions", Enum.map(rows, &Wrap.fit_head(&1.label, inner)), selected, area,
+      picker(
+        "Sessions",
+        Enum.map(rows, &Wrap.fit_head(&1.label, picker_inner(area.width, @session_picker_pct))),
+        selected,
+        area,
         width: @session_picker_pct
       )
     ]
   end
+
+  # A picker popup's inner width (#146, shared by #152): the percent the
+  # Rust renderer actually draws the popup at (truncating division), minus
+  # the List block's borders, floored at 1 for degenerate frames. The
+  # popup's width and the row cap's budget derive from the one formula, so
+  # they can never disagree.
+  defp picker_inner(width, pct), do: max(div(width * pct, 100) - 2, 1)
 
   # The detail rides the status bar's own humanize ladder (999 reads "999",
   # not "0k"); the marker only on the provider's current model.

@@ -2157,6 +2157,26 @@ defmodule DashFloat.TUI.ViewTest do
       assert "current" not in items
     end
 
+    test "a wide-grapheme id cuts at the cluster boundary (issue #152)" do
+      # The #146 Han parity: 19 Han graphemes are 38 cells vs the 36-cell
+      # inner — 17 fit (34 cells; the 18th would straddle the cut), `…`
+      # marks the rest. Ids are user-controlled on custom endpoints; CJK
+      # ids are legal.
+      id = String.duplicate("汉", 19)
+      entries = [%{model: id, context: nil}]
+      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: "other", api_key: "k"}}
+
+      palette = %Palette{mode: :modal, kind: :models, items: entries, selected: 0}
+      state = %{new_state(provider: provider) | palette: palette}
+
+      assert [{%ExRatatui.Widgets.Popup{content: %ExRatatui.Widgets.List{items: items}}, _area}] =
+               state
+               |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+               |> Enum.take(-1)
+
+      assert items == [String.duplicate("汉", 17) <> "…"]
+    end
+
     test "the profiles picker caps the name at the same inner width (issue #152)" do
       name = String.duplicate("p", 50)
 

@@ -183,8 +183,8 @@ setup > phase.
   imprecision; option COUNT is capped at 10 at validation. (The clip was
   superseded 2026-11-01 by [ADR 0015](0015-input-surface-cursor-stats-ghost.md)'s
   #152 amendment: every row head-fits at the box's inner width, `…`
-  marking the cut; the count-based arithmetic stands and gains a
-  no-wrap guarantee.)
+  marking the cut; the count-based arithmetic stands, and the box's
+  clip-now-fitted behavior is unchanged in kind — honesty was the gain.)
 - The model can now block on the user mid-batch (the tool slot parks on
   `{:asking, _}`); a mode switch mid-ask does not touch the standing
   answer (the human's pending answer outranks the mode, ADR 0016 §3's
