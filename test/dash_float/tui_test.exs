@@ -15,13 +15,20 @@ defmodule DashFloat.TUITest do
   alias DashFloat.Config
   alias DashFloat.Config.JSON5
   alias DashFloat.Config.Onboarding
+  alias DashFloat.Session
   alias DashFloat.SSEServer
   alias DashFloat.TUI
+  alias DashFloat.TUI.Palette
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Suggest
   alias DashFloat.TUI.Theme
   alias DashFloat.TUI.View
   alias ExRatatui.Runtime
+
+  # A struct no clause names — the handle_event/2 catch-all's payload.
+  defmodule UnknownEvent do
+    defstruct []
+  end
 
   @opts [test_mode: {80, 24}, name: nil]
 
@@ -1991,6 +1998,12 @@ defmodule DashFloat.TUITest do
     send(pid, :stray_message)
     after_stray = get_state(pid)
     assert State.input_text(after_stray) == "pasted text"
+
+    # The event catch-all: a struct the app never names schedules (never
+    # crashes) and renders nothing.
+    inject(pid, %UnknownEvent{})
+    after_unknown = get_state(pid)
+    assert State.input_text(after_unknown) == "pasted text"
   end
 
   # Focus events gate the composer's cursor artifact (ADR 0015 §1): an
@@ -3742,6 +3755,285 @@ defmodule DashFloat.TUITest do
 
       assert_receive {:herdr, %{method: "pane.report_agent_session", params: params}}, 1_000
       assert List.last(params.resume_argv) == "m2"
+    end
+  end
+
+  # The /resume picker (issue #128) end to end through the real event loop,
+  # and the exit print (issue #127) at the teardown every deliberate quit
+  # The /resume picker (issue #128) end to end through the real event loop,
+  # and the exit print (issue #127) at the teardown every deliberate quit
+  # funnels through. The default fake agent is this test process: the
+  # adoption send lands in this mailbox.
+  describe "the /resume picker and the exit print (#127/#128)" do
+    @resume_id "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5c"
+    @older_id "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5d"
+
+    defp sessions_dir do
+      dir = wizard_dir("dashfloat-tui-resume")
+
+      save_session(dir, @resume_id, "2026-10-30T23:00:00Z", "Pick Me", [
+        %{"role" => "user", "content" => "the resume question"}
+      ])
+
+      save_session(dir, @older_id, "2026-10-29T23:00:00Z", nil, [
+        %{"role" => "user", "content" => "the older question"}
+      ])
+
+      dir
+    end
+
+    defp save_session(dir, id, created_at, title, messages) do
+      :ok =
+        Session.save(dir, %{
+          version: 1,
+          id: id,
+          created_at: created_at,
+          title: title,
+          pin: %{profile: "personal", model: "test-model", base_url: "http://localhost:1"},
+          messages: messages
+        })
+    end
+
+    defp picker_herdr do
+      test = self()
+
+      %DashFloat.Herdr{
+        pane: "wA:p1",
+        socket: "/tmp/opencode/herdr-tui.sock",
+        runner: fn request -> send(test, {:herdr, request}) end
+      }
+    end
+
+    test "/resume lists the store most-recent first and Enter adopts the picked session" do
+      dir = sessions_dir()
+
+      {:ok, pid} =
+        start_tui(
+          provider: provider(),
+          sessions_dir: dir,
+          herdr: picker_herdr()
+        )
+
+      assert_receive {:herdr, _request}, 1_000
+
+      submit(pid, "/resume")
+      opened = eventually(pid, fn s -> match?(%Palette{kind: :sessions}, s.palette) end)
+
+      [first, second] = opened.palette.items
+      assert first.id == @resume_id
+      assert String.starts_with?(first.label, "Pick Me ·")
+      assert second.id == @older_id
+      assert String.starts_with?(second.label, "the older question ·")
+
+      press(pid, "enter")
+
+      {ui, session} =
+        receive do
+          {:adopt_session, ui, session} -> {ui, session}
+        after
+          1_000 -> flunk("the agent never received the adoption")
+        end
+
+      assert ui == pid
+      assert session.id == @resume_id
+      assert session.title == "Pick Me"
+
+      # The log is the adopted transcript's replay; the identity follows.
+      adopted = eventually(pid, fn s -> s.session_id == @resume_id end)
+      assert entry?(adopted, :user, "the resume question")
+      assert adopted.palette == nil
+
+      # The Herdr reporter re-reports the switched session's id (the
+      # signature carries it, ADR 0024 §5).
+      assert_receive {:herdr, %{method: "pane.report_agent_session", params: params}}, 1_000
+      assert params.agent_session_id == @resume_id
+    end
+
+    test "a session deleted between listing and Enter refuses loudly, untouched" do
+      dir = sessions_dir()
+      {:ok, pid} = start_tui(provider: provider(), sessions_dir: dir)
+
+      submit(pid, "/resume")
+      eventually(pid, fn s -> match?(%Palette{kind: :sessions}, s.palette) end)
+
+      victim = Path.join(dir, @resume_id <> ".json")
+      File.rm!(victim)
+      press(pid, "enter")
+
+      refused =
+        eventually(
+          pid,
+          fn s ->
+            Enum.any?(s.entries, &match?(%{kind: :system, text: "[resume failed: " <> _tail}, &1))
+          end
+        )
+
+      assert refused.session_id == nil
+      refute_receive {:adopt_session, _ui, _session}, 100
+    end
+
+    test "no sessions dir warns locally and never opens the picker" do
+      {:ok, pid} = start_tui(provider: provider())
+
+      submit(pid, "/resume")
+
+      warned =
+        eventually(
+          pid,
+          fn s ->
+            Enum.any?(
+              s.entries,
+              &match?(%{kind: :system, text: "[no saved sessions" <> _tail}, &1)
+            )
+          end
+        )
+
+      assert warned.palette == nil
+    end
+
+    test "Esc over the open picker cancels back untouched" do
+      dir = sessions_dir()
+      {:ok, pid} = start_tui(provider: provider(), sessions_dir: dir, session_id: @older_id)
+
+      submit(pid, "/resume")
+      eventually(pid, fn s -> match?(%Palette{kind: :sessions}, s.palette) end)
+      press(pid, "esc")
+
+      cancelled = eventually(pid, fn s -> s.palette == nil end)
+      assert cancelled.session_id == @older_id
+      assert cancelled.entries == []
+      refute_receive {:adopt_session, _ui, _session}, 100
+    end
+
+    test "exit_message: the title form when titled, the id form otherwise, nothing unpersisted" do
+      dir = sessions_dir()
+
+      # Titled and persisted — the quoted title command.
+      titled =
+        State.new(
+          test_mode: {80, 24},
+          sessions_dir: dir,
+          session_id: @resume_id,
+          title: "Pick Me"
+        )
+
+      assert TUI.exit_message(titled) ==
+               "resume this session with:\ndashfloat --resume \"Pick Me\"\n"
+
+      # Untitled — the bare id (a UUID needs no quoting).
+      untitled = State.new(test_mode: {80, 24}, sessions_dir: dir, session_id: @older_id)
+
+      assert TUI.exit_message(untitled) ==
+               "resume this session with:\ndashfloat --resume #{@older_id}\n"
+
+      # A title carrying shell specials escapes them.
+      spiky =
+        State.new(
+          test_mode: {80, 24},
+          sessions_dir: dir,
+          session_id: @resume_id,
+          title: ~s(he said "hi" & `that`)
+        )
+
+      # Backtick escapes too — all four POSIX double-quote specials
+      # (\" \\ \$ \`) must be prefixed for a verbatim paste.
+      assert TUI.exit_message(spiky) ==
+               "resume this session with:\ndashfloat --resume \"he said \\\"hi\\\" & \\`that\\`\"\n"
+
+      # Nothing persisted: no session id, or an id whose file is gone —
+      # the command that would refuse at the next boot prints nothing.
+      fresh = State.new(test_mode: {80, 24}, sessions_dir: dir)
+      assert TUI.exit_message(fresh) == nil
+
+      gone =
+        State.new(
+          test_mode: {80, 24},
+          sessions_dir: dir,
+          session_id: "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5e"
+        )
+
+      assert TUI.exit_message(gone) == nil
+      no_dir = State.new(test_mode: {80, 24}, session_id: @resume_id)
+      assert TUI.exit_message(no_dir) == nil
+    end
+
+    test "terminate prints the command on the clean quit, after the release, never on a crash" do
+      dir = sessions_dir()
+
+      # The release runs inline through the runner seam inside terminate —
+      # a marker write orders it against the print inside one capture.
+      herdr = %DashFloat.Herdr{
+        pane: "wA:p1",
+        socket: "/tmp/opencode/x.sock",
+        runner: fn request -> IO.write("RELEASED:#{request.method}") end
+      }
+
+      state =
+        State.new(
+          test_mode: {80, 24},
+          sessions_dir: dir,
+          session_id: @resume_id,
+          title: "Pick Me",
+          herdr: herdr
+        )
+
+      output =
+        ExUnit.CaptureIO.capture_io(fn ->
+          assert TUI.terminate(:normal, state) == :ok
+        end)
+
+      # The release lands first (ADR 0024 §6's ordering), the print after —
+      # the two surfaces never fight.
+      assert {release_at, _release_end} = :binary.match(output, "RELEASED:pane.release_agent")
+      assert {print_at, _print_end} = :binary.match(output, "dashfloat --resume \"Pick Me\"")
+      assert release_at < print_at
+
+      # A crash (or supervisor shutdown) never prints — the release still
+      # fires (ADR 0024 §6 releases on every terminate), the print is the
+      # clean exit's alone.
+      quiet =
+        ExUnit.CaptureIO.capture_io(fn ->
+          assert TUI.terminate({:shutdown, :killed}, state) == :ok
+        end)
+
+      assert quiet =~ "RELEASED:pane.release_agent"
+      refute quiet =~ "dashfloat --resume"
+    end
+
+    test "every quit path prints the command on its clean teardown" do
+      dir = sessions_dir()
+
+      quits = [
+        ctrl_q: fn pid -> press(pid, "q", ["ctrl"]) end,
+        double_ctrl_c: fn pid ->
+          press(pid, "c", ["ctrl"])
+          press(pid, "c", ["ctrl"])
+        end,
+        slash_quit: fn pid -> submit(pid, "/quit") end,
+        # Ctrl+P's palette runs the same run_command("quit") clause; quit
+        # sits at registry index 6 (clear compact help mode model profile
+        # QUIT resume title) — six downs land the highlight on it.
+        palette_quit: fn pid ->
+          press(pid, "p", ["ctrl"])
+          Enum.each(1..6, fn _step -> press(pid, "down", []) end)
+          press(pid, "enter")
+        end
+      ]
+
+      for {name, quit} <- quits do
+        output =
+          ExUnit.CaptureIO.capture_io(fn ->
+            {:ok, pid} =
+              start_tui(provider: provider(), sessions_dir: dir, session_id: @resume_id)
+
+            ref = Process.monitor(pid)
+            quit.(pid)
+            assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 2_000
+          end)
+
+        assert output =~ "dashfloat --resume",
+               "#{name} never printed the resume command: #{inspect(output)}"
+      end
     end
   end
 end

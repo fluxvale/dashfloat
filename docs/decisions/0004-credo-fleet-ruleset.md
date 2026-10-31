@@ -113,3 +113,9 @@ the direct precedent). Numbered against the #113 Herdr rider's landing
 between design and rebase, they are fields 48–50. `max_fields` moves to
 50, again the smallest whole number above the actual size, so the creep
 gate stands.
+
+**Rider (2026-10-31, [issues #127/#128](https://github.com/fluxvale/dashfloat/issues/127)):**
+the sessions store directory ([ADR 0027](0027-exit-resume-command-and-resume-picker.md))
+is field 51 — pure state the /resume picker's listing and the exit print's
+existence check both read. `max_fields` moves to 51, again the smallest
+whole number above the actual size, so the creep gate stands.

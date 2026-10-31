@@ -829,6 +829,16 @@ defmodule DashFloat.TUI.View do
     [picker("Profiles", names, selected, area)]
   end
 
+  # The session picker (issue #128): rows run long (preview · time ·
+  # provider · model), so the popup takes 85% — at 80 cols the inner width
+  # is ~62, enough for a 40-grapheme preview plus its metadata.
+  defp render_palette(
+         %State{palette: %Palette{kind: :sessions, items: rows, selected: selected}},
+         area
+       ) do
+    [picker("Sessions", Enum.map(rows, & &1.label), selected, area, width: 85)]
+  end
+
   # The detail rides the status bar's own humanize ladder (999 reads "999",
   # not "0k"); the marker only on the provider's current model.
   defp model_item(id, context, current) do
@@ -838,7 +848,10 @@ defmodule DashFloat.TUI.View do
     id <> detail <> marker
   end
 
-  defp picker(title, items, selected, area) do
+  # The shared picker popup (ADR 0020): the model/profile pickers at the
+  # historical 50% width; `width:` overrides for wider rows (the session
+  # picker, issue #128).
+  defp picker(title, items, selected, area, opts \\ []) do
     {%Popup{
        content: %ExRatatui.Widgets.List{
          items: items,
@@ -852,7 +865,7 @@ defmodule DashFloat.TUI.View do
            border_style: Theme.style(:dim)
          }
        },
-       percent_width: 50,
+       percent_width: opts[:width] || 50,
        percent_height: 40
      }, area}
   end

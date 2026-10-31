@@ -2,6 +2,11 @@
 
 - **Status:** Accepted (design; the plan gate of 2026-10-27). Implementation
   lands through [issue #27](https://github.com/fluxvale/dashfloat/issues/27).
+  *(Amended 2026-10-31, [ADR 0027](0027-exit-resume-command-and-resume-picker.md):
+  the §6 resume hand-off is now reachable mid-process too — the /resume
+  picker's Enter loads a session and hands it to both the agent and the TUI
+  exactly as the boot does, with the §6 pin compare riding along as the
+  switch's note. The boot path itself is unchanged.)*
 - **Date:** 2026-10-27
 - **Implements:** [issue #27](https://github.com/fluxvale/dashfloat/issues/27) — Phase 4
   of the [ADR 0001](0001-founding-stack-and-architecture.md) roadmap.

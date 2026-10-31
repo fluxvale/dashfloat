@@ -2,14 +2,15 @@ defmodule DashFloat.TUI.Palette do
   @moduledoc """
   The open command palette (ADR 0020): `:filter` is the composer's derived
   slash autocomplete; `:modal` is Ctrl+P, the /model picker, or the /profile
-  picker. Pure data plus the one clamped movement.
+  picker — and, since issue #128, the /resume session picker. Pure data plus
+  the one clamped movement.
   """
 
   @enforce_keys [:mode, :kind, :items]
   defstruct [:mode, :kind, :items, selected: 0]
 
   @type mode :: :filter | :modal
-  @type kind :: :commands | :models | :profiles
+  @type kind :: :commands | :models | :profiles | :sessions
 
   @type t :: %__MODULE__{
           mode: mode(),

@@ -360,7 +360,7 @@ defmodule DashFloat.Application do
     [
       {Task.Supervisor, name: DashFloat.TaskSupervisor}
       | engine_children(classification, resume, cli, sessions_dir) ++
-          tui_child(classification, config_dir, env, cli, resume)
+          tui_child(classification, config_dir, env, cli, resume, sessions_dir)
     ]
   end
 
@@ -442,8 +442,10 @@ defmodule DashFloat.Application do
   # output verbatim, no renormalizing. The Herdr context is detected from
   # the boot env here (ADR 0024) — nil outside Herdr — and the resumed
   # session's id rides along so the reporter can attach the resume command
-  # from mount.
-  defp tui_child(classification, config_dir, env, cli, resume) do
+  # from mount. The sessions store rides along too (issue #128): the
+  # /resume picker's listing source and the exit print's existence check
+  # (issue #127).
+  defp tui_child(classification, config_dir, env, cli, resume, sessions_dir) do
     resume_opts =
       case resume do
         nil ->
@@ -469,7 +471,8 @@ defmodule DashFloat.Application do
          config_dir: config_dir,
          setup: setup_state(classification),
          resolve: boot_resolver(config_dir, env, cli),
-         herdr: DashFloat.Herdr.detect(env)
+         herdr: DashFloat.Herdr.detect(env),
+         sessions_dir: sessions_dir
        ] ++ resume_opts}
     ]
   end

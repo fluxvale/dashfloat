@@ -20,6 +20,7 @@ defmodule DashFloat.TUI.Commands do
     %Command{name: "model", description: "pick a model for the next request"},
     %Command{name: "profile", description: "pick a profile"},
     %Command{name: "quit", description: "quit DashFloat"},
+    %Command{name: "resume", description: "pick a saved session to open"},
     %Command{name: "title", description: "rename this session"}
   ]
 

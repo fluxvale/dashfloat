@@ -25,6 +25,7 @@ defmodule DashFloat.TUI do
   alias DashFloat.Config.Catalog
   alias DashFloat.Config.Onboarding
   alias DashFloat.Herdr
+  alias DashFloat.Session
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Suggest
@@ -256,6 +257,41 @@ defmodule DashFloat.TUI do
   # opens the picker or warns when there is nothing to list (ADR 0020).
   defp run_action(:list_profiles, state),
     do: State.profiles_arrived(state, Config.profile_names(state.config_dir))
+
+  # /resume's list (issue #128): the /profile precedent — one fast local
+  # read of the sessions store (a fail-open scan, never a write), the rows
+  # landing through sessions_arrived. The heavier full load happens only on
+  # the picked row's Enter.
+  defp run_action(:list_sessions, %State{} = state) do
+    State.sessions_arrived(
+      state,
+      Session.summaries(state.sessions_dir),
+      System.system_time(:second)
+    )
+  end
+
+  # The /resume picker's Enter (issue #128): one load, two consumers — the
+  # boot's own rule (ADR 0014 §6). The agent adopts the loaded session
+  # through the {:adopt_session, _} seam; the TUI replays the same load's
+  # transcript with the boot's pin compare (Application.pin_note — the one
+  # implementation of the mismatch warning, reused) riding as the resume
+  # note. A load refusal lands as one system entry and the current session
+  # is untouched — Enter merely failed; ESC-cancel's guarantee holds.
+  defp run_action({:resume_session, id}, %State{} = state) do
+    case Session.load(state.sessions_dir, id) do
+      {:ok, session} ->
+        send(state.agent, {:adopt_session, self(), session})
+
+        State.session_adopted(
+          state,
+          session,
+          DashFloat.Application.pin_note(session, state.provider)
+        )
+
+      {:error, message} ->
+        State.session_refused(state, message)
+    end
+  end
 
   # The refusal detection the list-stop keys on: the bounce leaves the
   # wizard's error set (issue #39).
@@ -636,10 +672,64 @@ defmodule DashFloat.TUI do
     _released = Herdr.release(state.herdr)
     code = exit_code(reason)
 
+    # The exit print (issue #127): a CLEAN deliberate exit — every one of
+    # them funnels here (Ctrl+Q, the confirmed double Ctrl+C, /quit, the
+    # palette's quit) — names the command that reopens the session. The
+    # terminal is already restored by the time this callback runs (the
+    # server's teardown leaves the alt screen first), so the bytes land on
+    # the normal screen, after the release, before the VM stops.
+    write_exit_message(code, state)
+
     if state.live?, do: System.stop(code)
 
     :ok
   end
+
+  defp write_exit_message(0, %State{} = state) do
+    case exit_message(state) do
+      nil -> :ok
+      message -> IO.binwrite(:stdio, message)
+    end
+  end
+
+  defp write_exit_message(_crash, _state), do: :ok
+
+  @doc """
+  The command that reopens this session (issue #127), or nil when there is
+  nothing persisted to reopen: a lead-in line plus `dashfloat --resume`
+  with the session's TITLE when one is live (double-quoted and
+  shell-escaped so a multi-word title pastes verbatim) and its UUIDv7 id
+  otherwise — the id path needs no quoting. The gate is the store itself:
+  a known session id whose file exists under `sessions_dir`; a session
+  that never persisted (launch-and-quit, a first save that failed) prints
+  nothing rather than a command that would refuse at the next boot.
+  """
+  @spec exit_message(State.t()) :: String.t() | nil
+  def exit_message(%State{session_id: nil}), do: nil
+
+  def exit_message(%State{session_id: id, sessions_dir: dir, title: title})
+      when is_binary(id) and is_binary(dir) do
+    path = Path.join(dir, id <> ".json")
+
+    if File.exists?(path) do
+      "resume this session with:\ndashfloat --resume " <> resume_value(id, title) <> "\n"
+    else
+      nil
+    end
+  end
+
+  def exit_message(%State{}), do: nil
+
+  # The title form is the human-shaped handle; the id always resolves. A
+  # quoted title keeps multi-word names a single argv word — `"` `\` `$` and
+  # backtick escaped, the four characters POSIX double quotes treat as
+  # special — so the printed line pastes verbatim into any POSIX shell.
+  # An on-disk duplicate title (the ADR 0023 §4 race) refuses loudly at the
+  # next boot with both ids named — the accepted posture, never silent.
+  defp resume_value(id, nil), do: id
+
+  defp resume_value(_id, title),
+    do: "\"" <> String.replace(title, ["\"", "\\", "$", "`"], &("\\" <> &1)) <> "\""
 
   @doc """
   Exit status for a standalone run: `0` only for a user quit (`:normal`),

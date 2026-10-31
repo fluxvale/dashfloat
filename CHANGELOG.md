@@ -14,6 +14,8 @@ when its tag is cut.
 
 ### Added
 
+- Quitting DashFloat with an ongoing session prints the command that reopens it — `dashfloat --resume <title-or-id>`, the title (shell-quoted) when one is set, else the UUIDv7 id; nothing prints when nothing persisted (#127).
+- `/resume` opens a keyboard-navigable picker over saved sessions — title or first-message preview, relative time, provider · model, most recent first; Enter switches in place, Esc cancels untouched (#128).
 - `dashfloat update` checks the latest GitHub release against the running version and updates the installation: install.sh installs are replaced in place (sha256-verified download, atomic swap, a start-up smoke of the new release, rollback on failure), Homebrew installs print the `brew upgrade dashfloat` handoff, and anything else refuses with both options (#122).
 - `dashfloat update --check` is the scriptable form — prints the latest version, exits 0 when current, 1 when outdated, 2 when the check itself failed (offline and rate-limited are visible refusals).
 

@@ -21,6 +21,7 @@ defmodule DashFloat.TUI.State do
   alias DashFloat.Config.Presets
   alias DashFloat.Images
   alias DashFloat.Mode
+  alias DashFloat.Session
   alias DashFloat.Tools
   alias DashFloat.TUI.Commands
   alias DashFloat.TUI.Palette
@@ -63,7 +64,8 @@ defmodule DashFloat.TUI.State do
   keys.json5 write, the `/models` fetch, and the final settings.json5
   write. The wizard may return an ordered LIST of actions (issue #64: the
   accepted key writes, then its fetch fires), executed in order by the
-  runner.
+  runner. `:list_sessions`/`{:resume_session, _}` are the /resume picker's
+  (issue #128): the list read, then the picked session's load-and-adopt.
   """
   @type action ::
           :quit
@@ -74,6 +76,8 @@ defmodule DashFloat.TUI.State do
           | {:set_title, String.t()}
           | {:switch_model, DashFloat.Config.classification()}
           | :list_profiles
+          | :list_sessions
+          | {:resume_session, String.t()}
           | :compact
           | nil
           | {:select_profile, String.t()}
@@ -98,6 +102,16 @@ defmodule DashFloat.TUI.State do
   @in_flight_cap 64 * 1024
   # The double Ctrl+C exit window (issue #28; ADR 0006 amendment).
   @exit_window_ms 2_000
+  # The fresh stats map: the boot state and a picker session switch (issue
+  # #128) both open with every counter zeroed — replay is pure (ADR 0014
+  # §6).
+  @zero_stats %{
+    tokens: 0,
+    first_token_at: nil,
+    rate: nil,
+    prompt_tokens: nil,
+    completion_tokens: nil
+  }
   # /help's key hints (ADR 0020) — the composer's static hints plus the
   # palette and mode keys.
   @key_hints "Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit · Ctrl+P commands · Ctrl+O attach · Shift+Tab mode"
@@ -142,13 +156,7 @@ defmodule DashFloat.TUI.State do
     blink_ms: nil,
     exit_guard_at: nil,
     exit_guard_ref: nil,
-    stats: %{
-      tokens: 0,
-      first_token_at: nil,
-      rate: nil,
-      prompt_tokens: nil,
-      completion_tokens: nil
-    },
+    stats: @zero_stats,
     # The stage-2 context snapshot (ADR 0015 §2 amendment): the agent's
     # {messages, anchor} pair, pushed at every transcript mutation and each
     # usage frame — what the footer's Accounting.usage/3 read computes from.
@@ -200,7 +208,11 @@ defmodule DashFloat.TUI.State do
     # set at mount for a resumed boot, or on the agent's `{:session_id, _}`
     # when a fresh session's id is minted at first save.
     herdr: nil,
-    session_id: nil
+    session_id: nil,
+    # The sessions store directory (issue #128): the /resume picker reads
+    # listings from it and the exit print (issue #127) checks the session
+    # file exists there. nil — the embedded/test default — means no store.
+    sessions_dir: nil
   ]
 
   @type t :: %__MODULE__{
@@ -258,7 +270,8 @@ defmodule DashFloat.TUI.State do
           title: String.t() | nil,
           title_dialog: title_dialog() | nil,
           herdr: DashFloat.Herdr.t() | nil,
-          session_id: String.t() | nil
+          session_id: String.t() | nil,
+          sessions_dir: String.t() | nil
         }
 
   @typedoc """
@@ -350,7 +363,10 @@ defmodule DashFloat.TUI.State do
       # The Herdr reporter's seams (ADR 0024): the detected context (nil
       # outside Herdr — inert) and the resumed boot's session id.
       herdr: Keyword.get(opts, :herdr),
-      session_id: Keyword.get(opts, :session_id)
+      session_id: Keyword.get(opts, :session_id),
+      # The sessions store (issue #128): the /resume picker's listing source
+      # and the exit print's existence check (issue #127).
+      sessions_dir: Keyword.get(opts, :sessions_dir)
     }
 
     replay(state, Keyword.get(opts, :transcript, []), Keyword.get(opts, :resume_note))
@@ -1538,6 +1554,14 @@ defmodule DashFloat.TUI.State do
     {%{state | palette: nil}, {:select_profile, Enum.at(names, selected)}}
   end
 
+  # The session picker's Enter (issue #128): the picked row's id rides to
+  # the runner, which loads and adopts — the switch itself is the TUI's
+  # (Session.load + the agent's {:adopt_session, _} send), not a State
+  # transition here.
+  defp execute_palette(state, %Palette{kind: :sessions, items: rows, selected: selected}) do
+    {%{state | palette: nil}, {:resume_session, Enum.at(rows, selected).id}}
+  end
+
   # One clause per registry entry; the actions ride to the TUI ({:set_mode,
   # _}, {:set_title, _}, {:switch_model, _}, :list_profiles, :compact, :quit).
 
@@ -1615,6 +1639,10 @@ defmodule DashFloat.TUI.State do
 
   defp run_command(state, "profile", _rest), do: {state, :list_profiles}
 
+  # /resume opens the session picker (issue #128): the runner reads the
+  # store and the rows land through sessions_arrived — the /profile shape.
+  defp run_command(state, "resume", _rest), do: {state, :list_sessions}
+
   # The model picker's Enter: a catalog id has no nickname — it nils out and
   # the label falls back to the catalog (ADR 0020). The context window
   # re-resolves for the PICKED id (issue #111, hostile review F2): its own
@@ -1673,6 +1701,151 @@ defmodule DashFloat.TUI.State do
   def profiles_arrived(%__MODULE__{} = state, names) when is_list(names) do
     %{state | palette: %Palette{mode: :modal, kind: :profiles, items: names, selected: 0}}
   end
+
+  @doc """
+  The saved-session summaries for /resume's picker landed (issue #128): the
+  modal opens over them — one row per session, most recent first (the
+  summaries arrive pre-sorted) — or an empty store warns: nothing to
+  resume. `now` is unix seconds (injectable so the relative-time labels are
+  testable).
+  """
+  @spec sessions_arrived(t(), [Session.summary()], integer()) :: t()
+  def sessions_arrived(%__MODULE__{} = state, [], _now),
+    do: append_entry(state, :system, "[no saved sessions — nothing to resume]")
+
+  def sessions_arrived(%__MODULE__{} = state, summaries, now) when is_list(summaries) do
+    rows = Enum.map(summaries, &%{id: &1.id, label: session_row(&1, now)})
+    %{state | palette: %Palette{mode: :modal, kind: :sessions, items: rows, selected: 0}}
+  end
+
+  # One picker row (issue #128): title or first-message preview, relative
+  # time, provider · model — the issue's three groups, `·`-joined (the
+  # footer's separator). The provider half is the pin's profile name, else
+  # the base_url's preset label, else its host (ADR 0015 §2's ladder,
+  # rungs a–c); nil pin fields read `—`.
+  @preview_cap 40
+
+  defp session_row(%{} = summary, now) do
+    %{
+      title: title,
+      preview: preview,
+      created_at: created_at,
+      pin: pin
+    } = summary
+
+    Enum.join(
+      [
+        preview_label(title, preview),
+        relative_time(created_at, now),
+        provider_half(pin),
+        pin.model || "—"
+      ],
+      " · "
+    )
+  end
+
+  defp preview_label(nil, preview), do: cap_preview(preview)
+  defp preview_label(title, _preview), do: cap_preview(title)
+
+  # One flat line, capped at @preview_cap graphemes with `…` marking the
+  # cut; newlines flatten to spaces, other control characters (verbatim
+  # user text) never reach the row.
+  defp cap_preview(text) do
+    flat =
+      text
+      |> String.replace("\n", " ")
+      |> String.replace(~r/[\x00-\x1F\x7F]/, "")
+
+    if String.length(flat) <= @preview_cap do
+      flat
+    else
+      String.slice(flat, 0, @preview_cap) <> "…"
+    end
+  end
+
+  # Relative time: `now`, `Nm`, `Nh`, `Nd`, then the plain date once the
+  # unit stops being about "today". An unparseable stamp falls back to the
+  # raw string — honest, never a crash.
+  defp relative_time(created_at, now) do
+    case DateTime.from_iso8601(created_at) do
+      {:ok, at, _offset} ->
+        diff = now - DateTime.to_unix(at)
+
+        cond do
+          diff < 60 ->
+            "now"
+
+          diff < 3_600 ->
+            "#{div(diff, 60)}m"
+
+          diff < 86_400 ->
+            "#{div(diff, 3_600)}h"
+
+          diff < 7 * 86_400 ->
+            "#{div(diff, 86_400)}d"
+
+          true ->
+            at
+            |> DateTime.to_date()
+            |> Date.to_string()
+        end
+
+      _unparseable ->
+        created_at
+    end
+  end
+
+  defp provider_half(%{profile: nil, base_url: nil}), do: "—"
+
+  defp provider_half(%{profile: nil, base_url: base_url}),
+    do: Presets.label(base_url) || Config.host_label(base_url) || "—"
+
+  defp provider_half(%{profile: profile}), do: profile
+
+  @doc """
+  The /resume picker's Enter landed (issue #128): the loaded session
+  replaces the live one. The log is re-derived from its transcript — the
+  resume replay (ADR 0014 §6), leading system message skipped (ADR 0019,
+  the #116 crash fix) — the session identity and title follow the file, and
+  every live-turn surface resets: stats, context snapshot, scroll and
+  selection, pending attachments (they belonged to the outgoing turn), any
+  open dialog. The draft and input history survive — composer state, not
+  session state (/clear's own rule). The pin warning, when the boot compare
+  produces one, appends last exactly as a resumed boot's note does.
+  """
+  @spec session_adopted(t(), Session.t(), String.t() | nil) :: t()
+  def session_adopted(%__MODULE__{} = state, session, note) do
+    base =
+      dismiss_suggestion(%__MODULE__{
+        state
+        | entries: [],
+          in_flight: nil,
+          in_flight_lines: nil,
+          in_flight_dirty: false,
+          selection: nil,
+          scroll: 0,
+          follow?: true,
+          stats: @zero_stats,
+          context: nil,
+          confirm: nil,
+          attachments: [],
+          palette: nil,
+          title_dialog: nil,
+          session_id: session.id,
+          title: Map.get(session, :title)
+      })
+
+    replay(base, session.messages, note)
+  end
+
+  @doc """
+  The /resume picker's load refused (issue #128): the refusal lands as one
+  system entry and the current session is untouched — the named-request
+  rule (ADR 0014 §6); Enter merely failed, ESC-cancel's guarantee holds.
+  """
+  @spec session_refused(t(), String.t()) :: t()
+  def session_refused(%__MODULE__{} = state, message) when is_binary(message),
+    do: append_entry(state, :system, "[resume failed: #{message}]")
 
   ## Stream messages (the Phase 2 seam)
 

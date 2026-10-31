@@ -79,6 +79,92 @@ defmodule DashFloat.Session do
     <<a::binary, ?-, b::binary, ?-, c::binary, ?-, d::binary, ?-, e::binary>>
   end
 
+  @typedoc """
+  One saved session's picker row data (issue #128): identity, the optional
+  title, the creation stamp, the pin, and the first user message's text.
+  """
+  @type summary :: %{
+          id: String.t(),
+          title: String.t() | nil,
+          created_at: String.t(),
+          pin: pin(),
+          preview: String.t()
+        }
+
+  @doc """
+  The saved sessions' summaries, most recent first (issue #128): one
+  fail-open pass over the store — the title scan's discipline
+  ([ADR 0023](0023-session-titles-and-uuid-ids.md) §4) — never a write. A
+  file that is not a decodable map whose `id` equals its UUID-shaped
+  filename with a string `created_at` and a `messages` list is skipped
+  silently: the load path stays the loud reporter of hand damage. Order is
+  `created_at` descending with the id as the tiebreak — UUIDv7 keeps
+  name-sortable ≈ time-sortable (ADR 0023 §1). A nil directory (the
+  embedded/test default) lists nothing.
+  """
+  @spec summaries(Path.t() | nil) :: [summary()]
+  def summaries(nil), do: []
+
+  def summaries(dir) do
+    case File.ls(dir) do
+      {:ok, names} ->
+        names
+        |> Enum.filter(&String.ends_with?(&1, ".json"))
+        |> Enum.flat_map(&summarize(dir, &1))
+        |> Enum.sort_by(&{&1.created_at, &1.id}, :desc)
+
+      {:error, _reason} ->
+        []
+    end
+  end
+
+  # Only a UUID-named, id-consistent, decodable session is pickable — it is
+  # exactly what `--resume`/`Session.load/2` can open. The preview is the
+  # first user message's text (a parts list joins its text parts, ADR 0018
+  # §2) — display data, never validated here.
+  defp summarize(dir, name) do
+    id = String.replace_suffix(name, ".json", "")
+    path = Path.join(dir, name)
+
+    summary =
+      with true <- valid_id?(id),
+           {:ok, body} <- File.read(path),
+           {:ok, decoded} when is_map(decoded) <- Jason.decode(body),
+           %{"id" => ^id} <- decoded,
+           %{"created_at" => created_at} when is_binary(created_at) <- decoded,
+           %{"messages" => messages} when is_list(messages) <- decoded do
+        %{
+          id: id,
+          title: string_or_nil(decoded["title"]),
+          created_at: created_at,
+          pin: build_pin(decoded),
+          preview: preview(messages)
+        }
+      else
+        _skipped -> nil
+      end
+
+    List.wrap(summary)
+  end
+
+  defp preview(messages) do
+    Enum.find_value(messages, "", fn
+      %{"role" => "user", "content" => content} -> user_text(content)
+      _other -> nil
+    end)
+  end
+
+  defp user_text(content) when is_binary(content), do: content
+
+  defp user_text(parts) when is_list(parts) do
+    Enum.map_join(parts, "", fn
+      %{"type" => "text", "text" => text} when is_binary(text) -> text
+      _other_part -> ""
+    end)
+  end
+
+  defp user_text(_other), do: ""
+
   @doc """
   Writes the session as compact JSON + newline via
   `DashFloat.Config.Posture.write_private/2` (0600, atomic rename over a
