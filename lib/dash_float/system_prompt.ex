@@ -2,8 +2,12 @@ defmodule DashFloat.SystemPrompt do
   @moduledoc """
   Assembles the session system prompt once, at session start: identity, tool
   discipline, edit rules, environment facts, and project instructions, with
-  named seams for per-mode prompt sections and skills injection. See ADR 0019.
+  named seams for per-mode prompt sections and skills injection. The tool
+  prose enumerates the registry's advertised names by derivation (ADR 0030).
+  See ADR 0019.
   """
+
+  alias DashFloat.Tools
 
   @identity """
   You are DashFloat, an AI coding assistant running in the user's terminal. You help
@@ -11,28 +15,66 @@ defmodule DashFloat.SystemPrompt do
   running commands, and answering questions about the project.
   """
 
-  @tool_calling """
-  # Tool calling
+  # The catalogue sentence and the approval grouping render from the
+  # registry's advertised names (Tools.names, ADR 0007 / ADR 0030) — the
+  # prose restates the schema by derivation, so adding or gating a tool
+  # (web_search rides a Synthetic ctx, ADR 0021 §6) flows through with no
+  # prompt edit. Behavior prose below still names always-present tools.
+  defp tool_calling(opts) do
+    names = Keyword.get(opts, :tools, Tools.names(nil))
 
-  You have six tools: read_file, write_file, edit_file, execute_command,
-  list_directory, and question. All file paths are relative to the working
-  directory.
+    """
+    # Tool calling
 
-  - Before calling a tool, say briefly what you plan to do and why, then call it
-    right away — do not ask in chat whether you may proceed. The user approves or
-    rejects mutations in the interface; a rejection or cancellation comes back to
-    you as a result, so adjust your approach instead of repeating the same call.
-  - read_file and list_directory run automatically. write_file, edit_file, and
-    execute_command wait for the user's approval.
-  - question asks the user directly: it renders as a choice list they answer
-    with arrows and Enter (or dismisses, which answers cancelled). Use it
-    whenever a decision or preference belongs to the user — never guess when
-    you can ask, and never re-ask what they just answered.
-  - Tool results are JSON objects. {"ok": false} is information, not a dead end:
-    read the error and try a different approach.
-  - edit_file replaces one exact text block that must match the file exactly once;
-    read the file first and search for a unique anchor.
-  """
+    You have #{length(names)} #{tool_noun(names)}: #{enumerate(names)}. All file paths are relative to the working
+    directory.
+
+    - Before calling a tool, say briefly what you plan to do and why, then call it
+      right away — do not ask in chat whether you may proceed. The user approves or
+      rejects mutations in the interface; a rejection or cancellation comes back to
+      you as a result, so adjust your approach instead of repeating the same call.
+    - #{approval_line(names)}
+    - question asks the user directly: it renders as a choice list they answer
+      with arrows and Enter (or dismisses, which answers cancelled). Use it
+      whenever a decision or preference belongs to the user — never guess when
+      you can ask, and never re-ask what they just answered.
+    - Tool results are JSON objects. {"ok": false} is information, not a dead end:
+      read the error and try a different approach.
+    - edit_file replaces one exact text block that must match the file exactly once;
+      read the file first and search for a unique anchor.
+    """
+  end
+
+  # Safe tools (question excepted — the agent intercepts it before the gate,
+  # ADR 0028) run on their own; mutating and risky ones wait for approval.
+  # The grouping is derived per name from Tools.class, so a new tool's class
+  # decides its sentence placement, not this module's memory.
+  defp approval_line(names) do
+    auto = for name <- names, name != "question" and Tools.class(name) == :safe, do: name
+    confirm = for name <- names, Tools.class(name) != :safe, do: name
+
+    [
+      group(auto, "run", "runs", "automatically"),
+      group(confirm, "wait", "waits", "for the user's approval")
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" ")
+  end
+
+  defp group([], _plural, _singular, _rest), do: nil
+  defp group([name], _plural, singular, rest), do: "#{name} #{singular} #{rest}."
+  defp group(names, plural, _singular, rest), do: "#{enumerate(names)} #{plural} #{rest}."
+
+  defp tool_noun([_name]), do: "tool"
+  defp tool_noun(_names), do: "tools"
+
+  defp enumerate([name]), do: name
+  defp enumerate([first, second]), do: "#{first} and #{second}"
+
+  defp enumerate(names) do
+    {init, [last]} = Enum.split(names, -1)
+    Enum.join(init, ", ") <> ", and " <> last
+  end
 
   @editing """
   # Editing code
@@ -54,11 +96,15 @@ defmodule DashFloat.SystemPrompt do
       the live git probe (the deterministic test seam)
     * `:project_instructions` — a list of `%{path: String.t(), content:
       String.t()}` maps rendered as the project instructions section (default: none)
+    * `:tools` — the ordered tool names the tool-discipline prose enumerates;
+      defaults to `Tools.names(nil)` (the registry's base catalogue). A session
+      carrying a Synthetic context passes `Tools.names(synthetic)` so web_search
+      rides in (ADR 0021 §6), and tests inject hypothetical catalogues here
   """
   @spec build(Path.t(), keyword()) :: String.t()
   def build(cwd, opts \\ []) do
     sections =
-      [@identity, @tool_calling, @editing] ++
+      [@identity, tool_calling(opts), @editing] ++
         mode_sections(opts) ++
         [environment(Path.expand(cwd), opts), skills_section(opts), project_instructions(opts)]
 

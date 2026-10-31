@@ -2,7 +2,13 @@
 
 - **Status:** Accepted (design settled in
   [issue #71](https://github.com/fluxvale/dashfloat/issues/71) and
-  [issue #72](https://github.com/fluxvale/dashfloat/issues/72), filed Oct 29).
+  [issue #72](https://github.com/fluxvale/dashfloat/issues/72), filed Oct 29;
+  **amended 2026-11-01 by
+  [ADR 0030](0030-sysprompt-tool-prose-derives-from-the-registry.md)**
+  ([#101](https://github.com/fluxvale/dashfloat/issues/101)): §1's
+  tool-discipline prose — count, name list, and auto/confirm grouping — now
+  renders from the tool registry (`Tools.names/1` + `Tools.class/1`), never
+  a memorized sentence).
 - **Date:** 2026-10-30
 - **Implements:** issues #71 and #72 — the system-prompt half of the owner's
   Octofriend study (Oct 29).
@@ -47,8 +53,12 @@ Three constraints from the settled codebase shaped the design:
 seam for tests and callers): identity ("You are DashFloat, an AI coding
 assistant running in the user's terminal"), tool discipline (the five tools,
 announce-then-call, read/list auto-run vs. mutate/confirm, `{"ok": false}` is
-information), editing rules (match style, minimal diffs, run the project's own
-checks), environment facts, and the slots below. A **fresh** session seeds
+information) *(amended 2026-11-01,
+[ADR 0030](0030-sysprompt-tool-prose-derives-from-the-registry.md): the
+enumeration and the auto/confirm grouping render from `Tools.names/1` and
+`Tools.class/1` — "the five tools" is no longer a fixed list)*, editing rules
+(match style, minimal diffs, run the project's own checks), environment
+facts, and the slots below. A **fresh** session seeds
 `messages` with `%{role: "system", content: build(cwd, ...)}` as its first
 element — `Agent.init`'s `initial_messages/3`. A **resumed** session adopts
 the persisted transcript verbatim: it already carries the system message the

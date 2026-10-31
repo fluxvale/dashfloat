@@ -14,6 +14,7 @@ when its tag is cut.
 
 ### Fixed
 
+- The system prompt's tool prose can no longer drift from the advertised catalogue: the "You have N tools" sentence and the auto/confirm grouping render from the tool registry (`Tools.names/1` + risk classes) for the session's Synthetic context, so web_search appears in the prose when it appears in the schema, and adding or gating a tool flows through with no prompt edit — pinned by tests that extract the enumeration from the rendered prompt and require it to equal the schema's advertised set (ADR 0030, amending ADR 0019 §1) (#101).
 - The capture rig's reply-end waits are exchange-unique: the mock numbers every stock reply (`— turn-N.`) and each reply-end wait rides its own exchange's closing, so a second exchange can no longer be satisfied by the first reply's stale text (measured on main: the second wait returned in 0.00 s) and stills cannot ship mid-race as settled evidence; the mock's usage frame and `[DONE]` stream again after a post-extraction `NameError` had silently killed every stream's tail since the choice-widget merge, restoring growing-session's usage-driven footer-growth guard (ADR 0029) (#125).
 
 ### Added

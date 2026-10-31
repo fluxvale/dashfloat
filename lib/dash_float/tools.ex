@@ -226,6 +226,17 @@ defmodule DashFloat.Tools do
   def class(name), do: Map.get(@classes, name, :risky)
 
   @doc """
+  The catalogue's advertised names, in order — the one derivation both the
+  `tools` array (`schema/1`) and the system prompt's tool prose render from,
+  so the advertised contract and the prose cannot drift (ADR 0030).
+  web_search drops out without a Synthetic context (ADR 0021 §6).
+  """
+  @spec names(term()) :: [String.t()]
+  def names(synthetic \\ nil) do
+    if synthetic, do: @order, else: List.delete(@order, "web_search")
+  end
+
+  @doc """
   The OpenAI `tools` array advertising the catalogue. web_search is
   advertised only when `synthetic` — the session's Synthetic context — is
   present (ADR 0021 §6); without one the array is the base six-tool list
@@ -233,9 +244,9 @@ defmodule DashFloat.Tools do
   """
   @spec schema(term()) :: [map()]
   def schema(synthetic \\ nil) do
-    order = if synthetic, do: @order, else: List.delete(@order, "web_search")
-
-    Enum.map(order, fn name ->
+    synthetic
+    |> names()
+    |> Enum.map(fn name ->
       params = @params[name]
 
       %{
