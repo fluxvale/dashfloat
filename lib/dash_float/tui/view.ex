@@ -765,7 +765,7 @@ defmodule DashFloat.TUI.View do
   # clipped head (completion and editing work at the end).
   defp activity_widget(%State{attach: %{draft: draft}} = state) do
     width = content_width(elem(state.size, 0))
-    {draft_shown, hint} = attach_layout(draft, width, String.length(@attach_label))
+    {draft_shown, hint} = attach_layout(draft, width, Wrap.width(@attach_label))
 
     %Paragraph{
       text: [
@@ -799,19 +799,17 @@ defmodule DashFloat.TUI.View do
   end
 
   # Everything fits — the full draft plus the hints. Anything else drops
-  # the hints and tail-shows the draft into the whole remaining row.
-  defp attach_layout(draft, width, label_len) do
-    if label_len + String.length(draft) + 1 + String.length(@attach_hint) <= width do
+  # the hints and tail-shows the draft into the whole remaining row. Every
+  # measurement rides the renderer's classifier (Wrap — #144, the #139
+  # class): a CJK path counts two cells a grapheme, so a wide draft yields
+  # the hints at the honest cell and its tail-fit never overflows the
+  # rect (#139's amendment: no second width classifier exists).
+  defp attach_layout(draft, width, label_w) do
+    if label_w + Wrap.width(draft) + 1 + Wrap.width(@attach_hint) <= width do
       {draft, @attach_hint}
     else
-      budget = max(width - label_len - 1, 1)
-
-      shown =
-        if String.length(draft) >= budget,
-          do: "…" <> String.slice(draft, String.length(draft) - budget + 1, budget),
-          else: draft
-
-      {shown, ""}
+      budget = max(width - label_w - 1, 1)
+      {Wrap.fit_tail(draft, budget), ""}
     end
   end
 
@@ -1056,7 +1054,7 @@ defmodule DashFloat.TUI.View do
 
   # The session picker (issue #128): rows run long (preview · time ·
   # provider · model), so the popup takes 85% — at 80 cols the inner width
-  # is ~62, enough for a 40-grapheme preview plus its metadata.
+  # is ~62, enough for a 40-column preview plus its metadata.
   defp render_palette(
          %State{palette: %Palette{kind: :sessions, items: rows, selected: selected}},
          area
@@ -1126,13 +1124,12 @@ defmodule DashFloat.TUI.View do
   # The attach row's own solution (attach_layout): the TAIL shows — the
   # cursor rides at the end, where editing happens — into the row's budget
   # after the `❯ ` prefix AND the cursor's own cell, `…` marking the
-  # clipped head.
+  # clipped head. Wrap.fit_tail measures cells (#144, the #139 class): a
+  # CJK or emoji title clips at the box edge exactly, never a cell late,
+  # and no wide cluster is ever cut in half.
   defp dialog_draft(draft, inner) do
-    budget = max(inner - String.length("❯ ") - 1, 1)
-
-    if String.length(draft) < budget,
-      do: draft,
-      else: "…" <> String.slice(draft, String.length(draft) - budget + 1, budget)
+    budget = max(inner - Wrap.width("❯ ") - 1, 1)
+    Wrap.fit_tail(draft, budget)
   end
 
   defp refusal_lines(nil, _width), do: []

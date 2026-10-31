@@ -32,6 +32,7 @@ defmodule DashFloat.TUI.Wrap do
   # renderer). Standalone they sit in the wide table.
   @skin_tones for cp <- 0x1F3FB..0x1F3FF, do: <<cp::utf8>>
   @alphanumeric ~r/[\p{L}\p{N}]/u
+  @ellipsis "…"
 
   # Width 2 ranges: East Asian Width W and F codepoints, plus codepoints the
   # bundled renderer (unicode-width 0.2.2, Unicode 15.1/16 data) measures as
@@ -376,6 +377,64 @@ defmodule DashFloat.TUI.Wrap do
   # stops at the first invalid byte and undercounts the row.
   defp sanitized(text) do
     if String.valid?(text), do: text, else: String.replace_invalid(text)
+  end
+
+  @doc """
+  The longest HEAD of `text` that fits `budget` display columns, `…`
+  marking the dropped tail. The result never exceeds `budget` columns.
+  """
+  @spec fit_head(String.t(), non_neg_integer()) :: String.t()
+  def fit_head(_text, budget) when budget <= 0, do: ""
+
+  def fit_head(text, budget) when is_binary(text) and is_integer(budget) do
+    if width(text) <= budget do
+      text
+    else
+      {head, _rest} = split_fit(sanitized(text), budget - 1, false)
+      head <> @ellipsis
+    end
+  end
+
+  @doc """
+  The longest TAIL of `text` that fits `budget` display columns, `…`
+  marking the dropped head — the cursor-editing surfaces' rule (the tail
+  is where editing happens). The result never exceeds `budget` columns.
+  """
+  @spec fit_tail(String.t(), non_neg_integer()) :: String.t()
+  def fit_tail(_text, budget) when budget <= 0, do: ""
+
+  def fit_tail(text, budget) when is_binary(text) and is_integer(budget) do
+    if width(text) <= budget do
+      text
+    else
+      tail =
+        text
+        |> sanitized()
+        |> String.graphemes()
+        |> tail_fit(budget - 1)
+
+      @ellipsis <> tail
+    end
+  end
+
+  # take_fit/5 mirrored right-to-left: takes trailing graphemes while the
+  # accumulated width stays within `budget` — a wide cluster enters whole
+  # or not at all, so the cut never straddles a cell. The accumulator
+  # prepends, so it lands in reading order — NOT join/1, which reverses
+  # take_fit's backward accumulation.
+  defp tail_fit(graphemes, budget) do
+    {taken, _used} =
+      graphemes
+      |> Enum.reverse()
+      |> Enum.reduce_while({[], 0}, fn grapheme, {acc, used} ->
+        gw = width(grapheme)
+
+        if used + gw <= budget,
+          do: {:cont, {[grapheme | acc], used + gw}},
+          else: {:halt, {acc, used}}
+      end)
+
+    IO.iodata_to_binary(taken)
   end
 
   @doc """

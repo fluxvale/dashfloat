@@ -1195,6 +1195,57 @@ defmodule DashFloat.TUI.ViewTest do
       assert line =~ ".png█"
     end
 
+    # #144 (the #139 class): the attach row's fit test measured the draft
+    # with String.length, so a CJK path undercounted a cell per Han
+    # grapheme — a path the math believed fit beside the hints actually
+    # overflowed the rect and clipped the hint row's tail. Measured through
+    # the renderer's classifier, the hints drop at the honest cell.
+    test "a CJK path counts two cells a grapheme: hints drop at the honest cell" do
+      state = %{new_state() | attach: %{draft: "截图"}}
+
+      # Grapheme count says 2 fits beside the hints at rect 76 (15 + 2 + 1
+      # + 58 = 76); cells say 4 (15 + 4 + 1 + 58 = 78 > 76) — the old math
+      # kept the hints and clipped the row's last two columns at the rect
+      # edge. The classifier drops them instead.
+      line = activity_text(state)
+      assert line == "Attach image: 截图█"
+      refute line =~ "tab complete"
+      assert Wrap.width(line) <= 76
+
+      # Two columns wider (rect 78), the hints ride whole again — the same
+      # row the old math shipped one cell over.
+      wide = %{new_state(test_mode: {82, 24}) | attach: %{draft: "截图"}}
+      assert activity_text(wide, 82) =~ "⏎ attach"
+    end
+
+    # The same row's other half: a draft wider than the whole budget
+    # tail-fits by cells (Wrap.fit_tail) — the extension `.png` survives
+    # whole at the cursor, the head is a marked clip, and no wide cluster
+    # is ever cut in half at the boundary.
+    test "a long CJK path tail-fits by cells with the extension whole" do
+      draft = "~/图片/截图记录存档目录/" <> String.duplicate("存档", 15) <> ".png"
+      state = %{new_state() | attach: %{draft: draft}}
+
+      {widget, _rect} = activity(state)
+      [label, shown | _spans] = hd(widget.text).spans
+
+      assert label.content == "Attach image: "
+      assert String.starts_with?(shown.content, "…")
+      assert String.ends_with?(shown.content, ".png█")
+      # The cut never straddles a cluster: every surviving grapheme past
+      # the `…` marker is a whole grapheme of the draft (no isolated
+      # combining halves → tofu).
+      tail =
+        shown.content
+        |> String.trim_trailing("█")
+        |> String.trim_leading("…")
+
+      surviving = String.graphemes(tail)
+      assert Enum.all?(surviving, &String.contains?(draft, &1))
+      row_cells = Wrap.width(label.content) + Wrap.width(shown.content)
+      assert row_cells <= 76
+    end
+
     # Issue #28: the armed exit-guard prompt claims the transient row —
     # even while idle — and outranks the streaming/confirm activity text.
     test "the exit-guard prompt shows while armed, even at idle" do
@@ -1946,6 +1997,34 @@ defmodule DashFloat.TUI.ViewTest do
       # the draft's tail — the span is exactly the budget (40) + the cursor.
       assert String.ends_with?(body.content, "x█")
       assert String.length(body.content) == 41
+    end
+
+    # #144 (the #139 class): the draft's budget was measured with
+    # String.length, so a wide-glyph title undercounted itself into the box
+    # — a 25-Han title counted 25 of its 50 cells, rendered whole, and
+    # clipped 10 columns at the popup edge (cursor invisible). Measured
+    # through the classifier, the tail fits the box cell-for-cell and no
+    # wide or emoji cluster is ever cut in half.
+    test "a wide title tail-fits by cells, whole clusters only, cursor visible" do
+      for draft <- [String.duplicate("汉", 25), String.duplicate("🎉", 30)] do
+        [%ExRatatui.Text.Line{spans: [prefix, body]} | _rest] =
+          dialog_paragraph(dialog_state(draft, nil)).text
+
+        tail =
+          body.content
+          |> String.trim_trailing("█")
+          |> String.trim_leading("…")
+
+        assert prefix.content == "❯ "
+        assert String.starts_with?(body.content, "…")
+        assert String.ends_with?(body.content, String.last(draft) <> "█")
+        # Every surviving grapheme is a whole grapheme of the draft.
+        surviving = String.graphemes(tail)
+        assert Enum.all?(surviving, &String.contains?(draft, &1))
+        # The row fits the 43-column inner width by CELLS, not graphemes.
+        row_cells = Wrap.width(prefix.content) + Wrap.width(body.content)
+        assert row_cells <= 43
+      end
     end
   end
 
