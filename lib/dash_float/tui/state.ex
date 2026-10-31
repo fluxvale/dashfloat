@@ -2911,7 +2911,8 @@ defmodule DashFloat.TUI.State do
   defp scoped_reasoning_index(_state, nil), do: nil
 
   defp scoped_reasoning_index(state, {x, y}) do
-    %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
+    %{log: log} =
+      View.regions(state.size, input_line_count(state), overlay?(state), state.choice != nil)
 
     if y >= log.y and y < log.y + max(log.height, 0) and x >= log.x and
          x < log.x + max(log.width, 0) do
