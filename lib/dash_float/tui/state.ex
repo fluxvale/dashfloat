@@ -1607,8 +1607,9 @@ defmodule DashFloat.TUI.State do
   # The session picker's Enter (issue #128): the picked row's id rides to
   # the runner, which loads and adopts — the switch itself is the TUI's
   # (Session.load + the agent's {:adopt_session, _} send), not a State
-  # transition here. A selector, not a send: the reader's place keeps
-  # (issue #131's amendment groups the pickers together).
+  # transition here. A selector, not a send (issue #131's amendment groups
+  # the pickers) — though the adopt that follows resets the view wholesale,
+  # correctly: the log is replaced (ADR 0027).
   defp execute_palette(state, %Palette{kind: :sessions, items: rows, selected: selected}, _enter) do
     {%{state | palette: nil}, {:resume_session, Enum.at(rows, selected).id}}
   end

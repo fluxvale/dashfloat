@@ -777,9 +777,11 @@ stand unchanged — this amendment only removes what #110 had added on top.
   re-pins after a real dispatch — a plain message (the existing clause),
   a command (new: typed, the palette's filtered Enter, or the MODAL
   command palette's Enter — none of which re-pinned before — Enter is
-  Enter), an unknown-bare-slash warn. The model/profile pickers are
-  selectors, not sends: nothing lands in the transcript, so they keep the
-  reader's place. A no-op Enter (blank draft, mid-stream) pins nothing.
+  Enter), an unknown-bare-slash warn. The model/profile/session pickers
+  are selectors, not sends: nothing lands in the transcript, so they keep
+  the reader's place (the session picker's adopt then resets the view
+  wholesale, correctly — the log is replaced; ADR 0027). A no-op
+  Enter (blank draft, mid-stream) pins nothing.
 - **A reply arriving while scrolled up does not yank the view** —
   verified, not assumed: the scroll intent is top-anchored (an offset
   from the log's first display row), so streaming tokens and landed
