@@ -41,7 +41,11 @@ Same flow (watch t1, submit, switch away mid-turn):
 Sidebar workspace row at completion vs a settled-idle pane:
 
     done:  ' ● ~ · 1'   (filled dot; `herdr agent list` → dashfloat done, completion_seq 9)
-    idle:  ' ○ ~ · 1'   (round 7's watched completion)
+    idle:  ' ○ ~ · 1'   (a settled-idle pane)
+
+(The chime half of the stock-config notification is verified from Herdr
+source — sound enabled by default, dashfloat on no mute list — not observed:
+no rig carries audio.)
 
 ## 3. The wire (logging proxy, round 3's turn)
 
@@ -59,7 +63,7 @@ state report first, session report behind:
 signature, so the pair re-fires — ADR 0024 §3. The turn-end pair carries the
 same session id.)
 
-## 4. Watched completions do not notify — Herdr's design (rounds 6/7)
+## 4. Watched completions do not notify — Herdr's design
 
 Same flow but the client stayed on DashFloat's tab past completion:
 
@@ -69,13 +73,22 @@ The completion registered (`completion_seq` advanced) but the pane is marked
 seen: status `idle`, no badge, no toast, and nothing re-fires when the user
 later switches away. Source (herdr 0.9.5, `src/app/actions.rs`):
 `active_tab_suppresses_notifications` suppresses the finished toast/sound for
-the active tab, and `apply_pane_state_change` marks the pane
+the active tab while the outer terminal is focused (an unfocused OS window
+notifies even the active tab), and `apply_pane_state_change` marks the pane
 `seen = suppress_active_tab_notifications`. `done` is a derived view
 (`pane_agent_status`: idle+unseen), never a reportable state
 (`PaneAgentState` = idle|working|blocked|unknown in both the CLI and the
-socket schema).
+socket schema); completions derive from `working → idle` and
+`blocked → idle` alike (`is_background_completion_transition`).
 
 This — not a missing report — is what the v0.4.0 smoke test saw: the working
 indicator is visible from any tab, while the done notification is judged at
 the instant the `idle` report lands; a turn that finishes while the pane is
 being watched is silently idle, permanently.
+
+## 5. Independent hostile re-review
+
+`02-hostile-review-findings.md` — a fresh-context reviewer re-ran all three
+flows on its own isolated `herdr --session df132-review` (same Herdr 0.9.5,
+same real app) with its own proxy/mock rig and reproduced every observation
+above, including the watched-completion suppression and the wire shape.

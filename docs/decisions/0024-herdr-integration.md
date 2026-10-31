@@ -163,31 +163,48 @@ Investigated against Herdr 0.9.5; the finding changes no code.
 
 `done` is not reportable — `pane.report_agent` accepts
 `idle|working|blocked|unknown` (CLI and socket schema both). The API's
-`AgentStatus` adds `done` as a **derived** view: a `working → idle`
-transition on a pane that is not being watched marks the pane unseen,
-flips its status to `done` (the sidebar badge), and emits the finished
-notification (toast and/or chime per Herdr config). DashFloat's reports
-already produce that transition. Verified live end to end — the real TUI in
-a pane of an isolated `herdr --session`, one mock turn, the pane backgrounded
-mid-turn through the client's own tab switch: `working → done`
+`AgentStatus` adds `done` as a **derived** view: a `working → idle` (or
+`blocked → idle`) transition on a pane that is not being watched marks the
+pane unseen, flips its status to `done` (the sidebar badge), and emits the
+finished notification (toast and/or chime per Herdr config). DashFloat's
+reports already produce that transition. Verified live end to end — the real
+TUI in a pane of an isolated `herdr --session`, one mock turn, the pane
+backgrounded mid-turn through the client's own tab switch: `working → done`
 (`completion_seq` set) and the `● dashfloat finished` toast rendered; with
 the owner's stock config the same flow yields the `done` badge. Evidence and
-wire capture in `docs/screenshots/132/`.
+wire capture in `docs/screenshots/132/` (the review's independent
+reproduction in `02-hostile-review-findings.md`).
 
-Two Herdr-side semantics bound what any integration can get, both by design:
+Herdr-side semantics bound what any integration can get, all by design:
 
-- **Watched completions never notify.** The transition is judged at the
-  instant the `idle` report lands; if the pane's tab is the client's active
-  tab, the pane is marked seen — no badge, no toast, no chime — and nothing
-  re-fires when the user later switches away. A turn that finishes while
-  the user is still looking at the pane is silently idle. Short turns race
-  the user's switch-away; this, not a missing report, is what the smoke
-  test saw (the working indicator is visible from any tab, so "working but
-  never done" is exactly a watched completion).
+- **Watched completions never notify** (while the outer terminal is
+  focused — Herdr notifies even the active tab when the OS window is
+  unfocused). The transition is judged at the instant the `idle` report
+  lands; if the pane's tab is the client's active tab, the pane is marked
+  seen — no badge, no toast, no chime — and nothing re-fires when the user
+  later switches away. A turn that finishes while the user is still looking
+  at the pane is silently idle. Short turns race the user's switch-away;
+  this, not a missing report, is what the smoke test saw (the working
+  indicator is visible from any tab, so "working but never done" is exactly
+  a watched completion).
 - **Toast delivery is config-gated; the badge and chime are not.** With the
   default `[ui.toast] delivery = "off"` (the owner's config has no
   `[ui.toast]` section), the done notification is chime + sidebar badge
-  only — no visible toast anywhere.
+  only — no visible toast anywhere. (The chime half is verified from
+  source — sound enabled by default, dashfloat not on any mute list — not
+  observed: no e2e rig carries audio.)
+- **`blocked → idle` counts as a completion, and DashFloat has a
+  timer-driven one.** The exit guard's expiry (§2's double-Ctrl+C prompt
+  disarming after its 2 s window) reports blocked → idle with no user
+  input: a backgrounded pane whose exit prompt cancels itself shows a
+  "finished" badge for zero work. Herdr-side semantics, honest reports;
+  accepted (verified live in review).
+- **One corner loses a turn's notification outright.** A `working` report
+  whose task stalls past the turn's end (§4's 2 s bounds) is discarded by
+  Herdr's seq guard once the `idle` lands: the server sees idle → idle, no
+  completion fires, and nothing re-fires later — that turn is never done
+  on the wire. Rare (a local socket stalling seconds), inside §4's
+  fail-open risk; accepted.
 
 No DashFloat change follows: the sanctioned transport already carries
 everything Herdr needs, and fabricating a `working` report to re-arm a
@@ -213,7 +230,9 @@ watched completion would lie about state and corrupt `herdr agent wait`.
   inside the task); two tasks may interleave *between* reports, at worst
   briefly dropping an older task's session request to the newer one's seq —
   self-healing at the next signature change, which re-sends the session
-  request every time.
+  request every time. The worse corner — a stalled `working` state report
+  discarded behind the turn-end `idle`, silently losing that turn's done
+  notification (§8) — is the fail-open risk §4 already accepts.
 - **Attaching the resume argv to the state report** — rejected in favor of the
   dedicated `pane.report_agent_session` follow-up: the docs require the source
   to hold the pane first, and the pair (state, then session with the next
