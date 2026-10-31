@@ -827,7 +827,11 @@ defmodule DashFloat.AgentTest do
     # The seeded system prompt enumerates the same registry slice the wire
     # schema advertises — the agent seam of the #101 drift pin (ADR 0030):
     # dropping the Tools.names(synthetic) pass-through here fails this.
-    [pinned_system | _] = Map.fetch!(Jason.decode!(with_body), "messages")
+    [pinned_system | _rest] =
+      with_body
+      |> Jason.decode!()
+      |> Map.fetch!("messages")
+
     assert pinned_system["role"] == "system"
     assert pinned_system["content"] =~ "You have 7 tools"
 
@@ -857,7 +861,11 @@ defmodule DashFloat.AgentTest do
              "question"
            ]
 
-    [plain_system | _] = Map.fetch!(Jason.decode!(without_body), "messages")
+    [plain_system | _rest] =
+      without_body
+      |> Jason.decode!()
+      |> Map.fetch!("messages")
+
     assert plain_system["content"] =~ "You have 6 tools"
 
     # "and web_search", not bare "web_search": this test's tmp-dir name
