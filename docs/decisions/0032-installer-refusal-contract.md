@@ -42,12 +42,14 @@ assert the specific refusal. The contract has three clauses:
 The clauses are asserted in one shared, shellchecked script,
 `scripts/refusal-contract.sh`, used by both negative smokes: the tag-run
 `smoke-linux` bullseye arm (against the published `install.sh`, still
-`curl | sh`) and a new bullseye arm in the dispatch `smoke-rehearsal`
-(against the branch's installer and freshly built artifacts) — so the
+`curl | sh`) and a new bullseye arm in the dispatch `smoke-rehearsal` —
+where the stable arm still installs the freshly built artifacts end to end
+and the bullseye arm proves the refusal fires before any download — so the
 strengthened assertion runs before a tag exists instead of first reding on
-release day. A hermetic mix test pins the die message and the contract
-script's grep to the same fragment and requires both smokes to invoke the
-contract script, so the pair cannot drift through `mix ci`.
+release day. A hermetic mix test checks the contract script's grep against
+the installer's rendered die line (a wording change on either side reds
+`mix ci`) and requires both smokes to invoke the contract script, so the
+pair cannot drift apart between releases.
 
 The floor itself stays where [ADR 0010](0010-release-packaging.md) put it:
 a property of the pinned Debian 12 build image, moved only by deliberate
@@ -78,4 +80,7 @@ captured error; it now prints the binary's actual failure before refusing.
   exit code, an unrelated crash, or a leftover partial install each red the
   job. That is the point.
 - Wording changes to the floor refusal must update `install.sh` and
-  `scripts/refusal-contract.sh` together — or `mix ci` reds.
+  `scripts/refusal-contract.sh` together — or `mix ci` reds. The mix test
+  is a tripwire against accidental drift, not against a deliberate edit
+  that preserves the pinned strings while disabling the clauses; the
+  smokes' own runs of the contract script are the backstop.

@@ -18,9 +18,12 @@ fail() { printf 'refusal contract: %s\n' "$1" >&2; exit 1; }
 
 [ "$status" -eq 1 ] ||
   fail "expected the installer to refuse with exit 1, got $status"
-grep -q 'is below the GLIBC_2.34 floor' "$log" ||
-  fail "the glibc-floor refusal message is absent from the output above — the failure is not the floor refusal"
-data_home="${XDG_DATA_HOME:-$HOME/.local/share}/dashfloat"
+# Anchored to die's output shape so a line that merely mentions the floor
+# (a warning, an echoed comment) cannot satisfy the clause — it must be
+# THE refusal line.
+grep -Eq '^dashfloat: glibc [0-9]+\.[0-9]+ is below the GLIBC_2\.34 floor' "$log" ||
+  fail "the glibc-floor refusal line is absent from the output above — the failure is not the floor refusal"
+data_home="${DASHFLOAT_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/dashfloat}"
 bin_dir="${DASHFLOAT_BIN_DIR:-$HOME/.local/bin}"
 [ ! -e "$data_home" ] ||
   fail "a refused install left $data_home behind"

@@ -130,6 +130,7 @@ require_glibc_floor() {
   esac
   minor=${ver#*.}
   minor=${minor%%[!0-9]*}
+  [ -n "$minor" ] || return 0
   if [ "$minor" -lt 34 ]; then
     die "glibc $ver is below the GLIBC_2.34 floor (DashFloat needs glibc 2.34+, Debian 12+, Ubuntu 22.04+); nothing was downloaded or installed"
   fi
