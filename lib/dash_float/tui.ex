@@ -697,28 +697,44 @@ defmodule DashFloat.TUI do
   @doc """
   The command that reopens this session (issue #127), or nil when there is
   nothing persisted to reopen: a lead-in line plus `dashfloat --resume`
-  with the session's TITLE when one is live (double-quoted and
-  shell-escaped so a multi-word title pastes verbatim) and its UUIDv7 id
-  otherwise — the id path needs no quoting. The gate is the store itself:
-  a known session id whose file exists under `sessions_dir`; a session
-  that never persisted (launch-and-quit, a first save that failed) prints
-  nothing rather than a command that would refuse at the next boot.
+  with the session's stored TITLE when the file carries one (double-quoted
+  and shell-escaped so a multi-word title pastes verbatim) and its UUIDv7
+  id otherwise — the id path needs no quoting. The gate is the store
+  itself, read once at exit: the session file must exist and decode, and
+  the title comes from ITS bytes — the exact truth the next boot's
+  resolution reads — never from live state, so a title whose save failed
+  (ADR 0023 §5's accepted fail-open) prints the id form instead of a
+  command that would refuse. A session that never persisted
+  (launch-and-quit) or whose file is unreadable prints nothing.
   """
   @spec exit_message(State.t()) :: String.t() | nil
-  def exit_message(%State{session_id: nil}), do: nil
-
-  def exit_message(%State{session_id: id, sessions_dir: dir, title: title})
+  def exit_message(%State{session_id: id, sessions_dir: dir})
       when is_binary(id) and is_binary(dir) do
     path = Path.join(dir, id <> ".json")
 
-    if File.exists?(path) do
-      "resume this session with:\ndashfloat --resume " <> resume_value(id, title) <> "\n"
-    else
-      nil
+    case stored_title(path) do
+      :none -> nil
+      {:title, title} -> "resume this session with:\ndashfloat --resume " <> quoted(title) <> "\n"
+      :untitled -> "resume this session with:\ndashfloat --resume #{id}\n"
     end
   end
 
   def exit_message(%State{}), do: nil
+
+  # The stored title, or :untitled when the file carries none — the
+  # `--resume` title path's own truth — and :none when nothing safely
+  # resumable exists (no file, unreadable, or not session-shaped JSON).
+  defp stored_title(path) do
+    with {:ok, body} <- File.read(path),
+         {:ok, decoded} when is_map(decoded) <- Jason.decode(body) do
+      case Map.get(decoded, "title") do
+        title when is_binary(title) and title != "" -> {:title, title}
+        _no_title -> :untitled
+      end
+    else
+      _unreadable -> :none
+    end
+  end
 
   # The title form is the human-shaped handle; the id always resolves. A
   # quoted title keeps multi-word names a single argv word — `"` `\` `$` and
@@ -726,9 +742,7 @@ defmodule DashFloat.TUI do
   # special — so the printed line pastes verbatim into any POSIX shell.
   # An on-disk duplicate title (the ADR 0023 §4 race) refuses loudly at the
   # next boot with both ids named — the accepted posture, never silent.
-  defp resume_value(id, nil), do: id
-
-  defp resume_value(_id, title),
+  defp quoted(title),
     do: "\"" <> String.replace(title, ["\"", "\\", "$", "`"], &("\\" <> &1)) <> "\""
 
   @doc """

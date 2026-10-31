@@ -3760,8 +3760,6 @@ defmodule DashFloat.TUITest do
 
   # The /resume picker (issue #128) end to end through the real event loop,
   # and the exit print (issue #127) at the teardown every deliberate quit
-  # The /resume picker (issue #128) end to end through the real event loop,
-  # and the exit print (issue #127) at the teardown every deliberate quit
   # funnels through. The default fake agent is this test process: the
   # adoption send lands in this mailbox.
   describe "the /resume picker and the exit print (#127/#128)" do
@@ -3868,7 +3866,10 @@ defmodule DashFloat.TUITest do
           end
         )
 
-      assert refused.session_id == nil
+      # Untouched: the refusal is the ONLY entry (no replay happened) and
+      # no adoption ever reached the agent.
+      assert length(refused.entries) == 1
+      assert refused.palette == nil
       refute_receive {:adopt_session, _ui, _session}, 100
     end
 
@@ -3905,40 +3906,29 @@ defmodule DashFloat.TUITest do
       refute_receive {:adopt_session, _ui, _session}, 100
     end
 
-    test "exit_message: the title form when titled, the id form otherwise, nothing unpersisted" do
+    test "exit_message: the stored title's form, the id otherwise, nothing unpersisted" do
       dir = sessions_dir()
 
-      # Titled and persisted — the quoted title command.
-      titled =
-        State.new(
-          test_mode: {80, 24},
-          sessions_dir: dir,
-          session_id: @resume_id,
-          title: "Pick Me"
-        )
+      # The store's OWN title decides (the bytes --resume resolves): the
+      # live state.title is never trusted.
+      titled = State.new(test_mode: {80, 24}, sessions_dir: dir, session_id: @resume_id)
 
       assert TUI.exit_message(titled) ==
                "resume this session with:\ndashfloat --resume \"Pick Me\"\n"
 
-      # Untitled — the bare id (a UUID needs no quoting).
-      untitled = State.new(test_mode: {80, 24}, sessions_dir: dir, session_id: @older_id)
-
-      assert TUI.exit_message(untitled) ==
-               "resume this session with:\ndashfloat --resume #{@older_id}\n"
-
-      # A title carrying shell specials escapes them.
-      spiky =
+      # Untitled on disk — the bare id (a UUID needs no quoting); a live
+      # title whose save failed (ADR 0023 §5's fail-open — hostile review)
+      # must not promise the title path either.
+      untitled =
         State.new(
           test_mode: {80, 24},
           sessions_dir: dir,
-          session_id: @resume_id,
-          title: ~s(he said "hi" & `that`)
+          session_id: @older_id,
+          title: "never reached disk"
         )
 
-      # Backtick escapes too — all four POSIX double-quote specials
-      # (\" \\ \$ \`) must be prefixed for a verbatim paste.
-      assert TUI.exit_message(spiky) ==
-               "resume this session with:\ndashfloat --resume \"he said \\\"hi\\\" & \\`that\\`\"\n"
+      assert TUI.exit_message(untitled) ==
+               "resume this session with:\ndashfloat --resume #{@older_id}\n"
 
       # Nothing persisted: no session id, or an id whose file is gone —
       # the command that would refuse at the next boot prints nothing.
@@ -3955,6 +3945,27 @@ defmodule DashFloat.TUITest do
       assert TUI.exit_message(gone) == nil
       no_dir = State.new(test_mode: {80, 24}, session_id: @resume_id)
       assert TUI.exit_message(no_dir) == nil
+    end
+
+    test "exit_message: a stored title carrying shell specials escapes them" do
+      dir = wizard_dir("dashfloat-tui-exit-spiky")
+
+      :ok =
+        Session.save(dir, %{
+          version: 1,
+          id: @resume_id,
+          created_at: "2026-10-30T23:00:00Z",
+          title: ~s(he said "hi" & `that`),
+          pin: %{profile: nil, model: nil, base_url: nil},
+          messages: [%{"role" => "user", content: "q"}]
+        })
+
+      spiky = State.new(test_mode: {80, 24}, sessions_dir: dir, session_id: @resume_id)
+
+      # All four POSIX double-quote specials (\" \\ \$ \`) are prefixed for
+      # a verbatim paste.
+      assert TUI.exit_message(spiky) ==
+               "resume this session with:\ndashfloat --resume \"he said \\\"hi\\\" & \\`that\\`\"\n"
     end
 
     test "terminate prints the command on the clean quit, after the release, never on a crash" do

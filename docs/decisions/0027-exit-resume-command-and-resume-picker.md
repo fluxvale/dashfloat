@@ -55,14 +55,18 @@ boot's pin-compare warning covers provider drift, and Herdr's richer argv
 (ADR 0024 §5) is its own surface with its own rules — divergent purposes,
 not divergent presentations of one command.
 
-**The gate is the store itself:** a session id whose file exists under the
-sessions directory. A launch-and-quit (no id minted) or a first save that
-persistently failed (id announced, no file — ADR 0023 §5's accepted
-posture) prints nothing rather than a command that would refuse at the next
-boot; a resumed boot mounts the id and the file was just loaded. A title
-that collides on disk (the ADR 0023 §4 concurrent-race consequence) prints
-the title form; the next boot's ambiguity refusal names both ids — loud,
-never silent, the same backstop the title set paths rely on.
+**The gate is the store itself:** at exit the session file is read once —
+it must exist and decode, and the printed title comes from ITS bytes, the
+exact truth the next boot's title resolution reads, never from live state
+(so a live title whose save failed — ADR 0023 §5's accepted fail-open —
+prints the id form instead of a command that would refuse; hostile review
+finding). A launch-and-quit (no id minted) or a first save that
+persistently failed (id announced, no file) prints nothing rather than a
+command that would refuse at the next boot; a resumed boot mounts the id
+and the file was just loaded. A title that collides on disk (the ADR 0023
+§4 concurrent-race consequence) prints the title form; the next boot's
+ambiguity refusal names both ids — loud, never silent, the same backstop
+the title set paths rely on.
 
 ### 2. The /resume picker (#128)
 
