@@ -11,8 +11,8 @@
   and bullets render from the registry).
 - **Cross-refs:** [ADR 0007](0007-tool-calls-and-execution.md) (the tool
   catalogue's advertised/enforced no-drift principle — the same rule now
-  covers prose), [ADR 0021](0021-synthetic-repair-and-web-search.md) §6
-  (web_search is advertised only with a Synthetic context),
+  covers prose), [ADR 0021](0021-synthetic-repair-and-web-search.md) §7
+  (web_search — advertisement gated on the context),
   [ADR 0028](0028-choice-widget-and-ask-user.md) (the question tool rides
   every mode).
 
@@ -36,7 +36,7 @@ web_search (a safe, auto-running tool) whenever one was advertised.
 
 1. **One name derivation.** `DashFloat.Tools.names/1` returns the
    catalogue's advertised names in order (web_search gated on the Synthetic
-   context, ADR 0021 §6). `schema/1` renders the wire array from it; the
+   context, ADR 0021 §7). `schema/1` renders the wire array from it; the
    system prompt renders its prose from it. Names now have exactly one
    source, the way parameters already do (ADR 0007's one-table rule).
 
@@ -72,6 +72,12 @@ web_search (a safe, auto-running tool) whenever one was advertised.
 
 - **Re-hardcode the corrected sentence** — rejected: it drifted twice
   already; the third drift was one merge away.
+- **Re-derive the system message on `:set_provider`** (the discrete
+  mid-session provider/model/profile swap that re-resolves the Synthetic
+  context) — deferred: it rewrites already-persisted prompt history
+  (ADR 0019 §5) to fix an advisory-prose edge the schema channel already
+  covers; revisit if mid-session swaps carrying a Synthetic toggle become
+  common.
 - **Re-derive the prompt per request** — rejected: re-litigates ADR 0019's
   assembly-once (and would rewrite the persisted transcript's history).
 - **Derive every tool-name mention** — rejected: guarding behavior prose
@@ -81,6 +87,11 @@ web_search (a safe, auto-running tool) whenever one was advertised.
 ## Consequences
 
 The prompt's tool section can no longer disagree with the schema the model
-actually receives. `Tools.names/1` becomes public API of the catalogue; the
-system prompt grows a compile-time dependency on the tool registry it
-describes — the coupling is the point.
+actually receives. The count now renders as a numeral ("You have 6 tools"
+where the old text spelled "six") and the derived sentences no longer wrap
+at the old hand-broken line widths — byte changes with no content change.
+`Tools.names/1` becomes public API of the catalogue; the system prompt
+grows a compile-time dependency on the tool registry it describes — the
+coupling is the point. A test pins the agent seam itself: a session with a
+pinned Synthetic context seeds a prompt that advertises web_search, and a
+plain session's prompt does not.

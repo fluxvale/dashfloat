@@ -18,7 +18,7 @@ defmodule DashFloat.SystemPrompt do
   # The catalogue sentence and the approval grouping render from the
   # registry's advertised names (Tools.names, ADR 0007 / ADR 0030) — the
   # prose restates the schema by derivation, so adding or gating a tool
-  # (web_search rides a Synthetic ctx, ADR 0021 §6) flows through with no
+  # (web_search rides a Synthetic ctx, ADR 0021 §7) flows through with no
   # prompt edit. Behavior prose below still names always-present tools.
   defp tool_calling(opts) do
     names = Keyword.get(opts, :tools, Tools.names(nil))
@@ -99,7 +99,7 @@ defmodule DashFloat.SystemPrompt do
     * `:tools` — the ordered tool names the tool-discipline prose enumerates;
       defaults to `Tools.names(nil)` (the registry's base catalogue). A session
       carrying a Synthetic context passes `Tools.names(synthetic)` so web_search
-      rides in (ADR 0021 §6), and tests inject hypothetical catalogues here
+      rides in (ADR 0021 §7), and tests inject hypothetical catalogues here
   """
   @spec build(Path.t(), keyword()) :: String.t()
   def build(cwd, opts \\ []) do

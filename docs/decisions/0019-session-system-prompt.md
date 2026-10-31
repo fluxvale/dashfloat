@@ -60,7 +60,7 @@ enumeration and the auto/confirm grouping render from `Tools.names/1` and
 (match style, minimal diffs, run the project's own checks), environment
 facts, and the slots below. A **fresh** session seeds
 `messages` with `%{role: "system", content: build(cwd, ...)}` as its first
-element — `Agent.init`'s `initial_messages/3`. A **resumed** session adopts
+element — `Agent.init`'s `initial_messages/4`. A **resumed** session adopts
 the persisted transcript verbatim: it already carries the system message the
 original session start built, and re-seeding would duplicate it. A session
 persisted before this ADR simply never gains one — no migration.
