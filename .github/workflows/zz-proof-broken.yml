@@ -1,7 +1,0 @@
-on: push
-jobs:
-  broken-on-purpose:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "${{ matrix.foo }}"
-      - uses: actions/checkout
