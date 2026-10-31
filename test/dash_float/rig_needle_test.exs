@@ -10,7 +10,9 @@ defmodule DashFloat.RigNeedleTest do
 
   use ExUnit.Case, async: true
 
-  @source File.read!(Path.expand("../../scripts/capture.py", __DIR__))
+  @source "../../scripts/capture.py"
+          |> Path.expand(__DIR__)
+          |> File.read!()
 
   test "no reply-end wait rides the stock body's text (the #125 class)" do
     refute @source =~ ~s{wait_for("rest")},
