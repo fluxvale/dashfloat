@@ -868,7 +868,8 @@ defmodule DashFloat.TUI.ViewTest do
     # candidate ships clipped. The exact-equality pins the arithmetic to
     # the cell AND the spacing: the row lands whole or the cwd yields.
     test "the ladder counts BMP-wide cwd glyphs at two cells" do
-      state = Map.put(new_state(provider: provider(nil)), :cwd, "~/项目/中文目录")
+      base = new_state(provider: provider(nil))
+      state = Map.put(base, :cwd, "~/项目/中文目录")
 
       # The full row is 34 display cells: ❯-head (17 — "❯ " plus the
       # 15-cell cwd, every Han grapheme two) + " · " (3) + model (14).
@@ -885,7 +886,8 @@ defmodule DashFloat.TUI.ViewTest do
       cjk_model =
         {:ok, %DashFloat.Config{base_url: "http://x", model: "汉语模型", api_key: "k"}}
 
-      state = Map.put(new_state(provider: cjk_model), :cwd, "~/a")
+      base = new_state(provider: cjk_model)
+      state = Map.put(base, :cwd, "~/a")
 
       # "x - 汉语模型" is 12 display cells (4 ASCII + four Han pairs);
       # the full row is 5 + 3 + 12 = 20. At rect 20 it lands whole; at 19
@@ -1991,7 +1993,9 @@ defmodule DashFloat.TUI.ViewTest do
   # FORMATTED label — State.new runs format_cwd) on a state carrying every
   # footer group — model, context snapshot, ttft, and a frozen rate.
   defp ladder_state(cwd) do
-    new_state(provider: provider(128_000))
+    base = new_state(provider: provider(128_000))
+
+    base
     |> Map.put(:cwd, cwd)
     |> Map.put(:phase, :streaming)
     |> State.stream_message({:token, "a"}, 1_400)
