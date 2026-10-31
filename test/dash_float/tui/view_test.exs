@@ -354,6 +354,59 @@ defmodule DashFloat.TUI.ViewTest do
       assert text =~ "space toggle"
     end
 
+    # Issue #152's class sweep found the fourth surface here: option labels
+    # and descriptions are model-authored and unbounded, and the box
+    # silently clipped them (ADR 0028's recorded clip). Every row now caps
+    # at the box's render-time inner width (the 76-cell input region minus
+    # borders → 74 at 80 cols), Wrap.fit_head by cells, one `…` cut, the
+    # marker chrome surviving the cut.
+    test "a choice's rows cap at the box's inner width (issue #152)" do
+      question = String.duplicate("q", 80)
+      label = String.duplicate("L", 80)
+      description = String.duplicate("d", 80)
+
+      state =
+        State.stream_message(new_state(), {
+          :question,
+          make_ref(),
+          %{
+            question: question,
+            options: [%{"label" => label, "description" => description}],
+            multiple: false
+          }
+        })
+
+      text = input_text(state)
+
+      assert text =~ String.duplicate("q", 73) <> "…"
+      # The marker survives; the label's own budget is the inner width
+      # minus the marker's 2 cells.
+      assert text =~ "❯ " <> String.duplicate("L", 71) <> "…"
+      assert text =~ "    " <> String.duplicate("d", 69) <> "…"
+      refute text =~ String.duplicate("q", 74)
+      refute text =~ String.duplicate("L", 72)
+    end
+
+    test "a multi choice's label budget drops the checkbox cells (issue #152)" do
+      label = String.duplicate("M", 80)
+
+      state =
+        State.stream_message(new_state(), {
+          :question,
+          make_ref(),
+          %{
+            question: "Pick any",
+            options: [%{"label" => label}],
+            multiple: true
+          }
+        })
+
+      text = input_text(state)
+
+      # "❯ [x] " is 6 cells; the label's budget is 74 - 6 = 68.
+      assert text =~ "❯ [ ] " <> String.duplicate("M", 67) <> "…"
+    end
+
     # The mouse-selection geometry during a choice (delta re-review #2):
     # cell_at must map through the choice-aware log rect — a click below
     # the (taller) box anchors on the REAL last log row, never on phantom
@@ -2059,6 +2112,89 @@ defmodule DashFloat.TUI.ViewTest do
       state = %{new_state() | palette: palette}
 
       assert [_widget | _rest] = View.render(state, %ExRatatui.Frame{width: 12, height: 5})
+    end
+
+    # Issue #152, the #146 class's third application: the model/profile
+    # picker rows cap at the popup's render-time inner width (50% of the
+    # inset area, truncating division: 36 cells at 80 cols), Wrap.fit_head
+    # measuring cells. Drop order: the `· current` marker, then the context
+    # detail — the rightmost scaffolding — lose cells first; the id is the
+    # payload and the last to lose cells, one `…` cut, no span ladder.
+    test "the models picker caps the row at the popup's inner width (issue #152)" do
+      # 80 cols: inset 76, popup 50% → 38 wide, 36 inner.
+      id = String.duplicate("m", 60)
+      entries = [%{model: id, context: 128_000}]
+      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: id, api_key: "k"}}
+
+      palette = %Palette{mode: :modal, kind: :models, items: entries, selected: 0}
+      state = %{new_state(provider: provider) | palette: palette}
+
+      assert [{%ExRatatui.Widgets.Popup{content: %ExRatatui.Widgets.List{items: items}}, _area}] =
+               state
+               |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+               |> Enum.take(-1)
+
+      # The id alone overflows: the cut lands in its tail, the head rides.
+      assert items == [String.duplicate("m", 35) <> "…"]
+    end
+
+    test "a fitting model's scaffolding drops before the id loses cells (issue #152)" do
+      # 30-cell id + " (128k)" + " · current" = 47 cells vs the 36-cell
+      # inner: the marker and most of the detail go, the id rides whole.
+      id = String.duplicate("i", 30)
+      entries = [%{model: id, context: 128_000}]
+      provider = {:ok, %DashFloat.Config{base_url: "http://x", model: id, api_key: "k"}}
+
+      palette = %Palette{mode: :modal, kind: :models, items: entries, selected: 0}
+      state = %{new_state(provider: provider) | palette: palette}
+
+      assert [{%ExRatatui.Widgets.Popup{content: %ExRatatui.Widgets.List{items: items}}, _area}] =
+               state
+               |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+               |> Enum.take(-1)
+
+      assert items == [String.duplicate("i", 30) <> " (128…"]
+      assert "current" not in items
+    end
+
+    test "the profiles picker caps the name at the same inner width (issue #152)" do
+      name = String.duplicate("p", 50)
+
+      palette = %Palette{mode: :modal, kind: :profiles, items: ["demo", name], selected: 0}
+      state = %{new_state() | palette: palette}
+
+      assert [{%ExRatatui.Widgets.Popup{content: %ExRatatui.Widgets.List{items: items}}, _area}] =
+               state
+               |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+               |> Enum.take(-1)
+
+      # The name IS the payload: one cut in its tail; the fitting row whole.
+      assert items == ["demo", String.duplicate("p", 35) <> "…"]
+    end
+
+    test "the model/profile pickers never raise on degenerate frames (issue #152)" do
+      models = %Palette{
+        mode: :modal,
+        kind: :models,
+        items: [%{model: "m", context: nil}],
+        selected: 0
+      }
+
+      profiles = %Palette{mode: :modal, kind: :profiles, items: ["demo"], selected: 0}
+
+      # The models picker needs a resolved provider (its clause reads the
+      # current model for the marker).
+      assert [_widget | _rest] =
+               View.render(
+                 %{new_state(provider: provider(nil)) | palette: models},
+                 %ExRatatui.Frame{width: 6, height: 5}
+               )
+
+      assert [_widget | _rest] =
+               View.render(%{new_state() | palette: profiles}, %ExRatatui.Frame{
+                 width: 6,
+                 height: 5
+               })
     end
 
     test "a filter palette is idle-only: an active phase renders no palette widgets" do

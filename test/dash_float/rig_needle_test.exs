@@ -29,6 +29,7 @@ defmodule DashFloat.RigNeedleTest do
   # templates with their interpolation braces.
   @needle_allowlist MapSet.new([
                       "Models",
+                      "Profiles",
                       "Sessions",
                       "Session title",
                       "first run",

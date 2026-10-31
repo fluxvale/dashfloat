@@ -168,6 +168,18 @@ Scenarios:
                 types a 124-cell draft — the input line tail-fits (`…`
                 head-clip) so the block cursor stays on screen; asserted
                 on the rendered row before the still is written
+    model-tail  the #152 models-picker still: /model over the mock
+                catalog's appended custom-endpoint ids — the overlong
+                CURRENT id caps at the popup's inner width (50% minus
+                borders — 36 cells at 80 cols), one `…` cut inside its
+                tail, and the medium id rides whole while its context
+                detail loses cells; asserted on the rendered rows before
+                the still is written
+    profile-tail
+                the #152 profiles-picker still: /profile over a scratch
+                settings pair — the short profile and an overlong name;
+                the name caps at the same inner width, one `…` cut;
+                asserted on the rendered row before the still is written
     exit-print  the exit print (issue #127): one exchange persists and
                 auto-titles the session, Ctrl+Q exits, and the printed
                 command lands on the post-exit screen (the still); the
@@ -761,9 +773,24 @@ class MockHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # The #152 tail fixtures ride the catalog: a user-controlled overlong
+    # custom-endpoint id (the models picker's evidence row, made CURRENT by
+    # the scenario's --model) and a medium id whose context detail alone
+    # overflows — appended after the stock pair so model-switch's "second
+    # catalog entry" pick is unchanged.
+    LONG_MODEL_ID = (
+        "custom-endpoint-finetune-gpt-4o-2025-11-07-"
+        "reasoning-preview-experimental")
+    MEDIUM_MODEL_ID = "custom-endpoint-tuned-model-v2"
+
     def do_GET(self):
         if self.path.endswith("/models"):
-            self._json({"data": [{"id": "glm-5.3"}, {"id": "glm-5.3-flash"}]})
+            self._json({"data": [
+                {"id": "glm-5.3"},
+                {"id": "glm-5.3-flash"},
+                {"id": MockHandler.LONG_MODEL_ID, "context_length": 200000},
+                {"id": MockHandler.MEDIUM_MODEL_ID, "context_length": 200000},
+            ]})
         else:
             self._json({}, 404)
 
@@ -859,7 +886,7 @@ class App:
     def __init__(self, mix_args=("run", "--no-halt"), no_ghost=False,
                  context=524288, resume=None, images=False, cols=COLS,
                  rows=ROWS, base_url=None, unlabeled=False, model="glm-5.3",
-                 nickname="Sol", wizard=False):
+                 nickname="Sol", wizard=False, extra_profiles=()):
         self.cols, self.rows = cols, rows
         # wizard=True records that THIS run is supposed to boot into the
         # onboarding wizard (issue #147) — wait_boot's anti-wizard guard
@@ -921,22 +948,38 @@ class App:
         # scratch is bare, so the app boots into the first-run onboarding
         # wizard (ADR 0009), the capture's surface.
         if not wizard:
+            provider_block = (
+                "    providers: [{\n"
+                f"{label_field}"
+                f"      baseUrl: '{base}',\n"
+                f"      models: [{{ nickname: '{nickname}', model: '{model}'"
+                f"{context_field}{images_field} }}],\n"
+                "    }],\n"
+            )
+            # The #152 profile-tail fixture rides extra_profiles: names
+            # appended as providerless profiles (the struct's own default —
+            # they only need to LIST; the active profile stays 'demo').
+            # Array elements join with commas but never trail — the JSON5
+            # parser rejects a dangling array comma.
+            demo_block = (
+                "  {\n"
+                "    name: 'demo',\n"
+                f"{default_field}"
+                f"{provider_block}"
+                "  }"
+            )
+            extras = [
+                f"  {{\n    name: '{name}',\n    providers: [],\n  }}"
+                for name in extra_profiles
+            ]
+            profiles = ",\n".join([demo_block] + extras)
             with open(f"{scratch}/dashfloat/settings.json5", "w") as f:
                 f.write(
                     "{\n"
                     "  configVersion: 3,\n"
                     "  defaultProfile: 'demo',\n"
                     "  yourName: 'demo',\n"
-                    "  profiles: [{\n"
-                    "    name: 'demo',\n"
-                    f"{default_field}"
-                    "    providers: [{\n"
-                    f"{label_field}"
-                    f"      baseUrl: '{base}',\n"
-                    f"      models: [{{ nickname: '{nickname}', model: '{model}'"
-                    f"{context_field}{images_field} }}],\n"
-                    "    }],\n"
-                    "  }],\n"
+                    f"  profiles: [{profiles}],\n"
                     "}\n"
                 )
             with open(f"{scratch}/dashfloat/keys.json5", "w") as f:
@@ -1506,6 +1549,63 @@ class App:
             "the fitting titled row vanished"
         print(f"claim  picker row caps at the popup's inner width: "
               f"{row.strip()[:70]}…")
+
+    # The #152 models-picker still: /model over the mock catalog — the
+    # scenario's model (the long custom-endpoint id, made CURRENT) and the
+    # medium id both carry context details. Asserted on the RENDERED rows
+    # before the still: the long id caps at the popup's inner width (50%
+    # of the inset area minus borders — 36 cells at 80 cols) with one `…`
+    # cut inside its tail, the medium id rides WHOLE while its context
+    # detail is what loses cells — the footer ladder's rule (drop the
+    # scaffolding, keep the payload) — and the stock fitting rows render
+    # whole.
+    def scenario_model_tail(self):
+        self.type("/model")
+        self.send(b"\r")
+        self.wait_for("Models", timeout=10)
+        time.sleep(0.6)                # a readable beat on the open picker
+
+        lines = self.text().splitlines()
+        long_id = MockHandler.LONG_MODEL_ID
+        medium_id = MockHandler.MEDIUM_MODEL_ID
+
+        row_long = next(l for l in lines if long_id[:20] in l)
+        assert long_id[:35] + "…" in row_long, \
+            f"the overlong model id did not cap at the inner width: {row_long!r}"
+        assert long_id not in self.text(), \
+            "the overlong model id rendered whole — the row is not capped"
+        assert "current" not in row_long, \
+            f"the marker outlived the payload it marks: {row_long!r}"
+
+        row_medium = next(l for l in lines if medium_id in l)
+        assert medium_id + " (200…" in row_medium, \
+            f"the context detail did not drop before the id: {row_medium!r}"
+        assert "glm-5.3-flash" in self.text(), \
+            "the fitting stock row vanished"
+        print(f"claim  models rows cap: {row_long.strip()[:50]}… / "
+              f"{row_medium.strip()!r}")
+
+    # The #152 profiles-picker still: /profile over the scratch settings'
+    # two profiles — the short 'demo' and the long fixture name. The name
+    # IS the row's payload: one `…` cut in its tail at the same inner
+    # width, the short name whole.
+    LONG_PROFILE_NAME = (
+        "personal-experimental-fine-tuning-and-vibe-coding-workflow")
+
+    def scenario_profile_tail(self):
+        self.type("/profile")
+        self.send(b"\r")
+        self.wait_for("Profiles", timeout=10)
+        time.sleep(0.6)                # a readable beat on the open picker
+
+        lines = self.text().splitlines()
+        row = next(l for l in lines if self.LONG_PROFILE_NAME[:20] in l)
+        assert self.LONG_PROFILE_NAME[:35] + "…" in row, \
+            f"the overlong profile name did not cap: {row!r}"
+        assert self.LONG_PROFILE_NAME not in self.text(), \
+            "the overlong profile name rendered whole — the row is not capped"
+        assert "demo" in self.text(), "the fitting profile row vanished"
+        print(f"claim  profiles rows cap: {row.strip()!r}")
 
     # The #147 wizard still: boot into the first-run wizard, walk to the
     # custom-URL typing step, and type a 124-cell draft. Asserted on the
@@ -2490,6 +2590,7 @@ def main():
                              "reading-session",
                              "resume-session", "resume-picker",
                              "picker-tail", "wizard-draft",
+                             "model-tail", "profile-tail",
                              "exit-print", "model-switch",
                              "title-dialog", "title-wide",
                              "idle-blink", "tab-complete",
@@ -2624,6 +2725,15 @@ def main():
             ],
             pin={"profile": "personal", "model": "glm-5.3",
                  "base_url": None})
+    elif args.scenario == "model-tail":
+        # The #152 models-picker fixture rides the mock catalog (the two
+        # appended ids); making the LONG id the settings' model marks it
+        # `· current` — the marker and detail ride after the payload.
+        model = MockHandler.LONG_MODEL_ID
+    elif args.scenario == "profile-tail":
+        # The #152 profiles-picker fixture: the scratch settings carry a
+        # second, overlong profile name (providerless — it only lists).
+        pass
 
     if context is None and args.scenario not in ("stock-compact", "default-window"):
         context = 524288
@@ -2635,7 +2745,9 @@ def main():
               base_url=args.base_url or base_url, unlabeled=args.unlabeled,
               model=args.model or model,
               nickname=args.nickname or "Sol",
-              wizard=args.scenario == "wizard-draft")
+              wizard=args.scenario == "wizard-draft",
+              extra_profiles=(App.LONG_PROFILE_NAME,)
+              if args.scenario == "profile-tail" else ())
 
     def assert_claims():
         if args.style_claim:
@@ -2724,6 +2836,14 @@ def main():
                 # The #146 tail still: asserts on the rendered picker row
                 # before the generic tail shoot fires.
                 app.scenario_picker_tail()
+            elif args.scenario == "model-tail":
+                # The #152 models still: asserts on the rendered rows
+                # before the generic tail shoot fires.
+                app.scenario_model_tail()
+            elif args.scenario == "profile-tail":
+                # The #152 profiles still: asserts on the rendered row
+                # before the generic tail shoot fires.
+                app.scenario_profile_tail()
             elif args.scenario == "wizard-draft":
                 # The #147 wizard still: asserts on the rendered input row
                 # before the generic tail shoot fires.

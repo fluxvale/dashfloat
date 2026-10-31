@@ -36,6 +36,12 @@
   popup's inner width (metadata tail drops first), and the wizard's input
   lines tail-fit so the block cursor stays on screen; see
   [Amendment (2026-11-01, issues #146 + #147): the width stragglers](#amendment-2026-11-01-issues-146--147-the-width-stragglers)
+  below); **amended again 2026-11-01**
+  ([issue #152](https://github.com/fluxvale/dashfloat/issues/152) — the
+  width class closes: the model/profile picker rows cap at their popup's
+  inner width and the class sweep's fourth surface, the choice widget's
+  rows, caps at the composer box's; see
+  [Amendment (2026-11-01, issue #152): the width class closes](#amendment-2026-11-01-issue-152-the-width-class-closes)
   below).
 - **Date:** 2026-10-29
 - **Implements:** [issue #66](https://github.com/fluxvale/dashfloat/issues/66),
@@ -540,3 +546,54 @@ this records where they were still not applied. **Amends** [ADR
   masked draft overflows the row exactly the same way. This is the
   attach row's and title dialog's rule applied to the last cursor
   surface that lacked it.
+
+## Amendment (2026-11-01, issue #152): the width class closes
+
+**Status:** Accepted
+([issue #152](https://github.com/fluxvale/dashfloat/issues/152), found by
+#150's hostile review — the class's third sibling and its closure). The
+[#146 + #147 amendment](#amendment-2026-11-01-issues-146--147-the-width-stragglers)
+settled the class; this records its last two applications and the sweep
+that closed it. **Amends** [ADR 0020](0020-command-surface.md)'s
+picker-popup clause (the model/profile pickers' rows gain one rendering
+rule; composition and key handling unchanged) and [ADR
+0028](0028-choice-widget-and-ask-user.md)'s long-labels clip (replaced
+by the same fit).
+
+- **The model/profile picker rows cap at their popup's render-time inner
+  width.** The models row (`id (context detail) · current`) and the
+  profiles row (the bare name) are fit by `Wrap.fit_head` against the
+  popup the renderer actually draws (50% of the inset area, truncating
+  division, minus borders — 36 cells at 80 cols; the popup width and the
+  cap budget derive from one constant). **Drop order when the budget is
+  tight: the `· current` marker, then the context detail — the
+  rightmost scaffolding — lose cells first; the id is the payload and
+  the last to lose cells, and when the id ALONE overflows, one `…` cut
+  lands in its tail** (the head, where model ids are distinguished,
+  survives). The profile name IS the payload — no scaffolding exists to
+  drop first. The #146 mechanism, unchanged: one plain string in a
+  clipping `List`, one cut, no span ladder.
+- **The wider-percent alternative was rejected.** The session picker
+  took 85% because its four-group rows run long on typical rows; the
+  model/profile row is one label whose typical form fits the 36-cell
+  inner at 80 cols, and the fit makes any width safe — the cut, not the
+  clip, is what matters. No evidence in hand demands more cells; the
+  historical 50% stands.
+- **The class sweep's fourth surface: the choice widget's rows.** ADR
+  0028 recorded that long option labels and descriptions "clip at the
+  box's width" — model-authored and unbounded, the exact class. The
+  question, each option label, and each description now head-fit at the
+  composer box's render-time inner width (minus the marker/checkbox or
+  indent cells, which survive the cut), `Wrap.fit_head` by cells — the
+  silently eaten tail becomes an honest `…`, and the count-based height
+  arithmetic gains a guarantee it never had (a fitted row can never wrap
+  past its counted row). Motion captures for this surface wait on the
+  rig's episode queue (issue #143); the fit is pinned by cell-level
+  tests.
+- **The sweep itself** (grep for the pre-#148 naive-width patterns plus
+  a read of every row/label surface): no other uncapped surface
+  remains. The surviving `String.length`/`String.slice` sites are
+  content caps (bounded strings feeding wrapping renderers) or string
+  parsing, never display-width fits; the slash-command popup's rows are
+  static registry text verified to fit its 70% popup at 80 cols
+  (#148's F1).

@@ -180,7 +180,11 @@ setup > phase.
   tool-yellow) and the spinner keeps stepping (an active phase).
 - Long option labels and descriptions clip at the box's width — the height
   arithmetic stays count-based (one logical row per line), recorded
-  imprecision; option COUNT is capped at 10 at validation.
+  imprecision; option COUNT is capped at 10 at validation. (The clip was
+  superseded 2026-11-01 by [ADR 0015](0015-input-surface-cursor-stats-ghost.md)'s
+  #152 amendment: every row head-fits at the box's inner width, `…`
+  marking the cut; the count-based arithmetic stands and gains a
+  no-wrap guarantee.)
 - The model can now block on the user mid-batch (the tool slot parks on
   `{:asking, _}`); a mode switch mid-ask does not touch the standing
   answer (the human's pending answer outranks the mode, ADR 0016 §3's
