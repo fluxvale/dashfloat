@@ -139,7 +139,10 @@ defmodule DashFloat.LLM.ChatStream do
         # Reasoning is transcript truth, never wire truth: DeepSeek-class
         # endpoints reject `reasoning_content` on INPUT assistant messages
         # (HTTP 400), so the field is dropped here and only here (issue #78).
-        messages: Enum.map(messages, &Map.delete(&1, :reasoning_content)),
+        # BOTH key spellings: live messages are atom-keyed, but a RESUMED
+        # transcript loads string-keyed (Jason) — dropping only the atom key
+        # would leak the thinking of every resumed reasoning session.
+        messages: Enum.map(messages, &Map.drop(&1, [:reasoning_content, "reasoning_content"])),
         tools: tools
       },
       headers: [

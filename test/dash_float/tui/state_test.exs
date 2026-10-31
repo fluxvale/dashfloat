@@ -2507,16 +2507,93 @@ defmodule DashFloat.TUI.StateTest do
       assert reasoning_entry(outside).meta.view == 3
     end
 
+    test "a selection below the expanded block clears; one above survives" do
+      # Blocks among filler rows: expand one and select around it.
+      base =
+        new_state()
+        |> State.stream_message({:entry, :system, "filler above"})
+        |> then(fn s ->
+          Enum.reduce(1..3, s, fn i, acc ->
+            acc
+            |> Map.put(:phase, :streaming)
+            |> State.stream_message({:reasoning, "block #{i} line one\nline two"}, 1_000)
+            |> State.stream_message({:phase, :idle}, 1_500)
+          end)
+        end)
+        |> State.stream_message({:entry, :system, "filler below"})
+
+      block_index = Enum.find_index(base.entries, &(&1.kind == :reasoning))
+
+      # Select BELOW the block, then expand it: the insertion shifts the
+      # selected rows — the selection clears (the resize precedent).
+      {anchored, _no_copy} = State.select_mouse(base, "down", 10, 20, [])
+      {dragged, _no_copy} = State.select_mouse(anchored, "drag", 10, 21, [])
+      assert dragged.selection != nil
+
+      expanded = press(dragged, "r", ["ctrl"])
+      assert expanded.selection == nil
+
+      # A selection entirely ABOVE the block is stable under the insertion.
+      {anchored_above, _no_copy} = State.select_mouse(expanded, "down", 10, 4, [])
+      {dragged_above, _no_copy} = State.select_mouse(anchored_above, "drag", 10, 5, [])
+      assert dragged_above.selection != nil
+
+      refolded = press(dragged_above, "r", ["ctrl"])
+      assert refolded.selection != nil
+      refute Enum.at(refolded.entries, block_index).meta.expanded?
+    end
+
+    test "a selection SPANNING the block's first row clears too (round-2 hole)" do
+      base =
+        new_state()
+        |> State.stream_message({:entry, :system, "row above the block"})
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:reasoning, "span target one\nspan target two"}, 1_000)
+        |> State.stream_message({:phase, :idle}, 1_500)
+        |> State.stream_message({:entry, :system, "row below the block"})
+
+      # Anchor on the system row ABOVE the block, drag DOWN into it: the
+      # selection spans the insertion — it must clear, not survive with
+      # shifted content under its highlight.
+      rows = Enum.reduce(base.entries, [], &(&2 ++ Enum.map(&1.lines, fn l -> flatten(l) end)))
+
+      block_top = Enum.find_index(rows, &String.starts_with?(&1, "◔"))
+
+      # Screen row = content row + log.y (margin 2 + status 1). Anchor on
+      # the system row ABOVE the block's blank separator — a row the OLD
+      # from-row predicate would have kept, so this test pins the spanning
+      # hole itself.
+      anchor_y = 3 + block_top - 2
+      into_y = 3 + block_top + 1
+
+      {anchored, _no_copy} = State.select_mouse(base, "down", 10, anchor_y, [])
+      spanning = elem(State.select_mouse(anchored, "drag", 10, into_y, []), 0)
+      assert spanning.selection != nil
+
+      expanded = press(spanning, "r", ["ctrl"])
+      assert expanded.selection == nil
+    end
+
     test "a wheel over a collapsed block scrolls the transcript (position scopes only the expanded window)" do
+      # A log long enough to scroll: a notch on the collapsed block's rows
+      # unfollows the transcript (the real contract) and never opens the
+      # block's inner window.
+      filler = {:entry, :system, Enum.map_join(1..40, "\n", &"row #{&1}")}
+
       state =
-        streaming()
+        new_state()
+        |> State.stream_message(filler)
+        |> Map.put(:phase, :streaming)
         |> long_thinking()
-        |> settled()
+        |> State.stream_message({:phase, :idle}, 9_000)
+
+      assert state.follow?
+      before = State.effective_scroll(state, 13)
 
       wheeled = State.wheel_scroll(state, :up, {10, 4})
       assert reasoning_entry(wheeled).meta.view == 0
-      # Nothing to scroll yet (the log fits); the view stays pinned.
-      assert wheeled.follow?
+      refute wheeled.follow?
+      assert State.effective_scroll(wheeled, 13) < before
     end
 
     test "Esc while focused and idle closes the block; Esc while streaming keeps its interrupt" do

@@ -1336,6 +1336,67 @@ defmodule DashFloat.AgentTest do
     assert Process.alive?(agent)
   end
 
+  @tag :tmp_dir
+  @tag :tmp_dir
+  test "a RESUMED transcript's reasoning never rides the wire (string keys, issue #78)", ctx do
+    # The resume path loads Jason-decoded, string-keyed messages — the wire
+    # strip must catch both spellings or every resumed reasoning session
+    # leaks its thinking (DeepSeek-class 400s).
+    server = start_server([final_episode("fresh")])
+
+    resume = %{
+      id: "01J8RESUMED0000000000000000",
+      pin: nil,
+      messages: [
+        %{"role" => "user", "content" => "think about elixir"},
+        %{
+          "role" => "assistant",
+          "content" => "the answer",
+          "reasoning_content" => "the stored thinking"
+        }
+      ]
+    }
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, resume: resume)
+    send(agent, {:prompt, self(), "again", []})
+
+    assert_receive {:sse_request, "POST", _, _, body}, 4_000
+
+    resumed_messages = request_messages(body)
+    assert Enum.all?(resumed_messages, &is_nil(&1["reasoning_content"]))
+  end
+
+  @tag :tmp_dir
+  test "a tool-batch turn persists its thinking beside the tool_calls", ctx do
+    thinking = for n <- 1..3, do: reasoning_frame("plan #{n} ")
+    args = %{"path" => "out/with-thinking.txt", "content" => "x"}
+
+    server =
+      start_server([
+        [
+          {:send, [@headers, frame("I will write it.")]},
+          {:send, thinking},
+          {:send, tool_frames("call_r", "write_file", [Jason.encode!(args)])},
+          {:send, "data: [DONE]\n\n"}
+        ],
+        final_episode("done")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :unchained, session_dir: sessions)
+    send(agent, {:prompt, self(), "write it", []})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+    assert_receive {:tool_preview, %{id: "call_r"}}, 2_000
+
+    # The dangling batch write carries the thinking with the tool_calls.
+    session = load_own_session(sessions, agent)
+    batch = Enum.find(session.messages, &is_map_key(&1, "tool_calls"))
+
+    assert batch["role"] == "assistant"
+    assert batch["content"] == "I will write it."
+    assert batch["reasoning_content"] == "plan 1 plan 2 plan 3 "
+  end
+
   test "a stream_done without the reasoning key is read as no thinking" do
     server = start_server([final_episode("unused")])
     {agent, _sup} = start_agent(server, System.tmp_dir!())

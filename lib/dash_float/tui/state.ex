@@ -2361,11 +2361,32 @@ defmodule DashFloat.TUI.State do
               lines: reasoning_display(meta, log_width(state))
           })
 
-        reveal_reasoning(%{state | entries: entries}, index)
+        %{state | entries: entries}
+        |> clear_selection_from(index)
+        |> reveal_reasoning(index)
 
       %{kind: :reasoning, meta: %{expanded?: true}} ->
         collapse_reasoning(state, index)
     end
+  end
+
+  # Expanding inserts rows at the block; any selection whose rows reach AT
+  # or BELOW the insertion would highlight (and copy) the WRONG content
+  # after the shift — including one that merely SPANS into it from above —
+  # so the geometry moving under it clears it (the resize precedent). Only
+  # a selection that ENDS entirely before the block is stable: rows below
+  # an anchor never move it.
+  defp clear_selection_from(%{selection: nil} = state, _index), do: state
+
+  defp clear_selection_from(%{selection: selection} = state, index) do
+    {_from, {to_row, _tc}} = Selection.range(selection)
+
+    top =
+      state.entries
+      |> Enum.take(index)
+      |> Enum.reduce(0, &(&2 + length(&1.lines)))
+
+    if to_row >= top, do: %{state | selection: nil}, else: state
   end
 
   defp collapse_reasoning(state, index) do
@@ -2375,7 +2396,10 @@ defmodule DashFloat.TUI.State do
       %{kind: :reasoning, meta: meta} ->
         meta = %{meta | expanded?: false}
         entry = %{entry | meta: meta, lines: reasoning_display(meta, log_width(state))}
-        %{state | entries: List.replace_at(state.entries, index, entry)}
+
+        state
+        |> Map.put(:entries, List.replace_at(state.entries, index, entry))
+        |> clear_selection_from(index)
     end
   end
 
@@ -2797,7 +2821,8 @@ defmodule DashFloat.TUI.State do
   defp scoped_reasoning_index(state, {x, y}) do
     %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
 
-    if y >= log.y and y < log.y + max(log.height, 0) and x >= log.x do
+    if y >= log.y and y < log.y + max(log.height, 0) and x >= log.x and
+         x < log.x + max(log.width, 0) do
       row = effective_scroll(state, log.height) + (y - log.y)
 
       case entry_at_row(state, row) do

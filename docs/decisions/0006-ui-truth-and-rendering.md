@@ -866,7 +866,7 @@ nothing else in this ADR moves. Capture and persistence are
 ### Live behavior (streaming)
 
 - **The live block grows in a tail-following window**: blank separator, a
-  live header `◔ Thinking · <deltas>`, then the LAST eight wrapped rows of
+  live header `◔ Thinking · <N> tokens` (the running delta count), then the LAST eight wrapped rows of
   what has streamed — always the tail, Octofriend's own auto-follow (there
   is deliberately NO inner scrolling while live; the content is moving).
   Rendering rides the tick's bounded refresh and the same 64 KiB live cap

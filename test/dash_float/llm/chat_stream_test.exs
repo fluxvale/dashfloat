@@ -1261,10 +1261,16 @@ defmodule DashFloat.LLM.ChatStreamTest do
   end
 
   test "episode accumulations past 4 MiB abort the stream" do
-    # ~9 half-MiB content frames: no single frame trips the 1 MiB frame cap
-    # and the stream never idles — only the episode cap stops it.
+    # ~9 half-MiB frames — three of them REASONING (issue #78): thinking
+    # bytes count toward the episode budget exactly like content bytes. No
+    # single frame trips the 1 MiB frame cap and the stream never idles —
+    # only the episode cap stops it.
     blob = String.duplicate("x", 512 * 1024)
-    frames = Enum.map(1..9, fn _i -> frame(blob) end)
+
+    frames =
+      Enum.map(1..9, fn i ->
+        if rem(i, 3) == 0, do: reasoning_frame("reasoning_content", blob), else: frame(blob)
+      end)
 
     server =
       start_server([
