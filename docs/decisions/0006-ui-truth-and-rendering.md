@@ -50,7 +50,8 @@ UI strings). Out of scope (binding, from the issue): syntax highlighting
 inside code blocks, resizable panes, mouse support, modal/confirmation UI.
 
 Dependency facts verified from source before deciding (`ex_ratatui` 0.17.1,
-`earmark_parser` 1.4.46):
+`earmark_parser` 1.4.46; the `ex_ratatui` facts re-verified unchanged at the
+0.19.0 bump, 2026-10-31):
 
 - `ExRatatui.Widgets.Markdown` exists but is a NIF (`tui-markdown` crate,
   pulldown-cmark + syntect) with a hardcoded `base16-ocean.dark` syntect
@@ -709,6 +710,11 @@ notes) are read against this amendment, not independently.
   (pty probe over 3 s: 6 frame-bursts, 297 bytes — the one-cell cursor diff;
   `scripts/capture.py probe`). That is the honest cost the owner accepted:
   idle is no longer zero renders, and this ADR no longer claims it is.
+  Re-measured at the `ex_ratatui` 0.19.0 bump (2026-10-31): **identical
+  numbers** — 6 frame-bursts / 297 B over 3 s, fresh and after an exchange,
+  three runs each; the upgrade changed neither the blink's scheduling nor
+  its render cost, and frame-hash comparison of pty captures shows the
+  rendered output byte-identical.
 - **Dedicated timer, not the tick.** Riding the existing 125 ms activity
   tick would re-render at 8 Hz idle — 4× the accepted cost — and couple the
   blink to spinner bookkeeping. The blink owns its own timer, the same

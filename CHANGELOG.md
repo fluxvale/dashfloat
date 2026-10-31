@@ -10,6 +10,12 @@ version bump — the release-notes template in `.github/workflows/release.yml`
 and this changelog must never drift. The date of a pending section is filled in
 when its tag is cut.
 
+## [Unreleased]
+
+### Changed
+
+- Dependency bump: `ex_ratatui` 0.17.1 → 0.19.0 (`rustler_precompiled` rides to 0.10.1; OTP 29 now loads its own NIF-2.18 precompile instead of the 2.17 ABI build). Rendered output verified pixel-identical by frame-hash comparison of pty captures, and the idle cursor blink re-measured at its recorded 2.0 renders/s / ~50 B per frame.
+
 ## [0.4.0] - 2026-10-31
 
 ### Added

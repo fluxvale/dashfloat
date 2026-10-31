@@ -61,7 +61,7 @@ defmodule DashFloat.MixProject do
   defp deps do
     [
       {:earmark_parser, "~> 1.4"},
-      {:ex_ratatui, "~> 0.17.1"},
+      {:ex_ratatui, "~> 0.19.0"},
       {:jason, "~> 1.4"},
       # JSON5 config files (ADR 0008). json5 pins decimal ~2.0.0 — exactly
       # 2.0.0, which carries two MEDIUM DoS advisories; override to the fixed

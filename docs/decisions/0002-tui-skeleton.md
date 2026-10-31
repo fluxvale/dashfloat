@@ -10,7 +10,9 @@
 Phase 1 builds the `ex_ratatui` application shell: status bar, scrollable log,
 multi-line input — no LLM, streaming, or tool execution. Before designing, the
 `ex_ratatui` 0.17.1 surface was read from source and probed empirically (a
-throwaway script under `mix run`, not committed). Facts that shaped this ADR:
+throwaway script under `mix run`, not committed; the facts below were
+re-verified unchanged at the 0.19.0 bump, 2026-10-31). Facts that shaped this
+ADR:
 
 - `ExRatatui.App` is a LiveView-style behaviour — `mount/1`, `render/2`,
   `handle_event/2`, `handle_info/2`, `terminate/2` — run by `ExRatatui.Server`,

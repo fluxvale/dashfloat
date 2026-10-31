@@ -24,7 +24,7 @@ workloads (streaming, tool execution, session management).
 | Concern | Choice | Pin | Verified notes |
 | --- | --- | --- | --- |
 | Language / runtime | Elixir / Erlang OTP | `mix.exs` requires `~> 1.20.0`; dev runs 1.20.4 / OTP 29; CI floats `1.20.x` (currently 1.20.4) | ex_ratatui supports Elixir 1.17+, OTP 26–29 |
-| TUI | `ex_ratatui` | `~> 0.17.1` | Rustler-backed ratatui bindings; precompiled NIFs for OTP 26–29 (ABI 2.17 loads on OTP 29) |
+| TUI | `ex_ratatui` | `~> 0.19.0` | Rustler-backed ratatui bindings; precompiled NIFs for OTP 26–29 (its own NIF-2.18 build on OTP 29 since 0.18) |
 | HTTP + SSE | `req` | `~> 0.7.5` | stable line (0.8 is release-candidate only) |
 | JSON | `jason` | `~> 1.4` | 1.4.5 is the latest stable |
 | Distribution | core `mix release` | built into Elixir | per-platform tarballs + installer + Homebrew; see [ADR 0010](0010-release-packaging.md) |
