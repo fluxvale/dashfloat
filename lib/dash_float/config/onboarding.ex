@@ -24,11 +24,14 @@ defmodule DashFloat.Config.Onboarding do
   side-effecting actions — `action` is a single action or an ordered LIST of
   actions, executed in order. Actions: `{:write_key, {profile, base_url,
   value}}` (atomic 0600 merge into keys.json5), `{:fetch_models, {base_url,
-  raw_key}}` (the standing catalog fetch), `{:write_settings, map}` (atomic
-  0600 write), `:finish` (hand the freshly-written config to the app),
-  `:quit` (abort — nothing further is written). `models_arrived/2` feeds the
-  fetch result back. Key inputs render masked; this module never echoes a
-  value.
+  raw_key, epoch}}` (the standing catalog fetch, stamped with the fetch
+  generation that issued it), `{:write_settings, map}` (atomic 0600
+  write), `:finish` (hand the freshly-written config to the app),
+  `:quit` (abort — nothing further is written). `models_arrived/3` feeds
+  the fetch result back tagged with the request's provider identity
+  `{base_url, epoch}` — a result is accepted only when the tag matches
+  the pending provider and the current generation (issue #87). Key
+  inputs render masked; this module never echoes a value.
   """
 
   alias DashFloat.Config.Catalog
@@ -73,7 +76,8 @@ defmodule DashFloat.Config.Onboarding do
           providers: [provider_draft()],
           mcp: [%{name: String.t(), command: String.t(), args: [String.t()], token: nil | :ref}],
           memory: %{optional(step()) => %{draft: String.t(), choice: non_neg_integer()}},
-          note: String.t() | nil
+          note: String.t() | nil,
+          fetch_epoch: non_neg_integer()
         }
 
   # Inspected standalone (logs, IEx): the draft, the pending provider, and
@@ -101,7 +105,12 @@ defmodule DashFloat.Config.Onboarding do
             # The manual-fallback screen's gentle note (issue #64): the
             # fetch failure's short class phrase — informational, never an
             # error, and never response-body content.
-            note: nil
+            note: nil,
+            # Monotonic fetch generation (issue #87): every key-enter's
+            # fetch issues the next one; a result belongs to the current
+            # generation only when its tag's epoch equals this. Resets
+            # with the struct — never persisted, never reused within a run.
+            fetch_epoch: 0
 
   @doc "The initial wizard state."
   @spec new() :: t()
@@ -242,12 +251,26 @@ defmodule DashFloat.Config.Onboarding do
         {to_manual(state), nil}
 
       value ->
+        # The fetch's generation (issue #87): this enter issues epoch+1,
+        # the action carries it, and only a result tagged with both the
+        # pending provider and this epoch can feed the picker — a slower
+        # superseded fetch (previous provider, or this endpoint under the
+        # pre-edit key) is refused downstream.
+        epoch = state.fetch_epoch + 1
+
         actions = [
           {:write_key, {profile, pending.base_url, value}},
-          {:fetch_models, {pending.base_url, value}}
+          {:fetch_models, {pending.base_url, value, epoch}}
         ]
 
-        {%{step(state, :fetching, "") | pending: %{pending | key: value}, fetched: []}, actions}
+        landed = %{
+          step(state, :fetching, "")
+          | pending: %{pending | key: value},
+            fetched: [],
+            fetch_epoch: epoch
+        }
+
+        {landed, actions}
     end
   end
 
@@ -389,17 +412,36 @@ defmodule DashFloat.Config.Onboarding do
   defp step_key(state, :done, _code), do: {state, nil}
 
   @doc """
-  Feeds the `/models` fetch result back into the picker: ids populate the
-  picker, an empty list or any failure falls back to manual entry with a
-  gentle `note` on screen (ADR 0009: the fetch is failure-soft, never an
-  error screen). The reason is a class phrase from the fetch layer — an HTTP
-  status or an error class — never response-body content. Stale results (the
-  wizard moved on) are inert.
+  Feeds the `/models` fetch result back into the picker. `tag` is the
+  result's provider identity — `{base_url, epoch}`, stamped by the task
+  at creation (issue #87) — and the picker populates only when it matches
+  the pending provider AND the current fetch generation. On a match: ids
+  populate the picker, an empty list or any failure falls back to manual
+  entry with a gentle `note` on screen (ADR 0009: the fetch is
+  failure-soft, never an error screen). The reason is a class phrase from
+  the fetch layer — an HTTP status or an error class — never
+  response-body content.
+
+  A tag mismatch — a superseded generation's result landing while this
+  one waits — is INERT: the wizard stays at `:fetching` and the current
+  generation's own result decides the screen. It is guaranteed to land
+  (`Catalog.fetch/3` never raises; a failed task spawn degrades to an
+  error result), so neither refetching (a duplicate is already in
+  flight) nor surfacing the refusal (noise with no remedy) is wanted.
+  Results arriving after the wizard moved on are inert, as before.
   """
-  @spec models_arrived(t(), {:ok, [Catalog.entry()]} | {:error, String.t()} | :error | term()) ::
-          t()
-  def models_arrived(%__MODULE__{step: :fetching} = state, {:ok, entries})
-      when is_list(entries) do
+  @spec models_arrived(
+          t(),
+          {String.t(), non_neg_integer()},
+          {:ok, [Catalog.entry()]} | {:error, String.t()} | :error | term()
+        ) :: t()
+  def models_arrived(
+        %__MODULE__{step: :fetching, pending: %{base_url: base_url}, fetch_epoch: epoch} =
+          state,
+        tag,
+        {:ok, entries}
+      )
+      when tag == {base_url, epoch} and is_list(entries) do
     ids = Enum.map(entries, & &1.model)
 
     if ids == [] do
@@ -416,14 +458,30 @@ defmodule DashFloat.Config.Onboarding do
     end
   end
 
-  def models_arrived(%__MODULE__{step: :fetching} = state, {:error, reason})
-      when is_binary(reason),
+  def models_arrived(
+        %__MODULE__{step: :fetching, pending: %{base_url: base_url}, fetch_epoch: epoch} =
+          state,
+        tag,
+        {:error, reason}
+      )
+      when tag == {base_url, epoch} and is_binary(reason),
       do: manual_with_note(state, "Couldn't fetch the model list — " <> reason <> ".")
 
-  def models_arrived(%__MODULE__{step: :fetching} = state, _failure),
-    do: manual_with_note(state, "Couldn't fetch the model list.")
+  def models_arrived(
+        %__MODULE__{step: :fetching, pending: %{base_url: base_url}, fetch_epoch: epoch} =
+          state,
+        tag,
+        _failure
+      )
+      when tag == {base_url, epoch},
+      do: manual_with_note(state, "Couldn't fetch the model list.")
 
-  def models_arrived(%__MODULE__{} = state, _result), do: state
+  # A superseded generation's result (issue #87): wrong provider, or this
+  # endpoint under an earlier key. Inert — the current generation's own
+  # result still lands and decides the screen.
+  def models_arrived(%__MODULE__{step: :fetching} = state, _superseded, _result), do: state
+
+  def models_arrived(%__MODULE__{} = state, _tag, _result), do: state
 
   @doc """
   A wizard write refused (issue #39): the TUI runner feeds the config layer's

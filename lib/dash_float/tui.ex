@@ -239,8 +239,8 @@ defmodule DashFloat.TUI do
   defp run_action({:write_key, {profile, base_url, value}}, state),
     do: write_wizard_key(state, profile, base_url, value)
 
-  defp run_action({:fetch_models, {base_url, raw_key}}, state),
-    do: fetch_wizard_models(state, base_url, raw_key)
+  defp run_action({:fetch_models, {base_url, raw_key, epoch}}, state),
+    do: fetch_wizard_models(state, base_url, raw_key, epoch)
 
   defp run_action({:write_settings, doc}, state),
     do: write_wizard_settings(state, doc)
@@ -439,10 +439,11 @@ defmodule DashFloat.TUI do
   def handle_info({:catalog, results}, state),
     do: schedule(State.catalog_arrived(state, results))
 
-  # The wizard's /models fetch landed (ADR 0009): feeds the picker; any
-  # failure already degraded to manual entry by the fetch's fail-open.
-  def handle_info({:wizard_models, result}, state),
-    do: schedule(State.models_arrived(state, result))
+  # The wizard's /models fetch landed (ADR 0009): `tag` is the request's
+  # provider identity (issue #87) — the picker feeds only on the current
+  # generation's result; a superseded list is refused inside models_arrived.
+  def handle_info({:wizard_models, tag, result}, state),
+    do: schedule(State.models_arrived(state, tag, result))
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     {state, _verdict} = State.agent_down(state, ref, reason)
@@ -906,15 +907,31 @@ defmodule DashFloat.TUI do
   end
 
   # The wizard's /models fetch: a supervised task so a 5 s timeout never
-  # blocks the UI; the result lands as `{:wizard_models, _}`. A `$ENV_VAR`
-  # key resolves here — the wizard stores references verbatim.
-  defp fetch_wizard_models(%State{} = state, base_url, raw_key) do
+  # blocks the UI; the result lands as `{:wizard_models, tag, _}` carrying
+  # the request's identity — {base_url, fetch epoch} (issue #87) — so a
+  # superseded generation's list can never feed the picker. A `$ENV_VAR`
+  # key resolves here — the wizard stores references verbatim. A dead
+  # task supervisor EXITS the start call (the start_suggest form): caught,
+  # and the epoch still gets its error result — the wizard can never hang
+  # at :fetching waiting for a delivery that will not come.
+  defp fetch_wizard_models(%State{} = state, base_url, raw_key, epoch) do
     parent = self()
     key = resolve_wizard_key(raw_key)
+    tag = {base_url, epoch}
 
-    Task.Supervisor.start_child(DashFloat.TaskSupervisor, fn ->
-      send(parent, {:wizard_models, Catalog.fetch(base_url, key)})
-    end)
+    started =
+      try do
+        Task.Supervisor.start_child(DashFloat.TaskSupervisor, fn ->
+          send(parent, {:wizard_models, tag, Catalog.fetch(base_url, key)})
+        end)
+      catch
+        :exit, _reason -> :error
+      end
+
+    case started do
+      {:ok, _pid} -> :ok
+      _no_task -> send(self(), {:wizard_models, tag, {:error, "could not start"}})
+    end
 
     state
   end

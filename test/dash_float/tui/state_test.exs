@@ -3144,13 +3144,15 @@ defmodule DashFloat.TUI.StateTest do
       keys = ["enter", "enter", "enter", "enter", "k", "enter", "enter"]
 
       wizard = Enum.reduce(keys, start, &step_wizard/2)
+      # The current generation's tag (issue #87): pending provider, epoch.
+      tag = {wizard.pending.base_url, wizard.fetch_epoch}
 
       state = setup_state(setup: wizard)
 
-      fed = State.models_arrived(state, {:ok, [%{model: "m1", context: nil}]})
+      fed = State.models_arrived(state, tag, {:ok, [%{model: "m1", context: nil}]})
       assert fed.setup.step == :model_pick
 
-      stale = State.models_arrived(setup_state(), {:ok, [%{model: "late"}]})
+      stale = State.models_arrived(setup_state(), tag, {:ok, [%{model: "late"}]})
       assert stale.setup == nil
     end
 

@@ -462,6 +462,105 @@ defmodule DashFloat.TUITest do
     assert manual.setup.step == :model_manual
   end
 
+  test "a wrong-provider fetch result never populates the picker (issue #87)" do
+    # The standin answers THIS provider's fetch; a second, stale delivery —
+    # byte-shape what a previous provider's still-live task sends today —
+    # races it. The stale list must never reach the picker.
+    script = [http_ok(models_body(["glm-fresh"])), :close]
+    {:ok, server} = SSEServer.start_link(script)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    base = SSEServer.base_url(server)
+
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-87-wrong-provider"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    for ch <- String.codepoints(base), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("PLACEHOLDER-87"), do: press(pid, ch)
+    press(pid, "enter")
+
+    eventually(pid, fn s -> s.setup.step == :fetching end)
+    send(pid, {:wizard_models, {:ok, [%{model: "STALE-LIST", context: nil}]}})
+
+    # Only the standin's own answer may populate the picker.
+    landed = eventually(pid, fn s -> s.setup.step == :model_pick end)
+
+    assert landed.setup.fetched == [%{model: "glm-fresh", context: nil}]
+    assert screen_text(landed) =~ "glm-fresh"
+    refute screen_text(landed) =~ "STALE-LIST"
+  end
+
+  test "the stale key's late list never wins the refetch (issue #87, finding 2)" do
+    # Two fetch generations over ONE endpoint — the issue's executed repro.
+    # k1's fetch is slow (the standin holds its connection), the user esc's
+    # to the key, edits, and k2's refetch fires. k1's STALE list lands while
+    # k2's generation waits: it must be refused — only k2's answer, from
+    # k2's key, may populate.
+    k1_slow = [{:sleep, 700} | [http_ok(models_body(["STALE-K1-LIST"]))]]
+    k2 = [http_ok(models_body(["glm-k2"])), :close]
+    {:ok, server} = SSEServer.start_link(:per_connection, [k1_slow, k2])
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    base = SSEServer.base_url(server)
+
+    {:ok, pid} = esc_tui(wizard_dir("dashfloat-tui-87-stale-key"))
+
+    press(pid, "enter")
+    press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    for ch <- String.codepoints(base), do: press(pid, ch)
+    press(pid, "enter")
+    press(pid, "enter")
+    for ch <- String.codepoints("k-1"), do: press(pid, ch)
+    press(pid, "enter")
+
+    eventually(pid, fn s -> s.setup.step == :fetching and s.setup.fetch_epoch == 1 end)
+
+    # Esc to manual, back to the key, and re-key as k-2: generation 2.
+    press(pid, "esc")
+    eventually(pid, fn s -> s.setup.step == :model_manual end)
+    press(pid, "esc")
+
+    rekeyed =
+      eventually(pid, fn s -> s.setup.step == :key and s.setup.draft == "k-1" end)
+
+    assert rekeyed.setup.fetch_epoch == 1
+
+    press(pid, "backspace")
+    press(pid, "2")
+    press(pid, "enter")
+
+    eventually(pid, fn s -> s.setup.step == :fetching and s.setup.fetch_epoch == 2 end)
+
+    # Both fetches really ran; the refetch carried the new key.
+    assert_receive {:sse_request, "GET", "/models", %{"authorization" => "Bearer k-1"}, _},
+                   1_000
+
+    assert_receive {:sse_request, "GET", "/models", %{"authorization" => "Bearer k-2"}, _},
+                   3_000
+
+    # The standin answers k1 first (its sleep expires, and connection two is
+    # only accepted after connection one closes) — the STALE list lands
+    # while generation two waits, then k2's answer lands. The picker ends
+    # up holding ONLY k2's list.
+    landed =
+      eventually(
+        pid,
+        fn s -> s.setup.step == :model_pick and s.setup.fetch_epoch == 2 end,
+        400
+      )
+
+    assert landed.setup.fetched == [%{model: "glm-k2", context: nil}]
+    assert screen_text(landed) =~ "glm-k2"
+    refute screen_text(landed) =~ "STALE-K1-LIST"
+  end
+
   test "esc at the picker returns to key with the key draft intact (issue #65)" do
     script = [http_ok(models_body(["glm-loopback"])), :close]
     {:ok, server} = SSEServer.start_link(script)
@@ -1052,7 +1151,14 @@ defmodule DashFloat.TUITest do
     # A backslash (or both quote kinds) cannot be stored in the JSON5
     # dialect: write_keys_entry refuses, keys.json5 stays absent, and the
     # wizard shows the refusal AT the key step — the draft restored (masked),
-    # the hint no longer promising a write that did not happen.
+    # the hint no longer promising a write that did not happen. The wizard
+    # runs against the loopback standin (hermetic, issue #87's rider): the
+    # retry's fetch answers from the script, deterministically.
+    script = [http_ok(models_body(["glm-loopback"])), :close]
+    {:ok, server} = SSEServer.start_link(script)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    base = SSEServer.base_url(server)
+
     dir = wizard_dir("dashfloat-tui-p33")
 
     {:ok, pid} =
@@ -1062,9 +1168,14 @@ defmodule DashFloat.TUITest do
         config_dir: dir
       )
 
-    # To the key step (zai preset, suggested label), then a backslash key.
+    # To the key step (custom provider at the standin, suggested label),
+    # then a backslash key.
     press(pid, "enter")
     press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    for ch <- String.codepoints(base), do: press(pid, ch)
     press(pid, "enter")
     press(pid, "enter")
     for ch <- String.codepoints("k-1\\9"), do: press(pid, ch)
@@ -1089,28 +1200,35 @@ defmodule DashFloat.TUITest do
     refute screen =~ "k-1"
 
     # Fix in place: backspace out the backslash, re-accept — the retry writes
-    # and its fetch fires (issue #64). No loopback stands in here, so the
-    # wizard leaves :fetching for whichever arm the live endpoint yields.
+    # and its fetch fires (issue #64) against the standin: the picker
+    # populates with the scripted list.
     press(pid, "backspace")
     press(pid, "backspace")
     press(pid, "9")
     press(pid, "enter")
 
-    eventually(
-      pid,
-      fn s -> s.setup != nil and s.setup.step != :fetching end,
-      600
-    )
+    landed =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :model_pick
+      end)
 
-    zai = "https://api.z.ai/api/coding/paas/v4"
-    assert {:ok, %{"personal" => %{^zai => "k-19"}}} = JSON5.read_map(keys_file)
+    assert landed.setup.fetched == [%{model: "glm-loopback", context: nil}]
+
+    assert {:ok, %{"personal" => %{^base => "k-19"}}} = JSON5.read_map(keys_file)
   end
 
   test "a pre-existing unquotable keys value refuses naming it; the hint matches the remedy (issue #42)" do
     # A hand-edited keys.json5 holding a backslashed value on ANOTHER
     # endpoint: the wizard's own entry is clean, so the refusal must blame
     # the stored value — and the bounce hint must not claim that fixing the
-    # typed key fixes the write (the error/remedy contradiction).
+    # typed key fixes the write (the error/remedy contradiction). The
+    # wizard runs against the loopback standin (hermetic, issue #87's
+    # rider): the retry's fetch answers from the script, deterministically.
+    script = [http_ok(models_body(["glm-loopback"])), :close]
+    {:ok, server} = SSEServer.start_link(script)
+    on_exit(fn -> DashFloat.TestTeardown.stop(server) end)
+    base = SSEServer.base_url(server)
+
     dir = wizard_dir("dashfloat-tui-p42")
     keys_file = Path.join(dir, "keys.json5")
     File.write!(keys_file, "{personal: {'https://other/v1': 'a\\b'}}")
@@ -1122,9 +1240,14 @@ defmodule DashFloat.TUITest do
         config_dir: dir
       )
 
-    # To the key step (zai preset, suggested label), then a CLEAN key.
+    # To the key step (custom provider at the standin, suggested label),
+    # then a CLEAN key.
     press(pid, "enter")
     press(pid, "enter")
+    press(pid, "down")
+    press(pid, "down")
+    press(pid, "enter")
+    for ch <- String.codepoints(base), do: press(pid, ch)
     press(pid, "enter")
     press(pid, "enter")
     for ch <- String.codepoints("clean-key"), do: press(pid, ch)
@@ -1147,22 +1270,21 @@ defmodule DashFloat.TUITest do
     assert File.read!(keys_file) == "{personal: {'https://other/v1': 'a\\b'}}"
 
     # Apply the remedy by hand, retry the same key — the write lands and its
-    # fetch fires (issue #64). The wizard leaves :fetching for whichever arm
-    # the live endpoint yields; the assertions below are about the file.
+    # fetch fires (issue #64) against the standin: the picker populates with
+    # the scripted list; the assertions below are about the file.
     File.write!(keys_file, "{personal: {'https://other/v1': 'ab'}}")
     press(pid, "enter")
 
-    eventually(
-      pid,
-      fn s -> s.setup != nil and s.setup.step != :fetching end,
-      600
-    )
+    landed =
+      eventually(pid, fn s ->
+        s.setup != nil and s.setup.step == :model_pick
+      end)
 
-    zai = "https://api.z.ai/api/coding/paas/v4"
+    assert landed.setup.fetched == [%{model: "glm-loopback", context: nil}]
 
     assert {:ok, %{"personal" => merged}} = JSON5.read_map(keys_file)
     assert merged["https://other/v1"] == "ab"
-    assert merged[zai] == "clean-key"
+    assert merged[base] == "clean-key"
   end
 
   defp wizard_dir(prefix) do
