@@ -156,6 +156,18 @@ Scenarios:
                 row second — ↓ moves, ⏎ adopts, and the replayed log
                 renders the adopted turns (still or GIF; the GIF is the
                 motion capture)
+    picker-tail the #146 tail still: /resume over a fitting titled row
+                and the issue's evidence row (37-cell preview · now ·
+                personal · glm-5.3 = 64 cells vs the popup's 62-cell
+                inner at 80 cols) — the row caps at the inner width, the
+                cut lands inside the model; asserted on the rendered row
+                before the still is written
+    wizard-draft
+                the #147 wizard still: boots the first-run wizard (no
+                scratch settings), walks to the custom-URL typing step,
+                types a 124-cell draft — the input line tail-fits (`…`
+                head-clip) so the block cursor stays on screen; asserted
+                on the rendered row before the still is written
     exit-print  the exit print (issue #127): one exchange persists and
                 auto-titles the session, Ctrl+Q exits, and the printed
                 command lands on the post-exit screen (the still); the
@@ -655,11 +667,14 @@ PICKER_MESSAGES = [
 ]
 
 
-def write_picker_fixture(scratch: str, title, age_seconds: int) -> str:
+def write_picker_fixture(scratch: str, title, age_seconds: int,
+                         messages=None, pin=None) -> str:
     """One /resume-picker fixture (issue #128): a session stamped
     `age_seconds` ago (the relative-time row reads a real bucket), titled
     when `title` is a string, else previewing its first question. The two
-    fixture turns are unique needles the capture can prove replayed."""
+    fixture turns are unique needles the capture can prove replayed.
+    `messages` overrides the stock turns and `pin` the demo pin (the #146
+    tail still wants an overlong first question on a long-profile pin)."""
     session_id = str(uuid.uuid4())
     sessions = f"{scratch}/dashfloat/sessions"
     os.makedirs(sessions, exist_ok=True)
@@ -668,8 +683,9 @@ def write_picker_fixture(scratch: str, title, age_seconds: int) -> str:
         "id": session_id,
         "created_at": time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age_seconds)),
-        "pin": {"profile": "demo", "model": "glm-5.3", "base_url": None},
-        "messages": PICKER_MESSAGES,
+        "pin": pin or {"profile": "demo", "model": "glm-5.3",
+                       "base_url": None},
+        "messages": messages if messages is not None else PICKER_MESSAGES,
     }
     if title is not None:
         body["title"] = title
@@ -843,8 +859,12 @@ class App:
     def __init__(self, mix_args=("run", "--no-halt"), no_ghost=False,
                  context=524288, resume=None, images=False, cols=COLS,
                  rows=ROWS, base_url=None, unlabeled=False, model="glm-5.3",
-                 nickname="Sol"):
+                 nickname="Sol", wizard=False):
         self.cols, self.rows = cols, rows
+        # wizard=True records that THIS run is supposed to boot into the
+        # onboarding wizard (issue #147) — wait_boot's anti-wizard guard
+        # (a wizard boot means the scratch config was missed) stands down.
+        self._wizard = wizard
         self.sink = None  # callable(bytes) set during read loop
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
@@ -897,26 +917,30 @@ class App:
         # whose window must resolve from seed/default (issue #111).
         images_field = ", images: true" if images else ""
         context_field = f", context: {context}" if context is not None else ""
-        with open(f"{scratch}/dashfloat/settings.json5", "w") as f:
-            f.write(
-                "{\n"
-                "  configVersion: 3,\n"
-                "  defaultProfile: 'demo',\n"
-                "  yourName: 'demo',\n"
-                "  profiles: [{\n"
-                "    name: 'demo',\n"
-                f"{default_field}"
-                "    providers: [{\n"
-                f"{label_field}"
-                f"      baseUrl: '{base}',\n"
-                f"      models: [{{ nickname: '{nickname}', model: '{model}'"
-                f"{context_field}{images_field} }}],\n"
-                "    }],\n"
-                "  }],\n"
-                "}\n"
-            )
-        with open(f"{scratch}/dashfloat/keys.json5", "w") as f:
-            f.write("{ demo: { '%s': 'capture-mock-key' } }\n" % base)
+        # wizard=True (issue #147): write NEITHER settings nor keys — the
+        # scratch is bare, so the app boots into the first-run onboarding
+        # wizard (ADR 0009), the capture's surface.
+        if not wizard:
+            with open(f"{scratch}/dashfloat/settings.json5", "w") as f:
+                f.write(
+                    "{\n"
+                    "  configVersion: 3,\n"
+                    "  defaultProfile: 'demo',\n"
+                    "  yourName: 'demo',\n"
+                    "  profiles: [{\n"
+                    "    name: 'demo',\n"
+                    f"{default_field}"
+                    "    providers: [{\n"
+                    f"{label_field}"
+                    f"      baseUrl: '{base}',\n"
+                    f"      models: [{{ nickname: '{nickname}', model: '{model}'"
+                    f"{context_field}{images_field} }}],\n"
+                    "    }],\n"
+                    "  }],\n"
+                    "}\n"
+                )
+            with open(f"{scratch}/dashfloat/keys.json5", "w") as f:
+                f.write("{ demo: { '%s': 'capture-mock-key' } }\n" % base)
 
         env = dict(os.environ)
         env.update({
@@ -1033,7 +1057,7 @@ class App:
             if self._total > 800 and self._alt:
                 quiet_since = quiet_since or time.monotonic()
                 if time.monotonic() - quiet_since >= 0.6:
-                    if "first run" in self.text():
+                    if "first run" in self.text() and not self._wizard:
                         raise RuntimeError(
                             "the app booted the onboarding wizard — "
                             "the scratch config was not picked up")
@@ -1455,6 +1479,61 @@ class App:
         self.wait_for("❯ fixture question two", timeout=10)
         self.wait_for("Fixture answer two, also replayed.", timeout=10)
         self.wait_quiet()              # the replay settled
+
+    # The #146 tail still: /resume over two fixtures — a titled row that
+    # fits whole, and the issue's evidence row (37-cell preview + `· now ·
+    # personal · glm-5.3` = 64 cells vs the popup's 62-cell inner at 80
+    # cols). Asserted on the RENDERED row before the still: the cut lands
+    # inside the model (`glm-…`), the model id is never whole on screen,
+    # and the preview + time + provider ride intact — the footer ladder's
+    # drop order (metadata tail first, payload last).
+    TAIL_PREVIEW = "fix the parser bug in the width class"
+
+    def scenario_picker_tail(self):
+        self.type("/resume")
+        self.send(b"\r")
+        self.wait_for("Sessions", timeout=10)
+        self.wait_for(self.TAIL_PREVIEW, timeout=10)
+        time.sleep(0.6)                # a readable beat on the open picker
+
+        row = next(l for l in self.text().splitlines()
+                   if self.TAIL_PREVIEW in l)
+        assert " · now · personal · glm-…" in row, \
+            f"the metadata tail did not cut inside the model: {row!r}"
+        assert "glm-5.3" not in row, \
+            "the evidence row's model id rendered whole — the row is not capped"
+        assert "Titled fixture session" in self.text(), \
+            "the fitting titled row vanished"
+        print(f"claim  picker row caps at the popup's inner width: "
+              f"{row.strip()[:70]}…")
+
+    # The #147 wizard still: boot into the first-run wizard, walk to the
+    # custom-URL typing step, and type a 124-cell draft. Asserted on the
+    # RENDERED row before the still: the head clips (`❯ …`), the draft's
+    # last 70 cells ride whole at the block cursor — the cursor never
+    # leaves the screen (the attach row's and title dialog's rule).
+    WIZARD_DRAFT = "https://api." + "x" * 90 + ".example.com/v1/models"
+
+    def scenario_wizard_draft(self):
+        self.wait_for("first run", timeout=30)
+        self.send(b"\r")              # welcome → name the profile
+        self.send(b"\r")              # accept the prefilled name → provider
+        self.send(b"\x1b[B")          # ↓ ↓ — Custom OpenAI-compatible URL
+        self.send(b"\x1b[B")
+        self.send(b"\r")
+        self.wait_for("base URL", timeout=10)
+        self.wait_quiet()
+        self.type(self.WIZARD_DRAFT)
+        time.sleep(0.4)               # the tail-fit render to land
+
+        row = next(l for l in self.text().splitlines() if "❯" in l)
+        expected = "❯ …" + self.WIZARD_DRAFT[-70:] + "█"
+        assert expected in row, \
+            f"the draft did not tail-fit to the cursor: {row!r}"
+        assert "https://api." not in row, \
+            f"the dropped head is still on screen: {row!r}"
+        print(f"claim  wizard input tail-fits, cursor on screen: "
+              f"❯ …{self.WIZARD_DRAFT[-20:]}█")
 
     # The exit print (issue #127): one exchange persists (and auto-titles)
     # the session, Ctrl+Q quits, and the print lands on the normal screen
@@ -2410,6 +2489,7 @@ def main():
                              "attach-refusal", "attach-cjk",
                              "reading-session",
                              "resume-session", "resume-picker",
+                             "picker-tail", "wizard-draft",
                              "exit-print", "model-switch",
                              "title-dialog", "title-wide",
                              "idle-blink", "tab-complete",
@@ -2531,6 +2611,19 @@ def main():
         # its first question instead.
         write_picker_fixture(scratch_dir(), "Titled fixture session", 30 * 60)
         write_picker_fixture(scratch_dir(), None, 3 * 60 * 60)
+    elif args.scenario == "picker-tail":
+        # The #146 tail fixtures: a titled row that fits whole, then (the
+        # newer, so it leads) the issue's evidence row — a 37-cell preview
+        # whose metadata tail overflows the popup's 62-cell inner at 80.
+        write_picker_fixture(scratch_dir(), "Titled fixture session", 30 * 60)
+        write_picker_fixture(
+            scratch_dir(), None, 2,
+            messages=[
+                {"role": "user", "content": App.TAIL_PREVIEW},
+                {"role": "assistant", "content": "Fixture answer, replayed."},
+            ],
+            pin={"profile": "personal", "model": "glm-5.3",
+                 "base_url": None})
 
     if context is None and args.scenario not in ("stock-compact", "default-window"):
         context = 524288
@@ -2541,7 +2634,8 @@ def main():
               images=images, cols=args.cols, rows=args.rows,
               base_url=args.base_url or base_url, unlabeled=args.unlabeled,
               model=args.model or model,
-              nickname=args.nickname or "Sol")
+              nickname=args.nickname or "Sol",
+              wizard=args.scenario == "wizard-draft")
 
     def assert_claims():
         if args.style_claim:
@@ -2626,6 +2720,14 @@ def main():
             elif args.scenario == "resume-picker":
                 app.scenario_resume_picker()
                 assert_claims()
+            elif args.scenario == "picker-tail":
+                # The #146 tail still: asserts on the rendered picker row
+                # before the generic tail shoot fires.
+                app.scenario_picker_tail()
+            elif args.scenario == "wizard-draft":
+                # The #147 wizard still: asserts on the rendered input row
+                # before the generic tail shoot fires.
+                app.scenario_wizard_draft()
             elif args.scenario == "exit-print":
                 # The exit print (issue #127): the still is the POST-EXIT
                 # screen — the normal screen the print lands on — shot
