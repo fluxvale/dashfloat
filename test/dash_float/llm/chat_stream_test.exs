@@ -66,6 +66,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
   defp collect(acc \\ []) do
     receive do
       {:token, _text} = msg -> collect([msg | acc])
+      {:reasoning, _text} = msg -> collect([msg | acc])
       {:usage, _map} = msg -> collect([msg | acc])
       {:stream_failed, _text, _partial} = msg -> collect([msg | acc])
       {:stream_done, _report} = msg -> Enum.reverse([msg | acc])
@@ -100,7 +101,8 @@ defmodule DashFloat.LLM.ChatStreamTest do
 
     assert tokens(messages) == "Hello, world!"
 
-    assert {:stream_done, %{content: "Hello, world!", tool_calls: [], cancelled: false}} in messages
+    assert {:stream_done,
+            %{content: "Hello, world!", reasoning: "", tool_calls: [], cancelled: false}} in messages
 
     assert failures(messages) == []
     await_exit(ref)
@@ -220,7 +222,9 @@ defmodule DashFloat.LLM.ChatStreamTest do
     send(pid, :cancel)
 
     messages = collect()
-    assert {:stream_done, %{content: "partial", tool_calls: [], cancelled: true}} in messages
+
+    assert {:stream_done, %{content: "partial", reasoning: "", tool_calls: [], cancelled: true}} in messages
+
     assert failures(messages) == []
     assert_receive {:sse_closed}, 2_000
     await_exit(ref)
@@ -697,6 +701,98 @@ defmodule DashFloat.LLM.ChatStreamTest do
     await_exit(ref)
   end
 
+  # A reasoning delta frame (issue #78): both ecosystem spellings. Built as a
+  # map so the JSON is valid by construction (iodata frames are legal in the
+  # server's scripts).
+  defp reasoning_frame(field, content) do
+    frame = %{"choices" => [%{"index" => 0, "delta" => %{field => content}}]}
+    ["data: ", Jason.encode!(frame), "\n\n"]
+  end
+
+  test "reasoning_content frames become {:reasoning, _} messages and ride the done report" do
+    frames = [
+      reasoning_frame("reasoning_content", "The user asks "),
+      reasoning_frame("reasoning_content", "about Elixir."),
+      frame("Elixir processes run independently."),
+      "data: [DONE]\n\n"
+    ]
+
+    server = start_server([{:send, [@headers | frames]}, :close])
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    messages = collect()
+
+    assert for({:reasoning, text} <- messages, do: text) == ["The user asks ", "about Elixir."]
+    assert tokens(messages) == "Elixir processes run independently."
+
+    assert {:stream_done,
+            %{
+              content: "Elixir processes run independently.",
+              reasoning: "The user asks about Elixir.",
+              tool_calls: [],
+              cancelled: false
+            }} in messages
+
+    assert failures(messages) == []
+    await_exit(ref)
+  end
+
+  test "the reasoning field name is captured too (the OpenRouter spelling)" do
+    frames = [
+      reasoning_frame("reasoning", "thinking "),
+      reasoning_frame("reasoning", "hard"),
+      "data: [DONE]\n\n"
+    ]
+
+    server = start_server([{:send, [@headers | frames]}, :close])
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    messages = collect()
+
+    assert for({:reasoning, text} <- messages, do: text) == ["thinking ", "hard"]
+    assert {:stream_done, %{reasoning: "thinking hard", content: ""}} = done(messages)
+    await_exit(ref)
+  end
+
+  test "reasoning shape misses stay silent: empty strings, non-strings, role-only frames" do
+    frames = [
+      reasoning_frame("reasoning_content", ""),
+      ~s(data: {"choices":[{"index":0,"delta":{"reasoning_content":42}}]}\n\n),
+      ~s(data: {"choices":[{"index":0,"delta":{"reasoning":null}}]}\n\n),
+      ~s(data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n),
+      "data: [DONE]\n\n"
+    ]
+
+    server = start_server([{:send, [@headers | frames]}, :close])
+    {_pid, ref} = start_stream(SSEServer.base_url(server))
+
+    messages = collect()
+
+    assert for({:reasoning, text} <- messages, do: text) == []
+    assert {:stream_done, %{reasoning: ""}} = done(messages)
+    assert failures(messages) == []
+    await_exit(ref)
+  end
+
+  test "reasoning_content is stripped from the request wire (DeepSeek-class 400s)" do
+    server = start_server([{:send, [@headers, "data: [DONE]\n\n"]}, :close])
+
+    messages = [
+      %{role: "user", content: "hello"},
+      %{role: "assistant", content: "hi", reasoning_content: "I pondered."},
+      %{role: "user", content: "again"}
+    ]
+
+    base = SSEServer.base_url(server) <> "/"
+    {_pid, ref} = start_stream(base, messages: messages)
+    assert_receive {:sse_request, _method, _path, _headers, body}, 2_000
+
+    decoded = Jason.decode!(body)
+    stripped = Enum.map(messages, &Map.delete(&1, :reasoning_content))
+    assert decoded["messages"] == roundtrip(stripped)
+    await_exit(ref)
+  end
+
   test "a final usage frame becomes a {:usage, map} message before done" do
     usage =
       ~s(data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":42,"total_tokens":162}}\n\n)
@@ -789,6 +885,7 @@ defmodule DashFloat.LLM.ChatStreamTest do
     assert {:stream_done,
             %{
               content: "Let me look.",
+              reasoning: "",
               cancelled: false,
               tool_calls: [
                 %{
@@ -1164,10 +1261,16 @@ defmodule DashFloat.LLM.ChatStreamTest do
   end
 
   test "episode accumulations past 4 MiB abort the stream" do
-    # ~9 half-MiB content frames: no single frame trips the 1 MiB frame cap
-    # and the stream never idles — only the episode cap stops it.
+    # ~9 half-MiB frames — three of them REASONING (issue #78): thinking
+    # bytes count toward the episode budget exactly like content bytes. No
+    # single frame trips the 1 MiB frame cap and the stream never idles —
+    # only the episode cap stops it.
     blob = String.duplicate("x", 512 * 1024)
-    frames = Enum.map(1..9, fn _i -> frame(blob) end)
+
+    frames =
+      Enum.map(1..9, fn i ->
+        if rem(i, 3) == 0, do: reasoning_frame("reasoning_content", blob), else: frame(blob)
+      end)
 
     server =
       start_server([

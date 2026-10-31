@@ -124,15 +124,16 @@ defmodule DashFloat.TUI do
   # kitty-protocol terminals also report key releases; ignore them.
   def handle_event(%ExRatatui.Event.Key{}, state), do: schedule(state)
 
-  # The wheel always addresses the log view — never the input draft — so
-  # scrolling works while typing (issue #21; ADR 0006 amendment). Mouse
-  # capture is enabled at startup (Application), so terminals report real
-  # wheel events instead of emulating arrow keys.
-  def handle_event(%ExRatatui.Event.Mouse{kind: "scroll_up"}, state),
-    do: schedule(State.wheel_scroll(state, :up))
+  # The wheel addresses the log view — never the input draft — so scrolling
+  # works while typing (issue #21; ADR 0006 amendment), with ONE position
+  # scope: a notch over the expanded thinking block's rows scrolls inside
+  # the block (issue #78). Mouse capture is enabled at startup (Application),
+  # so terminals report real wheel events instead of emulating arrow keys.
+  def handle_event(%ExRatatui.Event.Mouse{kind: "scroll_up", x: x, y: y}, state),
+    do: schedule(State.wheel_scroll(state, :up, {x, y}))
 
-  def handle_event(%ExRatatui.Event.Mouse{kind: "scroll_down"}, state),
-    do: schedule(State.wheel_scroll(state, :down))
+  def handle_event(%ExRatatui.Event.Mouse{kind: "scroll_down", x: x, y: y}, state),
+    do: schedule(State.wheel_scroll(state, :down, {x, y}))
 
   # Left-button selection over the log (issue #28; ADR 0006 amendment):
   # down anchors, drag extends, up copies via OSC 52 — one bounded write on
@@ -389,6 +390,8 @@ defmodule DashFloat.TUI do
   def handle_info({kind, _payload} = msg, state)
       when kind in [
              :token,
+             # The thinking block's live growth (issue #78).
+             :reasoning,
              :phase,
              :usage,
              :context,

@@ -470,6 +470,7 @@ defmodule DashFloat.Session do
 
   defp check_message(path, index, %{"role" => "assistant"} = message, batch) do
     with :ok <- check_assistant_content(path, index, Map.get(message, "content")),
+         :ok <- check_reasoning(path, index, Map.get(message, "reasoning_content")),
          :ok <- check_tool_calls(path, index, Map.get(message, "tool_calls")) do
       {:ok, announce(message, batch)}
     end
@@ -501,6 +502,15 @@ defmodule DashFloat.Session do
 
   defp check_assistant_content(path, index, _other),
     do: {:error, "#{path}: message #{index} field \"content\" must be a string or null"}
+
+  # The persisted thinking (issue #78): absent or null on every pre-reasoning
+  # session, a string on reasoning ones; anything else is hand damage.
+  defp check_reasoning(_path, _index, reasoning)
+       when is_binary(reasoning) or is_nil(reasoning),
+       do: :ok
+
+  defp check_reasoning(path, index, _other),
+    do: {:error, "#{path}: message #{index} field \"reasoning_content\" must be a string"}
 
   defp check_string(_path, _index, _field, value) when is_binary(value), do: :ok
 

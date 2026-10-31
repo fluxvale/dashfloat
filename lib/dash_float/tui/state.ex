@@ -34,13 +34,30 @@ defmodule DashFloat.TUI.State do
   alias ExRatatui.Text.Span
 
   @type phase :: :idle | :streaming | :executing_tool | :checking | :confirming
-  @type entry_kind :: :user | :assistant | :tool | :system
+  @type entry_kind :: :user | :assistant | :tool | :system | :reasoning
+
+  @typedoc """
+  The reasoning block's display state (issue #78): `tokens`/`ms` are the
+  frozen live stats (nil on a replayed block — replay is pure, stats do not
+  survive resume); `content_lines` is the block's full content wrapped at the
+  current width; `expanded?`/`view` are the expansion and its inner scroll
+  offset. At most ONE block is expanded at a time, and the expanded index is
+  the one expanded entry.
+  """
+  @type reasoning_meta :: %{
+          optional(:tokens) => non_neg_integer(),
+          optional(:ms) => non_neg_integer(),
+          expanded?: boolean(),
+          view: non_neg_integer(),
+          content_lines: [ExRatatui.Text.Line.t()]
+        }
 
   @type entry :: %{
           kind: entry_kind(),
           text: String.t(),
           logical: [ExRatatui.Text.Line.t()],
-          lines: [ExRatatui.Text.Line.t()]
+          lines: [ExRatatui.Text.Line.t()],
+          meta: reasoning_meta() | nil
         }
   @type confirm :: %{ref: term(), id: term(), name: String.t()}
 
@@ -126,7 +143,16 @@ defmodule DashFloat.TUI.State do
   }
   # /help's key hints (ADR 0020) — the composer's static hints plus the
   # palette and mode keys.
-  @key_hints "Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit · Ctrl+P commands · Ctrl+O attach · Shift+Tab mode"
+  @key_hints "Enter send · Shift+Enter newline · Esc interrupt · Ctrl+Q quit · Ctrl+P commands · Ctrl+O attach · Shift+Tab mode · Ctrl+R thinking"
+
+  # The thinking block's inner viewport (issue #78): rows of content visible
+  # in the expanded (and live) form — Octofriend's own MAX_THOUGHTBOX_HEIGHT.
+  @reasoning_window 8
+  # One wheel notch scrolls the block three rows — the transcript's own
+  # convention (issue #21), scoped to the block.
+  @reasoning_wheel 3
+  # The expanded header's interaction hint.
+  @reasoning_hint "· ↑↓ scroll · ctrl+r close"
 
   @enforce_keys [:input]
 
@@ -156,6 +182,14 @@ defmodule DashFloat.TUI.State do
     in_flight: nil,
     in_flight_lines: nil,
     in_flight_dirty: false,
+    # The live reasoning block (issue #78): the episode's thinking state as
+    # ONE map — accumulated text, wrapped display lines (tick-refreshed
+    # under the in-flight cap), the dirty flag, and the live stats
+    # (first/last delta arrivals = the thinking's own decode window, plus
+    # the delta count). nil when the episode has no thinking. The EXPANDED
+    # block's key focus is not state at all: expanded ⇔ focused, so the
+    # one expanded entry IS the focus.
+    reasoning: nil,
     anim_step: 0,
     tick_ref: nil,
     # The idle cursor blink (issue #104; ADR 0006's 2026-10-31 amendment):
@@ -238,6 +272,16 @@ defmodule DashFloat.TUI.State do
           in_flight: String.t() | nil,
           in_flight_lines: [ExRatatui.Text.Line.t()] | nil,
           in_flight_dirty: boolean(),
+          reasoning:
+            %{
+              text: String.t(),
+              lines: [ExRatatui.Text.Line.t()] | nil,
+              dirty: boolean(),
+              started_at: integer() | nil,
+              last_at: integer() | nil,
+              tokens: non_neg_integer()
+            }
+            | nil,
           anim_step: non_neg_integer(),
           tick_ref: reference() | nil,
           blink_on: boolean(),
@@ -300,6 +344,7 @@ defmodule DashFloat.TUI.State do
   """
   @type stream_msg ::
           {:token, String.t()}
+          | {:reasoning, String.t()}
           | {:usage,
              %{
                prompt_tokens: non_neg_integer(),
@@ -430,18 +475,29 @@ defmodule DashFloat.TUI.State do
 
   # The prose lands first (markdown path), then one gear row per announced
   # call — a nil/empty content makes no assistant entry. Each call id
-  # registers its name for the tool rows that follow it.
+  # registers its name for the tool rows that follow it. The persisted
+  # thinking (issue #78) replays as its collapsed block — full text stored,
+  # stats empty (replay is pure; live stats never survived resume).
   defp replay_message(%{"role" => "assistant"} = message, {state, names}) do
     content = message["content"]
 
     state =
+      case message["reasoning_content"] do
+        reasoning when is_binary(reasoning) and reasoning != "" ->
+          put_reasoning_entry(state, reasoning, %{})
+
+        _none ->
+          state
+      end
+
+    with_content =
       if is_binary(content) and content != "" do
         append_entry(state, :assistant, content)
       else
         state
       end
 
-    Enum.reduce(message["tool_calls"] || [], {state, names}, fn call, {st, nm} ->
+    Enum.reduce(message["tool_calls"] || [], {with_content, names}, fn call, {st, nm} ->
       function = call["function"]
       name = function["name"]
       {text, lines} = Render.tool_call(name, decoded_args(function["arguments"]))
@@ -1197,20 +1253,41 @@ defmodule DashFloat.TUI.State do
        when phase in [:streaming, :executing_tool, :checking],
        do: {state, :cancel}
 
-  defp route_key(state, "esc", _modifiers, _now), do: {state, nil}
-
-  # Log scrolling.
-  defp route_key(state, "page_up", _modifiers, _now), do: {page_up(state), nil}
-  defp route_key(state, "page_down", _modifiers, _now), do: {page_down(state), nil}
-
-  # History-aware Up/Down: history only at the draft's row boundaries.
-  defp route_key(state, "up", _modifiers, _now) do
-    if on_first_row?(state), do: {history_prev(state), nil}, else: forward(state, "up", [])
+  # The thinking block (issue #78). Ctrl+R toggles the most recent block —
+  # expand with focus, or collapse. Below the mode clauses (the attach
+  # prompt, /title dialog, and modal palette own every key while open) and
+  # below the phase-Esc clause (a live stream's interrupt outranks the
+  # block), above the log/keys it scopes.
+  defp route_key(state, "r", ["ctrl"], _now) do
+    case last_reasoning_index(state) do
+      nil -> {state, nil}
+      index -> {toggle_reasoning(state, index), nil}
+    end
   end
 
-  defp route_key(state, "down", _modifiers, _now) do
-    if on_last_row?(state), do: {history_next(state), nil}, else: forward(state, "down", [])
+  # Esc while a block holds focus (and nothing is streaming — the clause
+  # above owns that Esc) closes it.
+  defp route_key(%{entries: entries} = state, "esc", _modifiers, _now) do
+    case expanded_index(entries) do
+      nil -> {state, nil}
+      focus -> {collapse_reasoning(state, focus), nil}
+    end
   end
+
+  # Navigation keys while a block holds focus scroll INSIDE the block
+  # (issue #78): the only bindings focus steals, and only while it lives —
+  # Enter still submits, typing still reaches the composer, everything else
+  # falls through untouched.
+  defp route_key(%{entries: entries} = state, code, modifiers, _now)
+       when code in ["up", "down", "page_up", "page_down", "home", "end"] do
+    case expanded_index(entries) do
+      nil -> route_log_key(state, code, modifiers)
+      focus -> {scroll_reasoning(state, focus, code), nil}
+    end
+  end
+
+  # Log scrolling and history-aware Up/Down live in route_log_key/3, behind
+  # the reasoning focus interception above (issue #78).
 
   # A chip pops before the draft loses its last grapheme (issue #112; ADR
   # 0018 amendment): Backspace on an empty draft — the cursor sits at the
@@ -1246,6 +1323,28 @@ defmodule DashFloat.TUI.State do
   # Everything else (typing, editing, Emacs shortcuts) goes to the textarea.
   defp route_key(state, code, modifiers, _now) when is_binary(code) and is_list(modifiers),
     do: forward(state, code, modifiers)
+
+  # The unscoped arm of the navigation interception (issue #78): exactly the
+  # bindings the focus clause sits above — page keys, history-aware arrows —
+  # unchanged, with home/end falling through to the textarea as before.
+  defp route_log_key(state, "page_up", _modifiers), do: {page_up(state), nil}
+  defp route_log_key(state, "page_down", _modifiers), do: {page_down(state), nil}
+
+  defp route_log_key(state, "up", _modifiers) do
+    if on_first_row?(state), do: {history_prev(state), nil}, else: forward(state, "up", [])
+  end
+
+  defp route_log_key(state, "down", _modifiers) do
+    if on_last_row?(state), do: {history_next(state), nil}, else: forward(state, "down", [])
+  end
+
+  defp route_log_key(state, code, _modifiers), do: forward(state, code, [])
+
+  # The expanded block's index — expanded ⇔ focused (issue #78): the one
+  # expanded entry IS the focus.
+  defp expanded_index(entries) do
+    Enum.find_index(entries, &match?(%{kind: :reasoning, meta: %{expanded?: true}}, &1))
+  end
 
   defp forward(state, code, modifiers) do
     before = input_text(state)
@@ -1619,16 +1718,18 @@ defmodule DashFloat.TUI.State do
 
   # /clear resets the log; the input history survives (ADR 0020).
   defp run_command(state, "clear", _rest) do
-    {%{
-       state
-       | entries: [],
-         in_flight: nil,
-         in_flight_lines: nil,
-         in_flight_dirty: false,
-         selection: nil,
-         scroll: 0,
-         follow?: true
-     }, nil}
+    cleared = %{
+      state
+      | entries: [],
+        in_flight: nil,
+        in_flight_lines: nil,
+        in_flight_dirty: false,
+        selection: nil,
+        scroll: 0,
+        follow?: true
+    }
+
+    {reset_reasoning(cleared), nil}
   end
 
   defp run_command(state, "help", _rest) do
@@ -1887,7 +1988,7 @@ defmodule DashFloat.TUI.State do
           title: Map.get(session, :title)
       })
 
-    replay(base, session.messages, note)
+    replay(reset_reasoning(base), session.messages, note)
   end
 
   @doc """
@@ -1963,6 +2064,31 @@ defmodule DashFloat.TUI.State do
     }
 
     %{state | in_flight: (state.in_flight || "") <> text, stats: stats, in_flight_dirty: true}
+  end
+
+  # Reasoning deltas (issue #78): accumulate the live block's text, count the
+  # delta (≈ one token, the content approximation's rule), and stamp the
+  # thinking's own decode window — first→last reasoning delta — for the
+  # collapsed summary's duration. Content stats are UNTOUCHED: ttft stays
+  # send→first answer token, tok/s stays answer-only. A reasoning delta at
+  # idle belongs to a turn that is over — ignored like a late token.
+  def stream_message(%{phase: :idle} = state, {:reasoning, _text}, _now), do: state
+
+  def stream_message(%{reasoning: live} = state, {:reasoning, text}, now)
+      when is_binary(text) do
+    live = live || %{text: "", lines: nil, dirty: false, started_at: nil, last_at: nil, tokens: 0}
+
+    %{
+      state
+      | reasoning: %{
+          live
+          | text: live.text <> text,
+            tokens: live.tokens + 1,
+            started_at: live.started_at || now,
+            last_at: now,
+            dirty: true
+        }
+    }
   end
 
   # A usage frame arriving after the turn finalized belongs to a turn that is
@@ -2101,10 +2227,229 @@ defmodule DashFloat.TUI.State do
   # see clear_selection_over_reply for the boundary rule.
   defp finalize_phase(state, phase, now) do
     state
+    |> finalize_reasoning(now)
     |> finalize_in_flight(now)
     |> Map.put(:phase, phase)
     |> Map.put(:confirm, nil)
   end
+
+  ## The reasoning block (issue #78; ADR 0006's reasoning amendment)
+
+  # The live block becomes a collapsed entry: the full text is the entry's
+  # truth, the one summary line its display — thinking never floods the log,
+  # the full content stays reachable through expansion (the display-excerpt
+  # vs transcript-truth rule, extended to reasoning). Blank-only thinking
+  # renders nothing. A selection reaching into the live rows clears by the
+  # gesture's own base — the same boundary rule as the reply's finalize.
+  defp finalize_reasoning(%{reasoning: nil} = state, _now), do: state
+
+  defp finalize_reasoning(%{reasoning: live} = state, _now) do
+    if String.trim(live.text) == "" do
+      reset_reasoning(state)
+    else
+      # Both stamps land with the first delta; the window is well-formed.
+      ms = max(live.last_at - live.started_at, 0)
+
+      state
+      |> put_reasoning_entry(live.text, %{tokens: live.tokens, ms: ms})
+      |> clear_selection_over_reply(state)
+      |> reset_reasoning()
+    end
+  end
+
+  defp reset_reasoning(state), do: %{state | reasoning: nil}
+
+  # Builds and appends the reasoning entry. `stats` is %{tokens:, ms:} live
+  # or an empty map on replay (stats are display-only — they do not survive
+  # resume; replay is pure, ADR 0014 §6).
+  defp put_reasoning_entry(state, text, stats) do
+    width = log_width(state)
+    content = Render.reasoning_logical(text)
+
+    meta =
+      Map.merge(%{expanded?: false, view: 0, content_lines: Wrap.wrap(content, width)}, stats)
+
+    entry = %{
+      kind: :reasoning,
+      text: text,
+      logical: content,
+      lines: reasoning_display(meta, width),
+      meta: meta
+    }
+
+    %{state | entries: state.entries ++ [entry]}
+  end
+
+  # The block's display lines: blank separator + header, then — only while
+  # expanded — the inner window over the wrapped content and its position
+  # footer. This is the ONE builder; collapsed, expanded, and re-wrapped
+  # views all read it, so the counted truth (`lines`) cannot drift from the
+  # block's state.
+  defp reasoning_display(meta, width) do
+    suffix = if meta.expanded?, do: @reasoning_hint, else: nil
+    header = [blank_line() | Wrap.wrap([Render.reasoning_header_line(meta, suffix)], width)]
+
+    if meta.expanded? do
+      total = length(meta.content_lines)
+      window = Enum.slice(meta.content_lines, meta.view, @reasoning_window)
+
+      if total > @reasoning_window do
+        header ++
+          window ++
+          [Render.reasoning_footer_line(meta.view + 1, meta.view + length(window), total)]
+      else
+        header ++ window
+      end
+    else
+      header
+    end
+  end
+
+  defp blank_line, do: Line.new([Span.new("")])
+
+  @doc """
+  The live thinking block's display rows (issue #78): blank separator, live
+  header (label + running delta count), and the auto-following tail window —
+  the last `#{@reasoning_window}` wrapped rows of what has streamed. Live
+  growth always pins to the block's tail (Octofriend's own rule); nil when
+  the episode has no reasoning.
+  """
+  @spec live_reasoning_rows(t()) :: [ExRatatui.Text.Line.t()] | nil
+  def live_reasoning_rows(%{reasoning: nil}), do: nil
+  def live_reasoning_rows(%{reasoning: %{text: ""}}), do: nil
+
+  def live_reasoning_rows(%{reasoning: live}) do
+    tail =
+      case live.lines do
+        nil -> []
+        rows -> Enum.take(rows, -@reasoning_window)
+      end
+
+    [blank_line(), Render.reasoning_header_line(%{tokens: live.tokens}, nil) | tail]
+  end
+
+  # Expand/collapse entry `index` (issue #78). One block expanded at a time:
+  # expanding collapses any other; the expanded index IS the key focus.
+  # Expanding REVEALS the block — if it sits outside the viewport the view
+  # moves to its header row (a user-directed navigation, like a scroll; the
+  # #131 rule binds composer edits, not this).
+  defp toggle_reasoning(state, index) do
+    entry = Enum.at(state.entries, index)
+
+    case entry do
+      %{kind: :reasoning, meta: %{expanded?: false}} ->
+        # Expanding collapses every other block — one expanded at a time.
+        indexed = Enum.with_index(state.entries)
+
+        entries =
+          Enum.map(indexed, fn
+            {%{kind: :reasoning, meta: %{expanded?: true}} = other, i} when i != index ->
+              meta = %{other.meta | expanded?: false}
+              %{other | meta: meta, lines: reasoning_display(meta, log_width(state))}
+
+            {other, _i} ->
+              other
+          end)
+
+        entry = Enum.at(entries, index)
+        meta = %{entry.meta | expanded?: true, view: 0}
+
+        entries =
+          List.replace_at(entries, index, %{
+            entry
+            | meta: meta,
+              lines: reasoning_display(meta, log_width(state))
+          })
+
+        %{state | entries: entries}
+        |> clear_selection_from(index)
+        |> reveal_reasoning(index)
+
+      %{kind: :reasoning, meta: %{expanded?: true}} ->
+        collapse_reasoning(state, index)
+    end
+  end
+
+  # Expanding inserts rows at the block; any selection whose rows reach AT
+  # or BELOW the insertion would highlight (and copy) the WRONG content
+  # after the shift — including one that merely SPANS into it from above —
+  # so the geometry moving under it clears it (the resize precedent). Only
+  # a selection that ENDS entirely before the block is stable: rows below
+  # an anchor never move it.
+  defp clear_selection_from(%{selection: nil} = state, _index), do: state
+
+  defp clear_selection_from(%{selection: selection} = state, index) do
+    {_from, {to_row, _tc}} = Selection.range(selection)
+
+    top =
+      state.entries
+      |> Enum.take(index)
+      |> Enum.reduce(0, &(&2 + length(&1.lines)))
+
+    if to_row >= top, do: %{state | selection: nil}, else: state
+  end
+
+  defp collapse_reasoning(state, index) do
+    entry = Enum.at(state.entries, index)
+
+    case entry do
+      %{kind: :reasoning, meta: meta} ->
+        meta = %{meta | expanded?: false}
+        entry = %{entry | meta: meta, lines: reasoning_display(meta, log_width(state))}
+
+        state
+        |> Map.put(:entries, List.replace_at(state.entries, index, entry))
+        |> clear_selection_from(index)
+    end
+  end
+
+  # The expanded block's header row → the first content row. Scroll so the
+  # header leads the viewport when the block is not fully visible; an
+  # already-visible block keeps the view exactly where it is.
+  defp reveal_reasoning(state, index) do
+    height = log_height(state)
+
+    top =
+      state.entries
+      |> Enum.take(index)
+      |> Enum.reduce(0, &(&2 + length(&1.lines)))
+
+    block = length(Enum.at(state.entries, index).lines)
+    offset = effective_scroll(state, height)
+
+    if top < offset or top + block > offset + height do
+      max_offset = max(log_line_count(state) - height, 0)
+      %{state | follow?: false, scroll: min(top, max_offset)}
+    else
+      state
+    end
+  end
+
+  # The focused block's inner scroll (issue #78): keys and the scoped wheel
+  # move the window; the offset clamps to the content — a wheel at the block's
+  # edge stays clamped and never falls through to the transcript.
+  defp scroll_reasoning(state, index, key) do
+    entry = Enum.at(state.entries, index)
+
+    case entry do
+      %{kind: :reasoning, meta: meta} ->
+        max_view = max(length(meta.content_lines) - @reasoning_window, 0)
+        view = clamp(scroll_step(key, meta.view, max_view), 0, max_view)
+        meta = %{meta | view: view}
+        entry = %{entry | meta: meta, lines: reasoning_display(meta, log_width(state))}
+        %{state | entries: List.replace_at(state.entries, index, entry)}
+    end
+  end
+
+  # The un-clamped next offset for one scroll gesture.
+  defp scroll_step("up", view, _max_view), do: view - 1
+  defp scroll_step("down", view, _max_view), do: view + 1
+  defp scroll_step("wheel_up", view, _max_view), do: view - @reasoning_wheel
+  defp scroll_step("wheel_down", view, _max_view), do: view + @reasoning_wheel
+  defp scroll_step("page_up", view, _max_view), do: view - @reasoning_window
+  defp scroll_step("page_down", view, _max_view), do: view + @reasoning_window
+  defp scroll_step("home", _view, _max_view), do: 0
+  defp scroll_step("end", _view, max_view), do: max_view
 
   # One-shot arm intent (ADR 0015 §3): only a finalized assistant turn with
   # an empty draft and suggestions enabled arms — at most one side-request
@@ -2208,7 +2553,8 @@ defmodule DashFloat.TUI.State do
       kind: kind,
       text: text,
       logical: logical,
-      lines: Wrap.wrap(logical, log_width(state))
+      lines: Wrap.wrap(logical, log_width(state)),
+      meta: nil
     }
 
     %{state | entries: state.entries ++ [entry]}
@@ -2236,6 +2582,7 @@ defmodule DashFloat.TUI.State do
       state
       |> Map.put(:anim_step, state.anim_step + 1)
       |> refresh_in_flight()
+      |> refresh_reasoning()
 
     {state, :cont}
   end
@@ -2261,6 +2608,23 @@ defmodule DashFloat.TUI.State do
   # Above the cap the live view keeps its last render; finalize still parses
   # once at the end (ADR 0006).
   defp refresh_in_flight(state), do: state
+
+  # The reasoning block's bounded refresh — the in-flight rule, verbatim:
+  # re-wrap only when dirty, only under the cap; above it the live window
+  # keeps its last render and finalize rebuilds once from the full text.
+  defp refresh_reasoning(%{reasoning: %{dirty: false}} = state), do: state
+
+  defp refresh_reasoning(%{reasoning: %{text: text} = live} = state)
+       when byte_size(text) <= @in_flight_cap do
+    lines =
+      text
+      |> Render.reasoning_logical()
+      |> Wrap.wrap(log_width(state))
+
+    %{state | reasoning: %{live | lines: lines, dirty: false}}
+  end
+
+  defp refresh_reasoning(state), do: state
 
   @doc "True when an active phase has no tick scheduled yet."
   @spec needs_tick?(t()) :: boolean()
@@ -2398,11 +2762,15 @@ defmodule DashFloat.TUI.State do
 
   ## Scrolling
 
-  @doc "Total display lines in the log (stored entry lines plus any in-flight lines)."
+  @doc """
+  Total display lines in the log: stored entry lines, the live reasoning
+  block's rows, and any in-flight lines — one accounting for the windowed
+  renderer, the scroll math, and the position span.
+  """
   @spec log_line_count(t()) :: non_neg_integer()
-  def log_line_count(%{entries: entries, in_flight_lines: in_flight_lines}) do
+  def log_line_count(%{entries: entries} = state) do
     count = Enum.reduce(entries, 0, fn %{lines: lines}, acc -> acc + length(lines) end)
-    count + length(in_flight_lines || [])
+    count + length(live_reasoning_rows(state) || []) + length(state.in_flight_lines || [])
   end
 
   @doc """
@@ -2427,15 +2795,58 @@ defmodule DashFloat.TUI.State do
   @wheel_lines 3
 
   @doc """
-  Scrolls the log one wheel notch. Wheel routing is focus-free (ADR 0006
-  amendment): it always addresses the log view — never the input draft —
-  including mid-confirmation. Semantics mirror the page keys at line
+  Scrolls the log one wheel notch — or, when the notch lands on the EXPANDED
+  thinking block's rows, scrolls inside that block (issue #78): position
+  scopes the wheel, the block's edge clamps it (never falling through), and
+  everywhere else the routing stays focus-free exactly as the mouse amendment
+  settled it (ADR 0006): the log view — never the input draft — including
+  mid-confirmation. Transcript semantics mirror the page keys at line
   granularity: up unfollows (with page_up's nothing-to-scroll guard), down
   re-pins at the bottom.
   """
-  @spec wheel_scroll(t(), :up | :down) :: t()
-  def wheel_scroll(state, :up), do: scroll(state, :up, @wheel_lines)
-  def wheel_scroll(state, :down), do: scroll(state, :down, @wheel_lines)
+  @spec wheel_scroll(t(), :up | :down, {integer(), integer()} | nil) :: t()
+  def wheel_scroll(state, direction, position \\ nil) do
+    case scoped_reasoning_index(state, position) do
+      nil -> scroll(state, direction, @wheel_lines)
+      index -> scroll_reasoning(state, index, wheel_key(direction))
+    end
+  end
+
+  # The wheel's scoped target: the expanded block, only when the notch lands
+  # inside the log rect AND on the block's display rows. A wheel anywhere
+  # else — status bar, composer, another part of the log, or a block that is
+  # not expanded — addresses the transcript.
+  defp scoped_reasoning_index(_state, nil), do: nil
+
+  defp scoped_reasoning_index(state, {x, y}) do
+    %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
+
+    if y >= log.y and y < log.y + max(log.height, 0) and x >= log.x and
+         x < log.x + max(log.width, 0) do
+      row = effective_scroll(state, log.height) + (y - log.y)
+
+      case entry_at_row(state, row) do
+        {index, %{kind: :reasoning, meta: %{expanded?: true}}} -> index
+        _other -> nil
+      end
+    else
+      nil
+    end
+  end
+
+  defp wheel_key(:up), do: "wheel_up"
+  defp wheel_key(:down), do: "wheel_down"
+
+  # The most recent reasoning block's index (Ctrl+R's target), nil when the
+  # session has none.
+  defp last_reasoning_index(state) do
+    state.entries
+    |> Enum.with_index()
+    |> Enum.reduce(nil, fn
+      {%{kind: :reasoning}, i}, _acc -> i
+      _other, acc -> acc
+    end)
+  end
 
   defp scroll(state, :up, step) do
     height = log_height(state)
@@ -2524,7 +2935,7 @@ defmodule DashFloat.TUI.State do
       cell ->
         case kind do
           "down" ->
-            base = log_line_count(state) - length(state.in_flight_lines || [])
+            base = stored_row_count(state)
             {%{state | selection: %{anchor: cell, head: cell, base_rows: base}}, nil}
 
           "drag" ->
@@ -2539,6 +2950,12 @@ defmodule DashFloat.TUI.State do
   defp extend(nil, _cell), do: nil
   defp extend(selection, cell), do: %{selection | head: cell}
 
+  # The entries' display-row count — the rows a finalize can replace (the
+  # live reasoning block and the in-flight reply are the mutable tail).
+  defp stored_row_count(%{entries: entries}) do
+    Enum.reduce(entries, 0, fn %{lines: lines}, acc -> acc + length(lines) end)
+  end
+
   defp release(state, cell) do
     case state.selection do
       %{anchor: anchor} when anchor != cell ->
@@ -2550,9 +2967,40 @@ defmodule DashFloat.TUI.State do
         end
 
       _collapsed_or_absent ->
-        # Click-to-clear: a press+release on the same cell.
-        {%{state | selection: nil}, nil}
+        # Click-to-clear: a press+release on the same cell — and a click on
+        # a thinking block toggles it (issue #78): expand or collapse, the
+        # mouse's position-targeted path.
+        {reasoning_click(%{state | selection: nil}, cell), nil}
     end
+  end
+
+  # A click's row → the reasoning entry under it, if any (issue #78). The
+  # toggle is the same state change Ctrl+R performs on the last block.
+  defp reasoning_click(state, {row, _col}) do
+    case entry_at_row(state, row) do
+      {index, %{kind: :reasoning}} -> toggle_reasoning(state, index)
+      _other -> state
+    end
+  end
+
+  # The content row → {entry index, entry} walk: the same block order the
+  # windowed renderer slices (entries, then the live tail blocks). nil when
+  # the row falls in the live tail.
+  defp entry_at_row(%{entries: entries}, row) when row >= 0 do
+    {_skipped, found} =
+      entries
+      |> Enum.with_index()
+      |> Enum.reduce_while({0, nil}, fn {entry, index}, {skipped, _found} ->
+        n = length(entry.lines)
+
+        if row < skipped + n do
+          {:halt, {skipped, {index, entry}}}
+        else
+          {:cont, {skipped + n, nil}}
+        end
+      end)
+
+    found
   end
 
   # A real drag crosses rows or spans at least three cells on a row: the
@@ -2685,15 +3133,37 @@ defmodule DashFloat.TUI.State do
           | size: {width, height},
             entries: Enum.map(state.entries, &rewrap_entry(&1, wrap_width)),
             in_flight_lines: rewrap_in_flight(state, wrap_width),
+            reasoning: rewrap_reasoning(state, wrap_width),
             selection: nil
         }
     end
+  end
+
+  defp rewrap_entry(%{kind: :reasoning, meta: meta} = entry, width) do
+    content = Wrap.wrap(entry.logical, width)
+    max_view = max(length(content) - @reasoning_window, 0)
+    meta = %{meta | content_lines: content, view: min(meta.view, max_view)}
+    %{entry | meta: meta, lines: reasoning_display(meta, width)}
   end
 
   defp rewrap_entry(entry, width) do
     logical = Map.get(entry, :logical, entry.lines)
     %{entry | lines: Wrap.wrap(logical, width)}
   end
+
+  # The live block re-wraps from its text under the same 64 KiB cap as the
+  # in-flight reply; above it the live window clears until finalize.
+  defp rewrap_reasoning(%{reasoning: %{text: text} = live} = _state, width)
+       when byte_size(text) <= @in_flight_cap do
+    lines =
+      text
+      |> Render.reasoning_logical()
+      |> Wrap.wrap(width)
+
+    %{live | lines: lines}
+  end
+
+  defp rewrap_reasoning(_state, _width), do: nil
 
   defp rewrap_in_flight(%{in_flight: in_flight} = _state, width)
        when is_binary(in_flight) and in_flight != "" and byte_size(in_flight) <= @in_flight_cap,

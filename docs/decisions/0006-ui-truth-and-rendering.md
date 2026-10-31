@@ -37,6 +37,11 @@
   transcript re-pins to its tail ONLY on a dispatched submit (Enter);
   see
   [Amendment (2026-10-31, issue #131): Enter-only re-pin — the typing snap (#110) reversed](#amendment-2026-10-31-issue-131-enter-only-re-pin--the-typing-snap-110-reversed)
+  below); **amended again 2026-10-31**
+  ([issue #78](https://github.com/fluxvale/dashfloat/issues/78) — model
+  reasoning renders as a small collapsible, internally-scrollable block;
+  see
+  [Amendment (2026-10-31, issue #78): the reasoning block](#amendment-2026-10-31-issue-78-the-reasoning-block)
   below)
 - **Date:** 2026-10-24
 - **Implements:** [issue #16](https://github.com/fluxvale/dashfloat/issues/16) — Phase 2.5 of the
@@ -794,3 +799,91 @@ stand unchanged — this amendment only removes what #110 had added on top.
   not sends); its Ctrl+O reasoning — a prompt action is not a composer
   edit — survives trivially, now as one case of the general rule that
   nothing but Enter pins.
+
+## Amendment (2026-10-31, issue #78): the reasoning block
+
+**Status:** Accepted. The owner's ask, verbatim (Oct 29, re-confirmed Oct 31):
+*"I like how Octofriend displays the reasoning of the model — a small block
+scrollable from the inside, so thinking isn't flooding the chat but I can
+look through it."* Adds one entry kind and its interaction vocabulary;
+nothing else in this ADR moves. Capture and persistence are
+[ADR 0005](0005-llm-streaming-engine.md)'s same-day amendment.
+
+### The block
+
+- **Collapsed (the resting state): one summary line** — `◔ Thinking · 342
+  tokens · 8.1s`, an accent `◔` (the phase dot's own family; `✻` was tried
+  and dropped — mono-font coverage is unreliable) before a dim body.
+  `342` is the reasoning-delta count (the content approximation's rule:
+  one delta ≈ one token); `8.1s` is the thinking's own decode window,
+  first→last reasoning delta, formatted like every duration span (trailing
+  `.0` trimmed). Replayed blocks carry NO stats — `◔ Thinking` bare —
+  replay is pure and live stats never survive resume (the stats-zeroed
+  rule, ADR 0014 §6).
+- **Expanded: an eight-row inner viewport** (Octofriend's
+  MAX_THOUGHTBOX_HEIGHT) over the block's full wrapped content, each row a
+  dim `│ `-prefixed line — the blockquote vocabulary, so hanging indents and
+  selection treat it like quoted prose — closed by a dim position footer
+  `└ 17–24/24` when (and only when) the content overflows the window. The
+  expanded header appends the hint `· ↑↓ scroll · ctrl+r close`. Total
+  expanded height is 10 rows — a small block, never a flood: finalize
+  collapses every block back to its one line automatically.
+- **Display excerpt vs transcript truth, extended.** The reasoning entry's
+  `text` is the full thinking (the copy/persistence truth);
+  `meta.content_lines` its wrap at the current width (the re-wrap cache);
+  `lines` — the counted truth the windowed renderer, scroll math, and
+  position span all read — is the collapsed summary or the expanded window,
+  rebuilt through ONE builder (`reasoning_display/2`) so they cannot drift.
+  One block expanded at a time: expanding collapses every other.
+
+### Interaction
+
+- **Ctrl+R toggles the LAST block** (expand with focus; collapse). Any
+  block's rows accept a CLICK (the position-targeted path: press+release
+  without a drag toggles the block under the pointer — the selection
+  gesture's own click rule). Expanding REVEALS the block: outside the
+  viewport, the view moves to its header row (a user-directed navigation,
+  like a scroll — the #131 rule binds composer edits, not this).
+- **Key focus is scoped and minimal.** The expanded index IS the focus
+  (`reasoning_focus`). While held, `up`/`down` (1 row), `page_up`/
+  `page_down` (the window), `home`/`end` scroll INSIDE the block — the only
+  bindings focus steals, and only while it lives. Enter still submits,
+  typing still reaches the composer, everything else falls through
+  untouched. Esc collapses while idle; while a stream/tool/check runs, Esc
+  keeps its interrupt meaning (that clause outranks the focus) and the
+  block closes by Ctrl+R or click.
+- **The wheel is scoped by position.** A notch landing inside the log rect
+  AND on the expanded block's rows scrolls the block (3 rows, the
+  transcript's own notch), clamped at both edges — never falling through.
+  Everywhere else — status bar, composer, other rows, a collapsed block —
+  the wheel keeps the focus-free log contract exactly as the mouse
+  amendment settled it. (The LIVE block is never wheel-scrolled: it
+  auto-follows its own tail.)
+- **Inner scroll intents survive resize numerically and re-clamp** (the
+  scroll-intent rule): the re-wrapped window reads over the new geometry,
+  the footer recomputes.
+
+### Live behavior (streaming)
+
+- **The live block grows in a tail-following window**: blank separator, a
+  live header `◔ Thinking · <N> tokens` (the running delta count), then the LAST eight wrapped rows of
+  what has streamed — always the tail, Octofriend's own auto-follow (there
+  is deliberately NO inner scrolling while live; the content is moving).
+  Rendering rides the tick's bounded refresh and the same 64 KiB live cap
+  as the in-flight reply; above the cap the window keeps its last render
+  and finalize rebuilds once from the full text. The live block renders
+  BETWEEN the stored entries and the in-flight reply — thinking precedes
+  the answer it produced; a tool loop's later episodes open their own
+  blocks.
+- **Arrival never yanks a parked view** — verified, not assumed: the scroll
+  intent is top-anchored, the block's rows append BELOW it, and the
+  capture rig pins the view two wheel-ups while thinking streams to prove
+  the window frozen while `/total` grows (the #131 principle, extended to
+  the block's live growth). Content stats stay answer-only: reasoning
+  deltas touch neither `ttft` nor `tok/s` — the footer's `ttft` reads
+  send → first ANSWER token.
+- **Finalize (any phase change) collapses the block into an entry** and
+  resets the live state; thinking that is blank-only renders nothing; a
+  selection reaching into the live rows clears by the gesture's own base
+  (the reply finalize's boundary rule).
+

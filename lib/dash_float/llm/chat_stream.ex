@@ -6,12 +6,16 @@ defmodule DashFloat.LLM.ChatStream do
   over a plain-message contract:
 
     * `{:token, text}` — one message per SSE data frame's content delta
+    * `{:reasoning, text}` — one message per SSE data frame's reasoning delta
+      (`reasoning_content`, else `reasoning` — the two ecosystem spellings;
+      issue #78)
     * `{:usage, map}` — a usage frame (the agent decides what reaches the UI)
     * `{:stream_failed, text, partial_content}` — the ADR-0005 error taxonomy,
       engine-authored text, with whatever content streamed before the failure
-    * `{:stream_done, %{content:, tool_calls:, cancelled:}}` — the terminal
-      report: assembled tool calls ([ADR 0007](0007-tool-calls-and-execution.md))
-      and the episode's full content; `cancelled` marks a user interrupt
+    * `{:stream_done, %{content:, reasoning:, tool_calls:, cancelled:}}` — the
+      terminal report: assembled tool calls ([ADR 0007](0007-tool-calls-and-execution.md)),
+      the episode's full content, and its full reasoning; `cancelled` marks a
+      user interrupt
 
   `run/4` is a Task body started by `DashFloat.Agent` under
   `DashFloat.TaskSupervisor`. Every exit path sends its own terminal report or
@@ -132,7 +136,13 @@ defmodule DashFloat.LLM.ChatStream do
         model: provider.model,
         stream: true,
         stream_options: %{include_usage: true},
-        messages: messages,
+        # Reasoning is transcript truth, never wire truth: DeepSeek-class
+        # endpoints reject `reasoning_content` on INPUT assistant messages
+        # (HTTP 400), so the field is dropped here and only here (issue #78).
+        # BOTH key spellings: live messages are atom-keyed, but a RESUMED
+        # transcript loads string-keyed (Jason) — dropping only the atom key
+        # would leak the thinking of every resumed reasoning session.
+        messages: Enum.map(messages, &Map.drop(&1, [:reasoning_content, "reasoning_content"])),
         tools: tools
       },
       headers: [
@@ -183,6 +193,7 @@ defmodule DashFloat.LLM.ChatStream do
           parser: SSE.new(),
           tool_calls: ToolCalls.new(),
           content: "",
+          reasoning: "",
           tool_bytes: 0,
           # The advertised tool names (ADR 0021 §3): repairs fire only for
           # calls the catalogue actually advertised.
@@ -240,7 +251,7 @@ defmodule DashFloat.LLM.ChatStream do
     receive do
       :cancel ->
         Req.cancel_async_response(resp)
-        terminal_cancel(agent, acc.content)
+        terminal_cancel(agent, acc.content, acc.reasoning)
 
       message ->
         handle_stream_message(agent, provider, resp, timeout, acc, message)
@@ -309,7 +320,12 @@ defmodule DashFloat.LLM.ChatStream do
     send(
       agent,
       {:stream_done,
-       %{content: acc.content, tool_calls: ToolCalls.finish(acc.tool_calls), cancelled: false}}
+       %{
+         content: acc.content,
+         reasoning: acc.reasoning,
+         tool_calls: ToolCalls.finish(acc.tool_calls),
+         cancelled: false
+       }}
     )
 
     :done
@@ -324,11 +340,17 @@ defmodule DashFloat.LLM.ChatStream do
     if cancelled? do
       # A cancel that landed while a repair POST was in flight wins — it was
       # invisible to the stream loop's own checks (ADR 0021 §5).
-      terminal_cancel(agent, acc.content)
+      terminal_cancel(agent, acc.content, acc.reasoning)
     else
       send(
         agent,
-        {:stream_done, %{content: acc.content, tool_calls: calls, cancelled: false}}
+        {:stream_done,
+         %{
+           content: acc.content,
+           reasoning: acc.reasoning,
+           tool_calls: calls,
+           cancelled: false
+         }}
       )
     end
 
@@ -339,6 +361,7 @@ defmodule DashFloat.LLM.ChatStream do
     case Jason.decode(data) do
       {:ok, decoded} ->
         acc = emit_content(agent, decoded, acc)
+        acc = emit_reasoning(agent, decoded, acc)
         acc = emit_tool_calls(acc, decoded)
         emit_usage(agent, decoded, acc)
 
@@ -441,6 +464,29 @@ defmodule DashFloat.LLM.ChatStream do
 
   defp emit_content(_agent, _decoded, acc), do: acc
 
+  # Reasoning deltas (issue #78): `reasoning_content` (DeepSeek/Z.AI) else
+  # `reasoning` (OpenRouter) — one message per frame, the same granularity
+  # and shape rules as content. Shape misses stay silent; a frame carrying
+  # BOTH fields counts only `reasoning_content` (no provider does; the order
+  # is just deterministic).
+  defp emit_reasoning(agent, %{"choices" => [%{"delta" => delta} | _rest]}, acc)
+       when is_map(delta) do
+    case delta do
+      %{"reasoning_content" => text} when is_binary(text) and text != "" ->
+        send(agent, {:reasoning, text})
+        %{acc | reasoning: acc.reasoning <> text}
+
+      %{"reasoning" => text} when is_binary(text) and text != "" ->
+        send(agent, {:reasoning, text})
+        %{acc | reasoning: acc.reasoning <> text}
+
+      _shape_miss ->
+        acc
+    end
+  end
+
+  defp emit_reasoning(_agent, _decoded, acc), do: acc
+
   # Tool-call fragments merge incrementally by index; arguments concatenate as
   # binaries and parse once, at the end (ADR 0007 §1).
   defp emit_tool_calls(acc, %{"choices" => [%{"delta" => %{"tool_calls" => deltas}} | _rest]})
@@ -475,7 +521,8 @@ defmodule DashFloat.LLM.ChatStream do
 
   defp args_bytes(_delta), do: 0
 
-  defp episode_bytes(acc), do: byte_size(acc.content) + acc.tool_bytes
+  defp episode_bytes(acc),
+    do: byte_size(acc.content) + byte_size(acc.reasoning) + acc.tool_bytes
 
   ## Non-2xx: drain a bounded body, then report the provider's message
   #
@@ -549,11 +596,15 @@ defmodule DashFloat.LLM.ChatStream do
     :ok
   end
 
-  # A user interrupt keeps the partial content; partial tool fragments are
-  # dropped (an assistant message with truncated tool_calls must never enter
-  # the conversation — ADR 0007 §4).
-  defp terminal_cancel(agent, partial) do
-    send(agent, {:stream_done, %{content: partial, tool_calls: [], cancelled: true}})
+  # A user interrupt keeps the partial content and thinking; partial tool
+  # fragments are dropped (an assistant message with truncated tool_calls
+  # must never enter the conversation — ADR 0007 §4).
+  defp terminal_cancel(agent, partial, reasoning \\ "") do
+    send(
+      agent,
+      {:stream_done, %{content: partial, reasoning: reasoning, tool_calls: [], cancelled: true}}
+    )
+
     :ok
   end
 end

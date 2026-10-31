@@ -10,11 +10,12 @@
 # reference's Phoenix-web-only exemptions (flux_vale_web modules, generated
 # components, telemetry, test/support, and Readability.Specs' web-layer file
 # exclusion) are dropped — nothing they match exists here. Specs are required
-# everywhere. StructFieldAmount allows 50 fields (ADR 0004, amended
+# everywhere. StructFieldAmount allows 52 fields (ADR 0004, amended
 # 2026-10-29 and 2026-10-30, for issue #75's attach prompt + attachments +
 # the Config model-menu, for issue #106's title + title dialog, and for
 # issue #113's Herdr reporter context + session id, and for issue #104's
-# blink phase/timer/cadence):
+# blink phase/timer/cadence, and 2026-10-31 for issue #78's live reasoning
+# map — one nested field, not six flat ones):
 # `TUI.State` is deliberately one flat pure struct (ADRs 0002/0006/0015),
 # and slicing it would fight the transitions that read it whole.
 #
@@ -143,7 +144,7 @@
           {Credo.Check.Warning.OperationWithConstantResult, []},
           {Credo.Check.Warning.RaiseInsideRescue, []},
           {Credo.Check.Warning.SpecWithStruct, []},
-          {Credo.Check.Warning.StructFieldAmount, [max_fields: 51]},
+          {Credo.Check.Warning.StructFieldAmount, [max_fields: 52]},
           {Credo.Check.Warning.UnsafeExec, []},
           {Credo.Check.Warning.UnsafeToAtom, []},
           {Credo.Check.Warning.UnusedEnumOperation, []},

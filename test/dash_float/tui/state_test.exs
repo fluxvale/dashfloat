@@ -2190,6 +2190,528 @@ defmodule DashFloat.TUI.StateTest do
     end
   end
 
+  describe "the reasoning block (issue #78)" do
+    # The episode's thinking: three deltas over a one-second decode window.
+    defp think(state, deltas \\ ["one ", "two ", "three "]) do
+      deltas
+      |> Enum.with_index()
+      |> Enum.reduce(state, fn {text, i}, acc ->
+        State.stream_message(acc, {:reasoning, text}, 1_000 + i * 500)
+      end)
+    end
+
+    defp streaming, do: Map.put(new_state(), :phase, :streaming)
+
+    defp settled(state),
+      do: State.stream_message(state, {:phase, :idle}, 3_000)
+
+    # Twenty NEWLINE-SEPARATED rows of thinking (one wrapped row each):
+    # enough to overflow the 8-row window with predictable geometry.
+    defp long_thinking(state) do
+      lines = Enum.map(1..19, fn i -> "line #{i} of the reasoning trail\n" end)
+      think(state, lines ++ ["line 20 of the reasoning trail"])
+    end
+
+    defp header(state) do
+      state.entries
+      |> Enum.find(&(&1.kind == :reasoning))
+      |> then(fn entry -> Enum.map(entry.lines, &flatten/1) end)
+      |> Enum.at(1)
+    end
+
+    # The expanded block's index — the app derives focus this way too
+    # (expanded <=> focused, issue #78).
+    defp expanded_index(state) do
+      Enum.find_index(state.entries, &match?(%{kind: :reasoning, meta: %{expanded?: true}}, &1))
+    end
+
+    defp reasoning_entry(state, index \\ 0) do
+      state.entries
+      |> Enum.filter(&(&1.kind == :reasoning))
+      |> Enum.at(index)
+    end
+
+    test "reasoning accumulates live, counts deltas, stamps its own window" do
+      state = think(streaming())
+
+      assert state.reasoning.text == "one two three "
+      assert state.reasoning.tokens == 3
+      assert state.reasoning.started_at == 1_000
+      assert state.reasoning.last_at == 2_000
+      assert state.reasoning.dirty
+
+      # Content stats stay answer-only: ttft and tokens never see reasoning.
+      assert state.stats.tokens == 0
+      assert state.stats.first_token_at == nil
+      assert state.in_flight == nil
+    end
+
+    test "a reasoning delta at idle is ignored like a late token" do
+      state = State.stream_message(new_state(), {:reasoning, "stray"}, 1_000)
+      assert state.reasoning == nil
+    end
+
+    test "the tick wraps the live block; its tail window auto-follows the stream" do
+      state =
+        streaming()
+        |> long_thinking()
+        |> State.tick(3_000)
+        |> elem(0)
+
+      rows = State.live_reasoning_rows(state)
+      assert length(rows) == 2 + 8
+
+      [blank, header | window] = rows
+      assert flatten(blank) == ""
+      assert flatten(header) == "◔ Thinking · 20 tokens"
+      # The LAST eight rows show — the window pins to the thinking's tail.
+      assert Enum.map(window, &flatten/1) ==
+               for(i <- 13..20, do: "│ line #{i} of the reasoning trail")
+
+      assert State.log_line_count(state) == 10
+    end
+
+    test "finalize collapses to the one-line summary; the full text stays the entry's truth" do
+      state =
+        streaming()
+        |> think()
+        |> then(&State.stream_message(&1, {:token, "ans"}, 2_500))
+        |> settled()
+
+      assert Enum.map(state.entries, & &1.kind) == [:reasoning, :assistant]
+
+      block = reasoning_entry(state)
+      assert block.text == "one two three "
+      assert Enum.map(block.lines, &flatten/1) == ["", "◔ Thinking · 3 tokens · 1s"]
+      assert block.meta.tokens == 3
+      assert block.meta.ms == 1_000
+      assert block.meta.expanded? == false
+
+      # The live block is spent.
+      assert state.reasoning == nil
+      assert State.live_reasoning_rows(state) == nil
+      assert State.log_line_count(state) == 4
+    end
+
+    test "blank-only thinking renders nothing" do
+      state =
+        streaming()
+        |> think([" ", " "])
+        |> settled()
+
+      assert state.entries == []
+      assert state.reasoning == nil
+    end
+
+    test "Ctrl+R with no reasoning block anywhere is a no-op" do
+      state =
+        new_state()
+        |> State.stream_message({:entry, :system, "plain"})
+        |> press("r", ["ctrl"])
+
+      assert pairs(state) == [{:system, "plain"}]
+    end
+
+    test "an empty-string delta opens a live block that renders its header only" do
+      state = State.stream_message(streaming(), {:reasoning, ""}, 1_000)
+      assert State.live_reasoning_rows(state) == nil
+
+      # Once real text lands but before any tick, the live block is its
+      # header alone — the tail window waits for the bounded refresh.
+      pending = State.stream_message(state, {:reasoning, "words"}, 1_100)
+      [blank, header | tail] = State.live_reasoning_rows(pending)
+      assert flatten(blank) == ""
+      assert flatten(header) == "◔ Thinking · 2 tokens"
+      assert tail == []
+    end
+
+    test "a second tick with nothing dirty re-wraps nothing" do
+      thinking = think(streaming())
+      {ticked, :cont} = State.tick(thinking, 2_000)
+      lines = ticked.reasoning.lines
+      {again, :cont} = State.tick(ticked, 2_125)
+      assert again.reasoning.lines == lines
+    end
+
+    test "resize re-wraps the live block's window" do
+      thinking = long_thinking(streaming())
+      {ticked, :cont} = State.tick(thinking, 3_000)
+      wide = length(ticked.reasoning.lines)
+
+      narrow = State.resize(ticked, 30, 24)
+      assert length(narrow.reasoning.lines) > wide
+    end
+
+    test "expanding a block above the viewport reveals it at the window's top" do
+      # A long transcript, the thinking block early in it, parked at the tail.
+      state =
+        streaming()
+        |> State.stream_message({:reasoning, "early thinking\nline two"}, 1_000)
+        |> State.stream_message({:phase, :idle}, 2_000)
+        |> then(fn s ->
+          Enum.reduce(1..30, s, fn i, acc ->
+            State.stream_message(acc, {:entry, :system, "filler row #{i}"})
+          end)
+        end)
+
+      # Following the tail, the early block sits above the viewport.
+      assert state.follow?
+      assert State.effective_scroll(state, 13) > 0
+
+      revealed = press(state, "r", ["ctrl"])
+      block_top = Enum.find_index(state.entries, &(&1.kind == :reasoning))
+
+      top =
+        state.entries
+        |> Enum.take(block_top)
+        |> Enum.reduce(0, &(&2 + length(&1.lines)))
+
+      assert State.effective_scroll(revealed, 13) == top
+    end
+
+    test "unscoped home/end still reach the composer (nothing expanded)" do
+      {homed, nil} = State.handle_key(new_state(), "home", [])
+      {ended, nil} = State.handle_key(homed, "end", [])
+      assert ended.entries == []
+    end
+
+    test "Ctrl+R expands the last block into the hinted 8-row window with a position footer" do
+      settled_state =
+        streaming()
+        |> long_thinking()
+        |> settled()
+
+      assert Enum.map(reasoning_entry(settled_state).lines, &flatten/1) == [
+               "",
+               "◔ Thinking · 20 tokens · 9.5s"
+             ]
+
+      expanded_state = press(settled_state, "r", ["ctrl"])
+      expanded = reasoning_entry(expanded_state)
+
+      rows = Enum.map(expanded.lines, &flatten/1)
+      assert hd(rows) == ""
+      assert Enum.at(rows, 1) == "◔ Thinking · 20 tokens · 9.5s · ↑↓ scroll · ctrl+r close"
+      assert Enum.at(rows, 2) == "│ line 1 of the reasoning trail"
+      assert length(rows) == 2 + 8 + 1
+      assert List.last(rows) == "└ 1–8/20"
+      assert expanded.meta.expanded?
+      assert expanded.meta.view == 0
+
+      assert expanded_index(expanded_state) ==
+               Enum.find_index(expanded_state.entries, &(&1.kind == :reasoning))
+
+      # A second Ctrl+R collapses and releases the focus.
+      refolded = press(expanded_state, "r", ["ctrl"])
+      assert reasoning_entry(refolded).meta.expanded? == false
+      assert expanded_index(refolded) == nil
+    end
+
+    test "content shorter than the window shows whole with no footer" do
+      expanded =
+        streaming()
+        |> think(["short thought"])
+        |> settled()
+        |> press("r", ["ctrl"])
+
+      rows = Enum.map(reasoning_entry(expanded).lines, &flatten/1)
+
+      assert rows == [
+               "",
+               "◔ Thinking · 1 tokens · 0s · ↑↓ scroll · ctrl+r close",
+               "│ short thought"
+             ]
+    end
+
+    test "expanding one block collapses the other — one window at a time" do
+      state =
+        streaming()
+        |> think(["first think "])
+        |> State.stream_message({:token, "a"}, 1_500)
+        |> State.stream_message({:phase, :executing_tool}, 1_600)
+        |> think(["second think "])
+        |> State.stream_message({:token, "b"}, 2_500)
+        |> settled()
+
+      assert Enum.map(state.entries, & &1.kind) == [
+               :reasoning,
+               :assistant,
+               :reasoning,
+               :assistant
+             ]
+
+      # Click-expand the FIRST block (row 1 is its header)…
+      {anchored, _no_copy} = State.select_mouse(state, "down", 10, 4, [])
+      {released, _no_copy2} = State.select_mouse(anchored, "up", 10, 4, [])
+      assert reasoning_entry(released, 0).meta.expanded?
+
+      # …then Ctrl+R expands the LAST: the first folds back.
+      switched = press(released, "r", ["ctrl"])
+      refute reasoning_entry(switched, 0).meta.expanded?
+      assert reasoning_entry(switched, 1).meta.expanded?
+      assert expanded_index(switched) != nil
+    end
+
+    test "focused keys scroll inside the block and clamp at both ends" do
+      state =
+        streaming()
+        |> long_thinking()
+        |> settled()
+        |> press("r", ["ctrl"])
+
+      down = press(state, "down", [])
+      assert reasoning_entry(down).meta.view == 1
+
+      up = press(down, "up", [])
+      assert reasoning_entry(up).meta.view == 0
+
+      # Two page-downs clamp at the end (max view 12 over 20 rows).
+      paged = press(press(up, "page_down", []), "page_down", [])
+      assert reasoning_entry(paged).meta.view == 12
+
+      back = press(paged, "page_up", [])
+      assert reasoning_entry(back).meta.view == 4
+
+      ended = press(back, "end", [])
+      assert reasoning_entry(ended).meta.view == 12
+      ended_rows = Enum.map(reasoning_entry(ended).lines, &flatten/1)
+      assert List.last(ended_rows) == "└ 13–20/20"
+
+      # Past the end stays clamped; home returns to the top.
+      past = press(ended, "down", [])
+      assert reasoning_entry(past).meta.view == 12
+      assert reasoning_entry(press(past, "home", [])).meta.view == 0
+    end
+
+    test "a wheel notch over the expanded rows scrolls the block, not the log" do
+      state =
+        streaming()
+        |> long_thinking()
+        |> settled()
+        |> press("r", ["ctrl"])
+
+      # Screen row 3 is the log's first row (margin 2 + status 1); the block
+      # header sits at content row 1 → screen row 4. Notch on a content row.
+      wheeled = State.wheel_scroll(state, :up, {10, 6})
+
+      # Already at the top: clamped, and the view never unfollowed.
+      assert reasoning_entry(wheeled).meta.view == 0
+      assert wheeled.follow?
+
+      down = State.wheel_scroll(wheeled, :down, {10, 6})
+      assert reasoning_entry(down).meta.view == 3
+      assert down.follow?
+
+      # A notch OUTSIDE the block's rows (the status bar) is the transcript's.
+      outside = State.wheel_scroll(down, :down, {10, 6 + 100})
+      assert reasoning_entry(outside).meta.view == 3
+    end
+
+    test "a selection below the expanded block clears; one above survives" do
+      # Blocks among filler rows: expand one and select around it.
+      base =
+        new_state()
+        |> State.stream_message({:entry, :system, "filler above"})
+        |> then(fn s ->
+          Enum.reduce(1..3, s, fn i, acc ->
+            acc
+            |> Map.put(:phase, :streaming)
+            |> State.stream_message({:reasoning, "block #{i} line one\nline two"}, 1_000)
+            |> State.stream_message({:phase, :idle}, 1_500)
+          end)
+        end)
+        |> State.stream_message({:entry, :system, "filler below"})
+
+      block_index = Enum.find_index(base.entries, &(&1.kind == :reasoning))
+
+      # Select BELOW the block, then expand it: the insertion shifts the
+      # selected rows — the selection clears (the resize precedent).
+      {anchored, _no_copy} = State.select_mouse(base, "down", 10, 20, [])
+      {dragged, _no_copy} = State.select_mouse(anchored, "drag", 10, 21, [])
+      assert dragged.selection != nil
+
+      expanded = press(dragged, "r", ["ctrl"])
+      assert expanded.selection == nil
+
+      # A selection entirely ABOVE the block is stable under the insertion.
+      {anchored_above, _no_copy} = State.select_mouse(expanded, "down", 10, 4, [])
+      {dragged_above, _no_copy} = State.select_mouse(anchored_above, "drag", 10, 5, [])
+      assert dragged_above.selection != nil
+
+      refolded = press(dragged_above, "r", ["ctrl"])
+      assert refolded.selection != nil
+      refute Enum.at(refolded.entries, block_index).meta.expanded?
+    end
+
+    test "a selection SPANNING the block's first row clears too (round-2 hole)" do
+      base =
+        new_state()
+        |> State.stream_message({:entry, :system, "row above the block"})
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:reasoning, "span target one\nspan target two"}, 1_000)
+        |> State.stream_message({:phase, :idle}, 1_500)
+        |> State.stream_message({:entry, :system, "row below the block"})
+
+      # Anchor on the system row ABOVE the block, drag DOWN into it: the
+      # selection spans the insertion — it must clear, not survive with
+      # shifted content under its highlight.
+      rows = Enum.reduce(base.entries, [], &(&2 ++ Enum.map(&1.lines, fn l -> flatten(l) end)))
+
+      block_top = Enum.find_index(rows, &String.starts_with?(&1, "◔"))
+
+      # Screen row = content row + log.y (margin 2 + status 1). Anchor on
+      # the system row ABOVE the block's blank separator — a row the OLD
+      # from-row predicate would have kept, so this test pins the spanning
+      # hole itself.
+      anchor_y = 3 + block_top - 2
+      into_y = 3 + block_top + 1
+
+      {anchored, _no_copy} = State.select_mouse(base, "down", 10, anchor_y, [])
+      spanning = elem(State.select_mouse(anchored, "drag", 10, into_y, []), 0)
+      assert spanning.selection != nil
+
+      expanded = press(spanning, "r", ["ctrl"])
+      assert expanded.selection == nil
+    end
+
+    test "a wheel over a collapsed block scrolls the transcript (position scopes only the expanded window)" do
+      # A log long enough to scroll: a notch on the collapsed block's rows
+      # unfollows the transcript (the real contract) and never opens the
+      # block's inner window.
+      filler = {:entry, :system, Enum.map_join(1..40, "\n", &"row #{&1}")}
+
+      state =
+        new_state()
+        |> State.stream_message(filler)
+        |> Map.put(:phase, :streaming)
+        |> long_thinking()
+        |> State.stream_message({:phase, :idle}, 9_000)
+
+      assert state.follow?
+      before = State.effective_scroll(state, 13)
+
+      wheeled = State.wheel_scroll(state, :up, {10, 4})
+      assert reasoning_entry(wheeled).meta.view == 0
+      refute wheeled.follow?
+      assert State.effective_scroll(wheeled, 13) < before
+    end
+
+    test "Esc while focused and idle closes the block; Esc while streaming keeps its interrupt" do
+      state =
+        streaming()
+        |> think()
+        |> settled()
+        |> press("r", ["ctrl"])
+
+      assert expanded_index(state) != nil
+
+      closed = press(state, "esc", [])
+      assert expanded_index(closed) == nil
+      assert reasoning_entry(closed).meta.expanded? == false
+
+      {streaming_focus, :cancel} =
+        state
+        |> Map.put(:phase, :streaming)
+        |> State.handle_key("esc", [])
+
+      assert expanded_index(streaming_focus) != nil
+      assert reasoning_entry(streaming_focus).meta.expanded?
+    end
+
+    test "thinking arriving under a parked view never yanks it (the #131 principle)" do
+      # A long transcript, parked two notches off the tail.
+      long_entry = {:entry, :system, Enum.map_join(1..40, "\n", &"row #{&1}")}
+      base = State.stream_message(new_state(), long_entry)
+
+      parked =
+        base
+        |> State.wheel_scroll(:up)
+        |> State.wheel_scroll(:up)
+
+      offset = State.effective_scroll(parked, 13)
+      refute parked.follow?
+
+      grew =
+        parked
+        |> Map.put(:phase, :streaming)
+        |> long_thinking()
+        |> State.tick(3_000)
+        |> elem(0)
+
+      # The window froze: the top-anchored intent ignores rows appended below.
+      assert State.effective_scroll(grew, 13) == offset
+      refute grew.follow?
+    end
+
+    test "replay renders the collapsed block from stored content with no stats" do
+      state =
+        new_state(
+          transcript: [
+            %{"role" => "user", "content" => "q"},
+            %{
+              "role" => "assistant",
+              "content" => "a",
+              "reasoning_content" => "the stored thinking"
+            }
+          ]
+        )
+
+      block = reasoning_entry(state)
+      assert block.text == "the stored thinking"
+      assert Enum.map(block.lines, &flatten/1) == ["", "◔ Thinking"]
+      # No stats keys at all — the header renders the bare label.
+      assert Map.get(block.meta, :tokens) == nil
+      assert Map.get(block.meta, :ms) == nil
+
+      # The full content is reachable: expansion wraps the stored text.
+      expanded = press(state, "r", ["ctrl"])
+      rows = Enum.map(reasoning_entry(expanded).lines, &flatten/1)
+      assert rows == ["", "◔ Thinking · ↑↓ scroll · ctrl+r close", "│ the stored thinking"]
+    end
+
+    test "resize re-wraps the expanded window and clamps the inner view" do
+      state =
+        streaming()
+        |> long_thinking()
+        |> settled()
+        |> press("r", ["ctrl"])
+
+      deep = press(press(press(state, "page_down", []), "page_down", []), "end", [])
+      assert reasoning_entry(deep).meta.view == 12
+
+      # A narrow frame re-wraps the content longer: the inner intent SURVIVES
+      # numerically and re-clamps (the scroll-intent rule, ADR 0006), and the
+      # footer reads over the new geometry.
+      narrow = State.resize(deep, 30, 24)
+      entry = reasoning_entry(narrow)
+      total = length(entry.meta.content_lines)
+      max_view = total - 8
+      assert total > 20
+      assert entry.meta.view == 12
+
+      bottom = press(narrow, "end", [])
+      assert reasoning_entry(bottom).meta.view == max_view
+
+      bottom_rows = Enum.map(reasoning_entry(bottom).lines, &flatten/1)
+      assert List.last(bottom_rows) == "└ #{max_view + 1}–#{total}/#{total}"
+    end
+
+    test "/clear spends the live block and the focus" do
+      cleared =
+        streaming()
+        |> long_thinking()
+        |> settled()
+        |> press("r", ["ctrl"])
+        |> type("/clear")
+        |> then(&State.handle_key(&1, "enter", []))
+        |> elem(0)
+
+      assert cleared.entries == []
+      assert expanded_index(cleared) == nil
+      assert cleared.reasoning == nil
+    end
+  end
+
   describe "resize/3" do
     test "records the new size" do
       state = State.resize(new_state(), 120, 40)

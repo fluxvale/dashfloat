@@ -1,6 +1,11 @@
 # 0005 — LLM streaming engine: SSE adapter process architecture
 
-- **Status:** Accepted
+- **Status:** Accepted; **amended 2026-10-31**
+  ([issue #78](https://github.com/fluxvale/dashfloat/issues/78) — reasoning
+  deltas are captured, reported, persisted, and stripped from the outbound
+  wire; see
+  [Amendment (2026-10-31, issue #78): reasoning capture](#amendment-2026-10-31-issue-78-reasoning-capture)
+  below)
 - **Date:** 2026-10-23
 - **Implements:** [issue #8](https://github.com/fluxvale/dashfloat/issues/8) — Phase 2 of the
   [ADR 0001](0001-founding-stack-and-architecture.md) roadmap. Supersedes the
@@ -162,6 +167,46 @@ byte-by-byte). `ChatStream` and the TUI integration run against a one-shot
 `:gen_tcp` loopback server (127.0.0.1, ephemeral port) scripted per test with
 exact bytes, sleeps, and closes — deterministic, no external network, no new
 dependencies. Live-key smoke is a documented manual step.
+
+## Amendment (2026-10-31, issue #78): reasoning capture
+
+**Status:** Accepted. Adds one contract message and one accumulator to the
+producer, one persisted field to the transcript, and one strip at the wire.
+Everything else in this ADR stands; the taxonomy row "Valid JSON frame
+without `choices[0].delta.content` … skipped silently" gains the reasoning
+exception below.
+
+- **Two spellings, one seam.** Reasoning deltas arrive as
+  `choices[0].delta.reasoning_content` (DeepSeek/Z.AI) or `…reasoning`
+  (OpenRouter) — Octofriend's own pair. `emit_reasoning/3` matches
+  `reasoning_content` first, `reasoning` as fallback (a frame carrying both
+  counts the first, deterministically; none does), the same shape rules as
+  content: one `{:reasoning, text}` message per SSE data frame carrying a
+  non-empty binary; empty strings, non-strings, and role-only frames stay
+  silent shape misses. Granularity, no-drop, and the tick-bounded render
+  are the content contract verbatim ([ADR 0006](0006-ui-truth-and-rendering.md)'s
+  reasoning amendment renders them).
+- **The terminal report carries `reasoning`.** `{:stream_done, %{content:,
+  reasoning:, tool_calls:, cancelled:}}` — including the cancel terminal (the
+  partial thinking rides with the partial content). The agent accumulates
+  its own `episode_reasoning` in parallel (every delta forwards through it),
+  which is what the failure and DOWN safety-net paths persist — the same
+  dual-truth shape `episode_content` already has.
+- **The episode cap counts thinking.** `reasoning` bytes join `content` and
+  tool-call bytes in the 4 MiB episode budget — a trickling endpoint must
+  not grow the thinking accumulator without bound either.
+- **Transcript truth, not wire truth.** The assistant message persists its
+  full thinking as `reasoning_content` (string, omitted when empty —
+  pre-reasoning sessions stay byte-identical; the session loader validates
+  string-or-absent and refuses anything else naming the field). The OUTBOUND
+  request strips the field: DeepSeek-class endpoints reject
+  `reasoning_content` on INPUT assistant messages with a 400, and no
+  mainstream provider needs it back. Consequence, recorded:
+  [ADR 0022](0022-context-accounting-and-compaction.md)'s estimate does not
+  count it (it is not on the wire), and thinking-only episodes (cancelled
+  before any answer token) persist nothing — a nil-content, no-tool_calls
+  assistant message is a degenerate wire shape no provider needs; the live
+  block is their display-only record.
 
 ## Alternatives considered
 

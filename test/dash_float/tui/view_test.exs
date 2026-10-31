@@ -258,6 +258,36 @@ defmodule DashFloat.TUI.ViewTest do
       assert Enum.map(lines, &flatten/1) == ["", "a system line", "", "streaming through"]
     end
 
+    # The live reasoning block (issue #78) renders between the stored
+    # entries and the in-flight reply, its tail window auto-following.
+    test "the live reasoning block renders between the entries and the reply" do
+      state =
+        new_state()
+        |> State.stream_message({:entry, :system, "a system line"})
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:reasoning, "thought one"}, 1_000)
+        |> State.stream_message({:reasoning, "thought two"}, 1_100)
+        |> State.stream_message({:token, "the reply"}, 1_200)
+
+      {ticked, :cont} = State.tick(state, 1_300)
+
+      # Deltas join into the block's text; line breaks are the model's own.
+      rows =
+        ticked
+        |> log_lines()
+        |> Enum.map(&flatten/1)
+
+      assert rows == [
+               "",
+               "a system line",
+               "",
+               "◔ Thinking · 2 tokens",
+               "│ thought onethought two",
+               "",
+               "the reply"
+             ]
+    end
+
     test "only the visible window is built — log text is bounded by the viewport" do
       state =
         Enum.reduce(1..100, new_state(), fn i, acc ->

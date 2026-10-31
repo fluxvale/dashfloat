@@ -14,6 +14,8 @@ when its tag is cut.
 
 ### Added
 
+- Model reasoning renders as a small collapsible block — Octofriend-style, thinking never floods the chat: the collapsed form is one summary line (`◔ Thinking · 342 tokens · 8.1s`), the expanded form an eight-row window over the full content, scrollable from the inside by keys (while focused) or the wheel (by position). While the model thinks the block grows live in a tail-following window, and a thinking turn's full reasoning persists in the transcript (`reasoning_content`) and replays on resume (ADR 0005 + ADR 0006 amendments) (#78).
+
 - The Herdr done-notification is verified working and its semantics documented: DashFloat's existing reports already drive Herdr's derived `done` status — the working→idle turn end (or a blocked→idle, which the exit-guard expiry also produces) on a pane the user isn't watching yields the badge + chime, and the toast when `[ui.toast]` delivery is enabled (the owner's stock config has it off); a completion that lands while DashFloat's tab is being watched never notifies — Herdr marks the pane seen by design — so short turns finish silently unless the user has switched away first (ADR 0024 §8, evidence in `docs/screenshots/132/`) (#132).
 
 - Quitting DashFloat with an ongoing session prints the command that reopens it — `dashfloat --resume <title-or-id>`, the title (shell-quoted) when one is set, else the UUIDv7 id; nothing prints when nothing persisted (#127).
