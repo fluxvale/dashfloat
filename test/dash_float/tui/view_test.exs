@@ -1403,6 +1403,68 @@ defmodule DashFloat.TUI.ViewTest do
       end
     end
 
+    test "a long draft tail-fits so the block cursor stays on screen (issue #147)" do
+      # Box inner 74 at 80 cols (frame − margin − borders); budget 71 =
+      # inner − the `❯ ` prefix − the cursor's own cell. An 80-cell draft
+      # head-clips: `…` + the last 70 cells + `█` — the cursor (where
+      # editing happens) is the last cell inside the border, never pushed
+      # off-screen.
+      state = new_state(setup: %Onboarding{step: :custom_url, draft: String.duplicate("a", 80)})
+
+      buffer = drawn_text(state)
+
+      assert buffer =~ "❯ …" <> String.duplicate("a", 70) <> "█"
+      refute buffer =~ String.duplicate("a", 71)
+    end
+
+    test "a long masked draft tail-fits the same way (issue #147)" do
+      state = new_state(setup: %Onboarding{step: :key, draft: String.duplicate("k", 80)})
+
+      buffer = drawn_text(state)
+
+      assert buffer =~ "❯ …" <> String.duplicate("*", 70) <> "█"
+      refute buffer =~ "kkkkkkk"
+    end
+
+    test "a wide-glyph draft tail-fits by cells, never cutting a glyph (issue #147)" do
+      # 80 Han graphemes are 160 cells; the 70-cell tail budget holds 35
+      # Han graphemes exactly — the clip lands on the boundary, no half
+      # glyph. Asserted on the widget's own spans: the buffer string
+      # space-separates wide glyphs (each trailing cell renders blank).
+      state = new_state(setup: %Onboarding{step: :custom_url, draft: String.duplicate("汉", 80)})
+
+      assert [{%ExRatatui.Widgets.Paragraph{text: lines}, _}] =
+               View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+
+      rendered =
+        lines
+        |> Enum.flat_map(& &1.spans)
+        |> Enum.map_join(& &1.content)
+
+      assert rendered =~ "❯ …" <> String.duplicate("汉", 35) <> "█"
+    end
+
+    test "every wizard input step renders on a degenerate frame without raising (issue #147)" do
+      steps = [
+        %Onboarding{step: :profile_name, draft: String.duplicate("a", 40)},
+        %Onboarding{step: :custom_url, draft: String.duplicate("a", 40)},
+        %Onboarding{step: :label, draft: String.duplicate("a", 40)},
+        %Onboarding{step: :key, draft: String.duplicate("a", 40)},
+        %Onboarding{step: :model_manual, draft: String.duplicate("a", 40)},
+        %Onboarding{step: :mcp_name, draft: String.duplicate("a", 40)},
+        %Onboarding{step: :mcp_command, draft: String.duplicate("a", 40)},
+        %Onboarding{step: :mcp_args, draft: String.duplicate("a", 40)},
+        %Onboarding{step: :mcp_token, draft: String.duplicate("a", 40)}
+      ]
+
+      for wizard <- steps do
+        state = new_state(setup: wizard)
+
+        assert [{%ExRatatui.Widgets.Paragraph{}, _}] =
+                 View.render(state, %ExRatatui.Frame{width: 10, height: 5})
+      end
+    end
+
     test "a refused write renders the error and remedy on the wizard surface (issue #39)" do
       # Key step: the refusal replaces the write-promise hint with the retry
       # wording, and the draft stays masked.
@@ -1907,6 +1969,93 @@ defmodule DashFloat.TUI.ViewTest do
 
       assert buffer =~ "Profiles"
       assert buffer =~ "personal"
+    end
+
+    # Issue #146: the session picker's metadata tail (· time · provider ·
+    # model) is unbounded — user-chosen profile and model names — so the
+    # whole row caps at the popup's render-time inner width (85% of the
+    # inset area, truncating division: 62 cells at 80 cols), Wrap.fit_head
+    # measuring cells. When the budget is tight the tail drops first — the
+    # model, then the provider, then the time — the preview (the row's
+    # identity payload, #144's 40-column cap) is the last to lose cells:
+    # the footer ladder's rule (drop the scaffolding, keep the payload).
+    test "the session picker caps the row at the popup's inner width (issue #146)" do
+      # 80 cols: inset 76, popup 85% → 64 wide, 62 inner.
+      label = String.duplicate("x", 70)
+
+      palette = %Palette{
+        mode: :modal,
+        kind: :sessions,
+        items: [%{id: "i", label: label}],
+        selected: 0
+      }
+
+      state = %{new_state() | palette: palette}
+
+      assert [{%ExRatatui.Widgets.Popup{content: %ExRatatui.Widgets.List{items: items}}, _}] =
+               state
+               |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+               |> Enum.take(-1)
+
+      assert items == [String.duplicate("x", 61) <> "…"]
+    end
+
+    test "a tight budget drops the metadata tail before the preview (issue #146)" do
+      # The #146 evidence row — 40-column Han preview (every glyph two
+      # cells) + metadata = 66 cells vs the 62-cell inner: the model's
+      # tail is what goes, `…` marking the cut, the preview rides whole.
+      label = String.duplicate("汉", 19) <> "… · now · personal · glm-5.3"
+
+      palette = %Palette{
+        mode: :modal,
+        kind: :sessions,
+        items: [%{id: "i", label: label}],
+        selected: 0
+      }
+
+      state = %{new_state() | palette: palette}
+
+      buffer = drawn_text(state)
+
+      assert buffer =~ "now · personal · gl…"
+      refute buffer =~ "glm-5.3"
+    end
+
+    test "a short preview with an unbounded model cuts inside the model (issue #146)" do
+      # 34 cells of preview + time + provider, then a 60-cell model id:
+      # the cut lands at cell 62 — 27 model cells shown, the payload whole.
+      label = "fix the parser · now · personal · " <> String.duplicate("m", 60)
+
+      palette = %Palette{
+        mode: :modal,
+        kind: :sessions,
+        items: [%{id: "i", label: label}],
+        selected: 0
+      }
+
+      state = %{new_state() | palette: palette}
+
+      assert [{%ExRatatui.Widgets.Popup{content: %ExRatatui.Widgets.List{items: items}}, _}] =
+               state
+               |> View.render(%ExRatatui.Frame{width: 80, height: 24})
+               |> Enum.take(-1)
+
+      assert items == ["fix the parser · now · personal · " <> String.duplicate("m", 27) <> "…"]
+    end
+
+    test "the session picker never raises on degenerate frames (issue #146)" do
+      label = String.duplicate("x", 70)
+
+      palette = %Palette{
+        mode: :modal,
+        kind: :sessions,
+        items: [%{id: "i", label: label}],
+        selected: 0
+      }
+
+      state = %{new_state() | palette: palette}
+
+      assert length(View.render(state, %ExRatatui.Frame{width: 12, height: 5})) >= 1
     end
 
     test "a filter palette is idle-only: an active phase renders no palette widgets" do

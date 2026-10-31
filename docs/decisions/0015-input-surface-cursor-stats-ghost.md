@@ -29,6 +29,13 @@
   ([ADR 0028](0028-choice-widget-and-ask-user.md), issues #133/#134 — the
   composer may be temporarily replaced by the choice widget; see
   [Amendment (2026-10-31, ADR 0028): the composer is replaceable](#amendment-2026-10-31-adr-0028-the-composer-is-replaceable)
+  below); **amended again 2026-11-01**
+  ([issues #146](https://github.com/fluxvale/dashfloat/issues/146) /
+  [#147](https://github.com/fluxvale/dashfloat/issues/147) — the two
+  width-class stragglers: the session picker's whole row caps at the
+  popup's inner width (metadata tail drops first), and the wizard's input
+  lines tail-fit so the block cursor stays on screen; see
+  [Amendment (2026-11-01, issues #146 + #147): the width stragglers](#amendment-2026-11-01-issues-146--147-the-width-stragglers)
   below).
 - **Date:** 2026-10-29
 - **Implements:** [issue #66](https://github.com/fluxvale/dashfloat/issues/66),
@@ -494,3 +501,41 @@ imprecision from #137's audit).
   grapheme) overflows the rect — never one cell late, which is precisely
   the clip the approximation could ship — and the never-drop rate lands
   whole behind it.
+
+## Amendment (2026-11-01, issues #146 + #147): the width stragglers
+
+**Status:** Accepted (issues
+[#146](https://github.com/fluxvale/dashfloat/issues/146) and
+[#147](https://github.com/fluxvale/dashfloat/issues/147), found by #144's
+hostile review). Both are completion work on the [#144
+amendment](#amendment-2026-11-01-issue-139-the-width-discipline-is-measured-by-the-renderers-classifier)'s
+class — the fit functions (`Wrap.fit_head/fit_tail`) already existed;
+this records where they were still not applied. **Amends** [ADR
+0027](0027-exit-resume-command-and-resume-picker.md) §2's row clause and
+[ADR 0009](0009-config-v3-persona-profiles.md)'s wizard-mechanics clause
+(one more rendering rule each; composition and masking unchanged).
+
+- **#146 — the session picker's whole row caps at the popup's inner
+  width.** The row label (`preview · time · provider · model`) is fit by
+  `Wrap.fit_head` at render time against the popup the renderer actually
+  draws (85% of the inset area, truncating division, minus borders —
+  62 cells at 80 cols). Two alternatives were weighed in the issue:
+  shrinking the preview budget was rejected because the metadata tail is
+  **unbounded** (user-chosen profile and model names) — no fixed shrink
+  can promise fit; only the render-time budget is honest. **Drop order
+  when the budget is tight: the model drops first, then the provider,
+  then the time; the preview is the row's identity payload and the last
+  to lose cells** — the [#130 ladder's](#amendment-2026-10-31-issues-129--130-breathing-gap-ttft-whole-response-toks)
+  rule (drop the scaffolding, keep the payload whole) by a deliberately
+  simpler mechanism: the picker row is one plain string in a `List` that
+  clips rather than wraps, so one `…` cut replaces the footer's span-
+  group ladder — no groups exist to drop one by one.
+- **#147 — the wizard's input lines ride the tail-showing rule.** Every
+  `input_line` call site tail-fits the shown draft (`…` marking the
+  dropped head) into the setup box's inner width minus the `❯ ` prefix
+  and the cursor's own cell, so the block cursor — where editing
+  happens — never leaves the screen. The masked-secrets form rides the
+  same budget: its stars are one cell each by construction, but a long
+  masked draft overflows the row exactly the same way. This is the
+  attach row's and title dialog's rule applied to the last cursor
+  surface that lacked it.
