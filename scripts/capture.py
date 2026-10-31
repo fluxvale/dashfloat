@@ -108,9 +108,26 @@ Scenarios:
                 "/mod" + Tab completes to "/model " (popup closes), then
                 "/c" + down + Tab completes the ARROW-SELECTED "/compact "
                 (issue #105; ADR 0020 amendment) — each act asserted
-    snap-scroll a resumed 40-turn log, two wheel-ups unfollow (the tail's
-                last line scrolls off), one keystroke re-pins to the tail
-                (issue #110) — asserted both ways
+    enter-snap  a resumed 40-turn log, two wheel-ups unfollow (the tail's
+                last line scrolls off), TYPING keeps the view exactly in
+                place, Enter — and only Enter — re-pins to the tail
+                (issue #131, reversing #110) — asserted act by act
+    scrolled-stream
+                a reply streaming while the view is parked two wheel-ups
+                off the tail: the window freezes (only the /total grows)
+                and the footer carries ttft alone — no live tok/s (issues
+                #130/#131)
+    breathing-gap
+                two exchanges, snapped to the tail: the two blank rows of
+                air above the composer are asserted before the still
+                (issue #129)
+    gap-scrolled
+                the same air asserted two wheel-ups into mid-history —
+                the gap holds in both scroll states (issue #129)
+    ttft-footer
+                one turn, two stills: mid-stream (ttft alone, no live
+                tok/s) and after finalize (the exact `ttft Ns · N tok/s`
+                pair) — both asserted before shooting (issue #130)
     reading-session
                 two completed exchanges so user/assistant alternate in the
                 log (issues #107/#108 stills). Asserts, before the still:
@@ -579,6 +596,10 @@ class MockHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
+        # A realistic first-token delay (issue #130): the request's own
+        # network + prefill latency before decode begins — ttft reads
+        # honestly instead of rounding to 0.
+        time.sleep(0.3)
         for token in REPLY_TOKENS:
             frame = {"choices": [{"delta": {"content": token + " "}}]}
             self.wfile.write(f"data: {json.dumps(frame)}\n\n".encode())
@@ -790,6 +811,23 @@ class App:
     def text(self) -> str:
         return "\n".join(row.rstrip() for row in self.screen.display)
 
+    def wait_gone(self, needle: str, timeout=30, hold=1.0):
+        """The inverse of wait_for: block until `needle` has been off the
+        screen for `hold` seconds — a single absent poll can race a row
+        mid-redraw, so absence must HOLD (a stream finalizing, an activity
+        row retiring) before a capture asserts the settled state."""
+        deadline = time.monotonic() + timeout
+        gone_since = None
+        while time.monotonic() < deadline:
+            if needle in self.text():
+                gone_since = None
+            else:
+                gone_since = gone_since or time.monotonic()
+                if time.monotonic() - gone_since >= hold:
+                    return True
+            time.sleep(0.1)
+        raise TimeoutError(f"screen never lost {needle!r}")
+
     def wait_for(self, needle: str, timeout=30):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -997,6 +1035,25 @@ class App:
                 f"row {y} ends at column {last} (> {self.cols - 1 - margin}): {row!r}"
         print(f"claim  margin {margin}: rows within columns "
               f"[{margin}, {self.cols - 1 - margin}] on a {self.cols}x{self.rows} pty")
+
+    # The #129 breathing gap: the composer's top border row, and the N
+    # rows directly above it must be ENTIRELY blank (the two-row air between
+    # the transcript and the composer cluster — holds in every scroll
+    # state, since the gap is a fixed region of the split).
+    def composer_top_y(self) -> int:
+        for y, row in enumerate(self.screen.display):
+            if row.lstrip().startswith("╭") and "❯" in row:
+                return y
+        raise AssertionError("the composer's top border row never rendered")
+
+    def assert_gap(self, rows: int):
+        top = self.composer_top_y()
+        for y in range(max(top - rows, 0), top):
+            row = self.screen.display[y]
+            assert not row.strip(), \
+                f"row {y} intrudes into the {rows}-row breathing gap: {row!r}"
+        print(f"claim  gap {rows}: rows {top - rows}..{top - 1} blank above "
+              f"the composer border on a {self.cols}x{self.rows} pty")
 
     # Two completed exchanges so user and assistant rows alternate (#107).
     def scenario_reading_session(self):
@@ -1323,12 +1380,24 @@ class App:
     # unfollows (the position span reads L..-../.. and the tail's last
     # line scrolls off), one keystroke re-pins to the tail, and the last
     # line is visible again.
-    def scenario_snap_scroll(self):
+    # Enter-only re-pin (issue #131, reversing #110): scroll back, TYPE —
+    # the view must stay EXACTLY in place (the owner is reading earlier
+    # context while composing) — then Enter, and only then does the view
+    # snap to the tail. The scenario asserts each act before the GIF is
+    # recorded; the mark lands BEFORE the wheel-ups so the GIF carries the
+    # scroll-back state itself (hostile review F1, kept from #110's rig).
+    POSITION_SPAN = re.compile(r"\bL\d+-\d+/\d+\b")
+
+    def position_span(self) -> str:
+        match = self.POSITION_SPAN.search(self.text())
+        return match.group(0) if match else ""
+
+    def scroll_away_from_tail(self):
+        """Two wheel-ups off the tail; asserts the unfollowed span and the
+        tail's unique line being gone. Returns the frozen span."""
         assert "follow L" in self.text(), \
             "the resumed log never reached a follow state"
-        # Mark BEFORE the wheel-ups: the GIF must contain the scroll-back
-        # state itself, not only the snap back (hostile review F1).
-        self._mark = time.monotonic()
+        self._mark = self._mark or time.monotonic()
         self.wheel("up")
         self.wheel("up")
         deadline = time.monotonic() + 5
@@ -1338,20 +1407,96 @@ class App:
             time.sleep(0.1)
         else:
             raise TimeoutError("the wheel never unfollowed the tail")
-        assert re.search(r"\bL\d+-\d+/\d+", self.text()), \
-            f"the scrolled position span never rendered: {self.text()[:120]!r}"
-        assert "forty" not in self.text(), \
+        span = self.position_span()
+        assert span, f"the scrolled position span never rendered: {self.text()[:120]!r}"
+        assert "turn forty done" not in self.text(), \
             "the tail's last line is still visible after scrolling away"
+        return span
 
-        self.type("h", per_key=0.4)
+    def scenario_enter_snap(self):
+        span = self.scroll_away_from_tail()
+
+        # TYPING: the view stays EXACTLY in place — same span, still
+        # unfollowed, the tail still out of sight (the #110 behavior is
+        # gone; this assert is the reversal's whole claim).
+        self.type("hi there", per_key=0.4)
+        time.sleep(0.4)
+        assert "follow" not in self.text(), \
+            "typing re-pinned the transcript (#131 violation)"
+        assert self.position_span() == span, \
+            f"typing moved the view: {span!r} -> {self.position_span()!r}"
+        assert "turn forty done" not in self.text(), \
+            "typing snapped the tail back into view (#131 violation)"
+
+        # ENTER — the one re-pin: the view returns to follow, the echo and
+        # then the reply arrive at the tail.
+        self.send(b"\r")
+        deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if "follow L" in self.text():
                 break
             time.sleep(0.1)
         else:
-            raise TimeoutError("typing never re-pinned the log to the tail")
-        assert "forty" in self.text(), \
-            "the re-pinned view does not show the tail's last line"
+            raise TimeoutError("Enter never re-pinned the log to the tail")
+        self.wait_for("hi there")
+        self.wait_for("rest")
+        self.wait_quiet()
+
+    # A reply arriving while scrolled up must not yank the view either
+    # (issue #131's verify-and-record clause): submit re-pins (that is
+    # Enter's own rule), then the wheel parks the view mid-reply and the
+    # streaming tokens land BELOW it — the span freezes while the footer's
+    # ttft ticks in.
+    def scenario_scrolled_stream(self):
+        self.type("stream while I read")
+        self.send(b"\r")
+        self.wait_for("processes")        # tokens are arriving
+        self.wheel("up")
+        self.wheel("up")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if "follow" not in self.text():
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("the wheel never unfollowed mid-stream")
+        span = self.position_span()
+        assert span, "the scrolled position span never rendered"
+        window = re.match(r"L\d+-\d+", span).group(0)   # not the /total —
+        # the total grows as the reply wraps; the WINDOW is the invariant.
+        time.sleep(1.6)                   # ~12 more tokens land below
+        now = self.position_span()
+        assert now.startswith(window + "/"), \
+            f"a streaming reply yanked the parked view: {span!r} -> {now!r}"
+        assert re.search(r"ttft \d+(\.\d+)?s", self.footer_span()), \
+            f"no ttft span while streaming: {self.footer_span()!r}"
+
+    # The #130 footer, both cadences asserted before their stills: while
+    # streaming ttft shows ALONE (no live tok/s — the owner's refinement),
+    # and after the turn ends the whole-response average appears beside it
+    # in the issue's exact format.
+    def scenario_ttft_footer(self, mid: str, after: str):
+        self.type("hello ttft")
+        self.send(b"\r")
+        self.wait_for("processes")        # mid-stream: tokens are flowing
+        time.sleep(0.3)                   # a few more land (a real window)
+        footer = self.footer_span()
+        assert re.search(r"ttft \d+(\.\d+)?s", footer), \
+            f"no ttft span mid-stream: {footer!r}"
+        assert "tok/s" not in footer, \
+            f"a live tok/s showed mid-stream (#130 violation): {footer!r}"
+        self.screenshot(mid)
+
+        self.wait_for("rest")
+        # The frozen average exists only once the agent's idle phase lands
+        # (finalize freezes the rate) — the activity row retiring is the
+        # visible edge of that.
+        self.wait_gone("Streaming")
+        self.wait_quiet()
+        footer = self.footer_span()
+        assert re.search(r"ttft \d+(\.\d+)?s · \d+(\.\d+)? tok/s", footer), \
+            f"the finished turn's footer lacks the exact format: {footer!r}"
+        self.screenshot(after)
 
     # The composer block's title row (the bordered input's top line, which
     # carries the pending chips). The row is the box's TOP BORDER with the
@@ -1511,7 +1656,9 @@ def main():
                              "attach-refusal", "reading-session",
                              "resume-session", "model-switch",
                              "title-dialog", "idle-blink", "tab-complete",
-                             "snap-scroll", "drop-image", "drop-refusal"])
+                             "breathing-gap", "gap-scrolled", "ttft-footer",
+                             "enter-snap", "scrolled-stream",
+                             "drop-image", "drop-refusal"])
     ap.add_argument("--out", default=None)
     # The compact-session flow shoots TWO stills: --out after the drop,
     # --out2 after the follow-up no-op command (its below-trigger entry).
@@ -1599,9 +1746,9 @@ def main():
         context = context  # None unless pinned
     elif args.scenario == "resume-session":
         resume = write_reading_fixture(scratch_dir())
-    elif args.scenario == "snap-scroll":
+    elif args.scenario in ("enter-snap", "gap-scrolled", "scrolled-stream"):
         # A 40-turn fixture log overflows the 24-row viewport several
-        # times over — the scroll-back state is real (issue #110).
+        # times over — the scroll-back state is real (issues #110/#131).
         resume = write_snap_fixture(scratch_dir())
     elif args.scenario == "title-dialog":
         # A holder session owns "Held Name"; the resumed fixture is titled
@@ -1688,6 +1835,29 @@ def main():
                 app.scenario_drop_refusal()
             elif args.scenario == "model-switch":
                 app.scenario_model_switch()
+            elif args.scenario == "breathing-gap":
+                # The tail state (issue #129): two exchanges, snapped to
+                # the tail, the two-row air asserted above the composer —
+                # the IDLE layout (no activity row between gap and input).
+                app.scenario_reading_session()
+                app.wait_gone("Streaming")
+                time.sleep(0.3)
+                app.assert_gap(2)
+            elif args.scenario == "gap-scrolled":
+                # The mid-history state (issue #129): parked two wheel-ups
+                # off the tail, the SAME two rows of air still hold.
+                app.scroll_away_from_tail()
+                time.sleep(0.3)
+                app.assert_gap(2)
+            elif args.scenario == "ttft-footer":
+                # Two stills in one run (issue #130): mid-stream (ttft
+                # alone) and after the turn (the exact paired format).
+                if not (args.out and args.out2):
+                    ap.error("ttft-footer shoots two stills: --out (mid) "
+                             "and --out2 (after) are both required")
+                app.scenario_ttft_footer(args.out, args.out2)
+            elif args.scenario == "scrolled-stream":
+                app.scenario_scrolled_stream()
             elif args.scenario == "title-dialog":
                 # Five stills in one app run (issue #106): open, refusal,
                 # success, esc, inline — each act asserts before it shoots.
@@ -1698,7 +1868,8 @@ def main():
                 app.scenario_title_dialog(holder_id, stills)
             if args.expect_label:
                 app.wait_footer_label(args.expect_label)
-            if args.scenario not in ("compact-session", "title-dialog"):
+            if args.scenario not in ("compact-session", "title-dialog",
+                                     "ttft-footer"):
                 app.screenshot(args.out)
         elif args.scenario == "slash-autocomplete":
             # The popup opening AND narrowing: "/" opens the full list, "c"
@@ -1756,10 +1927,11 @@ def main():
             app.scenario_tab_complete()
             time.sleep(0.5)            # a settled beat on the final draft
             app.gif(args.out, crop_rows=20, min_span=1.5)
-        elif args.scenario == "snap-scroll":
-            # Scroll back, type, snap (issue #110): the scenario asserts
-            # the unfollowed span, the invisible tail, and the re-pin.
-            app.scenario_snap_scroll()
+        elif args.scenario == "enter-snap":
+            # Scroll back, type (view STAYS), Enter (view snaps) — issue
+            # #131's reversal of #110, asserted act by act.
+            app._mark = None
+            app.scenario_enter_snap()
             time.sleep(0.5)
             app.gif(args.out, crop_rows=24, min_span=1.0)
         elif args.scenario == "drop-image":

@@ -32,6 +32,11 @@
   idle cursor blinks: the zero-render idle discipline gains one bounded,
   measured exception; see
   [Amendment (2026-10-31, issue #104): the idle cursor blinks](#amendment-2026-10-31-issue-104-the-idle-cursor-blinks)
+  below); **amended again 2026-10-31**
+  ([issue #131](https://github.com/fluxvale/dashfloat/issues/131) — the
+  transcript re-pins to its tail ONLY on a dispatched submit (Enter);
+  see
+  [Amendment (2026-10-31, issue #131): Enter-only re-pin — the typing snap (#110) reversed](#amendment-2026-10-31-issue-131-enter-only-re-pin--the-typing-snap-110-reversed)
   below)
 - **Date:** 2026-10-24
 - **Implements:** [issue #16](https://github.com/fluxvale/dashfloat/issues/16) — Phase 2.5 of the
@@ -207,10 +212,15 @@ by `DashFloat.TUI.Render.entry_lines/2`. The raw text never re-renders.
   shape misses, they are consumed. Provider-compat note: OpenAI-compatible
   routers broadly support `stream_options`; a provider that rejects it fails
   through the existing HTTP error taxonomy (degrades to a chat entry).
-- **tok/s** — cumulative average: `tokens / elapsed`, elapsed measured from
-  the first token's arrival (injected monotonic clock, below). Recomputed on
-  each tick while streaming; frozen at finalize/cancel — the last rate stays
-  visible after completion.
+- **tok/s** — *(superseded 2026-10-31, #130 — the rate is now the
+  whole-response average `tokens ÷ (first→last token)`, frozen at
+  finalize/cancel and NEVER live ("it tends to speed up by the end so it
+  doesn't give a good representation of the TPS" — the owner); ttft rides
+  beside it; see [ADR 0015](0015-input-surface-cursor-stats-ghost.md)'s
+  2026-10-31 #130 amendment)* cumulative average: `tokens / elapsed`,
+  elapsed measured from the first token's arrival (injected monotonic
+  clock, below). Recomputed on each tick while streaming; frozen at
+  finalize/cancel — the last rate stays visible after completion.
 - **Context usage** — *(the banking this bullet described is deleted — #67
   stage 2 replaced it; see the 2026-10-30 amendment to
   [ADR 0015](0015-input-surface-cursor-stats-ghost.md) §2 and
@@ -739,3 +749,41 @@ notes) are read against this amendment, not independently.
 - **Capture rig.** `wait_boot`/`wait_quiet` treat writes under 96 bytes as
   blink noise (quiet means "nothing substantive changed", not "zero
   bytes"); the probe reports bursts/s as the blink's metric.
+
+## Amendment (2026-10-31, issue #131): Enter-only re-pin — the typing snap (#110) reversed
+
+**Status:** Accepted. Supersedes the #110 decision — "any composer edit
+re-pins the log to its tail" (recorded in PR #117's notes-for-the-record,
+restated as the rule behind [ADR 0018](0018-image-attachments.md)'s
+2026-10-31 #112 amendment bullet, and implemented on the composer-edit
+paths) — which the owner reversed after real use, verbatim: *"I only want
+the chat to automatically scroll to the bottom once I press Enter and not
+when I type something. The reason is because I'm probably scrolling up on
+purpose and then typing in response to something from earlier in the
+chat."* Reading earlier context while composing a reply is a first-class
+posture, not a state to be snapped out of. The mouse-wheel amendment's own
+semantics ("up unfollows, down re-pins at the bottom, submit re-pins")
+stand unchanged — this amendment only removes what #110 had added on top.
+
+- **Composer edits NEVER move the transcript.** Draft keystrokes and
+  backspace, text pastes, dropped-image chips and their Backspace pops,
+  the ghost Tab, and the filter's completion Tab all leave `scroll` and
+  `follow?` exactly as they were — the reader parked above the tail keeps
+  the view to the row.
+- **The ONE re-pin gesture is a dispatched submit (Enter).** `submit/2`
+  re-pins after a real dispatch — a plain message (the existing clause),
+  a command (new: typed or the palette's filtered Enter, which previously
+  did not re-pin — Enter is Enter), an unknown-bare-slash warn. A no-op
+  Enter (blank draft, mid-stream) pins nothing.
+- **A reply arriving while scrolled up does not yank the view** —
+  verified, not assumed: the scroll intent is top-anchored (an offset
+  from the log's first display row), so streaming tokens and landed
+  entries extend the content BELOW the viewport and the visible rows
+  never move; the clamp only acts when content shrinks. Recorded here
+  because the follow machinery is this ADR's. Manual scroll-to-bottom
+  naturally re-follows (the wheel amendment's own down-re-pins rule).
+- **ADR 0018's #112 bullet is read against this amendment:** its "drop
+  path and chip pop DO snap" clause is reversed (they are composer edits,
+  not sends); its Ctrl+O reasoning — a prompt action is not a composer
+  edit — survives trivially, now as one case of the general rule that
+  nothing but Enter pins.

@@ -86,6 +86,9 @@ defmodule DashFloat.TUI.State do
   @type stats :: %{
           tokens: non_neg_integer(),
           first_token_at: integer() | nil,
+          last_token_at: integer() | nil,
+          sent_at: integer() | nil,
+          ttft_ms: non_neg_integer() | nil,
           rate: float() | nil,
           prompt_tokens: non_neg_integer() | nil,
           completion_tokens: non_neg_integer() | nil
@@ -142,9 +145,19 @@ defmodule DashFloat.TUI.State do
     blink_ms: nil,
     exit_guard_at: nil,
     exit_guard_ref: nil,
+    # The streaming stats (issue #130; ADR 0015's 2026-10-31 amendment):
+    # `sent_at` is the turn's Enter moment, `ttft_ms` the send→first-token
+    # reading captured once per turn (it survives the finalize so the footer
+    # keeps it after the turn ends), `last_token_at` the decode window's
+    # far end — the frozen rate is tokens ÷ (last − first), never
+    # send→done. `rate` is nil while streaming: no live number, by the
+    # owner's refinement.
     stats: %{
       tokens: 0,
       first_token_at: nil,
+      last_token_at: nil,
+      sent_at: nil,
+      ttft_ms: nil,
       rate: nil,
       prompt_tokens: nil,
       completion_tokens: nil
@@ -741,12 +754,25 @@ defmodule DashFloat.TUI.State do
 
   ## Status labels
 
-  @doc "The live tok/s rate as one decimal, or nil before any rate exists."
+  @doc """
+  The footer's ttft span (issue #130; ADR 0015's 2026-10-31 amendment):
+  send → first token in seconds, one decimal with a trailing `.0` trimmed
+  (the percent span's rule) — `1.4s`, `2s`. nil until the turn's first
+  token lands; persists after the turn ends until the next send.
+  """
+  @spec ttft_label(t()) :: String.t() | nil
+  def ttft_label(%__MODULE__{stats: %{ttft_ms: nil}}), do: nil
+  def ttft_label(%__MODULE__{stats: %{ttft_ms: ms}}), do: trim_zero(ms / 1_000)
+
+  @doc """
+  The whole-response tok/s average (issue #130; ADR 0015's 2026-10-31
+  amendment): one decimal, trailing `.0` trimmed — `9.9`, `32`. nil while
+  streaming and until the turn freezes a rate; never a live value.
+  """
   @spec rate_label(t()) :: String.t() | nil
   def rate_label(%__MODULE__{stats: %{rate: nil}}), do: nil
 
-  def rate_label(%__MODULE__{stats: %{rate: rate}}),
-    do: :erlang.float_to_binary(rate, decimals: 1)
+  def rate_label(%__MODULE__{stats: %{rate: rate}}), do: trim_zero(rate)
 
   @doc """
   The footer's context span (ADR 0015 §2 amendment, issue #67 stage 2):
@@ -814,8 +840,9 @@ defmodule DashFloat.TUI.State do
   converts to an attachment instead — the drag-and-drop shape (issue #112;
   ADR 0018's 2026-10-31 amendment): terminals paste a dropped file's path,
   and the composer answers with a chip, never literal path text. Refusals
-  follow the attach prompt's visible-entry rule. Either way the composer
-  was edited: the log re-pins to the tail (issue #110).
+  follow the attach prompt's visible-entry rule. A paste is a composer
+  EDIT, not a send: it never moves the transcript (issue #131 supersedes
+  #110's re-pin rule).
   """
   @spec paste(t(), String.t()) :: t()
   def paste(%__MODULE__{} = state, content) when is_binary(content) do
@@ -824,7 +851,7 @@ defmodule DashFloat.TUI.State do
     case dropped_image(state, normalized) do
       nil ->
         ExRatatui.textarea_insert_str(state.input, normalized)
-        follow_tail(refresh_palette(dismiss_suggestion(leave_history(state))))
+        refresh_palette(dismiss_suggestion(leave_history(state)))
 
       attached ->
         attached
@@ -868,23 +895,27 @@ defmodule DashFloat.TUI.State do
     refusal =
       "[images: model #{image_model_name(config)} does not accept images — attach refused]"
 
-    {:ok, follow_tail(append_entry(state, :system, refusal))}
+    # The refusal lands without moving the transcript (issue #131): a
+    # visible-entry append below a parked view stays put — Enter is the
+    # one re-pin.
+    {:ok, append_entry(state, :system, refusal)}
   end
 
   defp drop_attach(%__MODULE__{} = state, path) do
     case Images.check(path) do
       {:ok, meta} ->
-        {:ok,
-         follow_tail(%{state | attachments: state.attachments ++ [Map.put(meta, :path, path)]})}
+        # Composer edits never move the transcript (issue #131).
+        {:ok, %{state | attachments: state.attachments ++ [Map.put(meta, :path, path)]}}
 
       {:error, reason} ->
-        {:ok, follow_tail(append_entry(state, :system, "[images: " <> reason <> "]"))}
+        {:ok, append_entry(state, :system, "[images: " <> reason <> "]")}
     end
   end
 
-  # Any composer edit re-pins the log to its tail (issue #110): the user
-  # extending the conversation watches it grow. Scrolling, cursor-only
-  # keys, and history navigation do not ride this — entering text does.
+  # The transcript's one re-pin gesture (issue #131, reversing #110): a
+  # DISPATCHED submit — Enter on a message or command. Typing, pasting,
+  # drops, chip pops, and completions never ride this; a reader parked on
+  # earlier context keeps the view until they actually send.
   defp follow_tail(%__MODULE__{} = state), do: %{state | scroll: 0, follow?: true}
 
   @doc """
@@ -1087,7 +1118,11 @@ defmodule DashFloat.TUI.State do
   defp route_key(%{palette: %Palette{mode: :filter} = palette} = state, "enter", mods, _now)
        when mods in [[], ["ctrl"]] do
     command = Enum.at(palette.items, palette.selected)
-    run_submitted_command(state, input_text(state), command.name, "")
+
+    {state, action} = run_submitted_command(state, input_text(state), command.name, "")
+
+    # This Enter is a dispatched submit too (issue #131): it re-pins.
+    {follow_tail(state), action}
   end
 
   # Filter Tab COMPLETES to the selected match (issue #105; ADR 0020's
@@ -1107,7 +1142,6 @@ defmodule DashFloat.TUI.State do
     |> set_draft("/" <> command.name <> " ")
     |> refresh_palette()
     |> dismiss_suggestion()
-    |> follow_tail()
     |> then(&{&1, nil})
   end
 
@@ -1137,7 +1171,7 @@ defmodule DashFloat.TUI.State do
     do: {state, {:set_mode, Mode.cycle(state.mode)}}
 
   # Enter / Ctrl+Enter submit; Shift+Enter / Alt+Enter insert a newline.
-  defp route_key(state, "enter", mods, _now) when mods in [[], ["ctrl"]], do: submit(state)
+  defp route_key(state, "enter", mods, now) when mods in [[], ["ctrl"]], do: submit(state, now)
   defp route_key(state, "enter", ["shift"], _now), do: forward(state, "enter", [])
   defp route_key(state, "enter", ["alt"], _now), do: forward(state, "enter", [])
 
@@ -1171,7 +1205,8 @@ defmodule DashFloat.TUI.State do
   # the cursor until the draft is empty).
   defp route_key(%{attachments: [_chip | _rest]} = state, "backspace", [], _now) do
     if input_text(state) == "" do
-      {follow_tail(%{state | attachments: Enum.drop(state.attachments, -1)}), nil}
+      # A chip pop is a composer edit, not a send: the view stays (issue #131).
+      {%{state | attachments: Enum.drop(state.attachments, -1)}, nil}
     else
       forward(state, "backspace", [])
     end
@@ -1187,7 +1222,6 @@ defmodule DashFloat.TUI.State do
       |> set_draft(suggestion)
       |> refresh_palette()
       |> dismiss_suggestion()
-      |> follow_tail()
       |> then(&{&1, nil})
     else
       forward(state, "tab", [])
@@ -1204,12 +1238,14 @@ defmodule DashFloat.TUI.State do
     # Editing while browsing history keeps the edited text: it becomes the
     # live draft (no longer restorable by navigating down). The filter
     # palette re-derives only when the draft actually changed — Esc's
-    # dismissal survives cursor-only keys (ADR 0020) — and a real edit
-    # re-pins the log to its tail (issue #110): keystrokes, not focus.
+    # dismissal survives cursor-only keys (ADR 0020). A draft edit NEVER
+    # moves the transcript (issue #131 reverses #110): the reader parked
+    # on earlier context keeps the view exactly where they put it — Enter
+    # is the one re-pin.
     edited = dismiss_suggestion(leave_history(state))
 
     state =
-      if input_text(edited) == before, do: edited, else: follow_tail(refresh_palette(edited))
+      if input_text(edited) == before, do: edited, else: refresh_palette(edited)
 
     {state, nil}
   end
@@ -1319,28 +1355,36 @@ defmodule DashFloat.TUI.State do
   keep submit's idle gate and bookkeeping. Returns `{state, nil}` when
   nothing is submittable — a blank draft and no pending attachments — or a
   request is already in flight (one at a time; queueing is Phase 2).
+
+  A dispatched submit — message or command — is also the ONE gesture that
+  re-pins the transcript to its tail (issue #131; ADR 0006's 2026-10-31
+  amendment: the owner reverses #110's typing-snap — reading earlier
+  context while composing must not be yanked away). A no-op Enter (empty
+  draft, mid-stream) pins nothing. `now` is monotonic milliseconds — the
+  send → first-token clock's zero (issue #130).
   """
-  @spec submit(t()) :: {t(), action()}
-  def submit(%__MODULE__{} = state) do
+  @spec submit(t(), integer()) :: {t(), action()}
+  def submit(%__MODULE__{} = state, now \\ System.monotonic_time(:millisecond)) do
     text = input_text(state)
 
     if state.phase == :idle and (String.trim(text) != "" or state.attachments != []) do
-      dispatch_submit(state, text)
+      {state, action} = dispatch_submit(state, text, now)
+      {follow_tail(state), action}
     else
       {state, nil}
     end
   end
 
-  defp dispatch_submit(state, text) do
+  defp dispatch_submit(state, text, now) do
     trimmed = String.trim(text)
 
     case Commands.split_command(trimmed) do
       {name, rest} -> run_submitted_command(state, text, name, rest)
-      nil -> plain_or_unknown(state, text, trimmed)
+      nil -> plain_or_unknown(state, text, trimmed, now)
     end
   end
 
-  defp plain_or_unknown(state, text, trimmed) do
+  defp plain_or_unknown(state, text, trimmed, now) do
     case bare_slash_prefix(trimmed) do
       nil ->
         # The pending attachments ride the plain path only (ADR 0018 §5):
@@ -1355,9 +1399,11 @@ defmodule DashFloat.TUI.State do
         |> put_entry(:user, text, entry_lines)
         |> clear_input()
         |> Map.put(:phase, :streaming)
-        # A new question re-pins the log: the user wants to watch its answer
-        # arrive even if they had paged up first.
-        |> Map.put(:follow?, true)
+        # The turn's stats open here (issue #130): `sent_at` is the send →
+        # first-token clock's zero, and the previous turn's footer spans
+        # (ttft + frozen rate) retire now — a streaming footer shows the
+        # new turn's ttft once a token lands, never a stale tok/s.
+        |> Map.put(:stats, Map.merge(state.stats, %{sent_at: now, ttft_ms: nil, rate: nil}))
         |> dismiss_suggestion()
         |> then(&{&1, {:submit, text, paths}})
 
@@ -1726,16 +1772,18 @@ defmodule DashFloat.TUI.State do
     do: state
 
   def stream_message(state, {:token, text}, now) when is_binary(text) do
-    %{
-      state
-      | in_flight: (state.in_flight || "") <> text,
-        stats: %{
-          state.stats
-          | tokens: state.stats.tokens + 1,
-            first_token_at: state.stats.first_token_at || now
-        },
-        in_flight_dirty: true
+    stats = %{
+      state.stats
+      | tokens: state.stats.tokens + 1,
+        first_token_at: state.stats.first_token_at || now,
+        last_token_at: now,
+        # Send → first token, captured ONCE per turn (issue #130): tool
+        # interludes wipe the episode fields but the turn's ttft is sticky,
+        # so it always reads from the Enter that sent it.
+        ttft_ms: state.stats.ttft_ms || turn_ttft(state.stats, now)
     }
+
+    %{state | in_flight: (state.in_flight || "") <> text, stats: stats, in_flight_dirty: true}
   end
 
   # A usage frame arriving after the turn finalized belongs to a turn that is
@@ -1937,24 +1985,44 @@ defmodule DashFloat.TUI.State do
     if to_row >= base, do: %{state | selection: nil}, else: state
   end
 
-  # The turn's rate freezes here (ADR 0006); the context total is NOT banked
-  # anymore — the footer's tokens-used span reads Accounting.usage/3 off the
-  # agent's context snapshot (ADR 0015 §2 amendment, issue #67 stage 2).
-  defp frozen(%{stats: stats}, now) do
+  # The turn's rate freezes here — the WHOLE-RESPONSE average over the
+  # decode window, first→last token (issue #130's refinement: steady decode
+  # speed; send→done would fold TTFT in and drag the number down). The
+  # turn's ttft is NOT cleared — both spans persist in the footer after the
+  # turn ends until the next send. The context total is NOT banked — the
+  # footer's tokens-used span reads Accounting.usage/3 off the agent's
+  # context snapshot (ADR 0015 §2 amendment, issue #67 stage 2).
+  # The turn's rate freezes here — the WHOLE-RESPONSE average over the
+  # decode window, first→last token (issue #130's refinement: steady decode
+  # speed; send→done would fold TTFT in and drag the number down). The
+  # turn's ttft is NOT cleared — both spans persist in the footer after the
+  # turn ends until the next send. The context total is NOT banked — the
+  # footer's tokens-used span reads Accounting.usage/3 off the agent's
+  # context snapshot (ADR 0015 §2 amendment, issue #67 stage 2).
+  defp frozen(%{stats: stats}, _now) do
     %{
       stats
-      | rate: rate(stats.tokens, stats.first_token_at, now) || stats.rate,
+      | rate: rate(stats.tokens, stats.first_token_at, stats.last_token_at) || stats.rate,
         tokens: 0,
-        first_token_at: nil
+        first_token_at: nil,
+        last_token_at: nil
     }
   end
 
-  defp rate(tokens, first_token_at, now)
-       when is_integer(first_token_at) and is_integer(now) and tokens > 0 and now > first_token_at do
-    tokens * 1000 / (now - first_token_at)
+  defp rate(tokens, first_token_at, last_token_at)
+       when is_integer(first_token_at) and is_integer(last_token_at) and tokens > 0 and
+              last_token_at > first_token_at do
+    tokens * 1000 / (last_token_at - first_token_at)
   end
 
-  defp rate(_tokens, _first_token_at, _now), do: nil
+  defp rate(_tokens, _first_token_at, _last_token_at), do: nil
+
+  # The turn's ttft: send (the submit's `sent_at`) → first token. nil when
+  # no send opened the turn (resume replay, a straggler); a clock wound
+  # backwards reads as zero, never negative.
+  defp turn_ttft(%{sent_at: nil}, _now), do: nil
+  defp turn_ttft(%{sent_at: sent_at}, now) when now >= sent_at, do: now - sent_at
+  defp turn_ttft(_stats, _now), do: 0
 
   # `text` stays verbatim (ADR 0006: it is the persistence truth); `logical`
   # is the width-free render truth, `lines` its wrap at the current width —
@@ -1984,21 +2052,17 @@ defmodule DashFloat.TUI.State do
   @doc """
   Steps the spinner and refreshes the live in-flight render. Returns
   `{state, :halt}` immediately when idle — an idle UI must never keep a timer
-  alive (ADR 0006). `now` is monotonic milliseconds.
+  alive (ADR 0006). `now` is monotonic milliseconds. The tick no longer
+  touches the rate: tok/s is a whole-response average frozen at finalize,
+  never a live value (issue #130's refinement).
   """
   @spec tick(t(), integer()) :: {t(), :cont | :halt}
   def tick(%__MODULE__{phase: :idle} = state, _now), do: {state, :halt}
 
-  def tick(%__MODULE__{} = state, now) do
-    stats = state.stats
-
+  def tick(%__MODULE__{} = state, _now) do
     state =
       state
       |> Map.put(:anim_step, state.anim_step + 1)
-      |> Map.put(:stats, %{
-        stats
-        | rate: rate(stats.tokens, stats.first_token_at, now) || stats.rate
-      })
       |> refresh_in_flight()
 
     {state, :cont}

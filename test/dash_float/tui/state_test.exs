@@ -85,6 +85,9 @@ defmodule DashFloat.TUI.StateTest do
       assert state.stats == %{
                tokens: 0,
                first_token_at: nil,
+               last_token_at: nil,
+               sent_at: nil,
+               ttft_ms: nil,
                rate: nil,
                prompt_tokens: nil,
                completion_tokens: nil
@@ -269,16 +272,32 @@ defmodule DashFloat.TUI.StateTest do
       assert State.rate_label(new_state()) == nil
     end
 
-    test "the derived rate renders with one decimal" do
-      state =
-        Enum.reduce(1..10, Map.put(new_state(), :phase, :streaming), fn i, acc ->
-          State.stream_message(acc, {:token, "t#{i}"}, 1_000)
+    test "no ttft until a turn's first token lands" do
+      assert State.ttft_label(new_state()) == nil
+    end
+
+    test "the frozen rate renders with one decimal, trailing .0 trimmed" do
+      # 10 tokens over the 1.01 s decode window (first → last token) —
+      # frozen at finalize, never live on the tick (issue #130).
+      base = Map.put(new_state(), :phase, :streaming)
+
+      streamed =
+        Enum.reduce(1..10, base, fn i, acc ->
+          State.stream_message(acc, {:token, "t#{i}"}, 1_000 + div((i - 1) * 1_010, 9))
         end)
 
-      {ticked, :cont} = State.tick(state, 2_010)
+      state = State.stream_message(streamed, {:phase, :idle}, 3_000)
 
-      # 10 tokens over 1.01 s
-      assert State.rate_label(ticked) == "9.9"
+      assert_in_delta state.stats.rate, 9.9009, 0.001
+      assert State.rate_label(state) == "9.9"
+    end
+
+    test "ttft renders in seconds, trailing .0 trimmed" do
+      state = %{new_state() | stats: %{new_state().stats | ttft_ms: 1_400}}
+      assert State.ttft_label(state) == "1.4"
+
+      whole = %{new_state() | stats: %{new_state().stats | ttft_ms: 2_000}}
+      assert State.ttft_label(whole) == "2"
     end
 
     test "no context before the first snapshot lands" do
@@ -570,10 +589,10 @@ defmodule DashFloat.TUI.StateTest do
       assert above.selection.anchor == {top, 0}
 
       # Drag into the input pane (screen row 23): the viewport's last
-      # visible row (15-row idle viewport, issues #28 + #108: rows
-      # top..top + 14).
+      # visible row (13-row idle viewport, issues #28 + #108 + the #129
+      # gap: rows top..top + 12).
       {below, _nil} = State.select_mouse(scrolled, "down", 1, 23)
-      assert below.selection.anchor == {top + 14, 0}
+      assert below.selection.anchor == {top + 12, 0}
     end
 
     test "click jitter below the drag threshold clears instead of copying" do
@@ -1445,18 +1464,18 @@ defmodule DashFloat.TUI.StateTest do
   end
 
   describe "rate derivation and freezing" do
-    test "10 tokens over 1.01 s tick at 9.9 tok/s" do
+    test "the tick never derives a rate — no live tok/s (issue #130)" do
       state =
         Enum.reduce(1..10, Map.put(new_state(), :phase, :streaming), fn i, acc ->
           State.stream_message(acc, {:token, "t#{i}"}, 1_000)
         end)
 
       {ticked, :cont} = State.tick(state, 2_010)
-      assert_in_delta ticked.stats.rate, 9.9009, 0.001
-      assert State.rate_label(ticked) == "9.9"
+      assert ticked.stats.rate == nil
+      assert State.rate_label(ticked) == nil
     end
 
-    test "finalize freezes the rate and clears the streaming counters" do
+    test "finalize freezes the whole-response average and clears the counters" do
       state =
         new_state()
         |> Map.put(:phase, :streaming)
@@ -1464,14 +1483,17 @@ defmodule DashFloat.TUI.StateTest do
         |> State.stream_message({:token, "def"}, 1_500)
         |> State.stream_message({:phase, :idle}, 2_000)
 
-      # 2 tokens over 1.0 s
-      assert_in_delta state.stats.rate, 2.0, 0.0001
+      # 2 tokens over the 0.5 s decode window (first → last token, not
+      # send → done: the owner's refinement — elapsed-time rates fold TTFT
+      # in and drag the number down).
+      assert_in_delta state.stats.rate, 4.0, 0.0001
       assert state.stats.tokens == 0
       assert state.stats.first_token_at == nil
-      assert State.rate_label(state) == "2.0"
+      assert state.stats.last_token_at == nil
+      assert State.rate_label(state) == "4"
     end
 
-    test "the frozen rate survives the next turn until new ticks replace it" do
+    test "the frozen rate survives a late usage frame; the next submit retires it" do
       usage = %{prompt_tokens: 3, completion_tokens: 2, total_tokens: 5}
 
       state =
@@ -1482,21 +1504,31 @@ defmodule DashFloat.TUI.StateTest do
         |> State.stream_message({:usage, usage}, 1_800)
         |> State.stream_message({:phase, :idle}, 2_000)
 
-      assert State.rate_label(state) == "2.0"
+      assert State.rate_label(state) == "4"
 
       # A usage frame arriving after the turn ended belongs to nobody.
       late = State.stream_message(state, {:usage, usage}, 2_100)
-      assert State.rate_label(late) == "2.0"
+      assert State.rate_label(late) == "4"
+
+      # The next send clears the retired spans (issue #130: a streaming
+      # footer shows the new turn's ttft once a token lands — never a
+      # stale tok/s) and stamps the new clock zero.
+      resent = idle_submit(late, "next question")
+      assert resent.stats.rate == nil
+      assert resent.stats.ttft_ms == nil
+      assert is_integer(resent.stats.sent_at)
     end
 
     test "cancel-style finalize with no usage frame still freezes a rate" do
       state =
         new_state()
         |> Map.put(:phase, :streaming)
-        |> State.stream_message({:token, "partial"}, 1_000)
+        |> State.stream_message({:token, "par"}, 1_000)
+        |> State.stream_message({:token, "tial"}, 1_200)
         |> State.stream_message({:phase, :idle}, 1_500)
 
-      assert_in_delta state.stats.rate, 2.0, 0.0001
+      # 2 partial tokens over the 0.2 s decode window = 10 tok/s.
+      assert_in_delta state.stats.rate, 10.0, 0.0001
       assert state.stats.prompt_tokens == nil
       assert pairs(state) == [{:assistant, "partial"}]
     end
@@ -1507,15 +1539,82 @@ defmodule DashFloat.TUI.StateTest do
       assert State.rate_label(state) == nil
     end
 
-    test "an empty elapsed window keeps the prior rate" do
+    test "a single token has no decode window, so no rate" do
       state =
         new_state()
         |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "a"}, 1_000)
-        |> State.stream_message({:phase, :idle}, 1_000)
+        |> State.stream_message({:phase, :idle}, 2_000)
 
       assert state.stats.rate == nil
       assert State.rate_label(state) == nil
+    end
+  end
+
+  describe "ttft: send → first token (issue #130)" do
+    # The standin stream with a KNOWN first-token delay: Enter at t=0, the
+    # first token 1.4 s later, 96 tokens over a 3 s decode window, finalize
+    # at 5 s — the issue's own example numbers.
+    test "measured from the submit, shown alone while streaming, kept after the turn" do
+      base = type(new_state(), "hello")
+      {sent, {:submit, "hello", []}} = State.handle_key(base, "enter", [], 0)
+      assert sent.stats.sent_at == 0
+
+      # Mid-stream: ttft known from the first token, no tok/s beside it.
+      first_token = State.stream_message(sent, {:token, "t0"}, 1_400)
+      assert first_token.stats.ttft_ms == 1_400
+      assert State.ttft_label(first_token) == "1.4"
+      assert State.rate_label(first_token) == nil
+
+      streamed =
+        Enum.reduce(1..95, first_token, fn i, acc ->
+          State.stream_message(acc, {:token, "t#{i}"}, 1_400 + div(i * 3_000, 95))
+        end)
+
+      done = State.stream_message(streamed, {:phase, :idle}, 5_000)
+
+      # After the turn: both spans persist — `ttft 1.4s · 32 tok/s` — the
+      # rate is the whole-response average over the decode window alone.
+      assert State.ttft_label(done) == "1.4"
+      assert State.rate_label(done) == "32"
+      assert_in_delta done.stats.rate, 32.0, 0.001
+    end
+
+    test "ttft is captured once per turn — a tool interlude cannot reset it" do
+      base = type(new_state(), "q")
+      {sent, _action} = State.handle_key(base, "enter", [], 0)
+
+      state =
+        sent
+        |> State.stream_message({:token, "before"}, 1_400)
+        # A mid-turn tool episode finalizes the episode counters...
+        |> State.stream_message({:phase, :executing_tool}, 1_500)
+        |> State.stream_message({:phase, :streaming}, 1_600)
+        # ...so this is a NEW episode's first token — the turn's ttft
+        # still reads from the send.
+        |> State.stream_message({:token, "after"}, 2_000)
+
+      assert state.stats.ttft_ms == 1_400
+      assert state.stats.first_token_at == 2_000
+    end
+
+    test "a token with no send behind it reads no ttft" do
+      state =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "stray"}, 1_000)
+
+      assert state.stats.ttft_ms == nil
+      assert State.ttft_label(state) == nil
+    end
+
+    test "a token racing its own submit reads ttft zero, never negative" do
+      base = type(new_state(), "q")
+      {sent, _action} = State.handle_key(base, "enter", [], 5_000)
+
+      racing = State.stream_message(sent, {:token, "early"}, 4_000)
+      assert racing.stats.ttft_ms == 0
+      assert State.ttft_label(racing) == "0"
     end
   end
 
@@ -1655,15 +1754,15 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up on a viewport-fitting log is a no-op (stays pinned)" do
-      # The real idle viewport at 80x24 is 15 rows with the margin (issues
-      # #28 + #108; ADR 0015's footer took one more row); 7 entries = blank
-      # + line each fit inside one viewport.
-      base = full_state(7)
-      assert State.log_line_count(base) == 14
+      # The real idle viewport at 80x24 is 13 rows with the margin (issues
+      # #28 + #108; ADR 0015's footer took one row and its #129 gap two
+      # more); 6 entries = blank + line each fit inside one viewport.
+      base = full_state(6)
+      assert State.log_line_count(base) == 12
 
       {paged, nil} = State.handle_key(base, "page_up", [])
       assert paged.follow?
-      assert State.effective_scroll(paged, 15) == 0
+      assert State.effective_scroll(paged, 13) == 0
     end
 
     test "submit re-pins the log so the new reply is visible" do
@@ -1677,45 +1776,100 @@ defmodule DashFloat.TUI.StateTest do
       assert State.effective_scroll(state, 20) == 182
     end
 
-    # Typing snaps the transcript to the tail (issue #110): any composer
-    # EDIT while the view rests above the bottom re-pins immediately — the
-    # keystroke is the requirement, not focus, and no timer rides this.
-    test "a draft-editing keystroke re-pins the log to the tail" do
+    # Typing leaves the transcript EXACTLY in place (issue #131, reversing
+    # #110): the owner is deliberately reading earlier context while
+    # composing a reply — "I only want the chat to automatically scroll to
+    # the bottom once I press Enter and not when I type something." A
+    # composer edit is not a send; the view keeps its offset to the row.
+    test "a draft-editing keystroke leaves the view exactly in place" do
       base = full_state(100)
       {paged, nil} = State.handle_key(base, "page_up", [])
       refute paged.follow?
 
       {typed, nil} = State.handle_key(paged, "h", [])
-      assert typed.follow?
-      assert typed.scroll == 0
-      assert State.effective_scroll(typed, 20) == 180
+      refute typed.follow?
+      assert typed.scroll == paged.scroll
+      assert State.effective_scroll(typed, 20) == State.effective_scroll(paged, 20)
       assert State.input_text(typed) == "h"
     end
 
-    test "backspace editing an existing draft re-pins too" do
+    test "backspace editing an existing draft stays put too" do
       base = full_state(100)
       {drafted, nil} = State.handle_key(base, "a", [])
       {paged, nil} = State.handle_key(drafted, "page_up", [])
       refute paged.follow?
 
       {edited, nil} = State.handle_key(paged, "backspace", [])
-      assert edited.follow?
+      refute edited.follow?
+      assert edited.scroll == paged.scroll
       assert State.input_text(edited) == ""
     end
 
-    test "a paste re-pins the log to the tail" do
+    test "a paste stays put (a composer edit, not a send)" do
       base = full_state(100)
       {paged, nil} = State.handle_key(base, "page_up", [])
       refute paged.follow?
 
       pasted = State.paste(paged, "pasted text")
-      assert pasted.follow?
+      refute pasted.follow?
+      assert pasted.scroll == paged.scroll
       assert State.input_text(pasted) == "pasted text"
     end
 
-    # The negative space, recorded (issue #110's decision): cursor-only
-    # keys and history navigation are not "entering text" — the view stays
-    # where the reader put it.
+    # Enter is the ONE re-pin gesture: a dispatched submit — message or
+    # command — snaps the transcript to its tail (issue #131).
+    test "submitting a command re-pins the log too" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      refute paged.follow?
+
+      {helped, nil} =
+        paged
+        |> type("/help")
+        |> State.handle_key("enter", [])
+
+      assert helped.follow?
+      assert helped.scroll == 0
+    end
+
+    test "a no-op Enter (blank draft) pins nothing" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      refute paged.follow?
+
+      {noop, nil} = State.handle_key(paged, "enter", [])
+      refute noop.follow?
+      assert noop.scroll == paged.scroll
+    end
+
+    # A reply arriving while the view is parked above the tail must not
+    # yank it either (issue #131's verify-and-record clause): the scroll
+    # intent is top-anchored, so appends land below the viewport and the
+    # visible rows never move.
+    test "a reply arriving while scrolled up does not yank the view" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      refute paged.follow?
+      offset = State.effective_scroll(paged, 13)
+
+      arriving =
+        paged
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "the reply grows and grows"}, 1_000)
+
+      {ticked, :cont} = State.tick(arriving, 1_100)
+
+      growing = State.stream_message(ticked, {:token, " — more"}, 1_200)
+
+      refute growing.follow?
+      assert growing.scroll == paged.scroll
+      assert State.effective_scroll(growing, 13) == offset
+      assert State.log_line_count(growing) > State.log_line_count(paged)
+    end
+
+    # The negative space, recorded (issue #110's decision, kept by #131):
+    # cursor-only keys and history navigation are not sends — the view
+    # stays where the reader put it.
     test "cursor-only keys and history navigation do NOT re-pin" do
       base = full_state(100)
       {paged, nil} = State.handle_key(base, "page_up", [])
@@ -1737,18 +1891,18 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "page_up unfollows and pages back; page_down re-pins at the bottom" do
-      # 200 lines, 15-row viewport (the padded 80x24 layout with ADR 0015's
-      # footer) → bottom 185.
+      # 200 lines, 13-row viewport (the padded 80x24 layout with ADR 0015's
+      # footer and its #129 gap) → bottom 187.
       base = full_state(100)
       {up_one, nil} = State.handle_key(base, "page_up", [])
       refute up_one.follow?
-      assert State.effective_scroll(up_one, 15) == 170
+      assert State.effective_scroll(up_one, 15) == 174
 
       {up_two, nil} = State.handle_key(up_one, "page_up", [])
-      assert State.effective_scroll(up_two, 15) == 155
+      assert State.effective_scroll(up_two, 15) == 161
 
       {down_one, nil} = State.handle_key(up_two, "page_down", [])
-      assert State.effective_scroll(down_one, 15) == 170
+      assert State.effective_scroll(down_one, 15) == 174
 
       {down_two, nil} = State.handle_key(down_one, "page_down", [])
       assert down_two.follow?
@@ -1761,14 +1915,14 @@ defmodule DashFloat.TUI.StateTest do
 
       wheeled = State.wheel_scroll(base, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 15) == 182
+      assert State.effective_scroll(wheeled, 15) == 184
 
       again = State.wheel_scroll(wheeled, :up)
-      assert State.effective_scroll(again, 15) == 179
+      assert State.effective_scroll(again, 15) == 181
 
       down = State.wheel_scroll(again, :down)
       refute down.follow?
-      assert State.effective_scroll(down, 15) == 182
+      assert State.effective_scroll(down, 15) == 184
 
       pinned = State.wheel_scroll(down, :down)
       assert pinned.follow?
@@ -1776,8 +1930,8 @@ defmodule DashFloat.TUI.StateTest do
     end
 
     test "wheel up on a viewport-fitting log is a no-op (stays pinned)" do
-      base = full_state(7)
-      assert State.log_line_count(base) == 14
+      base = full_state(6)
+      assert State.log_line_count(base) == 12
       assert State.wheel_scroll(base, :up) == base
     end
 
@@ -1792,12 +1946,12 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.phase == :confirming
 
-      # The activity row is up while confirming: the viewport is 14 rows
-      # (ADR 0015's footer took one from the log).
-      bottom = State.effective_scroll(state, 14)
+      # The activity row is up while confirming: the viewport is 12 rows
+      # (ADR 0015's footer took one from the log, its #129 gap two more).
+      bottom = State.effective_scroll(state, 12)
       wheeled = State.wheel_scroll(state, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 14) == bottom - 3
+      assert State.effective_scroll(wheeled, 12) == bottom - 3
     end
 
     test "new content does not move an unfollowed view, but clamping still holds" do

@@ -19,29 +19,36 @@ defmodule DashFloat.TUI.ViewTest do
 
   describe "regions/3" do
     test "status 1 row, log the rest, no activity row when idle, input borders + draft, footer 1 row" do
-      %{status: status, log: log, activity: activity, input: input, footer: footer} =
+      %{status: status, log: log, gap: gap, activity: activity, input: input, footer: footer} =
         View.regions({80, 24}, 1, false)
 
-      assert {status.height, log.height, activity.height, input.height, footer.height} ==
-               {1, 15, 0, 3, 1}
+      assert {status.height, log.height, gap.height, activity.height, input.height, footer.height} ==
+               {1, 13, 2, 0, 3, 1}
 
       assert status.y == 2 and log.y == 3 and activity.y == 18 and input.y == 18
       assert Enum.map([status, log, activity, input, footer], & &1.width) == [76, 76, 76, 76, 76]
       # Two cells of padding on every side (issues #28 and #108): nothing at
       # the edges.
       assert status.x == 2 and log.x == 2 and input.x == 2 and footer.x == 2
+      # The breathing gap (issue #129): two blank rows between the
+      # transcript's bottom and the composer cluster — the margin language's
+      # own rhythm — with nothing rendered into them.
+      assert gap.y == 16 and gap.y + gap.height == input.y
       # The footer sits directly under the input (ADR 0015 §2).
       assert input.y + input.height == 21 and footer.y == 21
       assert footer.y + footer.height == 22
     end
 
-    test "an active phase claims one activity row between log and input" do
-      %{log: log, activity: activity, input: input, footer: footer} =
+    test "an active phase claims one activity row between the gap and input" do
+      %{log: log, gap: gap, activity: activity, input: input, footer: footer} =
         View.regions({80, 24}, 1, true)
 
       assert activity.height == 1
-      assert log.height == 14
-      assert activity.y == 17 and input.y == 18 and footer.y == 21
+      assert log.height == 12
+      # The gap sits between the transcript and the composer CLUSTER — the
+      # activity row belongs to the cluster (it is the composer's own
+      # status chrome), so it renders under the air, hugging the input.
+      assert gap.y == 15 and activity.y == 17 and input.y == 18 and footer.y == 21
     end
 
     test "the input grows with the draft" do
@@ -245,7 +252,7 @@ defmodule DashFloat.TUI.ViewTest do
 
       widget = log_widget(state, 80, 24)
       lines = widget.text
-      assert length(lines) == 15
+      assert length(lines) == 13
       assert flatten(List.last(lines)) =~ "line 100"
       # the window is pre-scrolled; the paragraph itself does no scrolling
       assert widget.scroll == {0, 0}
@@ -309,7 +316,7 @@ defmodule DashFloat.TUI.ViewTest do
         end)
 
       widget = log_widget(state, 80, 24)
-      assert length(widget.text) == 15
+      assert length(widget.text) == 13
     end
 
     test "the status position never shows an inverted range on tiny frames" do
@@ -353,10 +360,11 @@ defmodule DashFloat.TUI.ViewTest do
       assert Enum.map_join(entry.lines, &flatten/1) == long
 
       # The windowed view agrees with the accounting: follow shows the last
-      # 15 display rows — 14 full rows plus the 60-char tail, nothing else.
+      # 13 display rows — 12 full rows plus the 60-char tail, nothing else
+      # (the gap shrank the viewport by two, issue #129).
       visible = log_lines(state)
-      assert length(visible) == 15
-      assert Enum.map_join(visible, &flatten/1) == String.duplicate("x", 14 * 76 + 60)
+      assert length(visible) == 13
+      assert Enum.map_join(visible, &flatten/1) == String.duplicate("x", 12 * 76 + 60)
     end
 
     test "a tiny frame renders without raising" do
@@ -493,17 +501,71 @@ defmodule DashFloat.TUI.ViewTest do
       refute footer_text(new_state(provider: provider(nil))) =~ "📎"
     end
 
-    test "the rate shows only once one exists" do
+    test "the rate shows only once one exists — frozen, never live" do
       refute footer_text(new_state()) =~ "tok/s"
 
-      state =
+      # While streaming there is NO tok/s at all (issue #130's refinement:
+      # the live number misrepresents — "it tends to speed up by the end").
+      streaming =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "a"}, 1_000)
+
+      refute footer_text(streaming) =~ "tok/s"
+
+      # Frozen at finalize: 2 tokens over the 0 s decode window (both at
+      # t=1000) is no rate at all — never a division by zero.
+      zero_window =
         new_state()
         |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "a"}, 1_000)
         |> State.stream_message({:token, "b"}, 1_000)
         |> State.stream_message({:phase, :idle}, 2_000)
 
-      assert footer_text(state) =~ "2.0 tok/s"
+      refute footer_text(zero_window) =~ "tok/s"
+
+      state =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "a"}, 1_000)
+        |> State.stream_message({:token, "b"}, 1_500)
+        |> State.stream_message({:phase, :idle}, 2_000)
+
+      # 2 tokens ÷ 0.5 s decode window = 4.0 tok/s; a trailing ".0" trims
+      # (the percent span's rule, issue #130's exact format).
+      assert footer_text(state) =~ "4 tok/s"
+    end
+
+    test "ttft shows from the turn's first token and persists after the turn" do
+      # Before any token: no span.
+      refute footer_text(new_state()) =~ "ttft"
+
+      # A turn sent at t=0, first token at t=1_400: ttft is known while
+      # still streaming — alone, with no tok/s beside it.
+      streaming =
+        new_state()
+        |> Map.put(:stats, %{new_state().stats | sent_at: 0})
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "a"}, 1_400)
+
+      assert footer_text(streaming) =~ "ttft 1.4s"
+      refute footer_text(streaming) =~ "tok/s"
+
+      # After the turn ends both spans persist, ttft first (the issue's
+      # exact format): `ttft 1.4s · 32 tok/s` — 96 tokens over the 3 s
+      # decode window (1_400 → 4_400).
+      state =
+        new_state()
+        |> Map.put(:stats, %{new_state().stats | sent_at: 0})
+        |> Map.put(:phase, :streaming)
+        |> then(fn s ->
+          Enum.reduce(1..96, s, fn i, acc ->
+            State.stream_message(acc, {:token, "t#{i}"}, 1_400 + div((i - 1) * 3_000, 95))
+          end)
+        end)
+        |> State.stream_message({:phase, :idle}, 5_000)
+
+      assert footer_text(state) =~ "ttft 1.4s · 32 tok/s"
     end
 
     test "the usage-reconciled frozen rate follows the model, in ADR order" do
@@ -513,7 +575,7 @@ defmodule DashFloat.TUI.ViewTest do
         base
         |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "a"}, 1_000)
-        |> State.stream_message({:token, "b"}, 1_000)
+        |> State.stream_message({:token, "b"}, 1_500)
         |> State.stream_message(
           {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 4_100}},
           1_500
@@ -521,8 +583,9 @@ defmodule DashFloat.TUI.ViewTest do
         |> State.stream_message({:phase, :idle}, 2_000)
 
       # The usage frame reconciles the count (2 deltas batched 5 tokens), so
-      # the frozen rate uses the authoritative 5 tokens over the 1 s window.
-      assert footer_text(state) =~ ~r/test-model · 5\.0 tok\/s/
+      # the frozen rate uses the authoritative 5 tokens over the 0.5 s
+      # decode window = 10 tok/s.
+      assert footer_text(state) =~ ~r/test-model · 10 tok\/s/
     end
 
     # The stage-2 span (ADR 0015 §2 amendment): tokens-used and

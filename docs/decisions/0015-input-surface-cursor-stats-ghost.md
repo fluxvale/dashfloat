@@ -18,6 +18,13 @@
   ([issue #104](https://github.com/fluxvale/dashfloat/issues/104) — the
   idle cursor now blinks; see
   [Amendment (2026-10-31, issue #104): the idle cursor blinks](#amendment-2026-10-31-issue-104-the-idle-cursor-blinks)
+  below); **amended again 2026-10-31**
+  ([issue #129](https://github.com/fluxvale/dashfloat/issues/129) /
+  [issue #130](https://github.com/fluxvale/dashfloat/issues/130) — a
+  two-row breathing gap between the transcript and the composer cluster,
+  and the footer gains `ttft` beside a whole-response `tok/s` average that
+  is never live; see
+  [Amendment (2026-10-31, issues #129 + #130): breathing gap, ttft, whole-response tok/s](#amendment-2026-10-31-issues-129--130-breathing-gap-ttft-whole-response-toks)
   below).
 - **Date:** 2026-10-29
 - **Implements:** [issue #66](https://github.com/fluxvale/dashfloat/issues/66),
@@ -342,3 +349,80 @@ blink riding the 125 ms tick. The idle blink is a dedicated 500 ms timer —
 §3 is untouched: the ghost arms and lands only on an EMPTY draft, so a
 `/`-prefixed draft never carries a ghost, and the filter popup's Tab
 (issue #105, ADR 0020's amendment) cannot fight Tab-the-ghost.
+
+## Amendment (2026-10-31, issues #129 + #130): breathing gap, ttft, whole-response tok/s
+
+**Status:** Accepted. The owner's v0.4.0 smoke test (Oct 31), one lane:
+"Can you add some margin at the bottom of the chat so there's a gap
+between the chat and the input box" (#129) and "Can we show the
+time-to-first-token alongside the tok/s?" (#130), the latter refined
+mid-lane (below). #129 extends §2's split with one more fixed region; #130
+supersedes §2's rate wording ("live while streaming because the tick
+recomputes it; frozen after finalize" — the rate is no longer live at all)
+and [ADR 0006](0006-ui-truth-and-rendering.md)'s status-bar-truth "tok/s"
+bullet (cross-noted there). Everything else stands.
+
+### #129 — the breathing gap
+
+- **Two blank rows between the transcript and the composer CLUSTER.**
+  `View.regions/3`'s split becomes status / log / **gap** / activity /
+  input / footer, the gap a fixed `@gap = 2` rows carrying no widget —
+  the margin language's own rhythm
+  ([ADR 0006](0006-ui-truth-and-rendering.md)'s #108 amendment established
+  two cells at every screen edge; the gap is the same two cells, applied
+  inside the chrome). The activity row renders UNDER the air, hugging the
+  input: it is the composer's own status chrome (`Streaming… esc
+  interrupt` interrupts the turn the composer sent), so the cluster the
+  air separates from the chat is activity + input + footer together.
+- **Constant by construction.** The gap is a region, not a render effect:
+  it holds snapped to the tail and scrolled mid-history alike, and the
+  composer's own height never moves (the log absorbs the two rows — the
+  idle 80×24 log goes 15 → 13; that is the recorded cost of the air the
+  owner asked for). Popups and setup screens overlay the whole inset area
+  and are untouched.
+- **Degenerate frames give the air back first.** When the inset height
+  cannot carry status + gap + a minimal (3-row) composer + footer, the
+  gap collapses to zero and the layout degrades exactly as the margin
+  amendment's degenerate rule does — never raise, never negative.
+
+### #130 — ttft beside a whole-response tok/s
+
+The exact format, stated once: **`ttft 1.4s · 32 tok/s`** — ttft first,
+both one decimal with a trailing `.0` trimmed (the percent span's own
+rule, #67 stage 2: `1.4`, `2`, `32`).
+
+- **ttft = send → first token.** `submit/2` stamps `sent_at` (the Enter
+  moment, injectable like every clock read) and the turn's first token
+  captures `ttft_ms` **once per turn** — a mid-turn tool interlude wipes
+  the episode counters but not the turn's ttft, so it always reads from
+  the Enter that sent it. A token with no send behind it (resume replay,
+  a straggler) shows no span; a clock wound backwards reads 0, never
+  negative.
+- **During streaming: ttft alone, once known — never a live tok/s.** The
+  owner's refinement, verbatim: *"it tends to speed up by the end so it
+  doesn't give a good representation of the TPS."* The tick no longer
+  touches the rate at all (spinner + in-flight refresh only); `stats.rate`
+  is nil from send to finalize.
+- **The average definition (recorded next to the number):** the shown
+  tok/s is the **whole-response average — total tokens ÷ the decode
+  window, first → last token** — frozen at finalize (and cancel; a turn's
+  last episode wins, the existing carry). Total ÷ (send → done) was
+  rejected: it folds TTFT into a throughput number and drags it down —
+  the decode window is the representative reading of steady decode speed.
+  The usage frame still reconciles the count (its completion total
+  replaces the per-delta estimate, so the frozen average divides real
+  tokens), and a single token (zero-width window) honestly yields no
+  rate.
+- **Persistence: both spans outlive the turn; the next send retires
+  them.** After `{:phase, :idle}` the footer keeps the finished turn's
+  `ttft … · … tok/s` as its record; the next dispatched submit stamps a
+  new `sent_at` and clears `ttft_ms`/`rate` — so a streaming footer shows
+  the new turn's ttft once a token lands and never a stale tok/s.
+- **Width discipline: the pair may never clip.** At 80 cols the full row
+  (`❯ cwd · model · used/window · % · ttft · tok/s`) overflows; the
+  optional groups drop from the left in reverse order of urgency — the
+  cwd first (the least volatile thing on the row), then the context
+  snapshot, then ttft — the ❯ glyph, the model label, and the rate are
+  never dropped, and the last resort keeps the rate alone and clips as
+  the Paragraph always did. (The attach row's hints-drop is the
+  precedent: drop what fits worst, keep the payload whole.)
