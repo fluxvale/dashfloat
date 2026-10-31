@@ -3,9 +3,9 @@ defmodule Mix.Tasks.Lint.Workflows do
 
   @moduledoc """
   The repo-lint step of `mix ci` ([ADR 0030](../../../docs/decisions/0030-actionlint-inside-the-ci-gate.md)):
-  actionlint over every `.github/workflows/*.yml` — with shellcheck
-  integration on each `run:` block — and shellcheck over the repo's own
-  scripts (`install.sh` and `scripts/*.sh`). Both binaries are pinned and
+  actionlint over every workflow file under `.github/workflows` (`.yml` and
+  `.yaml`) — with shellcheck integration on each `run:` block — and
+  shellcheck over the repo's own scripts (`install.sh` and `scripts/*.sh`). Both binaries are pinned and
   fetched by `DashFloat.PinnedTool`: the gate never lints with whatever
   happens to be on PATH, and it never skips — a tool that cannot be
   obtained, or a file with findings, reds `mix ci` instead of passing
@@ -20,7 +20,7 @@ defmodule Mix.Tasks.Lint.Workflows do
   def run(_argv) do
     with {:ok, actionlint} <- PinnedTool.fetch(:actionlint),
          {:ok, shellcheck} <- PinnedTool.fetch(:shellcheck) do
-      workflows = Path.wildcard(".github/workflows/*.yml")
+      workflows = Path.wildcard(".github/workflows/*.{yml,yaml}")
       scripts = Enum.filter(["install.sh" | Path.wildcard("scripts/*.sh")], &File.exists?/1)
 
       run!(actionlint, ["-shellcheck", shellcheck | workflows], "actionlint")

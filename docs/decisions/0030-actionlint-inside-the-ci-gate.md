@@ -33,7 +33,8 @@ silent-gap class this lane exists to close, reopened.
 **One new alias step.** `mix ci` gains `lint.workflows` (second position,
 after `deps.get --check-locked`), running `Mix.Tasks.Lint.Workflows`:
 
-- actionlint over `.github/workflows/*.yml`, invoked with
+- actionlint over every workflow file under `.github/workflows` (`.yml` and
+  `.yaml`), invoked with
   `-shellcheck <pinned path>` so every `run:` block is shellchecked through
   actionlint's own integration — no PATH roulette;
 - shellcheck over `install.sh` and `scripts/*.sh`;
@@ -51,7 +52,10 @@ just the binary (stdlib `:erl_tar` — both tools ship `.tar.gz`, which is also
 why shellcheck's `.tar.xz` assets are not used) into
 `_build/tools/<tool>-<version>/bin/`, chmods it, and writes the archive sha
 as a marker **last**: marker + binary is the whole cache-validity story, so a
-version bump invalidates by content, with no cache-key dance. Later runs are
+version bump invalidates by content, with no cache-key dance. A successful
+install also prunes the previous version's cache dir. Transient download
+failures retry (`:safe_transient`) — a one-off network blip must not red a
+cold-cache CI run. Later runs are
 served warm (~1.3 s for the whole step).
 
 **No PATH lookup, no skip.** CI and local run the same code path and the same

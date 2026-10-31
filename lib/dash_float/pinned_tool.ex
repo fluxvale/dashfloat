@@ -131,6 +131,17 @@ defmodule DashFloat.PinnedTool do
            :ok <- verify(archive, sha, tool),
            do: extract_into(dir, archive, sha, tool)
 
+    # A version bump's old cache dirs would ride the CI _build cache
+    # forever; a successful install is the moment to drop them.
+    if match?({:ok, _bin}, result) do
+      root = Path.dirname(dir)
+      stale_pattern = Path.join(root, "#{tool}-*")
+
+      for sibling <- Path.wildcard(stale_pattern), sibling != dir do
+        File.rm_rf(sibling)
+      end
+    end
+
     File.rm(archive)
     result
   end
@@ -181,7 +192,11 @@ defmodule DashFloat.PinnedTool do
   end
 
   defp download(url, dest) do
-    case Req.get(url, into: File.stream!(dest), receive_timeout: @timeout_ms, retry: false) do
+    case Req.get(url,
+           into: File.stream!(dest),
+           receive_timeout: @timeout_ms,
+           retry: :safe_transient
+         ) do
       {:ok, %Req.Response{status: 200}} ->
         {:ok, dest}
 

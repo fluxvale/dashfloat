@@ -10,6 +10,9 @@ defmodule DashFloat.PinnedToolTest do
       assert PinnedTool.archive_url(:actionlint, {:linux, :amd64}) ==
                "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
 
+      assert PinnedTool.archive_url(:shellcheck, {:linux, :amd64}) ==
+               "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz"
+
       assert PinnedTool.archive_url(:shellcheck, {:darwin, :arm64}) ==
                "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.darwin.aarch64.tar.gz"
 
@@ -58,6 +61,11 @@ defmodule DashFloat.PinnedToolTest do
 
     test "a cold cache downloads, verifies, extracts, and installs both layouts" do
       root = tmp_path("cold")
+      # An orphaned old-version cache dir: a successful install must prune it.
+      stale = Path.join(root, "actionlint-1.6.9")
+      stale_bin = Path.join(stale, "bin")
+      File.mkdir_p!(stale_bin)
+
       {_al_archive, al_body, al_sha} = stub_archive("actionlint")
 
       {_sc_archive, sc_body, sc_sha} =
@@ -66,12 +74,23 @@ defmodule DashFloat.PinnedToolTest do
       {:ok, al_server} = SSEServer.start_link([{:send, http_ok(al_body)}])
       {:ok, sc_server} = SSEServer.start_link([{:send, http_ok(sc_body)}])
 
+      # The loopback servers forward every request here: asserting the exact
+      # asset path proves the download really hit the loopback (a regression
+      # in the base plumbing would otherwise download real GitHub bytes
+      # before failing elsewhere).
+      {:ok, platform} = host_platform()
+      al_asset = PinnedTool.asset_name(:actionlint, platform)
+
+      sc_asset = PinnedTool.asset_name(:shellcheck, platform)
+
       assert {:ok, al_bin} =
                PinnedTool.fetch(:actionlint,
                  root: root,
                  base: SSEServer.base_url(al_server),
                  sha: al_sha
                )
+
+      assert_received {:sse_request, "GET", "/" <> ^al_asset, _headers, _body}
 
       stub = File.read!(al_bin)
       assert String.contains?(stub, "#!/bin/sh")
@@ -84,6 +103,9 @@ defmodule DashFloat.PinnedToolTest do
                  base: SSEServer.base_url(sc_server),
                  sha: sc_sha
                )
+
+      assert_received {:sse_request, "GET", "/" <> ^sc_asset, _headers, _body}
+      refute File.exists?(stale)
 
       assert sc_bin ==
                Path.join([
@@ -196,6 +218,13 @@ defmodule DashFloat.PinnedToolTest do
 
   defp http_ok(body) do
     "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n#{body}"
+  end
+
+  defp host_platform do
+    case PinnedTool.normalize(:os.type(), to_string(:erlang.system_info(:system_architecture))) do
+      nil -> flunk("no supported platform on this test host")
+      platform -> {:ok, platform}
+    end
   end
 
   defp tmp_path(kind) do
