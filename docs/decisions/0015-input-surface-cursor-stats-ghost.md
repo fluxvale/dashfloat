@@ -36,7 +36,8 @@ surface: no cursor state (inside a multiplexer you cannot tell which pane
 holds focus), no stats under the input (OpenCode shows cwd / model / tok/s
 there), and no ghost-text suggestion (Claude Code shows a greyed next-input
 that Tab materializes). Dependency facts verified from source before
-deciding (`ex_ratatui` 0.17.1):
+deciding (`ex_ratatui` 0.17.1; re-verified unchanged at the 0.19.0 bump,
+2026-10-31):
 
 - `Widgets.Textarea` carries `cursor_style` / `cursor_line_style` (both
   default the empty style — which is why the composer shows no cursor
