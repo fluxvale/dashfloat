@@ -92,6 +92,16 @@ Scenarios:
     attach-refusal
                 the same attach attempt on a NON-capable model: the
                 visible [images: …] refusal entry in the log (nothing sent)
+    attach-cjk  the #144 wide-path still: a CJK image filename (73 cells)
+                typed into the open attach prompt at 80 cols — the hints
+                yield and the tail fits by cells (Wrap.fit_tail), `…`
+                marking the dropped head, `.png` whole at the cursor;
+                asserted on the rendered row before the still is written
+    title-wide  the #144 wide-title still: a titled fixture resumed, bare
+                /title pre-fills the dialog with a CJK+emoji title wider
+                than the box's draft budget — the tail fits by cells, the
+                emoji cluster rides whole at the cursor; asserted on the
+                rendered draft row before the still is written
     drop-image  the drag-and-drop flow (issue #112, ADR 0018 amendment) on
                 an IMAGE-CAPABLE model: a bracketed-pasted image path
                 becomes the [Image #1] chip (never path text), a second
@@ -547,12 +557,14 @@ def write_compact_fixture(scratch: str, turn_bytes: int = 20_000) -> str:
     return session_id
 
 
-def write_image_fixture(scratch: str) -> str:
+def write_image_fixture(scratch: str, name: str = "shot.png") -> str:
     """The attach-flow fixture image (ADR 0018): a few hundred bytes with a
     PNG magic header — nothing decodes the image (the data URL is base64 of
     whatever bytes are there), so a stub payload is honest. Returns the
-    ABSOLUTE path (the attach prompt's typed input)."""
-    path = f"{scratch}/shot.png"
+    ABSOLUTE path (the attach prompt's typed input). `name` may carry
+    subdirectories (issue #144's CJK-named fixture)."""
+    path = f"{scratch}/{name}"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
         f.write(b"\x89PNG\r\n\x1a\n" + b"\x11" * 300)
     return path
@@ -1579,6 +1591,46 @@ class App:
         assert "rest" not in self.text(), \
             "the refusal still streamed a reply — a request went out"
 
+    # The #144 wide-path capture: a CJK image filename (73 display cells)
+    # typed into the open attach prompt at 80 cols — the draft owns the
+    # row, the hints yield, and the TAIL fits by cells. Assert-then-shoot
+    # on the rendered row: the `…` marks the dropped head, `.png` rides
+    # whole at the cursor, and the surviving Han glyphs are on screen
+    # (rendered, not blanked) while the dropped directory head is not.
+    ATTACH_CJK_NAME = "图片存档目录/第四批界面截图记录存档整理完成最终修订版补充材料.png"
+
+    def attach_row(self) -> str:
+        """The activity row carrying the open attach prompt, or ''."""
+        for row in self.screen.display:
+            if "Attach image: " in row:
+                return row.rstrip()
+        return ""
+
+    def scenario_attach_cjk(self):
+        path = write_image_fixture(scratch_dir(), name=self.ATTACH_CJK_NAME)
+        assert "📎" in self.footer_span() or "📎" in self.text(), \
+            "the image-capable model's footer never showed the 📎 glyph"
+        self.send(b"\x0f")             # Ctrl+O — the attach prompt opens
+        self.wait_for("attach", timeout=10)
+        time.sleep(0.5)
+        self.type(path, per_key=0.02)
+        time.sleep(0.5)
+        row = self.attach_row()
+        assert row, "the attach prompt never rendered"
+        assert "…" in row, f"no head-clip marker on the wide row: {row!r}"
+        assert row.endswith(".png█"), \
+            f"the tail did not survive at the cursor: {row!r}"
+        assert "tab complete" not in row, \
+            f"the hints never yielded to the wide draft: {row!r}"
+        assert "补充材料.png█" in row, \
+            f"the CJK tail never rendered whole: {row!r}"
+        # The dropped head: the fixture's ASCII scratch prefix and the
+        # directory's first Han grapheme are gone — the tail-fit marker
+        # stands where they were.
+        assert "/tmp" not in row, f"the dropped head is still on screen: {row!r}"
+        assert "图片存档" not in row, f"the directory head never dropped: {row!r}"
+        print(f"claim  attach row tail-fits by cells: {row.strip()!r}")
+
     # The drop scenarios (issue #112; ADR 0018's 2026-10-31 amendment): a
     # bracketed-pasted path to an existing image file becomes a numbered
     # chip. drop-image runs on the CAPABLE model (chip -> send -> wire),
@@ -2028,6 +2080,29 @@ class App:
     def titled_entry_count(self) -> int:
         return self.text().count("session titled")
 
+    # The #144 wide-title capture: a titled fixture resumed, bare /title
+    # pre-fills the dialog with a 41-cell CJK+emoji title — wider than the
+    # box's 40-column draft budget at 80 cols. Assert-then-shoot on the
+    # rendered draft row: the `…` marks the dropped head, the emoji rides
+    # whole at the cursor (its cluster never split), and the surviving Han
+    # glyphs are on screen while the dropped head glyph is not.
+    WIDE_FIXTURE_TITLE = "发布流程界面文案修订完成核对无误准备上线 🎉"
+
+    def scenario_title_wide(self):
+        self.wait_for("supervised by")
+        self.wait_quiet()
+        self.type("/title")
+        self.send(b"\r")
+        self.wait_for("Session title")
+        time.sleep(0.5)                # a readable beat on the open dialog
+        row = self.dialog_draft_row().rstrip().rstrip("│").rstrip()
+        assert "❯ …" in row, f"no head-clip marker on the wide draft: {row!r}"
+        assert row.endswith("🎉█"), \
+            f"the wide/emoji tail did not survive at the cursor: {row!r}"
+        assert "上线" in row, f"the CJK tail never rendered: {row!r}"
+        assert "发" not in row, f"the dropped head glyph is still shown: {row!r}"
+        print(f"claim  title dialog tail-fits by cells: {row.strip()!r}")
+
     def scenario_title_dialog(self, holder_id: str, stills: list[str]):
         # The resumed titled session is on screen (the replayed log) before
         # anything is typed.
@@ -2332,10 +2407,12 @@ def main():
                              "growing-session", "compact-session",
                              "stock-compact", "default-window",
                              "slash-autocomplete", "attach",
-                             "attach-refusal", "reading-session",
+                             "attach-refusal", "attach-cjk",
+                             "reading-session",
                              "resume-session", "resume-picker",
                              "exit-print", "model-switch",
-                             "title-dialog", "idle-blink", "tab-complete",
+                             "title-dialog", "title-wide",
+                             "idle-blink", "tab-complete",
                              "breathing-gap", "gap-scrolled", "ttft-footer",
                              "enter-snap", "scrolled-stream",
                              "drop-image", "drop-refusal",
@@ -2444,6 +2521,10 @@ def main():
         # "Resume Me" — the dialog must pre-fill from it (issue #106).
         holder_id = write_titled_fixture(scratch_dir(), TITLE_HOLDER_TITLE)
         resume = write_titled_fixture(scratch_dir(), TITLE_FIXTURE_TITLE)
+    elif args.scenario == "title-wide":
+        # The #144 wide-title fixture: resumed, bare /title pre-fills the
+        # dialog with a CJK+emoji title wider than the draft's budget.
+        resume = write_titled_fixture(scratch_dir(), App.WIDE_FIXTURE_TITLE)
     elif args.scenario == "resume-picker":
         # The /resume picker's fixtures (issue #128): the TITLED session is
         # the newer (it must lead the picker), the untitled one previews
@@ -2453,7 +2534,7 @@ def main():
 
     if context is None and args.scenario not in ("stock-compact", "default-window"):
         context = 524288
-    images = args.scenario in ("attach", "drop-image")
+    images = args.scenario in ("attach", "drop-image", "attach-cjk")
     # The CLI flags (issue #109's precedent) outrank a scenario's own
     # choices.
     app = App(no_ghost=args.no_ghost, context=context, resume=resume,
@@ -2528,6 +2609,10 @@ def main():
                 app.scenario_attach()
             elif args.scenario == "attach-refusal":
                 app.scenario_attach_refusal()
+            elif args.scenario == "attach-cjk":
+                # The #144 wide-path still: asserts on the rendered attach
+                # row before the generic tail shoot fires.
+                app.scenario_attach_cjk()
             elif args.scenario == "drop-refusal":
                 app.scenario_drop_refusal()
             elif args.scenario == "auto-reject":
@@ -2596,6 +2681,10 @@ def main():
                     ap.error("title-dialog shoots five stills: "
                              "--out .. --out5 are all required")
                 app.scenario_title_dialog(holder_id, stills)
+            elif args.scenario == "title-wide":
+                # The #144 wide-title still: asserts on the rendered draft
+                # row before the generic tail shoot fires.
+                app.scenario_title_wide()
             if args.expect_label:
                 app.wait_footer_label(args.expect_label)
             if args.scenario not in ("compact-session", "title-dialog",

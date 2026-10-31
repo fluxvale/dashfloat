@@ -8,6 +8,7 @@ defmodule DashFloat.TUI.StateTest do
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Theme
   alias DashFloat.TUI.View
+  alias DashFloat.TUI.Wrap
 
   defp new_state(opts \\ []) do
     [test_mode: {80, 24}]
@@ -5072,9 +5073,40 @@ defmodule DashFloat.TUI.StateTest do
       state = State.sessions_arrived(new_state(), [long], now)
       [row] = state.palette.items
 
+      # The cap is 40 display columns WITH the ellipsis (#144, the #139
+      # class): 39 content columns + `…`, never 41 cells at the popup's edge.
       assert row.label ==
                String.duplicate("a", 20) <>
-                 " " <> String.duplicate("b", 19) <> "… · 1d · custom.example · —"
+                 " " <> String.duplicate("b", 18) <> "… · 1d · custom.example · —"
+
+      [capped | _rest] = String.split(row.label, " · ")
+      assert Wrap.width(capped) <= 40
+    end
+
+    # #144 (the #139 class): every Han grapheme is two display cells — a
+    # 40-grapheme CJK preview is 80 columns, and the grapheme-count cap
+    # shipped it whole, cutting the preview mid-glyph at the popup edge.
+    # The honest cap keeps the PREVIEW inside the popup's inner width;
+    # the row's metadata tail (· time · profile · model) stays uncapped
+    # for ASCII and wide alike — recorded imprecision, issue #146.
+    test "row labels: a wide-glyph preview caps at 40 columns, not 40 graphemes" do
+      now = DateTime.to_unix(~U[2026-10-31T00:00:00Z])
+
+      cjk =
+        summary("01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5c",
+          preview: String.duplicate("汉", 40),
+          created_at: "2026-10-30T23:59:30Z",
+          pin: %{profile: "personal", model: "glm-5.3", base_url: nil}
+        )
+
+      state = State.sessions_arrived(new_state(), [cjk], now)
+      [row] = state.palette.items
+
+      [capped | _rest] = String.split(row.label, " · ")
+
+      # 19 Han pairs (38) + `…` — 39 columns, the next glyph would overflow.
+      assert capped == String.duplicate("汉", 19) <> "…"
+      assert Wrap.width(capped) <= 40
     end
 
     test "row labels: minutes bucket, the plain-date fallback past a week, raw unparseable stamps" do

@@ -67,6 +67,78 @@ defmodule DashFloat.TUI.WrapTest do
     end
   end
 
+  # The one-row-budget fit helpers (#144): the attach row's and the title
+  # dialog's tail-showing rule and the picker preview's head cap, measured
+  # by the same classifier as width/1. The invariant throughout: the result
+  # never exceeds its budget in columns.
+  describe "fit_head/2 and fit_tail/2" do
+    test "a string that fits its budget passes through unchanged" do
+      assert Wrap.fit_head("日本語", 6) == "日本語"
+      assert Wrap.fit_head("日本語", 7) == "日本語"
+      assert Wrap.fit_tail("日本語", 6) == "日本語"
+      assert Wrap.fit_tail("ab", 2) == "ab"
+    end
+
+    test "an ASCII overflow keeps the old arithmetic: ellipsis plus budget-1" do
+      long = String.duplicate("x", 84)
+      head = String.duplicate("x", 39) <> "…"
+      tail = "…" <> String.duplicate("x", 59)
+
+      assert Wrap.fit_head(long, 40) == head
+      assert Wrap.fit_tail(long, 60) == tail
+      assert Wrap.width(head) == 40
+      assert Wrap.width(tail) == 60
+    end
+
+    test "wide glyphs count two cells a grapheme at the cut" do
+      # 10 columns of content: the head keeps four Han pairs and the tail
+      # keeps four — never five (the grapheme-count arithmetic).
+      cjk = String.duplicate("汉", 8)
+
+      assert Wrap.fit_head(cjk, 10) == String.duplicate("汉", 4) <> "…"
+      assert Wrap.fit_tail(cjk, 10) == "…" <> String.duplicate("汉", 4)
+
+      # The boundary never straddles a cluster: at the exact odd budget the
+      # wide grapheme yields a column rather than half-enters.
+      assert Wrap.fit_head("ab中cdef", 5) == "ab中…"
+      assert Wrap.fit_tail("ab中cdef", 5) == "…cdef"
+      assert Wrap.fit_head("ab中cdef", 4) == "ab…"
+      assert Wrap.fit_tail("ab中cdef", 4) == "…def"
+    end
+
+    test "emoji clusters enter whole or not at all" do
+      run = String.duplicate("🎉", 30)
+
+      assert Wrap.fit_head(run, 7) == String.duplicate("🎉", 3) <> "…"
+      assert Wrap.fit_tail(run, 7) == "…" <> String.duplicate("🎉", 3)
+
+      # A budget that fits the marker and exactly one cluster.
+      assert Wrap.fit_tail(run, 3) == "…🎉"
+
+      # A single cluster that fits passes through; one that cannot yields
+      # to the marker alone rather than overflowing.
+      assert Wrap.fit_head("🎉", 2) == "🎉"
+      assert Wrap.fit_head("🎉", 1) == "…"
+    end
+
+    test "a zero or negative budget fits nothing" do
+      assert Wrap.fit_head("abc", 0) == ""
+      assert Wrap.fit_tail("abc", 0) == ""
+      assert Wrap.fit_head("", 0) == ""
+    end
+
+    test "invalid UTF-8 never raises: the clip path sanitizes like width/1" do
+      bad = "ok" <> <<0xFF>> <> String.duplicate("汉", 30)
+
+      head = Wrap.fit_head(bad, 10)
+      tail = Wrap.fit_tail(bad, 10)
+
+      assert String.valid?(head) && String.valid?(tail)
+      assert Wrap.width(head) <= 10
+      assert Wrap.width(tail) <= 10
+    end
+  end
+
   describe "wrap/2 pass-through" do
     test "a line that fits is rebuilt identically" do
       original = [line([{"❯ ", :dim_italic}, {"hello world", :assistant}]), line("second")]
