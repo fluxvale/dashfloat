@@ -12,6 +12,10 @@ when its tag is cut.
 
 ## [Unreleased]
 
+### Fixed
+
+- The capture rig's reply-end waits are exchange-unique: the mock numbers every stock reply (`— turn-N.`) and each reply-end wait rides its own exchange's closing, so a second exchange can no longer be satisfied by the first reply's stale text (measured on main: the second wait returned in 0.00 s) and stills cannot ship mid-race as settled evidence; the mock's usage frame and `[DONE]` stream again after a post-extraction `NameError` had silently killed every stream's tail since the choice-widget merge, restoring growing-session's usage-driven footer-growth guard (ADR 0029) (#125).
+
 ### Added
 
 - Model reasoning renders as a small collapsible block — Octofriend-style, thinking never floods the chat: the collapsed form is one summary line (`◔ Thinking · 342 tokens · 8.1s`), the expanded form an eight-row window over the full content, scrollable from the inside by keys (while focused) or the wheel (by position). While the model thinks the block grows live in a tail-following window, and a thinking turn's full reasoning persists in the transcript (`reasoning_content`) and replays on resume (ADR 0005 + ADR 0006 amendments) (#78).

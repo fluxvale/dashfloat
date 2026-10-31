@@ -50,3 +50,4 @@ their replacement.
 | [0026](0026-update-command.md) | The update command: release check, method detection, verified self-replace | Accepted |
 | [0027](0027-exit-resume-command-and-resume-picker.md) | Exit prints the resume command; /resume opens an in-session session picker | Accepted |
 | [0028](0028-choice-widget-and-ask-user.md) | The choice widget: approvals as questions, the ask-user tool, AUTO's binary resolve | Accepted |
+| [0029](0029-rig-reply-end-needles-are-exchange-unique.md) | Capture-rig reply-end needles are exchange-unique: numbered stock replies, wrap-collapsed waits | Accepted |
