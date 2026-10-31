@@ -543,6 +543,43 @@ defmodule DashFloat.Agent do
 
   def handle_info({:set_title, _ui, _title}, state), do: {:noreply, state}
 
+  # The /resume picker's session switch (issue #128): the loaded session
+  # replaces the live one in a single move — init's resume adoption
+  # (ADR 0014 §6), mid-process. The transcript is adopted VERBATIM, its
+  # leading system message included — never re-seeded (ADR 0019 §1) — the
+  # pin/created_at/title follow the file, the context anchor re-derives from
+  # the persisted diagnostics, and the auto-title latch re-arms: the target
+  # session's next settled exchange is its own first chance at a title. No
+  # immediate persist — the file is the load's own bytes; a dangling-repair
+  # rewrite converges on the next save (ADR 0014 §4).
+  def handle_info(
+        {:adopt_session, ui, %{id: id} = session},
+        %__MODULE__{status: :idle} = state
+      )
+      when is_pid(ui) and is_binary(id) do
+    messages = Map.get(session, :messages, [])
+
+    {:noreply,
+     %{
+       state
+       | ui: ui,
+         session_id: id,
+         session_pin: Map.get(session, :pin),
+         session_created_at: Map.get(session, :created_at),
+         session_title: Map.get(session, :title),
+         title_fired?: false,
+         title_ref: nil,
+         messages: messages,
+         anchor: anchor_from_context(Map.get(session, :context), messages),
+         compactions: list_or_empty(Map.get(session, :compactions))
+     }}
+  end
+
+  # An adopt while a turn is open is a UI race (the picker is idle-gated,
+  # like submit): ignore, never crash — the message list is only mutated
+  # where it is stable.
+  def handle_info({:adopt_session, _ui, _session}, state), do: {:noreply, state}
+
   ## Monitors
 
   # A runner dying after the user cancelled (however it died): abort the batch

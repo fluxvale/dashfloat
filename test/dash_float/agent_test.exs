@@ -4002,6 +4002,145 @@ defmodule DashFloat.AgentTest do
     refute_received {:entry, :system, "[session titled" <> _}
   end
 
+  ## The /resume picker's session switch (issue #128): the agent side of the
+  ## adopt — the init resume adoption mid-process. The stored-system-message
+  ## path (ADR 0019, the #116 crash fix) is load-bearing here: an adopted
+  ## transcript carries the session-start system message, and the next
+  ## request must carry it exactly once.
+
+  @tag :tmp_dir
+  test "adopt_session: the loaded session replaces the live one; the next request carries its transcript",
+       ctx do
+    server = start_server([final_episode("adopted and continuing")])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+
+    # The target session, as Session.load returns it: a leading STORED
+    # system message (ADR 0019) plus one settled exchange, titled, with a
+    # persisted pin and an anchor-bearing context diagnostic.
+    target = %{
+      version: 1,
+      id: "01923f8e-6b1e-7abc-8def-123456789abc",
+      created_at: "2026-10-31T00:00:00Z",
+      title: "Adopted Thing",
+      pin: %{profile: "personal", model: "other-model", base_url: nil},
+      context: %{prompt_tokens: 12, messages: 2},
+      compactions: [%{"dropped" => 1}],
+      messages: [
+        system_message(ctx.tmp_dir),
+        %{"role" => "user", "content" => "the old question"},
+        %{"role" => "assistant", "content" => "the old answer"}
+      ]
+    }
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+
+    send(agent, {:adopt_session, self(), target})
+    Process.sleep(50)
+
+    adopted = :sys.get_state(agent)
+
+    assert adopted.session_id == target.id
+    assert adopted.session_pin == target.pin
+    assert adopted.session_created_at == target.created_at
+    assert adopted.session_title == "Adopted Thing"
+    assert adopted.messages == target.messages
+    assert adopted.anchor == %{tokens: 12, index: 2}
+    assert adopted.compactions == target.compactions
+
+    # The adopted session's next prompt sends the full restored history —
+    # the stored system message exactly once (no re-seed), then the old
+    # exchange, then the new prompt.
+    send(agent, {:prompt, self(), "continue here", []})
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+
+    assert [
+             %{"role" => "system", "content" => _stored},
+             %{"role" => "user", "content" => "the old question"},
+             %{"role" => "assistant", "content" => "the old answer"},
+             %{"role" => "user", "content" => "continue here"}
+           ] = request_messages(body)
+
+    assert_receive {:phase, :idle}, 2_000
+
+    # The next save rewrites the TARGET's file under its id, with the new
+    # turn and the title carried.
+    {:ok, saved} = Session.load(sessions, target.id)
+    assert saved.title == "Adopted Thing"
+    assert length(saved.messages) == 5
+  end
+
+  @tag :tmp_dir
+  test "adopt_session resets the auto-title latch for the target session", ctx do
+    # The outgoing session spent its nudge (a titled one); the adopted
+    # untitled session gets its own first chance.
+    titled = %{
+      version: 1,
+      id: "01923f8e-6b1e-7abc-8def-123456789abc",
+      created_at: "2026-10-31T00:00:00Z",
+      title: "Old",
+      pin: %{profile: nil, model: nil, base_url: nil},
+      messages: [
+        system_message(ctx.tmp_dir),
+        %{"role" => "user", "content" => "q"},
+        %{"role" => "assistant", "content" => "a"}
+      ]
+    }
+
+    untitled = %{
+      version: 1,
+      id: "01923f8e-6b1e-7abc-8def-123456789abd",
+      created_at: "2026-10-31T00:00:01Z",
+      pin: %{profile: nil, model: nil, base_url: nil},
+      messages: [
+        system_message(ctx.tmp_dir),
+        %{"role" => "user", "content" => "q2"},
+        %{"role" => "assistant", "content" => "a2"}
+      ]
+    }
+
+    server = start_server([final_episode("one"), final_episode("two")])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    send(agent, {:adopt_session, self(), titled})
+    Process.sleep(50)
+    assert %{session_title: "Old", title_fired?: false} = :sys.get_state(agent)
+
+    send(agent, {:adopt_session, self(), untitled})
+    Process.sleep(50)
+
+    assert %{session_id: "01923f8e-6b1e-7abc-8def-123456789abd", session_title: nil} =
+             :sys.get_state(agent)
+  end
+
+  @tag :tmp_dir
+  test "adopt_session while a turn is open is ignored", ctx do
+    server = start_server([final_episode("still streaming")])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    send(agent, {:prompt, self(), "hello", []})
+    assert_receive {:sse_request, "POST", _, _, _body}, 2_000
+
+    # The episode is open (the script has not answered): the adopt is a UI
+    # race — ignored, never a mid-turn transcript swap.
+    send(
+      agent,
+      {:adopt_session, self(),
+       %{
+         version: 1,
+         id: "01923f8e-6b1e-7abc-8def-123456789abf",
+         created_at: "2026-10-31T00:00:00Z",
+         pin: %{profile: nil, model: nil, base_url: nil},
+         messages: []
+       }}
+    )
+
+    assert_receive {:token, "still streaming"}, 2_000
+
+    assert :sys.get_state(agent).session_id != "01923f8e-6b1e-7abc-8def-123456789abf"
+    assert_receive {:phase, :idle}, 2_000
+  end
+
   ## The rename seam (#80)
 
   @tag :tmp_dir

@@ -123,6 +123,19 @@ Scenarios:
                 boots from a fixture session (user+assistant turns) via
                 --resume and asserts the replayed log keeps the SAME
                 style claim — replay rides the one styler
+    resume-picker
+                the /resume picker (issue #128): /resume opens the modal
+                over two fixtures — the titled newest first, the preview
+                row second — ↓ moves, ⏎ adopts, and the replayed log
+                renders the adopted turns (still or GIF; the GIF is the
+                motion capture)
+    exit-print  the exit print (issue #127): one exchange persists and
+                auto-titles the session, Ctrl+Q exits, and the printed
+                command lands on the post-exit screen (the still); the
+                printed line is then run VERBATIM (shlex word-split, the
+                shell's own paste semantics) in a second app over the
+                same scratch store, which must reopen and replay that
+                session
     model-switch
                 /model → the catalog picker opens, ↓ picks the other
                 entry, ⏎ swaps — the footer's model part follows the pick
@@ -165,6 +178,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pyte
 import re
+import shlex
 from PIL import Image, ImageDraw, ImageFont
 
 COLS, ROWS = 80, 24
@@ -500,6 +514,39 @@ def write_titled_fixture(scratch: str, title: str, messages=None) -> str:
             "title": title,
             "messages": messages if messages is not None else TITLED_MESSAGES,
         }, f)
+    return session_id
+
+
+PICKER_MESSAGES = [
+    {"role": "user", "content": "fixture question one"},
+    {"role": "assistant",
+     "content": "Fixture answer one — replayed by the picker."},
+    {"role": "user", "content": "fixture question two"},
+    {"role": "assistant",
+     "content": "Fixture answer two, also replayed."},
+]
+
+
+def write_picker_fixture(scratch: str, title, age_seconds: int) -> str:
+    """One /resume-picker fixture (issue #128): a session stamped
+    `age_seconds` ago (the relative-time row reads a real bucket), titled
+    when `title` is a string, else previewing its first question. The two
+    fixture turns are unique needles the capture can prove replayed."""
+    session_id = str(uuid.uuid4())
+    sessions = f"{scratch}/dashfloat/sessions"
+    os.makedirs(sessions, exist_ok=True)
+    body = {
+        "version": 1,
+        "id": session_id,
+        "created_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age_seconds)),
+        "pin": {"profile": "demo", "model": "glm-5.3", "base_url": None},
+        "messages": PICKER_MESSAGES,
+    }
+    if title is not None:
+        body["title"] = title
+    with open(f"{sessions}/{session_id}.json", "w") as f:
+        json.dump(body, f)
     return session_id
 
 
@@ -1097,6 +1144,74 @@ class App:
             f"the footer's provider span never read {expected!r}: "
             f"{self.footer_span()!r}")
 
+    # The /resume picker (issue #128): /resume opens the modal over the two
+    # fixtures — the TITLED newest first, the preview row second — then ↓
+    # selects the second and ⏎ adopts it. Asserted before any capture: the
+    # picker's rows, their order, and (post-Enter) the adopted transcript's
+    # own needles rendered by replay.
+    PICKER_TITLE_ROW = "Titled fixture session"
+    PICKER_PREVIEW_ROW = "fixture question one"
+
+    def scenario_resume_picker(self):
+        self.type("/resume")
+        self.send(b"\r")
+        self.wait_for("Sessions", timeout=10)
+        self.wait_for(self.PICKER_TITLE_ROW, timeout=10)
+        self.wait_for(self.PICKER_PREVIEW_ROW, timeout=10)
+
+        text = self.text()
+        titled = text.index(self.PICKER_TITLE_ROW)
+        preview = text.index(self.PICKER_PREVIEW_ROW)
+        assert titled < preview, \
+            "the picker is not most-recent first: the titled (newer) " \
+            "fixture must lead"
+        time.sleep(0.6)                # a readable beat on the open picker
+
+        self.send(b"\x1b[B")           # ↓ — the preview (older) fixture
+        time.sleep(0.4)
+        self.send(b"\r")               # ⏎ — adopt it
+
+        self.wait_for("❯ fixture question two", timeout=10)
+        self.wait_for("Fixture answer two, also replayed.", timeout=10)
+        self.wait_quiet()              # the replay settled
+
+    # The exit print (issue #127): one exchange persists (and auto-titles)
+    # the session, Ctrl+Q quits, and the print lands on the normal screen
+    # after the alt screen leaves. Returns the printed command line; the
+    # caller reopens with it VERBATIM (shlex — exactly what a shell passes).
+    def scenario_exit_print(self) -> str:
+        self.scenario_mid_session()
+        # The auto-title nudge lands after the settled turn (ADR 0023 §8) —
+        # the exit print's TITLE form is the capture's subject.
+        self.wait_for(f"[session titled: {TITLE_TEXT}]", timeout=10)
+        self.wait_quiet()
+
+        self.send(b"\x11")             # Ctrl+Q — the clean exit
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                pid, _status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                break                  # already reaped elsewhere
+            if pid == self.pid:
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("the app never exited on Ctrl+Q")
+
+        # The print is post-alt-screen bytes: find it in the RAW stream,
+        # then prove it rendered on the (main-screen) emulator too.
+        tail = b"".join(c for _t, c in self._chunks)
+        assert b"\x1b[?1049l" in tail, "the app never left the alt screen"
+        needle = b"dashfloat --resume"
+        at = tail.rindex(needle)
+        line = tail[at:].split(b"\n")[0].decode(errors="replace").strip()
+        assert line.startswith("dashfloat --resume"), line
+        print(f"print  {line!r}")
+        assert "resume this session with:" in self.text(), \
+            "the lead-in line never rendered on the post-exit screen"
+        return line
+
     def scenario_ghost(self):
         self.scenario_mid_session()
         self.wait_for(GHOST_TEXT, timeout=10)
@@ -1509,7 +1624,8 @@ def main():
                              "stock-compact", "default-window",
                              "slash-autocomplete", "attach",
                              "attach-refusal", "reading-session",
-                             "resume-session", "model-switch",
+                             "resume-session", "resume-picker",
+                             "exit-print", "model-switch",
                              "title-dialog", "idle-blink", "tab-complete",
                              "snap-scroll", "drop-image", "drop-refusal"])
     ap.add_argument("--out", default=None)
@@ -1608,6 +1724,12 @@ def main():
         # "Resume Me" — the dialog must pre-fill from it (issue #106).
         holder_id = write_titled_fixture(scratch_dir(), TITLE_HOLDER_TITLE)
         resume = write_titled_fixture(scratch_dir(), TITLE_FIXTURE_TITLE)
+    elif args.scenario == "resume-picker":
+        # The /resume picker's fixtures (issue #128): the TITLED session is
+        # the newer (it must lead the picker), the untitled one previews
+        # its first question instead.
+        write_picker_fixture(scratch_dir(), "Titled fixture session", 30 * 60)
+        write_picker_fixture(scratch_dir(), None, 3 * 60 * 60)
 
     if context is None and args.scenario not in ("stock-compact", "default-window"):
         context = 524288
@@ -1688,6 +1810,26 @@ def main():
                 app.scenario_drop_refusal()
             elif args.scenario == "model-switch":
                 app.scenario_model_switch()
+            elif args.scenario == "resume-picker":
+                app.scenario_resume_picker()
+                assert_claims()
+            elif args.scenario == "exit-print":
+                # The exit print (issue #127): the still is the POST-EXIT
+                # screen — the normal screen the print lands on — shot
+                # before the paste-verbatim round trip boots a second app.
+                line = app.scenario_exit_print()
+                app.screenshot(args.out)
+                reopened = App(no_ghost=args.no_ghost, context=context,
+                               cols=args.cols, rows=args.rows,
+                               mix_args=("run", "--no-halt", "--",
+                                         *shlex.split(line)[1:]))
+                try:
+                    reopened.wait_for("❯ what is elixir?", timeout=30)
+                    reopened.wait_for("supervised by", timeout=30)
+                    print(f"paste  reopened with {line!r} — "
+                          "the printed command is verbatim-runnable")
+                finally:
+                    reopened.close()
             elif args.scenario == "title-dialog":
                 # Five stills in one app run (issue #106): open, refusal,
                 # success, esc, inline — each act asserts before it shoots.
@@ -1698,7 +1840,7 @@ def main():
                 app.scenario_title_dialog(holder_id, stills)
             if args.expect_label:
                 app.wait_footer_label(args.expect_label)
-            if args.scenario not in ("compact-session", "title-dialog"):
+            if args.scenario not in ("compact-session", "title-dialog", "exit-print"):
                 app.screenshot(args.out)
         elif args.scenario == "slash-autocomplete":
             # The popup opening AND narrowing: "/" opens the full list, "c"
@@ -1761,6 +1903,16 @@ def main():
             # the unfollowed span, the invisible tail, and the re-pin.
             app.scenario_snap_scroll()
             time.sleep(0.5)
+            app.gif(args.out, crop_rows=24, min_span=1.0)
+        elif args.scenario == "resume-picker":
+            # The picker in motion (issue #128): /resume types in, the
+            # modal opens over the fixtures, ↓ moves the highlight, ⏎
+            # adopts and the log replays — the scenario asserts each act
+            # before recording. Full frame: the picker and the replayed
+            # log share it.
+            app._mark = time.monotonic()
+            app.scenario_resume_picker()
+            time.sleep(0.5)            # a settled beat on the replay
             app.gif(args.out, crop_rows=24, min_span=1.0)
         elif args.scenario == "drop-image":
             # The whole drop flow (issue #112): paste -> chip #1 ->

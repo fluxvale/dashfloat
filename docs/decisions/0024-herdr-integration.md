@@ -143,7 +143,12 @@ funnels there (Ctrl+Q, confirmed double-Ctrl+C, `/quit`). There is **no**
 in-process session switch in DashFloat (sessions change by restarting with
 `--resume`, which is a new process that reports afresh), so release-on-exit
 can never race a switch; releasing anywhere else would drop the pane's agent
-slot while the agent still runs.
+slot while the agent still runs. *(Amended 2026-10-31,
+[ADR 0027](0027-exit-resume-command-and-resume-picker.md)
+§3: the /resume picker introduced an in-process
+session switch; the narrowed claim that still holds is that release fires
+ONLY from `terminate/2` — a mid-process switch never releases, so
+exit-release and session-switch stay disjoint events. See 0027 §3.)*
 
 ### 7. Identity
 

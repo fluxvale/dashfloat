@@ -849,6 +849,108 @@ defmodule DashFloat.SessionTest do
     end
   end
 
+  describe "summaries/1 (issue #128)" do
+    @other_id "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5d"
+
+    defp write_session_at(ctx, id, created_at, overrides \\ []) do
+      body =
+        Map.merge(
+          %{
+            "version" => 1,
+            "id" => id,
+            "created_at" => created_at,
+            "pin" => %{"profile" => "work", "model" => "glm-5.3-flash", "base_url" => nil},
+            "messages" => [
+              %{"role" => "system", "content" => "prompt"},
+              %{"role" => "user", "content" => "the first question"}
+            ]
+          },
+          Map.new(overrides)
+        )
+
+      file = Path.join(ctx.tmp_dir, id <> ".json")
+      File.write!(file, Jason.encode!(body))
+    end
+
+    @tag :tmp_dir
+    test "lists sessions most recent first, with the picker row's fields", ctx do
+      write_session_at(ctx, @id, "2026-10-27T14:30:52Z")
+      write_session_at(ctx, @other_id, "2026-10-28T10:00:00Z", %{"title" => "Newest Thing"})
+
+      assert [
+               %{id: @other_id, title: "Newest Thing", created_at: "2026-10-28T10:00:00Z"} =
+                 newest,
+               %{id: @id, title: nil} = older
+             ] = Session.summaries(ctx.tmp_dir)
+
+      # The preview is the FIRST USER message — the system prompt (ADR 0019)
+      # and any later turns are not row material.
+      assert newest.preview == "the first question"
+      assert newest.pin == %{profile: "work", model: "glm-5.3-flash", base_url: nil}
+      assert older.preview == "the first question"
+    end
+
+    @tag :tmp_dir
+    test "a user turn carried as content parts previews its text parts (ADR 0018 §2)", ctx do
+      write_session_at(ctx, @id, @created_at, %{
+        "messages" => [
+          %{
+            "role" => "user",
+            "content" => [
+              %{"type" => "text", "text" => "look at "},
+              %{"type" => "image_url", "image_url" => %{"url" => "data:image/png;base64,xx"}},
+              %{"type" => "text", "text" => "this"}
+            ]
+          }
+        ]
+      })
+
+      assert [%{preview: "look at this"}] = Session.summaries(ctx.tmp_dir)
+    end
+
+    @tag :tmp_dir
+    test "a user turn with neither string nor parts content previews as empty", ctx do
+      # Hand-damage the load path would refuse; the listing fail-opens —
+      # the picker previews nothing rather than crashing on the row.
+      write_session_at(ctx, @id, @created_at, %{
+        "messages" => [%{"role" => "user", "content" => 12}]
+      })
+
+      assert [%{preview: ""}] = Session.summaries(ctx.tmp_dir)
+    end
+
+    @tag :tmp_dir
+    test "skips what it cannot pick: legacy names, damaged bodies, id mismatches", ctx do
+      # A timestamp-named file (pre-sweep shape — unresumable, ADR 0023 §2)…
+      legacy = Path.join(ctx.tmp_dir, "20261027-143052-a1b2c3.json")
+      File.write!(legacy, "{}")
+      # …a garbage body, a non-map body, an id that disagrees with its
+      # filename, a missing created_at, and a non-list messages field.
+      garbage = Path.join(ctx.tmp_dir, @id <> ".json")
+      File.write!(garbage, "{not json")
+      other = Path.join(ctx.tmp_dir, @other_id <> ".json")
+      File.write!(other, ~s([1, 2]))
+      third = "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5e"
+      write_session_at(ctx, third, @created_at, %{"id" => @id})
+      fourth = "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5f"
+      write_session_at(ctx, fourth, %{"created_at" => 12})
+      fifth = "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b50"
+      write_session_at(ctx, fifth, @created_at, %{"messages" => %{}})
+
+      assert Session.summaries(ctx.tmp_dir) == []
+      # Nothing was written: the damaged files are byte-identical, and no
+      # fresh files appeared (the load path stays the loud reporter).
+      assert length(File.ls!(ctx.tmp_dir)) == 6
+    end
+
+    @tag :tmp_dir
+    test "a nil directory and a missing directory list nothing", ctx do
+      assert Session.summaries(nil) == []
+      absent = Path.join(ctx.tmp_dir, "absent")
+      assert Session.summaries(absent) == []
+    end
+  end
+
   describe "migrate_legacy_ids/1" do
     # The suite's one deliberate legacy-shaped id: the sweep's input.
     @legacy_id "20261027-090000-abc123"

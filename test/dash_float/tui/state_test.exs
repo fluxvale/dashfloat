@@ -2853,7 +2853,7 @@ defmodule DashFloat.TUI.StateTest do
       typed = type(new_state(), "/")
       broad = press(typed, "down", [])
 
-      assert length(broad.palette.items) == 8
+      assert length(broad.palette.items) == 9
       assert broad.palette.selected == 1
 
       narrow = type(broad, "c")
@@ -3351,7 +3351,7 @@ defmodule DashFloat.TUI.StateTest do
       assert %{mode: :modal, kind: :commands, selected: 0} = state.palette
 
       assert Enum.map(state.palette.items, & &1.name) ==
-               ~w(clear compact help mode model profile quit title)
+               ~w(clear compact help mode model profile quit resume title)
     end
 
     test "ctrl+p is idle-gated like submit" do
@@ -4101,6 +4101,223 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.title_dialog == nil
       assert State.input_text(state) == ""
+    end
+  end
+
+  # The /resume picker (issue #128): the modal over saved sessions, and the
+  # adoption that lands when Enter picks one.
+  describe "the /resume picker (issue #128)" do
+    defp summary(id, overrides \\ []) do
+      Map.merge(
+        %{
+          id: id,
+          title: nil,
+          created_at: "2026-10-31T00:00:00Z",
+          pin: %{profile: nil, model: nil, base_url: nil},
+          preview: "the first question"
+        },
+        Map.new(overrides)
+      )
+    end
+
+    defp session_body(messages, overrides \\ []) do
+      Map.merge(
+        %{
+          version: 1,
+          id: "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5c",
+          created_at: "2026-10-30T09:00:00Z",
+          pin: %{profile: nil, model: nil, base_url: nil},
+          messages: messages,
+          context: nil,
+          compactions: []
+        },
+        Map.new(overrides)
+      )
+    end
+
+    test "/resume returns :list_sessions" do
+      {state, :list_sessions} = enter_typed(new_state(), "/resume")
+      assert state.palette == nil
+    end
+
+    test "sessions_arrived over an empty store warns, never opens" do
+      state = State.sessions_arrived(new_state(), [], 1_000)
+
+      assert pairs(state) == [{:system, "[no saved sessions — nothing to resume]"}]
+      assert state.palette == nil
+    end
+
+    test "sessions_arrived opens the picker: one labelled row per session" do
+      now = DateTime.to_unix(~U[2026-10-31T00:00:00Z])
+
+      rows = [
+        summary("01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5c",
+          title: "Titled Session",
+          created_at: "2026-10-30T23:59:30Z",
+          pin: %{profile: "personal", model: "glm-5.3", base_url: nil}
+        ),
+        summary("01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5d",
+          preview: "what is elixir?",
+          created_at: "2026-10-30T20:00:00Z",
+          pin: %{
+            profile: nil,
+            model: "glm-5.3-flash",
+            base_url: "https://api.z.ai/api/coding/paas/v4"
+          }
+        )
+      ]
+
+      state = State.sessions_arrived(new_state(), rows, now)
+
+      assert %{mode: :modal, kind: :sessions, selected: 0} = state.palette
+      [first, second] = state.palette.items
+      # Title wins over preview; relative time; provider · model — the
+      # profile name, else the base_url's preset label (ADR 0015 §2).
+      assert first.id == "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5c"
+      assert first.label == "Titled Session · now · personal · glm-5.3"
+      assert second.id == "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5d"
+      assert second.label == "what is elixir? · 4h · zai · glm-5.3-flash"
+    end
+
+    test "row labels: long previews cap with an ellipsis, control bytes drop, times bucket" do
+      now = DateTime.to_unix(~U[1970-01-02T02:00:00Z])
+
+      long =
+        summary("01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5c",
+          preview: String.duplicate("a", 20) <> "\n" <> String.duplicate("b", 25) <> "\e[31m",
+          created_at: "1970-01-01T00:00:00Z",
+          pin: %{profile: nil, model: nil, base_url: "https://custom.example/v1"}
+        )
+
+      state = State.sessions_arrived(new_state(), [long], now)
+      [row] = state.palette.items
+
+      assert row.label ==
+               String.duplicate("a", 20) <>
+                 " " <> String.duplicate("b", 19) <> "… · 1d · custom.example · —"
+    end
+
+    test "row labels: minutes bucket, the plain-date fallback past a week, raw unparseable stamps" do
+      now = DateTime.to_unix(~U[2026-10-31T12:00:00Z])
+
+      rows = [
+        summary("01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5c", created_at: "2026-10-31T11:30:00Z"),
+        summary("01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5d", created_at: "2026-10-20T00:00:00Z"),
+        summary("01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5e", created_at: "not a stamp")
+      ]
+
+      state = State.sessions_arrived(new_state(), rows, now)
+
+      assert Enum.map(state.palette.items, & &1.label) == [
+               "the first question · 30m · — · —",
+               "the first question · 2026-10-20 · — · —",
+               "the first question · not a stamp · — · —"
+             ]
+    end
+
+    test "Enter returns the picked row's id and closes the palette" do
+      rows = [
+        summary("01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5c"),
+        summary("01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5d")
+      ]
+
+      opened = State.sessions_arrived(new_state(), rows, 1_000)
+      moved = press(opened, "down", [])
+
+      {picked, {:resume_session, "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5d"}} =
+        State.handle_key(moved, "enter", [])
+
+      assert picked.palette == nil
+    end
+
+    test "Esc cancels back to the current session untouched" do
+      rows = [summary("01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5c")]
+      opened = State.sessions_arrived(new_state(), rows, 1_000)
+
+      {cancelled, nil} = State.handle_key(opened, "esc", [])
+
+      assert cancelled.palette == nil
+      assert cancelled.entries == opened.entries
+      assert cancelled.session_id == opened.session_id
+    end
+
+    test "session_adopted replays the transcript (stored system message skipped), resets the live surfaces, keeps the draft" do
+      # The current session has one exchange, a hot stats block, a context
+      # snapshot, a pending attachment, and a panned-away log.
+      live =
+        new_state()
+        |> idle_submit("the outgoing question")
+        |> Map.merge(%{
+          stats: %{
+            tokens: 9,
+            first_token_at: 1,
+            rate: 3.0,
+            prompt_tokens: 5,
+            completion_tokens: 4
+          },
+          context: %{messages: [%{role: "user", content: "x"}], anchor: nil},
+          attachments: [%{path: "shot.png", name: "shot.png", kb: 1}],
+          scroll: 4,
+          follow?: false,
+          suggestion: "a ghost"
+        })
+
+      streamed =
+        live
+        |> State.stream_message({:phase, :streaming}, 1_000)
+        |> State.stream_message({:token, "the outgoing answer"}, 1_001)
+        |> State.stream_message({:phase, :idle}, 1_002)
+
+      typed = type(streamed, "an unsent draft")
+
+      adopted =
+        State.session_adopted(
+          typed,
+          session_body(
+            [
+              %{"role" => "system", "content" => "the stored prompt (ADR 0019)"},
+              %{"role" => "user", "content" => "the adopted question"},
+              %{"role" => "assistant", "content" => "the adopted answer"}
+            ],
+            %{title: "Adopted", id: "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5f"}
+          ),
+          "[resuming session pinned to model other under active model m — continuing; the session keeps its pin]"
+        )
+
+      # The log is the replayed transcript: the STORED system message
+      # renders as nothing (ADR 0019 — the #116 crash shape), the two
+      # adopted turns replace the outgoing exchange, and the note rides
+      # last exactly as a resumed boot's.
+      assert pairs(adopted) == [
+               {:user, "the adopted question"},
+               {:assistant, "the adopted answer"},
+               {:system,
+                "[resuming session pinned to model other under active model m — continuing; the session keeps its pin]"}
+             ]
+
+      assert adopted.session_id == "01926cf4-9e8b-7f21-a3c4-8d1e2f3a4b5f"
+      assert adopted.title == "Adopted"
+      assert adopted.stats.tokens == 0 and adopted.stats.rate == nil
+      assert adopted.context == nil
+      assert adopted.attachments == []
+      assert adopted.scroll == 0 and adopted.follow? == true
+      assert adopted.suggestion == nil and adopted.suggest_reap == true
+      # The draft survives the switch — composer state, not session state.
+      assert State.input_text(adopted) == "an unsent draft"
+    end
+
+    test "session_refused lands one system entry and keeps the session" do
+      state = idle_submit(new_state(), "still here")
+
+      refused = State.session_refused(state, "no session gone under /tmp/x")
+
+      refused_pairs = pairs(refused)
+
+      assert List.last(refused_pairs) ==
+               {:system, "[resume failed: no session gone under /tmp/x]"}
+
+      assert Enum.take(refused_pairs, 1) == [{:user, "still here"}]
+      assert refused.session_id == state.session_id
     end
   end
 end

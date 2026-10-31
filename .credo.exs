@@ -143,7 +143,7 @@
           {Credo.Check.Warning.OperationWithConstantResult, []},
           {Credo.Check.Warning.RaiseInsideRescue, []},
           {Credo.Check.Warning.SpecWithStruct, []},
-          {Credo.Check.Warning.StructFieldAmount, [max_fields: 50]},
+          {Credo.Check.Warning.StructFieldAmount, [max_fields: 51]},
           {Credo.Check.Warning.UnsafeExec, []},
           {Credo.Check.Warning.UnsafeToAtom, []},
           {Credo.Check.Warning.UnusedEnumOperation, []},
