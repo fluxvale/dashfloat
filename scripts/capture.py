@@ -167,6 +167,22 @@ Scenarios:
     probe       idle frame-rate: bursts of tiny one-cell diffs, ~2/s
                 since the idle blink (issue #104) — bounded, never large;
                 0 bursts would mean the blink died
+    reasoning-block (issue #78, GIF): a "think" prompt streams the mock's
+                reasoning_content — the live block grows in its bounded
+                tail window, collapses to the one summary line at finalize,
+                Ctrl+R expands it into the scrollable window, arrow keys
+                scroll INSIDE, Ctrl+R folds it back — asserted act by act
+    reasoning-stills (issue #78): the collapsed and expanded states, one
+                app run, two stills (--out collapsed, --out2 expanded);
+                pair with --palette light for the light capture
+    reasoning-scroll (issue #78, GIF): thinking streaming while the view
+                is parked two wheel-ups off the tail: the window freezes
+                (the #131 principle holds for the block's live growth too)
+    reasoning-resume (issue #78): a thinking turn persists, the app exits,
+                and a resumed run replays the block from the STORED
+                content — expanded, the inner scroll reaches the stored
+                tail (the full thinking survived); the session file's
+                reasoning_content is asserted against the fixture text
 
 The scratch root is hermetic: XDG_CONFIG_HOME and XDG_DATA_HOME both point
 at it, so settings, keys, and session files (including the compact-session
@@ -206,6 +222,39 @@ REPLY_TOKENS = (
     "Elixir ` processes ` run ` independently ` , ` supervised ` by ` the ` "
     "VM ` . ` A ` crash ` in ` one ` never ` touches ` the ` rest ` ."
 ).split(" ` ")
+
+# The scripted thinking (issue #78): enough newline-separated lines to
+# overflow the block's 8-row window, dripped as reasoning_content deltas
+# before the answer. A prompt containing "think" (case-insensitive) opts
+# the mock's reply into a thinking phase — every other scenario is
+# byte-identical to before.
+REASONING_LINES = [
+    "consider what the user is really asking",
+    "the question is about Elixir processes",
+    "recall that processes are isolated",
+    "supervision trees provide restarts",
+    "links propagate exits, monitors do not",
+    "a crash in one process cannot touch another",
+    "the VM supervises the supervisors",
+    "message passing is the only shared state",
+    "mailboxes are per-process and ordered",
+    "so the answer should lead with isolation",
+    "then explain the supervision machinery",
+    "keep it short — two sentences will do",
+    "check the wording for accuracy",
+    "supervised is the right adjective here",
+    "the VM is the BEAM instance",
+    "no need to mention schedulers",
+    "the tail marker line is thinking alpha",
+    "the tail marker line is thinking bravo",
+    "the tail marker line is thinking charlie",
+    "the tail marker line is thinking delta",
+    "the tail marker line is thinking echo",
+    "the tail marker line is thinking foxtrot",
+    "the tail marker line is thinking golf",
+    "the tail marker line is thinking hotel",
+]
+REASONING_TAIL_MARK = "thinking hotel"
 
 GHOST_TEXT = "what happened next?"
 TITLE_TEXT = "composer demo"
@@ -647,6 +696,24 @@ class MockHandler(BaseHTTPRequestHandler):
         # network + prefill latency before decode begins — ttft reads
         # honestly instead of rounding to 0.
         time.sleep(0.3)
+        # The thinking phase (issue #78): a "think" prompt drips the
+        # reasoning lines first, one delta per line at the reply's cadence.
+        users = [m for m in req.get("messages", [])
+                 if m.get("role") == "user"]
+        thinks = any("think" in content_text(m.get("content", "")).lower()
+                     for m in users)
+        reasoning_deltas = 0
+        if thinks:
+            for i, line in enumerate(REASONING_LINES):
+                # No trailing newline on the last line — the wrapped row
+                # count the captures assert is exactly len(REASONING_LINES).
+                tail = "\n" if i < len(REASONING_LINES) - 1 else ""
+                frame = {"choices": [{"delta": {
+                    "reasoning_content": line + tail}}]}
+                self.wfile.write(f"data: {json.dumps(frame)}\n\n".encode())
+                self.wfile.flush()
+                time.sleep(0.09)
+                reasoning_deltas += 1
         for token in REPLY_TOKENS:
             frame = {"choices": [{"delta": {"content": token + " "}}]}
             self.wfile.write(f"data: {json.dumps(frame)}\n\n".encode())
@@ -661,7 +728,8 @@ class MockHandler(BaseHTTPRequestHandler):
         prompt_tokens = sum(content_bytes(m.get("content"))
                             for m in req.get("messages", [])) // 4
         usage = {"choices": [], "usage": {
-            "prompt_tokens": prompt_tokens, "completion_tokens": 34}}
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": 34 + reasoning_deltas}}
         self.wfile.write(f"data: {json.dumps(usage)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
@@ -1742,6 +1810,218 @@ class App:
         print("claim  inline: /title <name> entry landed, no dialog")
         self.screenshot(stills[4])
 
+    # -- the reasoning block (issue #78) -----------------------------------
+
+    # The block's header row ("◔ Thinking · …") on screen, or None.
+    def thinking_row(self):
+        for y, row in enumerate(self.screen.display):
+            if "◔ Thinking" in row:
+                return y
+        return None
+
+    def wait_thinking(self, timeout=15):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.thinking_row() is not None:
+                return self.thinking_row()
+            time.sleep(0.1)
+        raise TimeoutError("the thinking block never rendered")
+
+    def assert_block_footer(self, first, last, total):
+        """The expanded block's `└ first–last/total` position footer."""
+        row = self.thinking_row()
+        assert row is not None, "the thinking block never rendered"
+        needle = f"└ {first}–{last}/{total}"
+        found = any(needle in r for r in self.screen.display)
+        assert found, f"the block footer never read {needle!r}: " + \
+            repr([r.rstrip() for r in self.screen.display if "└" in r])
+        print(f"claim  block window {first}–{last} of {total}")
+
+    def scenario_reasoning_block(self):
+        # The turn: reasoning streams first (the live tail window), then the
+        # answer. The GIF mark is set by the caller BEFORE the submit.
+        self.type("think about elixir")
+        self.send(b"\r")
+        self.wait_thinking()
+        self.wait_for("thinking", timeout=15)      # live rows are visible
+        # The live block's auto-follow: the LAST reasoning line is on screen
+        # while the first is not (the window holds the tail).
+        self.wait_for(REASONING_TAIL_MARK, timeout=15)
+        assert "consider what the user" not in self.text(), \
+            "the live block shows its head — the tail window broke"
+        print("claim  live: tail window auto-follows the streaming thinking")
+
+        self.wait_for("rest")                      # the answer's last word
+        self.wait_gone("Streaming")
+        self.wait_quiet()
+        # Finalize collapsed the block to the one summary line.
+        row = self.thinking_row()
+        assert row is not None, "the collapsed summary line never rendered"
+        assert "tokens" in self.screen.display[row], \
+            f"the summary carries no stats: {self.screen.display[row]!r}"
+        assert REASONING_TAIL_MARK not in self.text(), \
+            "finalize left the block's content on screen (flood)"
+        print(f"claim  collapsed: {self.screen.display[row].strip()!r}")
+
+        # Expand: the 8-row window + position footer, focused.
+        self.send(b"\x12")                        # Ctrl+R
+        self.wait_for("↑↓ scroll", timeout=10)
+        self.assert_block_footer(1, 8, len(REASONING_LINES))
+        time.sleep(0.6)                            # a readable beat, expanded
+
+        # Inner scroll: keys move the window to the tail.
+        for _ in range(2):
+            self.send(b"\x1b[B")                  # Down
+            time.sleep(0.35)
+        self.send(b"\x1b[F")                      # End — the block's tail
+        time.sleep(0.5)
+        self.assert_block_footer(len(REASONING_LINES) - 7,
+                                 len(REASONING_LINES), len(REASONING_LINES))
+        assert REASONING_TAIL_MARK in self.text(), \
+            "the inner scroll never reached the stored tail"
+        print("claim  inner scroll: end reaches the thinking's tail")
+        time.sleep(0.6)
+
+        # Collapse: the content leaves the log again.
+        self.send(b"\x12")
+        self.wait_gone("↑↓ scroll", timeout=10)
+        assert REASONING_TAIL_MARK not in self.text(), \
+            "collapse left the block's content on screen"
+        print("claim  collapsed again: the one summary line returns")
+
+    def scenario_reasoning_stills(self, collapsed: str, expanded: str):
+        self.scenario_reasoning_block_until_collapsed()
+        self.screenshot(collapsed)
+        self.send(b"\x12")                        # Ctrl+R — expand
+        self.wait_for("↑↓ scroll", timeout=10)
+        time.sleep(0.5)
+        self.screenshot(expanded)
+
+    # The reasoning-block scenario's first half, stopping at the collapsed
+    # summary (the stills' shared setup).
+    def scenario_reasoning_block_until_collapsed(self):
+        self.type("think about elixir")
+        self.send(b"\r")
+        self.wait_thinking()
+        self.wait_for("rest")
+        self.wait_gone("Streaming")
+        self.wait_quiet()
+        row = self.thinking_row()
+        assert row is not None and "tokens" in self.screen.display[row], \
+            f"the collapsed summary line never rendered: " \
+            f"{self.screen.display[row] if row else None!r}"
+
+    # The no-yank claim for the block's live growth (issue #78 over #131):
+    # park the view two wheel-ups, let thinking stream, and require the
+    # position WINDOW to freeze while the /total grows.
+    def scenario_reasoning_scroll(self):
+        self.type("think while I read")
+        self.send(b"\r")
+        self.wait_thinking()
+        self.wheel("up")
+        self.wheel("up")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if "follow" not in self.text():
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("the wheel never unfollowed during thinking")
+        span = self.position_span()
+        window = re.match(r"L\d+-\d+", span).group(0)
+        # The parked view reads the FIXTURE's tail; the LIVE thinking grows
+        # below the window — its tail must be out of sight the whole time.
+        assert REASONING_TAIL_MARK not in self.text(), \
+            "the parked view shows the live thinking tail"
+
+        # ~15 more reasoning lines land under the frozen window.
+        time.sleep(2.0)
+        now = self.position_span()
+        assert now.startswith(window + "/"), \
+            f"the thinking block's live growth yanked the parked view: " \
+            f"{span!r} -> {now!r}"
+        assert int(now.split("/")[1]) > int(span.split("/")[1]), \
+            "the /total never grew — no thinking streamed under the window"
+        print(f"claim  no-yank: window {window} frozen, "
+              f"/total {span.split('/')[1]} -> {now.split('/')[1]}")
+        # Let the turn settle (the GIF wants the full interaction). The
+        # answer's words land below the parked window — the activity row's
+        # retirement is the visible edge of the turn's end.
+        self.wait_gone("Streaming", timeout=30)
+        self.wait_quiet()
+
+    # The persistence truth (issue #78): the session file carries the FULL
+    # thinking; a resumed run replays the block from it and the inner
+    # scroll reaches the stored tail.
+    def scenario_reasoning_resume(self, still: str):
+        self.scenario_reasoning_block_until_collapsed()
+        self.wait_for(f"[session titled: {TITLE_TEXT}]", timeout=10)
+        self.wait_quiet()
+
+        session_id = self.session_id_on_disk()
+        stored = self.stored_reasoning(session_id)
+        assert stored is not None, \
+            "the saved session carries no reasoning_content"
+        assert REASONING_TAIL_MARK in stored, \
+            "the saved reasoning is not the full thinking"
+        assert len(stored.splitlines()) >= len(REASONING_LINES), \
+            f"the saved reasoning lost lines: {len(stored.splitlines())}"
+        print(f"claim  persisted: reasoning_content has "
+              f"{len(stored.splitlines())} lines, tail present")
+
+        self.send(b"\x11")                        # Ctrl+Q — exit
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                pid, _status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if pid == self.pid:
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("the app never exited on Ctrl+Q")
+
+        reopened = App(no_ghost=True, resume=session_id)
+        try:
+            reopened.wait_for("think about elixir", timeout=30)
+            row = reopened.wait_thinking(timeout=10)
+            # Replayed blocks carry no stats (replay is pure).
+            assert "tokens" not in reopened.screen.display[row], \
+                f"a replayed block carries stats: {reopened.screen.display[row]!r}"
+            print(f"claim  replayed: {reopened.screen.display[row].strip()!r}")
+
+            reopened.send(b"\x12")                # Ctrl+R — expand
+            reopened.wait_for("↑↓ scroll", timeout=10)
+            reopened.assert_block_footer(1, 8, len(REASONING_LINES))
+            reopened.send(b"\x1b[F")              # End — the stored tail
+            time.sleep(0.5)
+            reopened.assert_block_footer(len(REASONING_LINES) - 7,
+                                         len(REASONING_LINES),
+                                         len(REASONING_LINES))
+            assert REASONING_TAIL_MARK in reopened.text(), \
+                "the resumed block's inner scroll never reached the tail"
+            print("claim  resumed: inner scroll reaches the STORED tail")
+            time.sleep(0.3)
+            reopened.screenshot(still)
+        finally:
+            reopened.close()
+
+    def session_id_on_disk(self) -> str:
+        sessions = f"{scratch_dir()}/dashfloat/sessions"
+        ids = [f[:-5] for f in os.listdir(sessions) if f.endswith(".json")]
+        assert len(ids) == 1, f"expected one session file, saw {ids}"
+        return ids[0]
+
+    def stored_reasoning(self, session_id: str):
+        path = f"{scratch_dir()}/dashfloat/sessions/{session_id}.json"
+        with open(path) as f:
+            body = json.load(f)
+        for m in body.get("messages", []):
+            if m.get("role") == "assistant" and "reasoning_content" in m:
+                return m["reasoning_content"]
+        return None
+
     def close(self):
         self._alive = False
         try:
@@ -1774,7 +2054,9 @@ def main():
                              "title-dialog", "idle-blink", "tab-complete",
                              "breathing-gap", "gap-scrolled", "ttft-footer",
                              "enter-snap", "scrolled-stream",
-                             "drop-image", "drop-refusal"])
+                             "drop-image", "drop-refusal",
+                              "reasoning-block", "reasoning-stills",
+                              "reasoning-scroll", "reasoning-resume"])
     ap.add_argument("--out", default=None)
     # The compact-session flow shoots TWO stills: --out after the drop,
     # --out2 after the follow-up no-op command (its below-trigger entry).
@@ -1862,7 +2144,8 @@ def main():
         context = context  # None unless pinned
     elif args.scenario == "resume-session":
         resume = write_reading_fixture(scratch_dir())
-    elif args.scenario in ("enter-snap", "gap-scrolled", "scrolled-stream"):
+    elif args.scenario in ("enter-snap", "gap-scrolled", "scrolled-stream",
+                           "reasoning-scroll"):
         # A 40-turn fixture log overflows the 24-row viewport several
         # times over — the scroll-back state is real (issues #110/#131).
         resume = write_snap_fixture(scratch_dir())
@@ -2000,6 +2283,13 @@ def main():
                 app.scenario_ttft_footer(args.out, args.out2)
             elif args.scenario == "scrolled-stream":
                 app.scenario_scrolled_stream()
+            elif args.scenario == "reasoning-stills":
+                if not (args.out and args.out2):
+                    ap.error("reasoning-stills shoots two stills: --out "
+                             "(collapsed) and --out2 (expanded) are required")
+                app.scenario_reasoning_stills(args.out, args.out2)
+            elif args.scenario == "reasoning-resume":
+                app.scenario_reasoning_resume(args.out)
             elif args.scenario == "title-dialog":
                 # Five stills in one app run (issue #106): open, refusal,
                 # success, esc, inline — each act asserts before it shoots.
@@ -2011,7 +2301,8 @@ def main():
             if args.expect_label:
                 app.wait_footer_label(args.expect_label)
             if args.scenario not in ("compact-session", "title-dialog",
-                                     "exit-print", "ttft-footer"):
+                                     "exit-print", "ttft-footer",
+                                     "reasoning-stills", "reasoning-resume"):
                 app.screenshot(args.out)
         elif args.scenario == "slash-autocomplete":
             # The popup opening AND narrowing: "/" opens the full list, "c"
@@ -2069,6 +2360,20 @@ def main():
             app.scenario_tab_complete()
             time.sleep(0.5)            # a settled beat on the final draft
             app.gif(args.out, crop_rows=20, min_span=1.5)
+        elif args.scenario == "reasoning-block":
+            # The whole block interaction: live growth -> collapse ->
+            # expand -> inner scroll -> collapse, asserted act by act.
+            app._mark = time.monotonic()
+            app.scenario_reasoning_block()
+            time.sleep(0.5)
+            app.gif(args.out, crop_rows=24, min_span=1.0)
+        elif args.scenario == "reasoning-scroll":
+            # Parked two wheel-ups while thinking streams — the window
+            # freezes (the #131 principle over the block's live growth).
+            app._mark = time.monotonic()
+            app.scenario_reasoning_scroll()
+            time.sleep(0.5)
+            app.gif(args.out, crop_rows=24, min_span=1.0)
         elif args.scenario == "enter-snap":
             # Scroll back, type (view STAYS), Enter (view snaps) — issue
             # #131's reversal of #110, asserted act by act.

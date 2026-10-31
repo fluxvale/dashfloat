@@ -63,6 +63,11 @@ defmodule DashFloat.Agent do
     status: :idle,
     messages: [],
     episode_content: "",
+    # The episode's accumulated reasoning (issue #78): every {:reasoning, _}
+    # delta appends here, mirroring episode_content — the failure/cancel
+    # paths persist from this accumulation while the stream_done report is
+    # the truth of record on the happy path.
+    episode_reasoning: "",
     pending_usage: nil,
     stream_ref: nil,
     stream_pid: nil,
@@ -384,6 +389,16 @@ defmodule DashFloat.Agent do
 
   def handle_info({:token, _text}, state), do: {:noreply, state}
 
+  # Reasoning deltas (issue #78): forwarded to the UI (the thinking block's
+  # live growth) and accumulated for the finalize paths' persistence.
+  def handle_info({:reasoning, text}, %__MODULE__{status: :streaming} = state)
+      when is_binary(text) do
+    display(state.ui, {:reasoning, text})
+    {:noreply, %{state | episode_reasoning: state.episode_reasoning <> text}}
+  end
+
+  def handle_info({:reasoning, _text}, state), do: {:noreply, state}
+
   # The episode's usage frame completes the anchor minted at episode start
   # (ADR 0022 §1): its prompt_tokens measured over the request's message
   # count. Display forwarding of pending_usage is unchanged (last frame wins
@@ -405,7 +420,7 @@ defmodule DashFloat.Agent do
       when is_binary(text) do
     state =
       state
-      |> finalize_episode(partial)
+      |> finalize_episode(partial, state.episode_reasoning)
       |> reset_turn()
 
     display(state.ui, {:entry, :system, text})
@@ -416,15 +431,32 @@ defmodule DashFloat.Agent do
   def handle_info({:stream_failed, _text, _partial}, state), do: {:noreply, state}
 
   def handle_info(
+        {:stream_done,
+         %{content: content, reasoning: reasoning, tool_calls: calls, cancelled: cancelled}},
+        %__MODULE__{status: :streaming} = state
+      )
+      when is_binary(reasoning) do
+    state = %{state | stream_ref: nil, stream_pid: nil}
+
+    cond do
+      cancelled -> end_turn_cancelled(state, content, reasoning)
+      calls == [] -> end_turn_final(state, content, reasoning)
+      true -> begin_tool_batch(state, content, reasoning, calls)
+    end
+  end
+
+  # A report without the reasoning key is an older producer shape — read as
+  # no thinking (hand-built sends, a future regression); never a crash.
+  def handle_info(
         {:stream_done, %{content: content, tool_calls: calls, cancelled: cancelled}},
         %__MODULE__{status: :streaming} = state
       ) do
     state = %{state | stream_ref: nil, stream_pid: nil}
 
     cond do
-      cancelled -> end_turn_cancelled(state, content)
-      calls == [] -> end_turn_final(state, content)
-      true -> begin_tool_batch(state, content, calls)
+      cancelled -> end_turn_cancelled(state, content, "")
+      calls == [] -> end_turn_final(state, content, "")
+      true -> begin_tool_batch(state, content, "", calls)
     end
   end
 
@@ -660,7 +692,7 @@ defmodule DashFloat.Agent do
       ) do
     state =
       state
-      |> finalize_episode(state.episode_content)
+      |> finalize_episode(state.episode_content, state.episode_reasoning)
       |> reset_turn()
 
     display(state.ui, {:entry, :system, "[stream failed: #{inspect_slice(reason)}]"})
@@ -732,6 +764,7 @@ defmodule DashFloat.Agent do
          stream_pid: pid,
          stream_ref: Process.monitor(pid),
          episode_content: "",
+         episode_reasoning: "",
          pending_usage: nil,
          request_len: length(state.messages)
      }}
@@ -742,14 +775,14 @@ defmodule DashFloat.Agent do
   # The auto-title side-request (#80) fires here and only here — the first
   # settled assistant turn — before the idle display and never on its critical
   # path: fetch_async returns as soon as the task starts.
-  defp end_turn_final(state, content) do
+  defp end_turn_final(state, content, reasoning) do
     if content == "" do
       display(state.ui, {:entry, :system, "[model returned nothing]"})
     end
 
     state =
       state
-      |> finalize_episode(content)
+      |> finalize_episode(content, reasoning)
       |> reset_turn()
       |> maybe_fire_title(content)
 
@@ -758,10 +791,10 @@ defmodule DashFloat.Agent do
     {:noreply, state}
   end
 
-  defp end_turn_cancelled(state, content) do
+  defp end_turn_cancelled(state, content, reasoning) do
     state =
       state
-      |> finalize_episode(content)
+      |> finalize_episode(content, reasoning)
       |> reset_turn()
 
     display(state.ui, {:entry, :system, "[cancelled]"})
@@ -769,10 +802,10 @@ defmodule DashFloat.Agent do
     {:noreply, state}
   end
 
-  defp begin_tool_batch(state, content, calls) do
+  defp begin_tool_batch(state, content, reasoning, calls) do
     calls = dedup_ids(calls)
 
-    assistant = %{
+    base = %{
       role: "assistant",
       content: if(content == "", do: nil, else: content),
       tool_calls:
@@ -784,6 +817,8 @@ defmodule DashFloat.Agent do
           }
         end)
     }
+
+    assistant = assistant_with_reasoning(base, reasoning)
 
     # The deliberately-dangling write (ADR 0014 §5): the batch is on disk
     # before any tool runs, so a kill mid-batch leaves the repairable shape.
@@ -1167,13 +1202,28 @@ defmodule DashFloat.Agent do
     {:noreply, state}
   end
 
-  defp finalize_episode(state, content) do
+  # Reasoning persists ONLY beside content (issue #78): a thinking-only
+  # episode (cancelled before any answer token) is display-only — an
+  # assistant message of nil content and no tool_calls is a degenerate wire
+  # shape no provider needs, so the block lives and dies with the live view.
+  defp finalize_episode(state, content, reasoning)
+       when is_binary(content) and is_binary(reasoning) do
     if content != "" do
-      persist(%{state | messages: state.messages ++ [%{role: "assistant", content: content}]})
+      message = assistant_with_reasoning(%{role: "assistant", content: content}, reasoning)
+      persist(%{state | messages: state.messages ++ [message]})
     else
       state
     end
   end
+
+  # The thinking rides the assistant message as `reasoning_content` — the
+  # provider's own field name, transcript truth (ADR 0006's persistence
+  # amendment); the key is omitted entirely when empty so non-reasoning
+  # sessions stay byte-identical.
+  defp assistant_with_reasoning(assistant, reasoning) when reasoning != "",
+    do: Map.put(assistant, :reasoning_content, reasoning)
+
+  defp assistant_with_reasoning(assistant, _empty), do: assistant
 
   defp reset_turn(state) do
     %{
@@ -1185,7 +1235,8 @@ defmodule DashFloat.Agent do
         tool_slot: :none,
         stream_ref: nil,
         stream_pid: nil,
-        episode_content: ""
+        episode_content: "",
+        episode_reasoning: ""
     }
   end
 

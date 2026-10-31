@@ -133,6 +133,14 @@ defmodule DashFloat.AgentTest do
     ~s(data: {"choices":[{"index":0,"delta":{"content":#{Jason.encode!(content)}}}]}\n\n)
   end
 
+  # A reasoning delta frame (issue #78) — the provider's spelling, built as a
+  # map so the JSON is valid by construction (iodata frames are legal in the
+  # server's scripts).
+  defp reasoning_frame(text) do
+    frame = %{"choices" => [%{"index" => 0, "delta" => %{"reasoning_content" => text}}]}
+    ["data: ", Jason.encode!(frame), "\n\n"]
+  end
+
   defp final_episode(text \\ "All done.", opts \\ []) do
     prefix = Keyword.get(opts, :prefix, [])
     suffix = if usage = opts[:usage], do: [usage_frame(usage)], else: []
@@ -1218,6 +1226,127 @@ defmodule DashFloat.AgentTest do
     assert %{"ok" => false, "error" => error} = Jason.decode!(result_json)
     assert error =~ "tool crashed"
     assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "reasoning forwards to the UI, persists with the reply, and never rides the next wire",
+       ctx do
+    thinking = for n <- 1..8, do: reasoning_frame("thought #{n} ")
+
+    server =
+      start_server([
+        [
+          {:send, [@headers | thinking ++ [frame("the answer")]]},
+          {:send, "data: [DONE]\n\n"},
+          :close
+        ],
+        final_episode("second")
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+    send(agent, {:prompt, self(), "hello", []})
+
+    for n <- 1..8 do
+      expected = "thought #{n} "
+      assert_receive {:reasoning, ^expected}, 2_000
+    end
+
+    assert_receive {:token, "the answer"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # Transcript truth: the assistant message carries its full reasoning.
+    session = load_own_session(sessions, agent)
+
+    assert %{
+             "role" => "assistant",
+             "content" => "the answer",
+             "reasoning_content" =>
+               "thought 1 thought 2 thought 3 thought 4 thought 5 thought 6 thought 7 thought 8 "
+           } in session.messages
+
+    # Wire truth: the next request strips the field (DeepSeek-class 400s).
+    send(agent, {:prompt, self(), "again", []})
+    assert_receive {:sse_request, "POST", _, _, body}, 4_000
+    wire_messages = request_messages(body)
+    assert Enum.all?(wire_messages, &is_nil(&1["reasoning_content"]))
+  end
+
+  @tag :tmp_dir
+  test "a crashed stream keeps the thinking that streamed with the partial reply", ctx do
+    server =
+      start_server([
+        [
+          {:send, [@headers, reasoning_frame("pondering "), frame("half")]},
+          {:sleep, 60_000},
+          {:wait_close, 1_000}
+        ]
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+    send(agent, {:prompt, self(), "hello", []})
+
+    assert_receive {:reasoning, "pondering "}, 2_000
+    assert_receive {:token, "half"}, 2_000
+
+    stream = await_task(sup)
+    Process.exit(stream, :boom)
+
+    assert_receive {:entry, :system, "[stream failed: :boom]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    session = load_own_session(sessions, agent)
+
+    assert %{"role" => "assistant", "content" => "half", "reasoning_content" => "pondering "} in session.messages
+  end
+
+  @tag :tmp_dir
+  test "thinking without an answer is display-only: nothing persists on cancel", ctx do
+    server =
+      start_server([
+        [
+          {:send, [@headers, reasoning_frame("only thinking ")]},
+          {:sleep, 60_000},
+          {:wait_close, 1_000}
+        ]
+      ])
+
+    sessions = Path.join(ctx.tmp_dir, "sessions")
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, session_dir: sessions)
+    send(agent, {:prompt, self(), "hello", []})
+
+    assert_receive {:reasoning, "only thinking "}, 2_000
+    send(agent, {:cancel})
+    assert_receive {:entry, :system, "[cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+
+    # The question persisted; no assistant message exists — a nil-content,
+    # no-tool_calls assistant is a degenerate wire shape no provider needs.
+    session = load_own_session(sessions, agent)
+    refute Enum.any?(session.messages, &(&1["role"] == "assistant"))
+  end
+
+  test "a late reasoning delta at a non-streaming phase is ignored" do
+    server = start_server([final_episode("unused")])
+    {agent, _sup} = start_agent(server, System.tmp_dir!())
+
+    send(agent, {:reasoning, "stray"})
+    refute_received {:reasoning, "stray"}
+    assert Process.alive?(agent)
+  end
+
+  test "a stream_done without the reasoning key is read as no thinking" do
+    server = start_server([final_episode("unused")])
+    {agent, _sup} = start_agent(server, System.tmp_dir!())
+
+    send(agent, {:prompt, self(), "hello", []})
+    assert_receive {:sse_request, "POST", _, _, _body}, 2_000
+
+    # The legacy producer shape: no reasoning key at all — the turn ends
+    # normally, read as no thinking.
+    send(agent, {:stream_done, %{content: "done", tool_calls: [], cancelled: false}})
+    assert_receive {:phase, :idle}, 1_000
   end
 
   test "a crashed stream task degrades to a system entry and idle" do

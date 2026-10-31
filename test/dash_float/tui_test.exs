@@ -2643,6 +2643,13 @@ defmodule DashFloat.TUITest do
     assert State.input_text(rejected) == ""
   end
 
+  # The reasoning block's inner view offset (issue #78).
+  defp reasoning_view(state) do
+    state.entries
+    |> Enum.find(&(&1.kind == :reasoning))
+    |> then(& &1.meta.view)
+  end
+
   # Issue #21 (ADR 0006 amendment): the wheel always addresses the log view —
   # never the input draft. Routing is focus-free: the pane under the cursor,
   # the draft's contents, and a pending confirm are all irrelevant to it.
@@ -2670,6 +2677,43 @@ defmodule DashFloat.TUITest do
 
     state = eventually(pid, fn s -> s.phase == :idle and State.log_line_count(s) >= 202 end)
     {state, State.effective_scroll(state, viewport(state))}
+  end
+
+  # Issue #78: a wheel notch over the EXPANDED thinking block's rows scrolls
+  # inside the block; a notch anywhere else keeps the transcript contract.
+  test "the wheel scopes to the expanded thinking block by position" do
+    {:ok, pid} = start_tui(provider: provider())
+    submit(pid, "think please")
+    assert_receive {:prompt, ui_pid, "think please", []}, 1_000
+
+    for i <- 1..20,
+        do: send(ui_pid, {:reasoning, "thought #{i}\n"})
+
+    send(ui_pid, {:token, "the answer"})
+    send(ui_pid, {:phase, :idle})
+
+    state = eventually(pid, fn s -> s.phase == :idle end)
+
+    # Rows: user (2), reasoning block (2), reply (2) — the block's header is
+    # content row 3, screen row 6 (margin 2 + status 1).
+    press(pid, "r", ["ctrl"])
+    expanded = get_state(pid)
+
+    assert Enum.any?(
+             expanded.entries,
+             &match?(%{kind: :reasoning, meta: %{expanded?: true}}, &1)
+           )
+
+    inject(pid, %ExRatatui.Event.Mouse{kind: "scroll_down", button: "", x: 10, y: 6})
+    inner = get_state(pid)
+    assert reasoning_view(inner) == 3
+    # The transcript never unfollowed — the notch was the block's.
+    assert inner.follow?
+
+    # A notch on the status bar (y 0) is the transcript's: nothing inner moves.
+    inject(pid, %ExRatatui.Event.Mouse{kind: "scroll_up", button: "", x: 10, y: 0})
+    outside = get_state(pid)
+    assert reasoning_view(outside) == 3
   end
 
   test "the wheel scrolls the log view, not the input draft" do

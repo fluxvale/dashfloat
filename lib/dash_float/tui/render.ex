@@ -1,12 +1,14 @@
 defmodule DashFloat.TUI.Render do
   @moduledoc """
   The one pure seam between entry truth and the log view:
-  `entry_lines/2` turns an entry's raw text into styled lines, and the
+  `entry_lines/2` turns an entry's raw text into styled lines, the
   tool-contract builders (`tool_call/2`, `tool_result/3`, `confirm_preview/1`)
-  turn the ADR 0007 messages into `{text, lines}` entries — text is the plain
-  persistence truth, lines the styled view. Every entry starts with one blank
-  separator line. Assistant text goes through the markdown mapper; the seam
-  itself stays these functions (ADR 0006).
+  turn the ADR 0007 messages into `{text, lines}` entries, and the reasoning
+  builders (issue #78) draw the thinking block's header, content, and
+  position footer — text is the plain persistence truth, lines the styled
+  view. Every entry starts with one blank separator line. Assistant text goes
+  through the markdown mapper; the seam itself stays these functions
+  (ADR 0006).
   """
 
   alias DashFloat.TUI.Markdown
@@ -39,6 +41,78 @@ defmodule DashFloat.TUI.Render do
   def tool_call(name, nil) when is_binary(name) do
     rest = name_with_summary(name, "(invalid arguments)")
     {"⚙ " <> rest, [blank(), tool_row(rest)]}
+  end
+
+  ## Reasoning block builders (issue #78)
+
+  @doc """
+  The thinking block's summary header line: accent `◔` glyph, then the dim
+  label. `meta` carries the block's display stats — `tokens` (the delta
+  count, live and finalized) and `ms` (the frozen first→last-delta duration,
+  finalized only) each render independently; a replayed block carries
+  neither (replay is pure — stats never survived resume). The suffix rides
+  the expanded header as the interaction hint.
+  """
+  @spec reasoning_header_line(map(), String.t() | nil) :: Line.t()
+  def reasoning_header_line(meta, suffix \\ nil) do
+    tokens = stat_part(meta, :tokens, &"#{&1} tokens")
+    duration = stat_part(meta, :ms, &duration_label(&1))
+    label = "Thinking" <> tokens <> duration <> suffix_part(suffix)
+
+    Line.new([
+      Span.new("◔ ", style: Theme.style(:accent)),
+      Span.new(label, style: Theme.style(:dim))
+    ])
+  end
+
+  defp stat_part(meta, key, render) do
+    case meta do
+      %{^key => value} when is_integer(value) and value >= 0 -> " · " <> render.(value)
+      _missing -> ""
+    end
+  end
+
+  defp suffix_part(nil), do: ""
+  defp suffix_part(suffix) when is_binary(suffix), do: " " <> suffix
+
+  @doc """
+  The thinking block's full content as logical lines: one dim `│ `-prefixed
+  row per reasoning line — the blockquote vocabulary, so hanging indents and
+  selection treat the block like quoted prose.
+  """
+  @spec reasoning_logical(String.t()) :: [Line.t()]
+  def reasoning_logical(text) when is_binary(text) do
+    text
+    |> String.split("\n")
+    |> Enum.map(fn line ->
+      Line.new([
+        Span.new("│ ", style: Theme.style(:dim)),
+        Span.new(line, style: Theme.style(:quote))
+      ])
+    end)
+  end
+
+  @doc """
+  The expanded block's position footer: dim `└ first–last/total` over the
+  visible window of wrapped content rows.
+  """
+  @spec reasoning_footer_line(non_neg_integer(), non_neg_integer(), non_neg_integer()) :: Line.t()
+  def reasoning_footer_line(first, last, total) do
+    Line.new([Span.new("└ #{first}–#{last}/#{total}", style: Theme.style(:dim))])
+  end
+
+  @doc """
+  Seconds for the thinking header: one decimal with a trailing `.0` trimmed
+  (the footer spans' rule) — `8.1s`, `2s`.
+  """
+  @spec duration_label(non_neg_integer()) :: String.t()
+  def duration_label(ms) when is_integer(ms) and ms >= 0 do
+    seconds = Float.round(ms / 1000, 1)
+
+    seconds
+    |> :erlang.float_to_binary(decimals: 1)
+    |> String.trim_trailing(".0")
+    |> then(&(&1 <> "s"))
   end
 
   @doc """

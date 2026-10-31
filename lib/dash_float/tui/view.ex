@@ -701,10 +701,24 @@ defmodule DashFloat.TUI.View do
     acc
   end
 
-  defp blocks(%State{in_flight_lines: nil} = state), do: Enum.map(state.entries, & &1.lines)
+  # The reasoning block's live rows (issue #78) sit between the stored
+  # entries and the in-flight reply — thinking precedes the answer it
+  # produced, and the live tail blocks are the log's mutable end.
+  defp blocks(%State{} = state) do
+    Enum.map(state.entries, & &1.lines) ++
+      reasoning_block(state) ++ in_flight_block(state)
+  end
 
-  defp blocks(%State{in_flight_lines: lines} = state),
-    do: Enum.map(state.entries, & &1.lines) ++ [lines]
+  defp reasoning_block(%State{} = state) do
+    case State.live_reasoning_rows(state) do
+      nil -> []
+      rows -> [rows]
+    end
+  end
+
+  defp in_flight_block(%State{in_flight_lines: nil}), do: []
+
+  defp in_flight_block(%State{in_flight_lines: lines}), do: [lines]
 
   defp take_block(lines, {skipped, acc}, offset, height) do
     n = length(lines)

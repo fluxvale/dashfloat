@@ -751,6 +751,48 @@ defmodule DashFloat.SessionTest do
     end
 
     @tag :tmp_dir
+    @tag :tmp_dir
+    test "an assistant message's reasoning_content round-trips verbatim (issue #78)", ctx do
+      messages = [
+        %{role: "user", content: "think about elixir"},
+        %{
+          role: "assistant",
+          content: "the answer",
+          reasoning_content: "the full thinking\nmulti-line too"
+        }
+      ]
+
+      save_ok(ctx, messages)
+      assert {:ok, loaded} = load(ctx)
+
+      assert %{
+               "role" => "assistant",
+               "content" => "the answer",
+               "reasoning_content" => "the full thinking\nmulti-line too"
+             } in loaded.messages
+    end
+
+    @tag :tmp_dir
+    test "a non-string reasoning_content refuses naming the field (issue #78)", ctx do
+      messages = [%{role: "user", content: "q"}, %{role: "assistant", content: "a"}]
+
+      save_ok(ctx, messages)
+      path = Path.join(ctx.tmp_dir, @id <> ".json")
+
+      decoded =
+        path
+        |> File.read!()
+        |> Jason.decode!()
+
+      damaged = List.update_at(decoded["messages"], 1, &Map.put(&1, "reasoning_content", 42))
+
+      File.write!(path, Jason.encode!(%{decoded | "messages" => damaged}))
+
+      assert {:error, error} = load(ctx)
+      assert error =~ ~s(message 1 field "reasoning_content" must be a string)
+    end
+
+    @tag :tmp_dir
     test "an image-bearing user message round-trips verbatim (ADR 0018 §2)", ctx do
       messages = [
         %{
