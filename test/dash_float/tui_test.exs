@@ -1236,26 +1236,42 @@ defmodule DashFloat.TUITest do
     assert status_text(state) =~ "Idle"
   end
 
-  test "the footer under the composer carries cwd, model, and the live rate during a stream" do
+  test "the footer carries cwd, model, ttft while streaming, and the frozen average after" do
     {:ok, pid} = start_tui(provider: provider())
     submit(pid, "stream for the footer")
 
     assert_receive {:prompt, ui_pid, "stream for the footer", []}, 1_000
+
+    # No token yet: neither span exists.
+    blank = get_state(pid)
+    refute footer_text(blank) =~ "tok/s"
+    refute footer_text(blank) =~ "ttft"
+
+    # Mid-stream (issue #130's refinement): NO live tok/s — the live number
+    # misrepresents ("it tends to speed up by the end") — only the turn's
+    # ttft, known from the first token.
     send(ui_pid, {:token, "x"})
     Process.sleep(20)
     send(ui_pid, {:token, "x"})
+    Process.sleep(60)
 
-    # The tick recomputes the rate while streaming; give it a few frames.
-    Process.sleep(300)
-
-    state = get_state(pid)
-    assert state.stats.rate != nil
-
-    # (a) Render-output seam: the footer line carries cwd, model, and rate.
-    text = footer_text(state)
-    assert text =~ State.cwd_label(state)
+    streaming = get_state(pid)
+    assert streaming.stats.rate == nil
+    text = footer_text(streaming)
+    assert text =~ State.cwd_label(streaming)
     assert text =~ "test-model"
-    assert text =~ "tok/s"
+    assert text =~ ~r/ttft \d+(\.\d+)?s/
+    refute text =~ "tok/s"
+
+    # After the turn ends both spans persist, ttft first — the issue's
+    # exact format, the rate the whole-response average over the decode
+    # window.
+    send(ui_pid, {:phase, :idle})
+    state = eventually(pid, fn s -> s.phase == :idle and s.in_flight == nil end)
+
+    assert state.stats.rate != nil
+    final = footer_text(state)
+    assert final =~ ~r/ttft \d+(\.\d+)?s · \d+(\.\d+)? tok\/s/
 
     # (b) Drawn-buffer probe: the footer reaches the screen.
     term = ExRatatui.init_test_terminal(80, 24)
@@ -2747,8 +2763,8 @@ defmodule DashFloat.TUITest do
   test "a left drag over the log selects display rows and copies on release" do
     {:ok, pid} = start_tui()
 
-    for i <- 1..8, do: send(pid, {:entry, :system, "selectable line #{i}"})
-    eventually(pid, &(State.log_line_count(&1) == 16))
+    for i <- 1..6, do: send(pid, {:entry, :system, "selectable line #{i}"})
+    eventually(pid, &(State.log_line_count(&1) == 12))
 
     # A drag with no press before it (a missed or dropped down event) is a
     # no-op, never a crash.
@@ -2757,17 +2773,18 @@ defmodule DashFloat.TUITest do
     assert bare.selection == nil
 
     # down at log row 1 ("selectable line 1"), drag to row 3, release.
-    # (16 lines in the 15-row idle viewport: follow pins the bottom, so the
-    # view sits at scroll 1 — screen row 3 is display row 1.)
-    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 4, y: 3})
+    # (12 lines in the 13-row idle viewport — the #129 gap took two rows —
+    # so the view sits at scroll 0: screen row 4 is display row 1, the
+    # log's own y=3 offset by the margin.)
+    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 4, y: 4})
     drag = eventually(pid, &(&1.selection != nil))
     assert drag.selection.anchor == {1, 2}
 
-    inject(pid, %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 6, y: 5})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "drag", button: "left", x: 6, y: 6})
     extended = get_state(pid)
     assert extended.selection.head == {3, 4}
 
-    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 6, y: 5})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 6, y: 6})
     released = get_state(pid)
 
     # The highlight stays after the copy (terminal convention)…
@@ -2779,8 +2796,8 @@ defmodule DashFloat.TUITest do
     assert State.selection_text(released) == "lectable line 1\n\nselec"
 
     # Click-to-clear: a press+release without extension clears it.
-    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 4, y: 3})
-    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 4, y: 3})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "down", button: "left", x: 4, y: 4})
+    inject(pid, %ExRatatui.Event.Mouse{kind: "up", button: "left", x: 4, y: 4})
     cleared = get_state(pid)
     assert cleared.selection == nil
   end

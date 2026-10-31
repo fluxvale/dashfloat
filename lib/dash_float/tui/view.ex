@@ -45,6 +45,14 @@ defmodule DashFloat.TUI.View do
   # width — which IS the wrap width — shrinks with it.
   @margin 2
 
+  # The breathing gap between the transcript and the composer cluster
+  # (issue #129; ADR 0015's 2026-10-31 amendment): two blank rows — the
+  # margin language's own rhythm — between the log's bottom and whatever
+  # follows it (the activity row when one exists, else the input box). A
+  # fixed region, so the gap holds in every scroll state and the composer's
+  # own height never moves.
+  @gap 2
+
   # The composer's placeholder, shown ONLY before the session's first
   # exchange (ADR 0015 §3, amended #91). The key map lives in /help.
   @input_hint "ask anything"
@@ -58,15 +66,19 @@ defmodule DashFloat.TUI.View do
   @title_dialog_hint "⏎ rename · esc cancel"
 
   @doc """
-  Splits `width` x `height` into status (1 row), log (rest), activity
-  (1 row while an overlay exists — an active phase, the exit prompt, or the
-  open attach prompt — else 0), input (`2 + input_lines` rows, clamped to a
-  third of the frame), and the permanent stats footer (1 row, ADR 0015) —
-  the whole chrome inset by two cells per side.
+  Splits `width` x `height` into status (1 row), log (rest), the breathing
+  gap (`@gap` blank rows — issue #129), activity (1 row while an overlay
+  exists — an active phase, the exit prompt, or the open attach prompt —
+  else 0), input (`2 + input_lines` rows, clamped to a third of the frame),
+  and the permanent stats footer (1 row, ADR 0015) — the whole chrome inset
+  by two cells per side. The gap sits between the transcript and the
+  composer CLUSTER (activity + input + footer are one unit); nothing
+  renders into it.
   """
   @spec regions({integer(), integer()}, integer(), boolean()) :: %{
           status: Rect.t(),
           log: Rect.t(),
+          gap: Rect.t(),
           activity: Rect.t(),
           input: Rect.t(),
           footer: Rect.t()
@@ -76,16 +88,27 @@ defmodule DashFloat.TUI.View do
              is_boolean(active?) do
     area = inset_area(width, height)
 
-    [status, log, activity, input, footer] =
+    [status, log, gap, activity, input, footer] =
       ExRatatui.Layout.split(area, :vertical, [
         {:length, 1},
         {:min, 0},
+        {:length, gap_height(area.height, active?)},
         {:length, if(active?, do: 1, else: 0)},
         {:length, input_height(input_lines, area.height)},
         {:length, 1}
       ])
 
-    %{status: status, log: log, activity: activity, input: input, footer: footer}
+    %{status: status, log: log, gap: gap, activity: activity, input: input, footer: footer}
+  end
+
+  # The gap collapses before the chrome does: on a frame whose inset height
+  # cannot carry status + gap + (the activity row, when one exists) + a
+  # minimal composer + footer, the air goes first — the layout degrades
+  # the way the margin amendment's degenerate rule does (never raise,
+  # never go negative).
+  defp gap_height(area_height, active?) do
+    demand = 1 + @gap + (if(active?, do: 1, else: 0) + 3) + 1
+    if area_height < demand, do: 0, else: @gap
   end
 
   @doc """
@@ -143,7 +166,7 @@ defmodule DashFloat.TUI.View do
       {log_widget(state, regions.log.height), regions.log},
       {activity_widget(state), regions.activity},
       {input_widget(state), regions.input},
-      {footer_widget(state), regions.footer}
+      {footer_widget(state, regions.footer.width), regions.footer}
     ] ++ palette_widgets(state, area) ++ title_dialog_widgets(state, area)
   end
 
@@ -456,36 +479,117 @@ defmodule DashFloat.TUI.View do
     %Paragraph{text: [Line.new(spans)]}
   end
 
-  # The stats footer under the composer (ADR 0015 §2): cwd, model, live
-  # tok/s in the old status-bar span vocabulary, plus the stage-2
+  # The stats footer under the composer (ADR 0015 §2, its 2026-10-31
+  # #130 amendment): cwd, model, the turn's `ttft` and the whole-response
+  # `tok/s` average in the old status-bar span vocabulary, plus the stage-2
   # tokens-used + percent-of-context span (ADR 0015 §2 amendment). Static
-  # data read at render time — live while streaming because the tick
-  # recomputes the rate; the rate and context spans are omitted entirely
-  # until one exists.
-  defp footer_widget(state) do
-    context_spans =
-      case State.context_label(state) do
-        nil -> []
-        label -> [separator(), Span.new(label, style: Theme.style(:dim))]
-      end
+  # data read at render time. The ttft span exists from the turn's first
+  # token (streaming included); the tok/s span exists only once a
+  # whole-response average has been frozen at finalize — never live, by the
+  # #130 refinement — and both persist after the turn ends until the next
+  # send clears them.
+  #
+  # Width discipline (same amendment): the pair the owner asked for may
+  # never clip, so when the whole line would overflow the footer rect the
+  # optional groups drop from the left in reverse order of urgency — the
+  # cwd first, the context snapshot next, then ttft — the model label and
+  # the rate last. (The attach row's hints-drop is the precedent: drop what
+  # fits worst, keep the payload whole.)
+  defp footer_widget(state, width) do
+    groups = footer_groups(state)
 
-    rate_spans =
-      case State.rate_label(state) do
-        nil -> []
-        rate -> [separator(), Span.new("#{rate} tok/s", style: Theme.style(:dim))]
-      end
+    # The drop ladder, stated once: the cwd drops first (the least
+    # volatile thing on the row), then the context snapshot, then ttft,
+    # then — only on a degenerate frame — the model label; the ❯ glyph and
+    # the rate are never dropped. The last level keeps the rate alone and
+    # the Paragraph clips as it always did if even that overflows.
+    drops = [
+      [],
+      [:cwd],
+      [:cwd, :context],
+      [:cwd, :context, :ttft],
+      [:cwd, :context, :ttft, :model]
+    ]
 
-    %Paragraph{
-      text: [
-        Line.new(
-          [Span.new("❯ " <> State.cwd_label(state), style: Theme.style(:dim))] ++
-            [
-              separator(),
-              Span.new(State.provider_label(state) || "—", style: Theme.style(:assistant))
-            ] ++ images_spans(state) ++ context_spans ++ rate_spans
-        )
-      ]
+    candidates = Enum.map(drops, &fitting_footer_line(groups, &1))
+
+    candidates
+    |> Enum.find(&(spans_width(&1) <= width or &1 == List.last(candidates)))
+    |> then(&%Paragraph{text: [Line.new(&1)]})
+  end
+
+  # The footer's span groups: the ❯ head (the cwd rides it, ADR 0015 §2's
+  # `❯ <cwd> · <model>`), the model label + capability glyph, then the
+  # optional context snapshot, ttft, and rate spans — each nil-label group
+  # is empty and drops out of the join.
+  defp footer_groups(state) do
+    ttft = State.ttft_label(state)
+    rate = State.rate_label(state)
+
+    %{
+      cwd: [Span.new("❯ " <> State.cwd_label(state), style: Theme.style(:dim))],
+      bare: [Span.new("❯", style: Theme.style(:dim))],
+      model:
+        [Span.new(State.provider_label(state) || "—", style: Theme.style(:assistant))] ++
+          images_spans(state),
+      context: dim_group(State.context_label(state)),
+      ttft: dim_group(ttft && "ttft #{ttft}s"),
+      rate: dim_group(rate && "#{rate} tok/s")
     }
+  end
+
+  defp dim_group(nil), do: []
+
+  defp dim_group(text) when is_binary(text),
+    do: [Span.new(text, style: Theme.style(:dim))]
+
+  # One ladder level: the groups that survive `drop`, joined with ` · `
+  # between the non-empty ones.
+  defp fitting_footer_line(groups, drop) do
+    head = if(:cwd in drop, do: groups.bare, else: groups.cwd)
+
+    tail = [model: groups.model, context: groups.context, ttft: groups.ttft, rate: groups.rate]
+
+    join_groups([head | Enum.reject(tail, fn {kind, _spans} -> kind in drop end)])
+  end
+
+  # Groups arrive tagged ({:model, spans}) or bare (the head); empty
+  # groups drop out and the separators go BETWEEN the survivors only.
+  defp join_groups(groups) do
+    groups
+    |> Enum.map(fn
+      {_kind, spans} -> spans
+      spans -> spans
+    end)
+    |> Enum.reject(&(&1 == []))
+    |> Enum.intersperse([separator()])
+    |> List.flatten()
+  end
+
+  # Display width, not grapheme count: the footer's span vocabulary can
+  # carry one emoji glyph (📎, two cells — String.length would undercount
+  # by one and a boundary-fit candidate would clip). Everything else in
+  # the vocabulary (❯, ·, ASCII) is one cell.
+  defp spans_width(spans) do
+    spans
+    |> Enum.map(&(String.length(&1.content) + wide_glyphs(&1.content)))
+    |> Enum.sum()
+  end
+
+  # One extra cell per grapheme whose first codepoint sits in the astral
+  # plane — the honest cheap approximation for a span vocabulary whose
+  # only wide glyph is 📎 (U+1F4CE). BMP-wide input (a CJK nickname, say)
+  # is undercounted — recorded imprecision. Never raises: an invalid-UTF-8
+  # grapheme (a raw byte in an OS cwd is legal on Linux) counts plain.
+  defp wide_glyphs(content) do
+    content
+    |> String.graphemes()
+    |> Enum.count(fn grapheme ->
+      case String.next_codepoint(grapheme) do
+        {<<cp::utf8>>, _rest} -> cp > 0xFFFF
+        _other -> false
+      end
+    end)
   end
 
   # The capability glyph (ADR 0018 §1): 📎 beside the model label while the

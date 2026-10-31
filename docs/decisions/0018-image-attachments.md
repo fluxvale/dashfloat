@@ -264,7 +264,11 @@ unchanged.
   composer EDITS — keystrokes and pastes; a prompt action is neither, and
   the prompt is open precisely because the user is mid-task on the
   composer's chrome). The drop path and the chip pop DO snap: they are
-  composer events.
+  composer events. *(Superseded 2026-10-31, #131 — [ADR
+  0006](0006-ui-truth-and-rendering.md)'s Enter-only re-pin amendment
+  reversed #110 wholesale: NOTHING but a dispatched Enter pins, the drop
+  path and chip pop included; the Ctrl+O clause above survives as one
+  case of that general rule.)*
 - **The submitted entry keeps §5's indicator rows** (`📎 name (n KB)` per
   image under the prompt text): the chips are the composer's pending
   display, the entry's rows are the transcript's record — different

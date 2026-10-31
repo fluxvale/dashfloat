@@ -19,29 +19,36 @@ defmodule DashFloat.TUI.ViewTest do
 
   describe "regions/3" do
     test "status 1 row, log the rest, no activity row when idle, input borders + draft, footer 1 row" do
-      %{status: status, log: log, activity: activity, input: input, footer: footer} =
+      %{status: status, log: log, gap: gap, activity: activity, input: input, footer: footer} =
         View.regions({80, 24}, 1, false)
 
-      assert {status.height, log.height, activity.height, input.height, footer.height} ==
-               {1, 15, 0, 3, 1}
+      assert {status.height, log.height, gap.height, activity.height, input.height, footer.height} ==
+               {1, 13, 2, 0, 3, 1}
 
       assert status.y == 2 and log.y == 3 and activity.y == 18 and input.y == 18
       assert Enum.map([status, log, activity, input, footer], & &1.width) == [76, 76, 76, 76, 76]
       # Two cells of padding on every side (issues #28 and #108): nothing at
       # the edges.
       assert status.x == 2 and log.x == 2 and input.x == 2 and footer.x == 2
+      # The breathing gap (issue #129): two blank rows between the
+      # transcript's bottom and the composer cluster — the margin language's
+      # own rhythm — with nothing rendered into them.
+      assert gap.y == 16 and gap.y + gap.height == input.y
       # The footer sits directly under the input (ADR 0015 §2).
       assert input.y + input.height == 21 and footer.y == 21
       assert footer.y + footer.height == 22
     end
 
-    test "an active phase claims one activity row between log and input" do
-      %{log: log, activity: activity, input: input, footer: footer} =
+    test "an active phase claims one activity row between the gap and input" do
+      %{log: log, gap: gap, activity: activity, input: input, footer: footer} =
         View.regions({80, 24}, 1, true)
 
       assert activity.height == 1
-      assert log.height == 14
-      assert activity.y == 17 and input.y == 18 and footer.y == 21
+      assert log.height == 12
+      # The gap sits between the transcript and the composer CLUSTER — the
+      # activity row belongs to the cluster (it is the composer's own
+      # status chrome), so it renders under the air, hugging the input.
+      assert gap.y == 15 and activity.y == 17 and input.y == 18 and footer.y == 21
     end
 
     test "the input grows with the draft" do
@@ -56,6 +63,20 @@ defmodule DashFloat.TUI.ViewTest do
     test "the input never exceeds a third of the frame" do
       assert View.input_height(10, 12) == 4
       assert View.input_height(1, 6) == 3
+    end
+
+    # The air collapses before the chrome does (issue #129): the demand the
+    # gap must yield to includes the activity row when one exists.
+    test "the gap collapses first on degenerate frames, counting the activity row" do
+      # Idle: status(1) + gap(2) + input(3) + footer(1) = 7 — at inset 7 the
+      # gap holds and the log takes 0; at 6 the air goes.
+      assert View.regions({80, 7 + 4}, 1, false).gap.height == 2
+      assert View.regions({80, 6 + 4}, 1, false).gap.height == 0
+
+      # With the activity row up the demand is 8: at inset 7 the air goes
+      # (not to 1 — the collapse is whole), at 8 it holds.
+      assert View.regions({80, 7 + 4}, 1, true).gap.height == 0
+      assert View.regions({80, 8 + 4}, 1, true).gap.height == 2
     end
 
     test "degenerate frames collapse regions without raising" do
@@ -245,7 +266,7 @@ defmodule DashFloat.TUI.ViewTest do
 
       widget = log_widget(state, 80, 24)
       lines = widget.text
-      assert length(lines) == 15
+      assert length(lines) == 13
       assert flatten(List.last(lines)) =~ "line 100"
       # the window is pre-scrolled; the paragraph itself does no scrolling
       assert widget.scroll == {0, 0}
@@ -309,7 +330,7 @@ defmodule DashFloat.TUI.ViewTest do
         end)
 
       widget = log_widget(state, 80, 24)
-      assert length(widget.text) == 15
+      assert length(widget.text) == 13
     end
 
     test "the status position never shows an inverted range on tiny frames" do
@@ -353,10 +374,11 @@ defmodule DashFloat.TUI.ViewTest do
       assert Enum.map_join(entry.lines, &flatten/1) == long
 
       # The windowed view agrees with the accounting: follow shows the last
-      # 15 display rows — 14 full rows plus the 60-char tail, nothing else.
+      # 13 display rows — 12 full rows plus the 60-char tail, nothing else
+      # (the gap shrank the viewport by two, issue #129).
       visible = log_lines(state)
-      assert length(visible) == 15
-      assert Enum.map_join(visible, &flatten/1) == String.duplicate("x", 14 * 76 + 60)
+      assert length(visible) == 13
+      assert Enum.map_join(visible, &flatten/1) == String.duplicate("x", 12 * 76 + 60)
     end
 
     test "a tiny frame renders without raising" do
@@ -484,6 +506,93 @@ defmodule DashFloat.TUI.ViewTest do
       refute footer_text(new_state(provider: provider)) =~ "(work)"
     end
 
+    # The width discipline (ADR 0015's #130 amendment): the stats pair may
+    # never clip, so the optional groups drop from the left in reverse
+    # urgency — cwd, then context, then ttft; the glyph, the model label,
+    # and the rate are never dropped. Rung by rung, against the footer
+    # rect's real width.
+    test "the drop ladder yields cwd, then context, then ttft — never the rate" do
+      # A PINNED cwd label (the state stores the FORMATTED label — State.new
+      # runs format_cwd): the ladder's arithmetic must not depend on where
+      # the suite happens to check out (32 display cells).
+      base = new_state(provider: provider(128_000))
+
+      full =
+        base
+        |> Map.put(:cwd, "~/FluxVale/dashfloat-129-surface")
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "a"}, 1_400)
+        |> State.stream_message({:token, "b"}, 1_500)
+        |> State.stream_message(
+          {:context,
+           %{messages: [%{role: "user", content: "ab"}], anchor: %{tokens: 4_100, index: 1}}}
+        )
+        |> Map.put(:stats, %{
+          new_state().stats
+          | sent_at: 0,
+            ttft_ms: 1_400,
+            rate: 32.0,
+            tokens: 0,
+            first_token_at: nil,
+            last_token_at: nil
+        })
+
+      # Everything fits at a wide footer (rect = frame − 4; the full row
+      # is 93 cells).
+      all = footer_text(full, 100)
+      assert all =~ "~/FluxVale" and all =~ "4.1k/128k · 3.2%" and all =~ "ttft 1.4s · 32 tok/s"
+
+      # 80 cols: the cwd yields, the context and the pair stay.
+      at_80 = footer_text(full, 80)
+      refute at_80 =~ "~/FluxVale"
+      assert at_80 =~ "x - test-model · 4.1k/128k · 3.2% · ttft 1.4s · 32 tok/s"
+
+      # Narrower: the context snapshot yields too, ttft + rate stay.
+      at_52 = footer_text(full, 52)
+      refute at_52 =~ "~/FluxVale"
+      refute at_52 =~ "4.1k/128k"
+      assert at_52 =~ "x - test-model · ttft 1.4s · 32 tok/s"
+
+      # Narrower still: ttft yields, the rate NEVER does.
+      at_36 = footer_text(full, 36)
+      refute at_36 =~ "ttft"
+      assert at_36 =~ "x - test-model · 32 tok/s"
+
+      # Degenerate: even alone, the rate is the last candidate standing.
+      assert footer_text(full, 22) =~ "32 tok/s"
+    end
+
+    # The 📎 glyph is two display cells (ADR 0018 §1): a boundary-fit
+    # candidate must count it wide — String.length would undercount by one
+    # and ship a clipped rate (hostile review F3).
+    test "the ladder counts the 📎 glyph at two cells" do
+      capable =
+        {:ok, %DashFloat.Config{base_url: "http://x", model: "glm", api_key: "k", images: true}}
+
+      capable_state = new_state(provider: capable)
+      state = Map.put(capable_state, :cwd, "~/FluxVale/dashfloat-129-surface")
+
+      # The full row is 47 display cells: ❯-head(34) + "x - glm"(7) +
+      # " 📎"(3 — the glyph's two cells plus its space). At rect 47 the cwd
+      # survives; at 46 it must already be gone — the one-cell difference
+      # is exactly the glyph's second cell, which String.length would have
+      # undercounted and shipped clipped. (The pinned cwd label is the
+      # FORMATTED one — 32 cells.)
+      assert footer_text(state, 51) =~ "~/FluxVale"
+      assert footer_text(state, 51) =~ "x - glm 📎"
+      refute footer_text(state, 50) =~ "~/FluxVale"
+      assert footer_text(state, 50) =~ "❯ · x - glm 📎"
+    end
+
+    # The width math never raises on hostile input (delta review N2): an
+    # invalid-UTF-8 byte in the cwd — legal in an OS path on Linux — is
+    # counted plain, and the footer still renders.
+    test "an invalid-UTF-8 cwd renders without raising" do
+      state = Map.put(new_state(), :cwd, <<0xFF>>)
+      assert footer_text(state, 80) =~ "❯"
+      assert footer_text(state, 80) =~ "—"
+    end
+
     # The capability glyph (ADR 0018 §1): visible before any attach attempt.
     test "shows 📎 beside the label only for an image-capable provider" do
       capable =
@@ -493,17 +602,71 @@ defmodule DashFloat.TUI.ViewTest do
       refute footer_text(new_state(provider: provider(nil))) =~ "📎"
     end
 
-    test "the rate shows only once one exists" do
+    test "the rate shows only once one exists — frozen, never live" do
       refute footer_text(new_state()) =~ "tok/s"
 
-      state =
+      # While streaming there is NO tok/s at all (issue #130's refinement:
+      # the live number misrepresents — "it tends to speed up by the end").
+      streaming =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "a"}, 1_000)
+
+      refute footer_text(streaming) =~ "tok/s"
+
+      # Frozen at finalize: 2 tokens over the 0 s decode window (both at
+      # t=1000) is no rate at all — never a division by zero.
+      zero_window =
         new_state()
         |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "a"}, 1_000)
         |> State.stream_message({:token, "b"}, 1_000)
         |> State.stream_message({:phase, :idle}, 2_000)
 
-      assert footer_text(state) =~ "2.0 tok/s"
+      refute footer_text(zero_window) =~ "tok/s"
+
+      state =
+        new_state()
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "a"}, 1_000)
+        |> State.stream_message({:token, "b"}, 1_500)
+        |> State.stream_message({:phase, :idle}, 2_000)
+
+      # 2 tokens ÷ 0.5 s decode window = 4.0 tok/s; a trailing ".0" trims
+      # (the percent span's rule, issue #130's exact format).
+      assert footer_text(state) =~ "4 tok/s"
+    end
+
+    test "ttft shows from the turn's first token and persists after the turn" do
+      # Before any token: no span.
+      refute footer_text(new_state()) =~ "ttft"
+
+      # A turn sent at t=0, first token at t=1_400: ttft is known while
+      # still streaming — alone, with no tok/s beside it.
+      streaming =
+        new_state()
+        |> Map.put(:stats, %{new_state().stats | sent_at: 0})
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "a"}, 1_400)
+
+      assert footer_text(streaming) =~ "ttft 1.4s"
+      refute footer_text(streaming) =~ "tok/s"
+
+      # After the turn ends both spans persist, ttft first (the issue's
+      # exact format): `ttft 1.4s · 32 tok/s` — 96 tokens over the 3 s
+      # decode window (1_400 → 4_400).
+      state =
+        new_state()
+        |> Map.put(:stats, %{new_state().stats | sent_at: 0})
+        |> Map.put(:phase, :streaming)
+        |> then(fn s ->
+          Enum.reduce(1..96, s, fn i, acc ->
+            State.stream_message(acc, {:token, "t#{i}"}, 1_400 + div((i - 1) * 3_000, 95))
+          end)
+        end)
+        |> State.stream_message({:phase, :idle}, 5_000)
+
+      assert footer_text(state) =~ "ttft 1.4s · 32 tok/s"
     end
 
     test "the usage-reconciled frozen rate follows the model, in ADR order" do
@@ -513,7 +676,7 @@ defmodule DashFloat.TUI.ViewTest do
         base
         |> Map.put(:phase, :streaming)
         |> State.stream_message({:token, "a"}, 1_000)
-        |> State.stream_message({:token, "b"}, 1_000)
+        |> State.stream_message({:token, "b"}, 1_500)
         |> State.stream_message(
           {:usage, %{prompt_tokens: 10, completion_tokens: 5, total_tokens: 4_100}},
           1_500
@@ -521,8 +684,9 @@ defmodule DashFloat.TUI.ViewTest do
         |> State.stream_message({:phase, :idle}, 2_000)
 
       # The usage frame reconciles the count (2 deltas batched 5 tokens), so
-      # the frozen rate uses the authoritative 5 tokens over the 1 s window.
-      assert footer_text(state) =~ ~r/test-model · 5\.0 tok\/s/
+      # the frozen rate uses the authoritative 5 tokens over the 0.5 s
+      # decode window = 10 tok/s.
+      assert footer_text(state) =~ ~r/test-model · 10 tok\/s/
     end
 
     # The stage-2 span (ADR 0015 §2 amendment): tokens-used and
@@ -1490,9 +1654,13 @@ defmodule DashFloat.TUI.ViewTest do
     widget.text
   end
 
-  defp footer_text(state) do
-    [line] = footer_line(state)
-    Enum.map_join(line.spans, "", & &1.content)
+  defp footer_text(state, width \\ 80) do
+    widgets = View.render(state, %ExRatatui.Frame{width: width, height: 24})
+    {widget, _rect} = Enum.at(widgets, 4)
+
+    widget.text
+    |> List.first()
+    |> then(&Enum.map_join(&1.spans, "", fn span -> span.content end))
   end
 
   defp activity(state, w \\ 80) do
