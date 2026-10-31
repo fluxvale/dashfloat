@@ -6,6 +6,7 @@ defmodule DashFloat.TUI.ViewTest do
   alias DashFloat.TUI.Commands
   alias DashFloat.TUI.Palette
   alias DashFloat.TUI.Render
+  alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Theme
   alias DashFloat.TUI.View
@@ -351,6 +352,109 @@ defmodule DashFloat.TUI.ViewTest do
       assert text =~ "[ ] a"
       assert text =~ "[ ] b"
       assert text =~ "space toggle"
+    end
+
+    # The mouse-selection geometry during a choice (delta re-review #2):
+    # cell_at must map through the choice-aware log rect — a click below
+    # the (taller) box anchors on the REAL last log row, never on phantom
+    # rows the draft's third-cap layout would invent.
+    test "mouse selection maps through the choice-aware log rect" do
+      options = for i <- 1..10, do: %{"label" => "option-#{i}", "description" => "d"}
+
+      entries_state =
+        new_state()
+        |> State.stream_message({:entry, :system, "row"})
+        |> then(fn s ->
+          for _n <- 1..30, reduce: s do
+            acc -> State.stream_message(acc, {:entry, :system, "row"})
+          end
+        end)
+
+      armed =
+        State.stream_message(entries_state, {
+          :question,
+          make_ref(),
+          %{question: "Pick one", options: options, multiple: false}
+        })
+
+      # The giant choice claims the whole area: the log rect collapses to
+      # zero rows, so a click over the box selects NOTHING — the honest
+      # mapping through the choice-aware rect (no phantom rows).
+      %{log: log} =
+        View.regions(armed.size, State.input_line_count(armed), State.overlay?(armed), true)
+
+      assert log.height == 0
+      {clicked, _copy} = State.select_mouse(armed, "down", 10, 22, [])
+      assert clicked.selection == nil
+
+      # A SMALLER choice leaves the log visible: clicks anchor inside the
+      # real (shrunken) rect — never past it.
+      small =
+        State.stream_message(entries_state, {
+          :question,
+          make_ref(),
+          %{
+            question: "Pick one",
+            options: [%{"label" => "a"}, %{"label" => "b"}],
+            multiple: false
+          }
+        })
+
+      %{log: small_log} =
+        View.regions(small.size, State.input_line_count(small), State.overlay?(small), true)
+
+      assert small_log.height > 0
+
+      # Clicks over the box (and past it) CLAMP to the log rect's bottom
+      # edge — the same content row for both — never inventing phantom
+      # rows under the taller box.
+      {clicked_small, _copy} = State.select_mouse(small, "down", 10, 22, [])
+      {clicked_below, _copy2} = State.select_mouse(small, "down", 10, 23, [])
+
+      {{_from, _fx}, {to_row, _tx}} = Selection.range(clicked_small.selection)
+      {{_from2, _fx2}, {to_row2, _tx2}} = Selection.range(clicked_below.selection)
+      assert to_row == to_row2
+      # The anchor sits at the clamp edge: the viewport's last content row.
+      assert to_row == State.log_line_count(small) - 1
+    end
+
+    # interior < 3 (degenerate frames, delta re-review #2's P3): at 80x10
+    # the clamp floors at 3 rows (interior 1) — the scroll must still aim
+    # AT the selection, keeping it on the one visible row.
+    test "the scroll never aims past the selection on degenerate interiors" do
+      alias ExRatatui.CellSession
+
+      options = for i <- 1..10, do: %{"label" => "option-#{i}", "description" => "d"}
+
+      armed =
+        State.stream_message(new_state(), {
+          :question,
+          make_ref(),
+          %{question: "Pick one", options: options, multiple: false}
+        })
+
+      moved =
+        Enum.reduce(1..9, armed, fn _i, state ->
+          {state, _nil} = State.handle_key(state, "down", [])
+          state
+        end)
+
+      assert moved.choice.selected == 9
+
+      session = CellSession.new(80, 10)
+
+      :ok =
+        CellSession.draw(
+          session,
+          View.render(moved, %ExRatatui.Frame{width: 80, height: 10})
+        )
+
+      snap = CellSession.take_cells(session)
+      CellSession.close(session)
+      text = Enum.map_join(snap.cells, "", & &1.symbol)
+
+      assert text =~ "option-10"
+      refute text =~ "option-1 "
     end
 
     defp asking_state do

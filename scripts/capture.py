@@ -802,9 +802,11 @@ class App:
         # history into its own screen, the reader thread must NOT feed new
         # bytes into the same pyte stream — the interleaving reorders the
         # stream (a later diff applied, then an earlier one re-applied)
-        # and blanks cells in the painted frames. Frozen bytes are queued
-        # and fed to the live screen when the replay ends.
+        # and blanks cells in the painted frames. The feed lock makes the
+        # freeze+swap atomic against the reader's record+feed; frozen
+        # bytes are queued and drained into the live screen on exit.
         self._frozen = 0
+        self._feed_lock = threading.Lock()
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -928,7 +930,6 @@ class App:
                 break
             now = time.monotonic()
             self._total += len(chunk)
-            self._chunks.append((now, chunk))
             # "Loud" writes are real frames (full draws, redraws, stream
             # chunks); anything smaller is the idle cursor blink's
             # one-cell diff (issue #104) — periodic, tiny, and never a
@@ -936,9 +937,14 @@ class App:
             if len(chunk) >= self.QUIET_CHUNK_BYTES:
                 self._loud_total += len(chunk)
                 self._last_loud = now
-            self._chunks.append((now, chunk))
-            if not self._frozen:
-                self.feed(chunk)
+            # The feed lock makes record+feed atomic against gif()'s
+            # freeze+swap: a chunk is either fed live BEFORE the freeze or
+            # drained into the live screen AFTER the replay — never fed
+            # into the replay stream mid-loop, and never dropped.
+            with self._feed_lock:
+                self._chunks.append((now, chunk))
+                if not self._frozen:
+                    self.feed(chunk)
             if self.sink:
                 self.sink(chunk)
 
@@ -1100,57 +1106,70 @@ class App:
         frames = []
         step = 1000 / fps
         replay = pyte.Screen(self.cols, self.rows)
-        # Freeze the reader's feed first (see _frozen): the replay below
-        # drives this stream in order; any byte the reader thread feeds
-        # concurrently reorders the stream and corrupts frames. The bytes
-        # that arrive during the replay are queued and re-fed to the live
-        # screen on exit, so the still path stays truthful.
-        self._frozen += 1
-        live_fed = len(self._chunks)
-        saved = (self.screen, self.stream, self._alt)
-        self.screen, self.stream, self._alt = replay, pyte.ByteStream(replay), False
-        events = list(self._chunks)
-        # Catch the replay screen up to the window's start.
-        while events and events[0][0] < self._mark:
-            _, chunk = events.pop(0)
-            self.feed(chunk)
-        window = [e for e in events if e[0] >= self._mark]
-        n_frames = max(
-            1,
-            int((window[-1][0] - self._mark) * 1000 / step),
-            int(min_span * 1000 / step),
-        )
-        for i in range(n_frames):
-            horizon = self._mark + (i + 1) * step / 1000
-            while events and events[0][0] <= horizon:
+        # Freeze the reader's feed FIRST, atomically with the stream swap
+        # (see _frozen/_feed_lock): the replay below drives this stream in
+        # order; any byte the reader thread feeds concurrently reorders the
+        # stream and corrupts frames. try/finally guarantees the live
+        # screen is restored and the queued bytes drained even on error.
+        with self._feed_lock:
+            self._frozen += 1
+            live_fed = len(self._chunks)
+            saved = (self.screen, self.stream, self._alt)
+            self.screen, self.stream, self._alt = replay, pyte.ByteStream(replay), False
+        try:
+            events = list(self._chunks)
+            # Catch the replay screen up to the window's start.
+            while events and events[0][0] < self._mark:
                 _, chunk = events.pop(0)
                 self.feed(chunk)
-            img = Image.new("RGB", (self.cols * cell_w, crop_rows * cell_h), DEFAULT_BG)
-            draw = ImageDraw.Draw(img)
-            top = self.rows - crop_rows
-            for y in range(top, self.rows):
-                for x in range(self.cols):
-                    paint(draw, metrics, replay.buffer[y][x],
-                          x * cell_w, (y - top) * cell_h)
-            # One SHARED palette for every frame (delta re-review): letting
-            # Pillow convert each RGB frame to GIF P-mode independently
-            # remapped static dim cells frame-to-frame — the hint row's ↑
-            # flickered between blank and a phantom block. Quantizing once
-            # (frame 0's median-cut palette, every later frame mapped into
-            # it, no dither) keeps identical source cells identical in
-            # every frame.
-            frames.append(img)
+            window = [e for e in events if e[0] >= self._mark]
+            n_frames = max(
+                1,
+                int((window[-1][0] - self._mark) * 1000 / step),
+                int(min_span * 1000 / step),
+            )
+            for i in range(n_frames):
+                horizon = self._mark + (i + 1) * step / 1000
+                while events and events[0][0] <= horizon:
+                    _, chunk = events.pop(0)
+                    self.feed(chunk)
+                img = Image.new("RGB", (self.cols * cell_w, crop_rows * cell_h), DEFAULT_BG)
+                draw = ImageDraw.Draw(img)
+                top = self.rows - crop_rows
+                for y in range(top, self.rows):
+                    for x in range(self.cols):
+                        paint(draw, metrics, replay.buffer[y][x],
+                              x * cell_w, (y - top) * cell_h)
+                frames.append(img)
+        finally:
+            self.screen, self.stream, self._alt = saved
+            # Drain the queued bytes into the restored live screen — in a
+            # caught-up loop: chunks may keep arriving (the blink) while
+            # the drain runs, and the freeze guarantees no concurrent feed.
+            seen = live_fed
+            while True:
+                chunks = list(self._chunks)
+                if len(chunks) <= seen:
+                    break
+                for _, chunk in chunks[seen:]:
+                    self.feed(chunk)
+                seen = len(chunks)
+            with self._feed_lock:
+                self._frozen -= 1
+
+        # One SHARED palette for every frame (delta re-review): letting
+        # Pillow convert each RGB frame to GIF P-mode independently
+        # remapped static dim cells frame-to-frame — the hint row's ↑
+        # flickered between blank and a phantom block. Quantizing once
+        # (frame 0's median-cut palette, every later frame mapped into
+        # it, no dither) keeps identical source cells identical in
+        # every frame.
         palettes = frames[0].quantize(colors=255, method=Image.MEDIANCUT)
         frames = [f.quantize(palette=palettes, dither=Image.Dither.NONE) for f in frames]
         frames[0].save(path, save_all=True, append_images=frames[1:],
                        duration=int(step), loop=0, optimize=False)
         print(f"gif    {path} ({os.path.getsize(path)} bytes, "
               f"{len(frames)} frames @ {fps}fps)")
-        # Unfreeze and drain the queued bytes into the restored live screen.
-        self.screen, self.stream, self._alt = saved
-        for _, chunk in list(self._chunks)[live_fed:]:
-            self.feed(chunk)
-        self._frozen -= 1
 
     # -- scenarios --------------------------------------------------------
 

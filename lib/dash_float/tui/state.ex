@@ -3141,7 +3141,9 @@ defmodule DashFloat.TUI.State do
     %{log: log} =
       View.regions(state.size, input_line_count(state), overlay?(state), state.choice != nil)
 
-    if count == 0 do
+    # A zero-row log rect (a tall choice can claim the whole area) shows
+    # nothing to select — the same nil as an empty log.
+    if count == 0 or log.height <= 0 do
       nil
     else
       width =
@@ -3149,7 +3151,7 @@ defmodule DashFloat.TUI.State do
         |> elem(0)
         |> View.content_width()
 
-      bottom = log.y + max(log.height, 1) - 1
+      bottom = log.y + log.height - 1
       screen_row = clamp(y, log.y, bottom)
       top = effective_scroll(state, log.height) + (screen_row - log.y)
       row = clamp(top, 0, count - 1)
