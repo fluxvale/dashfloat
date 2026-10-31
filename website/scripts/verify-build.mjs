@@ -8,8 +8,8 @@
 //      — a misnamed decision file used to build an empty page while this
 //      guard watched,
 //   4. every repo doc (README + each ADR) having a built, NON-EMPTY page,
-//   5. no raw markdown (bold, link syntax, backtick code spans) leaking
-//      into the docs index.
+//   5. no raw markdown (emphasis, strong, strike, link syntax, code spans)
+//      leaking into the docs index's ADR table.
 // Every check fails the build with its reason — a guard that warns is a
 // guard that isn't. The guard functions are exported for node --test.
 import { existsSync, readFileSync, readdirSync } from "node:fs";
@@ -17,17 +17,18 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ADR_FILE } from "../src/lib/adr.mjs";
 
-// Raw markdown that must never reach built HTML: bold markers, link tails,
-// or a backtick code span (issue #36: backticks were missing from this
-// scan, and ADR 0010's `mix release` title leaked for real). Titles and
-// statuses are stripped to plain inline text before rendering, so any hit
-// is leakage.
-export const MARKDOWN_LEAK = /\*\*|\]\(|`/;
+// Raw markdown that must never reach built HTML: code spans, emphasis,
+// strong, strike, or link tails (issue #36: backticks were missing from
+// this scan, and ADR 0010's `mix release` title leaked for real). Titles
+// and statuses are stripped to plain inline text before rendering, so any
+// hit is leakage. Mirrors plainInline in src/lib/docs.ts.
+const MARKDOWN_LEAK = /`|\*|__|~~|\]\(/;
 
-// Every non-README markdown file in docs/decisions must be a well-named
-// ADR — anything else fails the build instead of being silently invisible.
+// Every entry in docs/decisions except the index README must be a
+// well-named ADR — a misnamed, mis-cased, or nested file fails the build
+// instead of being silently invisible on the site.
 export function adrNameOffenses(files) {
-  return files.filter((f) => f.endsWith(".md") && f !== "README.md" && !ADR_FILE.test(f));
+  return files.filter((f) => f !== "README.md" && !ADR_FILE.test(f));
 }
 
 // The raw-markdown fragment (with context) in built HTML, for the reason.
@@ -90,12 +91,18 @@ function main() {
     (slug) => !readFileSync(join(dist, "docs", "decisions", slug, "index.html"), "utf8").includes("<h1"),
   );
   if (empty.length > 0) fail(`ADR pages with no rendered heading (empty page): ${empty.join(", ")}`);
-  if (!existsSync(join(dist, "docs", "readme", "index.html"))) fail("no built README page");
+  const readmePage = join(dist, "docs", "readme", "index.html");
+  if (!existsSync(readmePage)) fail("no built README page");
+  if (!readFileSync(readmePage, "utf8").includes("<h1")) fail("README page has no rendered heading");
   ok(`docs pages: README + ${adrSlugs.length} ADRs`);
 
-  // 5. No markdown syntax leaks into the docs index (title/status cells).
+  // 5. No markdown syntax leaks into the docs index — scan the ADR table's
+  //    rows (title/status cells), where repo text lands raw, not the page
+  //    chrome around it.
   const docsIndex = readFileSync(join(dist, "docs", "index.html"), "utf8");
-  const leak = markdownLeak(docsIndex);
+  const tbody = docsIndex.match(/<tbody>[\s\S]*<\/tbody>/);
+  if (!tbody) fail("docs index has no ADR table (tbody) to scan");
+  const leak = markdownLeak(tbody[0]);
   if (leak) fail(`raw markdown leaked into /docs: …${leak}… (check title/status cells)`);
   ok("no markdown leakage on /docs");
 

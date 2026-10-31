@@ -73,15 +73,17 @@ export function renderMarkdown(md: string): string {
   return marked.parser(tokens);
 }
 
-// Plain inline text for the docs index — raw markdown (links, bold, code
-// spans) in a title or status cell is exactly what verify-build's leak
-// guard rejects, so strip it at the source. ADR 0010's `mix release` title
-// shipped raw until issue #36.
+// Plain inline text for the docs index — raw markdown in a title or status
+// cell is exactly what verify-build's leak guard rejects, so strip the
+// family at the source (ADR 0010's `mix release` title shipped raw until
+// issue #36): links and images reduce to their labels, emphasis/strike/
+// code markers vanish. Mirrors MARKDOWN_LEAK in scripts/verify-build.mjs.
 function plainInline(text: string): string {
   return text
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
-    .replace(/\*\*/g, "")
-    .replace(/`/g, "")
+    .replace(/\[([^\]]+)\]\[[^\]]*\]/g, "$1")
+    .replace(/(\*\*|__|~~|`|\*)/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -115,10 +117,15 @@ export function listAdrs(): AdrMeta[] {
     .map((file) => {
       const md = fs.readFileSync(path.join(decisionsDir, file), "utf8");
       const heading = md.match(/^# (\d{4}) — (.+)$/m);
+      if (!heading) {
+        throw new Error(
+          `${file} lacks the house "# NNNN — title" heading — its /docs index row would degrade to the raw filename`,
+        );
+      }
       return {
         slug: file.replace(/\.md$/, ""),
-        number: heading?.[1] ?? file.slice(0, 4),
-        title: plainInline(heading?.[2] ?? file),
+        number: heading[1]!,
+        title: plainInline(heading[2]!),
         status: plainStatus(md),
       };
     });

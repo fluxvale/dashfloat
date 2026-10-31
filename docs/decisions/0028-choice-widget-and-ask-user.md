@@ -1,4 +1,4 @@
-# 0028: The choice widget — approvals as questions, the ask-user tool, AUTO's binary resolve
+# 0028 — The choice widget — approvals as questions, the ask-user tool, AUTO's binary resolve
 
 - **Status:** Accepted
 - **Date:** 2026-10-31

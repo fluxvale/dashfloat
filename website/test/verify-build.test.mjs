@@ -29,18 +29,27 @@ test("ADR_FILE accepts only NNNN-lowercase-kebab.md, anchored", () => {
   for (const name of bad) assert.ok(!ADR_FILE.test(name), `should reject ${JSON.stringify(name)}`);
 });
 
-test("adrNameOffenses flags misnamed decision files, not the index or non-markdown", () => {
+test("adrNameOffenses flags misnamed, mis-cased, or nested decision files, not the index", () => {
   assert.deepEqual(
-    adrNameOffenses(["0001-ok.md", "README.md", "0099-ADR-Bogus-Name.md", "notes.txt"]),
-    ["0099-ADR-Bogus-Name.md"],
+    adrNameOffenses([
+      "0001-ok.md",
+      "README.md",
+      "0099-ADR-Bogus-Name.md", // uppercase — the issue #36 repro
+      "0017-bogus.MD", // mis-cased extension must not slip past
+      "0017-x.md ", // trailing space (legal on Linux)
+      "wip", // a stray directory is not an ADR
+      "notes.txt", // the decisions directory is curated — strays fail loud
+    ]),
+    ["0099-ADR-Bogus-Name.md", "0017-bogus.MD", "0017-x.md ", "wip", "notes.txt"],
   );
 });
 
-test("markdownLeak catches backtick spans and singles, bold, and link tails", () => {
+test("markdownLeak catches the markdown family — code spans, emphasis, link tails", () => {
   const leaks = [
     "<td>core `mix release` tarballs</td>", // the live #36 leak (ADR 0010's title)
     "<td>`single backtick</td>",
-    "<td>**bold**</td>",
+    "<td>**bold** and *em*</td>",
+    "<td>__strong__ and ~~strike~~</td>",
     "<td>see [x](y)</td>",
   ];
   for (const html of leaks) assert.ok(markdownLeak(html), `should catch ${html}`);
@@ -56,11 +65,13 @@ test("listAdrs and readAdr agree — a mismatched name fails loudly, not with an
     assert.doesNotThrow(() => readAdr(slug), slug);
   }
   assert.throws(() => readAdr("0099-ADR-Bogus-Name"), /does not match .* rename the decision file/);
+  assert.throws(() => readAdr("0099-never-filed"), /does not exist/);
 });
 
 test("docs index text is plain — titles and statuses carry no raw markdown", () => {
   for (const adr of listAdrs()) {
-    assert.ok(!/[`*]|\]\(/.test(adr.title), `title leaks: ${adr.title}`);
-    assert.ok(!/[`*]|\]\(/.test(adr.status), `status leaks: ${adr.status}`);
+    assert.ok(!/[`*~]|__|\]\(/.test(adr.title), `title leaks: ${adr.title}`);
+    assert.ok(!/[`*~]|__|\]\(/.test(adr.status), `status leaks: ${adr.status}`);
+    assert.ok(!adr.title.endsWith(".md"), `title degraded to filename: ${adr.title}`);
   }
 });
