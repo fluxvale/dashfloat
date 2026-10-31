@@ -5085,9 +5085,10 @@ defmodule DashFloat.TUI.StateTest do
 
     # #144 (the #139 class): every Han grapheme is two display cells — a
     # 40-grapheme CJK preview is 80 columns, and the grapheme-count cap
-    # shipped it whole, pushing the row's metadata past the picker popup's
-    # edge (the popup's List clips, never wraps). The honest cap keeps the
-    # whole row inside the popup at every terminal width.
+    # shipped it whole, cutting the preview mid-glyph at the popup edge.
+    # The honest cap keeps the PREVIEW inside the popup's inner width;
+    # the row's metadata tail (· time · profile · model) stays uncapped
+    # for ASCII and wide alike — recorded imprecision, issue #146.
     test "row labels: a wide-glyph preview caps at 40 columns, not 40 graphemes" do
       now = DateTime.to_unix(~U[2026-10-31T00:00:00Z])
 

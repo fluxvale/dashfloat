@@ -1054,7 +1054,9 @@ defmodule DashFloat.TUI.View do
 
   # The session picker (issue #128): rows run long (preview · time ·
   # provider · model), so the popup takes 85% — at 80 cols the inner width
-  # is ~62, enough for a 40-column preview plus its metadata.
+  # is ~62, and the preview's 40-column cap (#144) keeps the preview side
+  # of the row inside it; the uncapped metadata tail is recorded
+  # imprecision (issue #146).
   defp render_palette(
          %State{palette: %Palette{kind: :sessions, items: rows, selected: selected}},
          area
