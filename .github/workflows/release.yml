@@ -353,13 +353,23 @@ jobs:
   # Rehearsal: the same installer, against the artifacts this run just built,
   # with no release to fetch from. Proves the whole path before a tag exists.
   smoke-rehearsal:
-    name: install smoke (rehearsal, debian:stable)
+    name: install smoke (rehearsal, debian:${{ matrix.release }})
     needs: [prepare, build-linux, build-macos]
     if: needs.prepare.outputs.publish != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     container:
-      image: debian:stable
+      image: debian:${{ matrix.release }}
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [stable, bullseye]
+        # bullseye is the negative arm: the glibc-floor refusal is asserted
+        # here too, so a broken assertion reds a dispatch rehearsal instead
+        # of surfacing first on release day (#52, ADR 0032).
+        include:
+          - release: bullseye
+            expect_failure: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -376,11 +386,43 @@ jobs:
           # NOT `VERSION`: `. /etc/os-release` below sets VERSION to the distro
           # release ("13 (trixie)") and would silently replace this value.
           DASHFLOAT_VER: ${{ needs.prepare.outputs.version }}
+          DEBIAN_RELEASE: ${{ matrix.release }}
+          EXPECT_FAILURE: ${{ matrix.expect_failure }}
         run: |
           set -eu
-          apt-get update -qq
+          if [ "$DEBIAN_RELEASE" = "bullseye" ]; then
+            # bullseye left LTS in Aug 2026 and the live pools no longer
+            # serve its debs (404s), so apt points at the archive (#47).
+            printf '%s\n' \
+              'deb http://archive.debian.org/debian bullseye main' \
+              'deb http://archive.debian.org/debian-security bullseye-security main' \
+              > /etc/apt/sources.list
+            apt-get -o Acquire::Check-Valid-Until=false update -qq
+          else
+            apt-get update -qq
+          fi
           apt-get install -y -qq --no-install-recommends ca-certificates curl python3 >/dev/null
           . /etc/os-release; echo "--- host: $PRETTY_NAME ($(ldd --version | head -1))"
+          if [ "${EXPECT_FAILURE:-false}" = "true" ]; then
+            # Below the declared floor, the refusal must be THE glibc-floor
+            # refusal, asserted through the shared contract script — the
+            # same clauses the tag-run smoke enforces (ADR 0032). The
+            # refusal fires in the installer's preflight, before any
+            # download, so the local asset server is not needed here.
+            work=$(mktemp -d)
+            set +e
+            DASHFLOAT_VERSION="$DASHFLOAT_VER" \
+            DASHFLOAT_RELEASE_BASE_URL=http://127.0.0.1:8765 \
+              sh ./install.sh >"$work/refusal.txt" 2>&1
+            status=$?
+            set -e
+            echo "--- installer output ($PRETTY_NAME, expected refused) ---"
+            cat "$work/refusal.txt"
+            sh scripts/refusal-contract.sh "$status" "$work/refusal.txt"
+            rm -rf "$work"
+            echo "install refused on the glibc floor on $PRETTY_NAME, as designed"
+            exit 0
+          fi
           (cd dist && sha256sum ./*.tar.gz | sed 's#  \./#  #' > "dashfloat-$DASHFLOAT_VER-sha256sums.txt")
           (cd dist && setsid python3 -m http.server 8765 >/dev/null 2>&1 &)
           for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -400,6 +442,7 @@ jobs:
       # container whose ERTS is built with SCTP support (so the warning is
       # possible here and nowhere else in CI). ADR 0011.
       - name: "Smoke the first run (fresh config: pty wizard, clean headless exit)"
+        if: matrix.expect_failure != true
         run: |
           set -eu
           export PATH="$HOME/.local/bin:$PATH"
@@ -442,7 +485,8 @@ jobs:
   # same command a user runs. debian:stable is the ticket's clean container;
   # debian:bookworm is the declared floor, so that claim is tested too;
   # bullseye (glibc 2.31) is the negative case, so the floor is proved to be a
-  # real limit rather than an assumption nobody checked.
+  # real limit rather than an assumption nobody checked — and the refusal
+  # itself is asserted, not just any failure (#52, ADR 0032).
   smoke-linux:
     name: install smoke (debian:${{ matrix.release }})
     needs: [prepare, publish]
@@ -459,6 +503,12 @@ jobs:
           - release: bullseye
             expect_failure: true
     steps:
+      # The checkout supplies scripts/refusal-contract.sh (ADR 0032); the
+      # installer itself still comes from the release assets below.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Install from the release, then ask the binary its version
         env:
           # NOT `VERSION`: `. /etc/os-release` sets VERSION to the distro
@@ -483,14 +533,23 @@ jobs:
           . /etc/os-release; echo "--- host: $PRETTY_NAME ($(ldd --version | head -1))"
           echo "--- installer (curl | sh, exactly what a user runs) ---"
           if [ "${EXPECT_FAILURE:-false}" = "true" ]; then
-            # Below the declared floor: the installer or the binary must fail
-            # with a clear message. A success here would mean the floor claim
-            # is wrong.
-            if curl -fsSL "https://github.com/fluxvale/dashfloat/releases/download/v$DASHFLOAT_VER/install.sh" | sh; then
-              echo "expected the install to fail on this glibc, but it succeeded" >&2
-              exit 1
-            fi
-            echo "install correctly refused on $(. /etc/os-release; echo "$PRETTY_NAME")"
+            # Below the declared floor the refusal must be THE glibc-floor
+            # refusal — a missing library, a network error, or a crash
+            # satisfies nothing. Any-failure acceptance here was a false
+            # green: on the v0.4.0 tag the libcrypto.so.3 preflight fired
+            # first and this job passed without the floor ever being
+            # exercised (#52, ADR 0032). The contract script asserts the
+            # specific message, exit 1, and that nothing was installed.
+            work=$(mktemp -d)
+            set +e
+            curl -fsSL "https://github.com/fluxvale/dashfloat/releases/download/v$DASHFLOAT_VER/install.sh" | sh >"$work/refusal.txt" 2>&1
+            status=$?
+            set -e
+            echo "--- installer output (expected refused on the glibc floor) ---"
+            cat "$work/refusal.txt"
+            sh scripts/refusal-contract.sh "$status" "$work/refusal.txt"
+            rm -rf "$work"
+            echo "install refused on the glibc floor on $(. /etc/os-release; echo "$PRETTY_NAME"), as designed"
             exit 0
           fi
           curl -fsSL "https://github.com/fluxvale/dashfloat/releases/download/v$DASHFLOAT_VER/install.sh" | sh

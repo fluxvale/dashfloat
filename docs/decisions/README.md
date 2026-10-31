@@ -53,3 +53,4 @@ their replacement.
 | [0029](0029-rig-reply-end-needles-are-exchange-unique.md) | Capture-rig reply-end needles are exchange-unique: numbered stock replies, wrap-collapsed waits | Accepted |
 | [0030](0030-sysprompt-tool-prose-derives-from-the-registry.md) | The system prompt's tool prose derives from the tool registry: count, names, and approval grouping render from `Tools.names/1` | Accepted |
 | [0031](0031-actionlint-inside-the-ci-gate.md) | actionlint inside the `mix ci` gate: sha256-pinned binaries fetched by the gate itself, no PATH lookup, no skip | Accepted |
+| [0032](0032-installer-refusal-contract.md) | The installer's glibc-floor refusal contract: specific message, exit 1, nothing installed — asserted by the smokes, pinned by mix ci | Accepted |
