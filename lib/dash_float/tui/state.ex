@@ -109,7 +109,7 @@ defmodule DashFloat.TUI.State do
           | {:select_profile, String.t()}
           | :setup_finish
           | {:write_key, {String.t(), String.t(), String.t()}}
-          | {:fetch_models, {String.t(), String.t()}}
+          | {:fetch_models, {String.t(), String.t(), non_neg_integer()}}
           | {:write_settings, map()}
           | [action()]
 
@@ -723,14 +723,15 @@ defmodule DashFloat.TUI.State do
 
   @doc """
   The wizard's `/models` fetch landed (ADR 0009): feeds the picker when the
-  wizard is waiting on it, ignores anything stale.
+  wizard is waiting on the tagged generation (issue #87), ignores anything
+  stale.
   """
-  @spec models_arrived(t(), term()) :: t()
-  def models_arrived(%__MODULE__{setup: %Onboarding{} = wizard} = state, result) do
-    %{state | setup: Onboarding.models_arrived(wizard, result)}
+  @spec models_arrived(t(), term(), term()) :: t()
+  def models_arrived(%__MODULE__{setup: %Onboarding{} = wizard} = state, tag, result) do
+    %{state | setup: Onboarding.models_arrived(wizard, tag, result)}
   end
 
-  def models_arrived(%__MODULE__{} = state, _result), do: state
+  def models_arrived(%__MODULE__{} = state, _tag, _result), do: state
 
   @doc """
   A wizard write refused (issue #39): the runner's error message lands on the

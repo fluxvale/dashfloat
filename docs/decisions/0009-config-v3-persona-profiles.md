@@ -559,7 +559,9 @@ issue #39 bounce gate — a key that is not on disk must not fetch). The
 while fetching, the picker's last option, or the keyless path — and a failed
 fetch (including an empty list) lands on manual entry with a short reason on
 screen. Reasons are classes or statuses from the fetch layer ("HTTP 500",
-"timed out"), never response-body content.
+"timed out"), never response-body content. Every result carries its
+request's identity — see the
+[issue #87 amendment](#wizard-fetch-identity-a-result-belongs-to-one-generation-issue-87-amendment).
 
 ### Wizard back navigation: Esc returns to the previous step (issue #65 amendment)
 
@@ -614,6 +616,71 @@ step through the wizard's spine, side-effect-free, with the entry preserved.
   server entry pre-filling the previous one's drafts — and memory never
   leaves the process: it is inspect-excluded with the draft and pending
   (the never-echo rule).
+
+### Wizard fetch identity: a result belongs to one generation (issue #87 amendment)
+
+The wizard's `/models` results carried no provider identity, and
+`models_arrived` gated on `step == :fetching` alone — so a stale result
+could repopulate the picker under the wrong provider: a slow fetch from a
+previous provider selection landing while the current one waits (the #64
+loop re-entry made this reachable), or — same endpoint — the pre-edit
+key's list landing after esc-back and a key edit, whichever delivery won
+the race. The user then picks a model the current provider does not serve.
+
+- **Identity at creation:** every fetch result is tagged where it is born —
+  the supervised task sends `{:wizard_models, {base_url, epoch}, result}`.
+  `base_url` is the provider identity; `epoch` is a monotonic fetch
+  generation the wizard's key-enter issues (`fetch_epoch + 1`, carried by
+  the `{:fetch_models, {base_url, key, epoch}}` action). A result feeds
+  the picker only when its tag equals `{pending.base_url, fetch_epoch}`;
+  `models_arrived/3` enforces the match with the pin-free guard form
+  (`tag == {base_url, epoch}` — cross-argument pins are illegal in a
+  `def` head). A refused write spends its epoch with no fetch in flight
+  (the #64 gate drops the action); the next enter issues a fresh one, so
+  epochs are never reused within a run.
+- **Mismatch policy — inert, not refetch, not a visible refusal.** A
+  superseded generation's result is dropped; the wizard stays at
+  `:fetching` and the CURRENT generation's own result decides the screen.
+  This is safe because delivery is guaranteed for every failure class the
+  fetch layer can produce — `Catalog.fetch/3` returns an error tuple for
+  every HTTP/transport outcome and rescues internal raises — and a failed
+  task spawn — the bare `Task.Supervisor.start_child` call could `:exit`
+  on a dead supervisor and strand the wizard at `:fetching` forever — now
+  follows `start_suggest`'s guarded form and delivers
+  `{:error, "could not start"}`, landing on the manual fallback with the
+  usual note. (A raw `:throw`/`:exit` escaping the rescue would leave the
+  wizard waiting; esc-to-manual stays the escape — no known path produces
+  one.) **Refetch was rejected** because a duplicate fetch is
+  already in flight — the current epoch's own HTTP request. **A visible
+  refusal was rejected** because nothing is wrong and no remedy exists:
+  the drop is invisible by design, and every generation's outcome
+  (picker, or manual entry with the class-phrase note) is the visible
+  surface — the same rule the #65 amendment set for results the wizard
+  moved past.
+- **Staleness policy — one fetch generation, session-scoped, never
+  persisted.** A fetched list is valid only for the exact
+  `{provider, epoch}` that fetched it. It is invalidated by: the next
+  key-enter (a new epoch; entering `:fetching` also resets `fetched`),
+  entering manual entry (which clears `fetched`), and any provider change
+  (a new pending; provider-scoped memory drops with it). Nothing is
+  cached across runs: `fetched` and `fetch_epoch` are process state,
+  `fetch_epoch` resets with the struct, a restarted wizard starts empty,
+  and in-flight results cannot cross process death. The loop's esc-pop
+  restore is not staleness: the snapshot rides the provider draft, so it
+  can only ever re-present the SAME provider's list — and a re-fetch from
+  the key step issues a new epoch that supersedes it.
+- **Hygiene riders from the review:** the guarded spawn above, and the
+  wizard's fetch tests run hermetically — the two suites that fired real
+  HTTP at the Z.AI preset endpoint now walk the custom-provider path into
+  the fleet's loopback standin (`SSEServer`), which also makes their
+  post-retry arms deterministic (a scripted picker instead of
+  "whichever arm the live endpoint yields").
+- Red-first proof: the wrong-provider arm populated the picker on
+  pre-fix main (`:model_pick` ≠ `:fetching`; TUI-level: the picker held
+  `STALE-LIST` instead of the standin's answer). Post-fix, a
+  two-generation same-endpoint repro (the issue's executed scenario,
+  ordering forced by a scripted slow first connection) lands the stale
+  list first and the picker ends holding only the refetch's list.
 
 ## Alternatives considered
 

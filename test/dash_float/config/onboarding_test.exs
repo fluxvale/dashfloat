@@ -89,7 +89,7 @@ defmodule DashFloat.Config.OnboardingTest do
 
       assert [
                {:write_key, {"work", @zai_url, "k-1"}},
-               {:fetch_models, {@zai_url, "k-1"}} | _rest
+               {:fetch_models, {@zai_url, "k-1", 1}} | _rest
              ] = actions
 
       assert {:write_settings, doc} = List.last(actions)
@@ -123,7 +123,7 @@ defmodule DashFloat.Config.OnboardingTest do
       results =
         {:ok, [%{model: "m-observed", context: 262_144}, %{model: "m-bare", context: nil}]}
 
-      picker = Onboarding.models_arrived(at_fetching(), results)
+      picker = feed(at_fetching(), results)
 
       picked = press(picker, ["enter"])
       observed = Onboarding.settings_doc(picked)
@@ -215,7 +215,7 @@ defmodule DashFloat.Config.OnboardingTest do
 
       assert actions == [
                {:write_key, {"personal", @zai_url, "sk-live-placeholder"}},
-               {:fetch_models, {@zai_url, "sk-live-placeholder"}}
+               {:fetch_models, {@zai_url, "sk-live-placeholder", 1}}
              ]
 
       assert state.step == :fetching
@@ -228,7 +228,7 @@ defmodule DashFloat.Config.OnboardingTest do
 
       assert actions == [
                {:write_key, {"personal", @zai_url, "$ZAI_KEY"}},
-               {:fetch_models, {@zai_url, "$ZAI_KEY"}}
+               {:fetch_models, {@zai_url, "$ZAI_KEY", 1}}
              ]
     end
 
@@ -255,7 +255,7 @@ defmodule DashFloat.Config.OnboardingTest do
 
       assert actions == [
                {:write_key, {"personal", @zai_url, "k-1\\9"}},
-               {:fetch_models, {@zai_url, "k-1\\9"}}
+               {:fetch_models, {@zai_url, "k-1\\9", 1}}
              ]
 
       bounced = Onboarding.write_failed(advanced, "keys.json5 cannot store that value")
@@ -273,14 +273,17 @@ defmodule DashFloat.Config.OnboardingTest do
       assert back.step == :label
       assert back.error == nil
 
-      # The retry re-emits BOTH actions, in order.
+      # The retry re-emits BOTH actions, in order — under a NEW fetch
+      # generation (issue #87): the refused enter's epoch is spent; only a
+      # result tagged with this epoch can feed the picker.
       {retry, retry_actions} = drive(bounced, ["backspace", "backspace", "9", "enter"])
       assert retry.step == :fetching
       assert retry.error == nil
+      assert retry.fetch_epoch == 2
 
       assert retry_actions == [
                {:write_key, {"personal", @zai_url, "k-19"}},
-               {:fetch_models, {@zai_url, "k-19"}}
+               {:fetch_models, {@zai_url, "k-19", 2}}
              ]
     end
 
@@ -332,6 +335,11 @@ defmodule DashFloat.Config.OnboardingTest do
       press(Onboarding.new(), ["enter", "enter", "enter", "enter", "k", "enter"])
     end
 
+    # The current fetch generation's tag (issue #87): what the task stamped
+    # for THIS pending provider at THIS epoch.
+    defp feed(state, result),
+      do: Onboarding.models_arrived(state, {state.pending.base_url, state.fetch_epoch}, result)
+
     test "the key enter lands at :fetching with both actions in order" do
       {state, actions} =
         drive(Onboarding.new(), ["enter", "enter", "enter", "enter", "k", "enter"])
@@ -340,13 +348,13 @@ defmodule DashFloat.Config.OnboardingTest do
 
       assert actions == [
                {:write_key, {"personal", @zai_url, "k"}},
-               {:fetch_models, {@zai_url, "k"}}
+               {:fetch_models, {@zai_url, "k", 1}}
              ]
     end
 
     test "ids populate the picker; nickname defaults to the id; an observed window rides the pick (issue #111)" do
       results = {:ok, [%{model: "m-a", context: nil}, %{model: "m-b", context: 8}]}
-      state = Onboarding.models_arrived(at_fetching(), results)
+      state = feed(at_fetching(), results)
 
       assert state.step == :model_pick
       assert state.fetched == [%{model: "m-a", context: nil}, %{model: "m-b", context: 8}]
@@ -357,19 +365,19 @@ defmodule DashFloat.Config.OnboardingTest do
     end
 
     test "an empty list falls back to manual with the reason on screen" do
-      state = Onboarding.models_arrived(at_fetching(), {:ok, []})
+      state = feed(at_fetching(), {:ok, []})
       assert state.step == :model_manual
       assert state.note == "The provider returned no models."
     end
 
     test "a failed fetch falls back to manual with the fetch layer's reason" do
-      http_401 = Onboarding.models_arrived(at_fetching(), {:error, "HTTP 401"})
+      http_401 = feed(at_fetching(), {:error, "HTTP 401"})
       assert http_401.step == :model_manual
       assert http_401.note == "Couldn't fetch the model list — HTTP 401."
 
       # A failure shape without a reason (kept for robustness) still degrades
       # gently.
-      bare = Onboarding.models_arrived(at_fetching(), :error)
+      bare = feed(at_fetching(), :error)
       assert bare.step == :model_manual
       assert bare.note == "Couldn't fetch the model list."
     end
@@ -379,8 +387,41 @@ defmodule DashFloat.Config.OnboardingTest do
       assert state.step == :model_manual
       assert state.note == nil
 
-      stale = Onboarding.models_arrived(state, {:ok, [%{model: "late"}]})
+      stale = feed(state, {:ok, [%{model: "late"}]})
       assert stale.step == :model_manual
+    end
+
+    test "a superseded generation's result never populates the picker (issue #87)" do
+      # The wizard waits at :fetching for THIS provider's fetch. A result
+      # from any earlier generation must be refused: wrong provider (a
+      # slower previous selection), this endpoint under the pre-edit key
+      # (finding 2), or no usable identity at all.
+      state = at_fetching()
+
+      wrong_provider =
+        Onboarding.models_arrived(
+          state,
+          {"https://other.example/v1", 1},
+          {:ok, [%{model: "FOREIGN"}]}
+        )
+
+      assert wrong_provider.step == :fetching
+      assert wrong_provider.fetched == []
+
+      stale_epoch = Onboarding.models_arrived(state, {@zai_url, 0}, {:ok, [%{model: "STALE"}]})
+
+      assert stale_epoch.step == :fetching
+      assert stale_epoch.fetched == []
+
+      anonymous = Onboarding.models_arrived(state, :no_tag, {:ok, [%{model: "ANON"}]})
+      assert anonymous.step == :fetching
+      assert anonymous.fetched == []
+
+      # The current generation's own result then populates, alone.
+      landed = feed(state, {:ok, [%{model: "glm-current"}]})
+
+      assert landed.step == :model_pick
+      assert landed.fetched == [%{model: "glm-current"}]
     end
 
     test "skip at the model step is a blank Enter on manual — the provider keeps an empty menu" do
@@ -585,12 +626,12 @@ defmodule DashFloat.Config.OnboardingTest do
       assert state.step == :model_manual
       assert state.fetched == []
 
-      stale = Onboarding.models_arrived(state, {:ok, [%{model: "late"}]})
+      stale = feed(state, {:ok, [%{model: "late"}]})
       assert stale.step == :model_manual
     end
 
     test "model_pick: esc returns to the key with its draft; the choice re-restores" do
-      picker = Onboarding.models_arrived(at_fetching(), {:ok, [%{model: "m-a"}, %{model: "m-b"}]})
+      picker = feed(at_fetching(), {:ok, [%{model: "m-a"}, %{model: "m-b"}]})
       moved = press(picker, ["down"])
 
       back = press(moved, ["esc"])
@@ -601,7 +642,7 @@ defmodule DashFloat.Config.OnboardingTest do
       {refetched, _actions} = drive(back, ["enter"])
       assert refetched.step == :fetching
 
-      relanded = Onboarding.models_arrived(refetched, {:ok, [%{model: "m-a"}, %{model: "m-b"}]})
+      relanded = feed(refetched, {:ok, [%{model: "m-a"}, %{model: "m-b"}]})
       assert relanded.step == :model_pick
       assert relanded.choice == 1
     end
@@ -630,7 +671,7 @@ defmodule DashFloat.Config.OnboardingTest do
     end
 
     test "loop pop after a picker finish: pick cleared, fetched restored, back at the picker" do
-      picker = Onboarding.models_arrived(at_fetching(), {:ok, [%{model: "m-a"}, %{model: "m-b"}]})
+      picker = feed(at_fetching(), {:ok, [%{model: "m-a"}, %{model: "m-b"}]})
       picked = press(picker, ["down", "enter"])
       assert picked.step == :loop
 
@@ -773,7 +814,7 @@ defmodule DashFloat.Config.OnboardingTest do
       # welcome) contribute none.
       assert actions == [
                {:write_key, {"personal", @zai_url, "k"}},
-               {:fetch_models, {@zai_url, "k"}}
+               {:fetch_models, {@zai_url, "k", 1}}
              ]
 
       assert state.step == :welcome
@@ -830,7 +871,7 @@ defmodule DashFloat.Config.OnboardingTest do
 
     test "consecutive providers cannot cross-contaminate the fetched list" do
       # Provider one finishes from the picker: its snapshot is the list.
-      picker = Onboarding.models_arrived(at_fetching(), {:ok, [%{model: "m-a"}]})
+      picker = feed(at_fetching(), {:ok, [%{model: "m-a"}]})
       one = press(picker, ["enter"])
       assert [%{fetched: [%{model: "m-a"}]}] = one.providers
 
@@ -862,7 +903,7 @@ defmodule DashFloat.Config.OnboardingTest do
       # Five downs on a six-model picker remember choice 5; a refetch
       # returning one model must clamp the restore, never leave Enter
       # pointing past the list.
-      six = Onboarding.models_arrived(at_fetching(), {:ok, Enum.map(1..6, &%{model: "m#{&1}"})})
+      six = feed(at_fetching(), {:ok, Enum.map(1..6, &%{model: "m#{&1}"})})
       moved = press(six, List.duplicate("down", 5))
       assert moved.choice == 5
 
@@ -872,7 +913,7 @@ defmodule DashFloat.Config.OnboardingTest do
       {refetched, _actions} = drive(back, ["enter"])
       assert refetched.step == :fetching
 
-      relanded = Onboarding.models_arrived(refetched, {:ok, [%{model: "only"}]})
+      relanded = feed(refetched, {:ok, [%{model: "only"}]})
       assert relanded.fetched == [%{model: "only"}]
       assert relanded.choice == 1
 
@@ -1044,7 +1085,7 @@ defmodule DashFloat.Config.OnboardingTest do
       assert fetch_noise.step == :fetching
 
       # model_pick: up wraps, noise inert, manual is the last option
-      picker = Onboarding.models_arrived(fetching, {:ok, [%{model: "a"}, %{model: "b"}]})
+      picker = feed(fetching, {:ok, [%{model: "a"}, %{model: "b"}]})
       {pick_up, nil} = Onboarding.handle_key(picker, "up")
       assert pick_up.choice == 2
 
