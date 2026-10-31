@@ -112,10 +112,36 @@ expected_sum() {
   ' "$1"
 }
 
+# The release is built inside a pinned Debian 12 image, so its ELF files
+# resolve GLIBC_2.34 symbols (ADR 0010) — the floor is a property of the
+# build image, moved only by deliberate commit. A below-floor host would
+# download and extract a full install that cannot start, so the floor is
+# checked before anything is downloaded or written (ADR 0032).
+require_glibc_floor() {
+  [ "$(uname -s)" = "Linux" ] || return 0
+
+  # `ldd --version` is glibc's own; its first line ends with the release
+  # ("ldd (Debian GLIBC 2.31-13+deb11u14) 2.31"). Anything unexpected is
+  # left to the post-install smoke rather than guessed at here.
+  ver=$(ldd --version 2>/dev/null | sed -n '1s/.* //p')
+  case "$ver" in
+    2.*) ;;
+    *) return 0 ;;
+  esac
+  minor=${ver#*.}
+  minor=${minor%%[!0-9]*}
+  if [ "$minor" -lt 34 ]; then
+    die "glibc $ver is below the GLIBC_2.34 floor (DashFloat needs glibc 2.34+, Debian 12+, Ubuntu 22.04+); nothing was downloaded or installed"
+  fi
+}
+
 # The release bundles ERTS but not the system libraries the BEAM and the crypto
 # NIF link against. Check them before downloading 30 MB, and name the package:
 # a minimal container has glibc but none of these (proved on debian:slim-style
 # images). fuser/ldd checks are avoided — a missing lib is what we are asking.
+# It runs after the glibc floor: on an old-glibc host a missing-library hint
+# is wrong advice — installing libssl3 cannot help a binary the loader will
+# still refuse (ADR 0032).
 require_linux_libs() {
   [ "$(uname -s)" = "Linux" ] || return 0
 
@@ -143,6 +169,7 @@ command -v curl >/dev/null 2>&1 || die "curl is required"
 
 target=$(detect_target)
 [ -n "$target" ] || die "could not detect this platform"
+require_glibc_floor
 require_linux_libs
 
 version=$(resolve_version)
@@ -203,6 +230,7 @@ chmod 755 "$BIN_DIR/dashfloat"
 # The point of the shim and the versioned dir: prove the installed artifact
 # actually runs on this host before claiming success.
 if ! installed=$("$target_dir/bin/dashfloat" --version 2>&1); then
+  printf '%s\n' "$installed" >&2
   die "installed, but the binary failed to run on this host.
 On Linux the release needs glibc 2.34+, OpenSSL 3 (libcrypto.so.3),
 libtinfo.so.6, and libstdc++.so.6; the error above names what is missing."

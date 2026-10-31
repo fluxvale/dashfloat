@@ -158,7 +158,11 @@ It installs into versioned directories and never writes outside them:
 
 Unsupported platforms fail with an explicit message before downloading:
 Linux non-x86_64, musl systems (detected via `ldd`), and macOS on anything but
-arm64/x86_64.
+arm64/x86_64. (*Amended by
+[ADR 0032](0032-installer-refusal-contract.md) — a Linux host below the
+glibc 2.34 floor is refused the same way, before the library preflight, and
+the negative release smokes assert that specific refusal: message, exit
+code, nothing installed.*)
 
 ### Homebrew
 
