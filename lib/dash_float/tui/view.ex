@@ -986,14 +986,17 @@ defmodule DashFloat.TUI.View do
   # The scroll offset that keeps the SELECTED option on screen when the
   # widget overflows its (already widened) region: scroll down just enough
   # to carry the selection with two rows of tail (the blank and, when it
-  # fits, the hint), never past the last row, never negative.
+  # fits, the hint), never past the last row, never negative. The tail
+  # budget floors at zero on degenerate interiors (< 3 rows) so the aim
+  # never over-scrolls past the selection itself.
   defp choice_scroll(%Choice{} = choice, interior) do
     total = Choice.height(choice)
 
     if total <= interior do
       0
     else
-      max(0, min(Choice.selected_row(choice) - (interior - 3), total - interior))
+      aim = Choice.selected_row(choice) - max(interior - 3, 0)
+      max(0, min(aim, total - interior))
     end
   end
 

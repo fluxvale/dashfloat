@@ -3137,7 +3137,9 @@ defmodule DashFloat.TUI.State do
   # rows at all.
   defp cell_at(state, x, y) do
     count = log_line_count(state)
-    %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
+
+    %{log: log} =
+      View.regions(state.size, input_line_count(state), overlay?(state), state.choice != nil)
 
     if count == 0 do
       nil
