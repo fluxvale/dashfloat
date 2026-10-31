@@ -2661,11 +2661,11 @@ defmodule DashFloat.TUITest do
   # once idle, with the bottom offset under the real rendered viewport (the
   # margin took two rows off the log height — issue #28).
   defp viewport(state) do
-    View.regions(state.size, State.input_line_count(state), false).log.height
+    View.regions(state.size, State.input_line_count(state), false, state.choice != nil).log.height
   end
 
   defp active_viewport(state) do
-    View.regions(state.size, State.input_line_count(state), true).log.height
+    View.regions(state.size, State.input_line_count(state), true, state.choice != nil).log.height
   end
 
   defp tall_log(pid) do
@@ -3710,14 +3710,21 @@ defmodule DashFloat.TUITest do
       assert herdr_state(request) == "idle"
     end
 
-    test "a confirm prompt reports blocked naming the decision" do
+    test "a pending question reports blocked carrying the question text" do
       {:ok, pid} = start_tui(provider: provider(), herdr: herdr_ctx())
       assert_receive {:herdr, _request}, 1_000
 
+      # An approval (#133): the message is the choice question itself.
       send(pid, {:confirm, make_ref(), %{id: "c1", name: "bash", args: %{}, lines: ["$ x"]}})
       assert_receive {:herdr, request}, 1_000
       assert herdr_state(request) == "blocked"
-      assert herdr_message(request) == "approve bash"
+      assert herdr_message(request) == "Approve bash?"
+
+      # A model ask (#134): the same seam, the model's question verbatim.
+      send(pid, {:question, make_ref(), question_msg()})
+      assert_receive {:herdr, request}, 1_000
+      assert herdr_state(request) == "blocked"
+      assert herdr_message(request) == "Which database?"
     end
 
     test "the exit prompt reports blocked; its expiry returns to idle" do
@@ -3816,6 +3823,64 @@ defmodule DashFloat.TUITest do
 
       assert_receive {:herdr, %{method: "pane.report_agent_session", params: params}}, 1_000
       assert List.last(params.resume_argv) == "m2"
+    end
+  end
+
+  # The ask-user seam's payload (ADR 0028): the validated tool args — shared
+  # by the Herdr hook's test and the question-flow describe below.
+  defp question_msg do
+    %{
+      question: "Which database?",
+      options: [%{"label" => "Postgres"}, %{"label" => "SQLite"}],
+      multiple: false
+    }
+  end
+
+  # The question flow end to end through the real TUI process (#134, ADR
+  # 0028): the composer is replaced, keys route to the widget, the answer
+  # carries the ask's ref to the agent, and the composer restores.
+  describe "the model's question (ADR 0028)" do
+    test "single-select: arrows + Enter answer with the ref; Esc answers dismissed" do
+      {:ok, pid} = start_tui(provider: provider())
+      ref = make_ref()
+
+      send(pid, {:question, ref, question_msg()})
+      armed = eventually(pid, fn s -> s.choice != nil end)
+      assert armed.phase == :asking
+
+      # Mid-ask, everything but the widget's keys is swallowed.
+      press(pid, "x")
+      press(pid, "enter", ["shift"])
+      inject(pid, %ExRatatui.Event.Paste{content: "pasted mid-ask"})
+      mid_ask = get_state(pid)
+      assert State.input_text(mid_ask) == ""
+
+      press(pid, "down")
+      press(pid, "enter")
+      assert_receive {:question_decision, ^ref, {:answered, ["SQLite"]}}, 1_000
+
+      dismissed_ref = make_ref()
+      send(pid, {:question, dismissed_ref, question_msg()})
+      eventually(pid, fn s -> s.choice != nil end)
+
+      press(pid, "esc")
+      assert_receive {:question_decision, ^dismissed_ref, :dismissed}, 1_000
+    end
+
+    test "multi-select: space toggles, Enter answers every checked label" do
+      {:ok, pid} = start_tui(provider: provider())
+      ref = make_ref()
+
+      multi = %{question_msg() | multiple: true}
+      send(pid, {:question, ref, multi})
+      eventually(pid, fn s -> s.choice != nil end)
+
+      press(pid, " ")
+      press(pid, "down")
+      press(pid, " ")
+      press(pid, "enter")
+
+      assert_receive {:question_decision, ^ref, {:answered, ["Postgres", "SQLite"]}}, 1_000
     end
   end
 

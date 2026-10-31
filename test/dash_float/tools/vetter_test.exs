@@ -40,9 +40,25 @@ defmodule DashFloat.Tools.VetterTest do
     assert {:allow} = vet(server)
   end
 
-  test "a confirm decision asks the human" do
+  # ADR 0028: the ask verdict carries its reason — it becomes the visible
+  # AUTO-reject text.
+  test "a confirm decision asks, carrying its reason" do
     server = start_server(completion(~s({"decision":"confirm","reason":"pushes"})))
-    assert {:ask} = vet(server)
+    assert {:ask, "pushes"} = vet(server)
+  end
+
+  test "a confirm decision without a reason falls to the generic wording" do
+    server = start_server(completion(~s({"decision":"confirm"})))
+    assert {:ask, reason} = vet(server)
+    assert is_binary(reason) and reason != ""
+  end
+
+  # Hostile review P2-4: a blank or control-character reason is nil's
+  # sibling — the generic wording, never an empty dash or stray bytes.
+  test "a blank or control-only reason falls to the generic wording" do
+    server = start_server(completion(~s({"decision":"confirm","reason":"  \\r "})))
+    assert {:ask, reason} = vet(server)
+    assert reason == "flagged by the auto safety check"
   end
 
   test "an unparseable reply is a failed check" do
@@ -216,8 +232,10 @@ defmodule DashFloat.Tools.VetterTest do
   end
 
   test "parse accepts only strict decision JSON" do
-    assert Vetter.parse(~s({"decision":"run","reason":"fine"})) == {:ok, :run}
-    assert Vetter.parse(~s({"decision":"confirm","reason":"pushes"})) == {:ok, :confirm}
+    assert Vetter.parse(~s({"decision":"run","reason":"fine"})) == {:ok, :run, nil}
+    assert Vetter.parse(~s({"decision":"run"})) == {:ok, :run, nil}
+    assert Vetter.parse(~s({"decision":"confirm","reason":"pushes"})) == {:ok, :confirm, "pushes"}
+    assert Vetter.parse(~s({"decision":"confirm"})) == {:ok, :confirm, nil}
     assert Vetter.parse(~s({"decision":"allow","reason":"no"})) == :error
     assert Vetter.parse(~s({"decision":1})) == :error
     assert Vetter.parse(~s({"reason":"missing decision"})) == :error

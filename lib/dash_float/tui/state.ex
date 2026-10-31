@@ -23,6 +23,7 @@ defmodule DashFloat.TUI.State do
   alias DashFloat.Mode
   alias DashFloat.Session
   alias DashFloat.Tools
+  alias DashFloat.TUI.Choice
   alias DashFloat.TUI.Commands
   alias DashFloat.TUI.Palette
   alias DashFloat.TUI.Render
@@ -33,7 +34,7 @@ defmodule DashFloat.TUI.State do
   alias ExRatatui.Text.Line
   alias ExRatatui.Text.Span
 
-  @type phase :: :idle | :streaming | :executing_tool | :checking | :confirming
+  @type phase :: :idle | :streaming | :executing_tool | :checking | :confirming | :asking
   @type entry_kind :: :user | :assistant | :tool | :system | :reasoning
 
   @typedoc """
@@ -60,6 +61,13 @@ defmodule DashFloat.TUI.State do
           meta: reasoning_meta() | nil
         }
   @type confirm :: %{ref: term(), id: term(), name: String.t()}
+
+  @typedoc """
+  The pending choice widget (ADR 0028): while set, it temporarily replaces
+  the composer — an approval question (#133) or the model's `question` tool
+  (#134). `nil` closed.
+  """
+  @type choice :: Choice.t()
 
   @typedoc "One pending attachment's display metadata — never the bytes (ADR 0018 §6)."
   @type attachment :: %{path: String.t(), name: String.t(), kb: pos_integer()}
@@ -88,6 +96,7 @@ defmodule DashFloat.TUI.State do
           :quit
           | {:submit, String.t(), [String.t()]}
           | {:confirm, :approved | :rejected}
+          | {:question_answer, {:answered, [String.t()]} | :dismissed}
           | :cancel
           | {:set_mode, Mode.mode()}
           | {:set_title, String.t()}
@@ -168,6 +177,9 @@ defmodule DashFloat.TUI.State do
     :cwd,
     :agent,
     :confirm,
+    # The choice widget (ADR 0028): nil closed; set while an approval or a
+    # question owns the input surface.
+    :choice,
     # The startup phase (ADR 0009): the forced-selection modal or the
     # onboarding wizard, rendered instead of the chat UI until it clears.
     :setup,
@@ -299,6 +311,7 @@ defmodule DashFloat.TUI.State do
           live?: boolean(),
           agent_ref: reference() | nil,
           confirm: confirm() | nil,
+          choice: choice() | nil,
           exit_guard_at: integer() | nil,
           exit_guard_ref: reference() | nil,
           selection: Selection.t() | nil,
@@ -353,10 +366,11 @@ defmodule DashFloat.TUI.State do
              }}
           | {:context, %{messages: [map()], anchor: Accounting.anchor()}}
           | {:phase, :streaming}
-          | {:phase, :executing_tool | :checking | :idle}
+          | {:phase, :executing_tool | :checking | :asking | :idle}
           | {:tool_call, tool_call_msg()}
           | {:tool_result, tool_result_msg()}
           | {:confirm, term(), confirm_msg()}
+          | {:question, term(), question_msg()}
           | {:entry, :tool | :system, String.t()}
           | {:mode, Mode.mode()}
           | {:tool_preview, confirm_msg()}
@@ -374,6 +388,10 @@ defmodule DashFloat.TUI.State do
          }
 
   @typep confirm_msg :: %{id: term(), name: String.t(), args: map(), lines: [String.t()]}
+
+  # The ask-user seam's payload (#134, ADR 0028): the validated tool args —
+  # string-keyed option maps (`"label"`, optional `"description"`).
+  @typep question_msg :: %{question: String.t(), options: [map()], multiple: boolean()}
 
   ## Construction
 
@@ -398,6 +416,7 @@ defmodule DashFloat.TUI.State do
       provider: Keyword.get(opts, :provider),
       agent: Keyword.get(opts, :agent, DashFloat.Agent),
       confirm: nil,
+      choice: nil,
       cwd: cwd_label(),
       size: initial_size(opts),
       live?: is_nil(Keyword.get(opts, :test_mode)),
@@ -562,7 +581,9 @@ defmodule DashFloat.TUI.State do
           blocked: result["blocked"],
           error: result["error"],
           output: result["output"],
-          content: result["content"]
+          content: result["content"],
+          reason: result["reason"],
+          answers: result["answers"]
         }
 
       _other ->
@@ -901,8 +922,14 @@ defmodule DashFloat.TUI.State do
   @spec input_text(t()) :: String.t()
   def input_text(%__MODULE__{input: input}), do: ExRatatui.textarea_get_value(input)
 
-  @doc "Number of lines in the draft."
+  @doc """
+  Number of lines the INPUT region must carry: the choice widget's height
+  while a choice replaces the composer (ADR 0028), else the draft's line
+  count.
+  """
   @spec input_line_count(t()) :: non_neg_integer()
+  def input_line_count(%__MODULE__{choice: %Choice{} = choice}), do: Choice.height(choice)
+
   def input_line_count(%__MODULE__{input: input}), do: ExRatatui.textarea_line_count(input)
 
   @doc """
@@ -1065,18 +1092,48 @@ defmodule DashFloat.TUI.State do
     setup_key(state, code)
   end
 
-  # Confirmation mode (a pending confirm from the agent, ADR 0007): Enter
-  # approves, Esc rejects, and every other key is swallowed — typing
-  # mid-decision must not reach the textarea nor become an accidental
-  # approve.
-  defp route_key(%{confirm: pending} = state, "enter", mods, _now)
-       when pending != nil and mods in [[], ["ctrl"]],
-       do: {state, {:confirm, :approved}}
+  # Choice mode (ADR 0028): a pending choice — an approval question (#133)
+  # or the model's question (#134) — temporarily replaces the composer and
+  # owns every key (ADR 0007 §4's swallow rule extended): arrows move,
+  # Space toggles (multi only), Enter answers, Esc is the explicit negative
+  # (Reject on an approval, a dismissed answer on a question). Every other
+  # key is swallowed — typing mid-decision must not reach the textarea nor
+  # become an accidental answer.
+  defp route_key(%{choice: %Choice{} = choice} = state, "up", _modifiers, _now),
+    do: {%{state | choice: Choice.move(choice, :up)}, nil}
 
-  defp route_key(%{confirm: pending} = state, "esc", _modifiers, _now) when pending != nil,
+  defp route_key(%{choice: %Choice{} = choice} = state, "down", _modifiers, _now),
+    do: {%{state | choice: Choice.move(choice, :down)}, nil}
+
+  defp route_key(%{choice: %Choice{} = choice} = state, " ", _modifiers, _now),
+    do: {%{state | choice: Choice.toggle(choice)}, nil}
+
+  defp route_key(
+         %{choice: %Choice{kind: :approve, selected: selected}} = state,
+         "enter",
+         mods,
+         _now
+       )
+       when mods in [[], ["ctrl"]] do
+    # Approve is option 0 of the fixed two-choice set (ADR 0028).
+    decision = if selected == 0, do: :approved, else: :rejected
+
+    {state, {:confirm, decision}}
+  end
+
+  defp route_key(%{choice: %Choice{kind: :ask} = choice} = state, "enter", mods, _now)
+       when mods in [[], ["ctrl"]],
+       do: {state, {:question_answer, Choice.answer(choice)}}
+
+  # Esc is the explicit negative: Reject on an approval (ADR 0007 §4), a
+  # dismissed answer on a question (#134) — never silent.
+  defp route_key(%{choice: %Choice{kind: :approve}} = state, "esc", _modifiers, _now),
     do: {state, {:confirm, :rejected}}
 
-  defp route_key(%{confirm: pending} = state, _code, _modifiers, _now) when pending != nil,
+  defp route_key(%{choice: %Choice{kind: :ask}} = state, "esc", _modifiers, _now),
+    do: {state, {:question_answer, :dismissed}}
+
+  defp route_key(%{choice: %Choice{}} = state, _code, _modifiers, _now),
     do: {state, nil}
 
   # The /title dialog (issue #106) is a key mode like the attach prompt
@@ -1981,6 +2038,7 @@ defmodule DashFloat.TUI.State do
           stats: @zero_stats,
           context: nil,
           confirm: nil,
+          choice: nil,
           attachments: [],
           palette: nil,
           title_dialog: nil,
@@ -2016,14 +2074,17 @@ defmodule DashFloat.TUI.State do
       survives); re-announcing streaming
       never finalizes (a producer resuming after a tool interlude must not
       fragment its reply)
-    * `{:phase, :executing_tool | :checking | :idle}` — set the phase and
+    * `{:phase, :executing_tool | :checking | :asking | :idle}` — set the phase and
       finalize the in-flight entry, freezing the rate
     * `{:tool_call, call}` — append the gear row built by `Render.tool_call/2`
     * `{:tool_result, result}` — append the status row and dim output built by
       `Render.tool_result/3`
     * `{:confirm, ref, request}` — append the preview entry built by
-      `Render.confirm_preview/1`, then arm `state.confirm` and flip to the
+      `Render.confirm_preview/1`, then arm `state.confirm` AND the approval
+      choice (the composer's replacement, ADR 0028) and flip to the
       `:confirming` phase (ADR 0007)
+    * `{:question, ref, request}` — arm the question choice (the same
+      composer replacement, ADR 0028) and flip to the `:asking` phase
     * `{:mode, mode}` — the single-voice echo: set the mode; no entry, no
       phase change (ADR 0016)
     * `{:tool_preview, request}` — append the preview entry built by
@@ -2123,15 +2184,16 @@ defmodule DashFloat.TUI.State do
       when is_list(messages),
       do: %{state | context: %{messages: messages, anchor: anchor}}
 
-  # Any phase message supersedes a pending confirm: the agent is the single
-  # voice, and a confirm the UI never decided must not outlive the turn it
+  # Any phase message supersedes a pending choice: the agent is the single
+  # voice, and a decision the UI never made must not outlive the turn it
   # belonged to (agent death included — agent_down routes through here).
   # A new turn also kills the old ghost — the reap intent rides the
   # resulting state (ADR 0015 §3) — and clears the pending attachments
   # (ADR 0018 §6): the turn's images are on the wire now. Clearing an
   # already-empty list is a no-op, so repeated tool-loop episodes are safe.
   def stream_message(state, {:phase, :streaming}, _now),
-    do: dismiss_suggestion(%{state | phase: :streaming, confirm: nil, attachments: []})
+    do:
+      dismiss_suggestion(%{state | phase: :streaming, confirm: nil, choice: nil, attachments: []})
 
   def stream_message(state, {:phase, :idle}, now) do
     # Arm only when THIS transition actually finalized an assistant reply:
@@ -2145,12 +2207,12 @@ defmodule DashFloat.TUI.State do
     |> maybe_arm_suggestion(finalized?)
   end
 
-  # Tool interludes are mid-turn — a safety check (ADR 0016 §7) no less than
-  # an execution: the phase changes and any in-flight partial reply
-  # finalizes, but the turn is not complete — never an arm (and every new
-  # phase still sets the reap intent, ADR 0015 §3).
+  # Tool interludes are mid-turn — a safety check (ADR 0016 §7) or a pending
+  # question (ADR 0028) no less than an execution: the phase changes and any
+  # in-flight partial reply finalizes, but the turn is not complete — never
+  # an arm (and every new phase still sets the reap intent, ADR 0015 §3).
   def stream_message(state, {:phase, phase}, now)
-      when phase in [:executing_tool, :checking] do
+      when phase in [:executing_tool, :checking, :asking] do
     state
     |> finalize_phase(phase, now)
     |> dismiss_suggestion()
@@ -2216,7 +2278,24 @@ defmodule DashFloat.TUI.State do
     state
     |> put_entry(:tool, text, entry_lines)
     |> Map.put(:confirm, %{ref: ref, id: id, name: name})
+    |> Map.put(:choice, Choice.approve(ref, name))
     |> Map.put(:phase, :confirming)
+    |> dismiss_suggestion()
+  end
+
+  # The ask-user seam (#134, ADR 0028): the question replaces the composer
+  # through the same widget, the phase parks on :asking, and the ghost is
+  # reaped — suppressed while replaced, re-armed next turn.
+  def stream_message(
+        state,
+        {:question, ref, %{question: question, options: options, multiple: multiple}},
+        _now
+      )
+      when is_binary(question) and is_list(options) and is_boolean(multiple) do
+    state
+    |> Map.put(:choice, Choice.ask(ref, question, options, multiple))
+    |> Map.put(:phase, :asking)
+    |> dismiss_suggestion()
   end
 
   # Finalizing renders the reply once and freezes the cumulative rate; the
@@ -2231,6 +2310,7 @@ defmodule DashFloat.TUI.State do
     |> finalize_in_flight(now)
     |> Map.put(:phase, phase)
     |> Map.put(:confirm, nil)
+    |> Map.put(:choice, nil)
   end
 
   ## The reasoning block (issue #78; ADR 0006's reasoning amendment)
@@ -2672,11 +2752,23 @@ defmodule DashFloat.TUI.State do
 
   @doc """
   Clears the pending confirmation once the decision has been sent to the
-  agent. The phase stays `:confirming` until the agent's next phase message
-  arrives — the gap is one mailbox hop, invisible under render coalescing.
+  agent — and with it the approval choice that replaced the composer (#133,
+  ADR 0028): the draft underneath was never touched, so the composer
+  restores with any in-flight draft preserved by construction. The phase
+  stays `:confirming` until the agent's next phase message arrives — the gap
+  is one mailbox hop, invisible under render coalescing.
   """
   @spec confirm_decided(t()) :: t()
-  def confirm_decided(%__MODULE__{} = state), do: %{state | confirm: nil}
+  def confirm_decided(%__MODULE__{} = state), do: %{state | confirm: nil, choice: nil}
+
+  @doc """
+  Clears the pending question once the answer has been sent to the agent
+  (#134, ADR 0028) — the ask twin of `confirm_decided/1`. The composer
+  restores with its draft intact; the phase waits for the agent's next
+  announcement.
+  """
+  @spec question_decided(t()) :: t()
+  def question_decided(%__MODULE__{} = state), do: %{state | choice: nil}
 
   @doc """
   Degrades to `:idle` with a `:system` entry explaining the failure. A binary
@@ -2819,7 +2911,8 @@ defmodule DashFloat.TUI.State do
   defp scoped_reasoning_index(_state, nil), do: nil
 
   defp scoped_reasoning_index(state, {x, y}) do
-    %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
+    %{log: log} =
+      View.regions(state.size, input_line_count(state), overlay?(state), state.choice != nil)
 
     if y >= log.y and y < log.y + max(log.height, 0) and x >= log.x and
          x < log.x + max(log.width, 0) do
@@ -2873,7 +2966,9 @@ defmodule DashFloat.TUI.State do
   end
 
   defp log_height(state) do
-    %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
+    %{log: log} =
+      View.regions(state.size, input_line_count(state), overlay?(state), state.choice != nil)
+
     log.height
   end
 
@@ -3043,9 +3138,13 @@ defmodule DashFloat.TUI.State do
   # rows at all.
   defp cell_at(state, x, y) do
     count = log_line_count(state)
-    %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
 
-    if count == 0 do
+    %{log: log} =
+      View.regions(state.size, input_line_count(state), overlay?(state), state.choice != nil)
+
+    # A zero-row log rect (a tall choice can claim the whole area) shows
+    # nothing to select — the same nil as an empty log.
+    if count == 0 or log.height <= 0 do
       nil
     else
       width =
@@ -3053,7 +3152,7 @@ defmodule DashFloat.TUI.State do
         |> elem(0)
         |> View.content_width()
 
-      bottom = log.y + max(log.height, 1) - 1
+      bottom = log.y + log.height - 1
       screen_row = clamp(y, log.y, bottom)
       top = effective_scroll(state, log.height) + (screen_row - log.y)
       row = clamp(top, 0, count - 1)

@@ -6,6 +6,7 @@ defmodule DashFloat.TUI.ViewTest do
   alias DashFloat.TUI.Commands
   alias DashFloat.TUI.Palette
   alias DashFloat.TUI.Render
+  alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
   alias DashFloat.TUI.Theme
   alias DashFloat.TUI.View
@@ -207,11 +208,277 @@ defmodule DashFloat.TUI.ViewTest do
             executing_tool: "Running tool",
             checking: "Checking",
             confirming: "Confirm",
+            asking: "Asking",
             idle: "Idle"
           ] do
         state = %{new_state() | phase: phase}
         assert status_text(state) =~ label
       end
+    end
+
+    test "a pending question's activity row names the wait and Esc's dismissal" do
+      state = asking_state()
+      assert activity_text(state) =~ "Waiting for your answer…"
+      assert activity_text(state) =~ "esc dismiss"
+    end
+
+    # The composer replacement (ADR 0028): while a choice is pending the
+    # input region carries a Paragraph (the question box), never the
+    # Textarea — and its rows carry the question, the options with their
+    # selection markers, and the hint.
+    test "a pending choice replaces the composer widget with the question box" do
+      state = asking_state()
+
+      widgets = View.render(state, %ExRatatui.Frame{width: 80, height: 24})
+
+      assert [
+               {%ExRatatui.Widgets.Paragraph{}, _status},
+               {%ExRatatui.Widgets.Paragraph{}, _log},
+               {%ExRatatui.Widgets.Paragraph{}, _activity},
+               {%ExRatatui.Widgets.Paragraph{}, _input},
+               {%ExRatatui.Widgets.Paragraph{}, _footer}
+             ] = widgets
+
+      # The choice's clamp is the area minus status/footer/activity/one
+      # log row (hostile review P0-1: the options are the payload) — the
+      # 7-row question box gets its full 9 rows at the stock geometry.
+      assert State.input_line_count(state) == 7
+      regions = regions_of(state)
+      assert {:ok, input} = Map.fetch(regions, :input)
+      assert input.height == 9
+
+      text = input_text(state)
+      assert text =~ "Which database?"
+      assert text =~ "❯ Postgres"
+      assert text =~ "  SQLite"
+      assert text =~ "    sturdy default"
+      assert text =~ "↑↓ move · ⏎ answer · esc dismiss"
+    end
+
+    # P0-1's regression proof at the DRAWN CELLS: at the stock 80x24 a
+    # 10-option question WITH descriptions (24 rows) overflows even the
+    # widened clamp — the box must SCROLL with the selection, so the
+    # last option is visible (and answerable with eyes open) when
+    # selected, and the first is honestly scrolled away.
+    test "an overflowing choice scrolls to keep the selected option visible" do
+      alias ExRatatui.CellSession
+
+      options = for i <- 1..10, do: %{"label" => "option-#{i}", "description" => "d#{i}"}
+
+      armed =
+        State.stream_message(new_state(), {
+          :question,
+          make_ref(),
+          %{question: "Pick one", options: options, multiple: false}
+        })
+
+      moved =
+        Enum.reduce(1..9, armed, fn _i, state ->
+          {state, _nil} = State.handle_key(state, "down", [])
+          state
+        end)
+
+      assert moved.choice.selected == 9
+
+      session = CellSession.new(80, 24)
+
+      :ok =
+        CellSession.draw(session, View.render(moved, %ExRatatui.Frame{width: 80, height: 24}))
+
+      snap = CellSession.take_cells(session)
+      CellSession.close(session)
+      text = Enum.map_join(snap.cells, "", & &1.symbol)
+
+      assert text =~ "option-10"
+      refute text =~ "option-1 "
+    end
+
+    # The plain 10-option list (14 rows) fits the widened clamp whole at
+    # the stock geometry — every option and the hint visible, no scroll.
+    test "a 10-option question without descriptions fits whole" do
+      alias ExRatatui.CellSession
+
+      options = for i <- 1..10, do: %{"label" => "option-#{i}"}
+
+      armed =
+        State.stream_message(new_state(), {
+          :question,
+          make_ref(),
+          %{question: "Pick one", options: options, multiple: false}
+        })
+
+      session = CellSession.new(80, 24)
+
+      :ok =
+        CellSession.draw(session, View.render(armed, %ExRatatui.Frame{width: 80, height: 24}))
+
+      snap = CellSession.take_cells(session)
+      CellSession.close(session)
+      text = Enum.map_join(snap.cells, "", & &1.symbol)
+
+      for i <- 1..10, do: assert(text =~ "option-#{i}")
+      assert text =~ "esc dismiss"
+    end
+
+    test "an approval renders its fixed two-choice set in the same box" do
+      ref = make_ref()
+
+      state =
+        State.stream_message(
+          new_state(),
+          {:confirm, ref, %{id: "c1", name: "write_file", args: %{}, lines: ["+ x"]}}
+        )
+
+      text = input_text(state)
+      assert text =~ "Approve write_file?"
+      assert text =~ "❯ Approve"
+      assert text =~ "  Reject"
+      assert text =~ "↑↓ move · ⏎ answer · esc reject"
+    end
+
+    test "a multi question shows checkboxes and the toggle hint" do
+      state =
+        State.stream_message(new_state(), {
+          :question,
+          make_ref(),
+          %{
+            question: "Pick any",
+            options: [%{"label" => "a"}, %{"label" => "b"}],
+            multiple: true
+          }
+        })
+
+      text = input_text(state)
+      assert text =~ "[ ] a"
+      assert text =~ "[ ] b"
+      assert text =~ "space toggle"
+    end
+
+    # The mouse-selection geometry during a choice (delta re-review #2):
+    # cell_at must map through the choice-aware log rect — a click below
+    # the (taller) box anchors on the REAL last log row, never on phantom
+    # rows the draft's third-cap layout would invent.
+    test "mouse selection maps through the choice-aware log rect" do
+      options = for i <- 1..10, do: %{"label" => "option-#{i}", "description" => "d"}
+
+      entries_state =
+        new_state()
+        |> State.stream_message({:entry, :system, "row"})
+        |> then(fn s ->
+          for _n <- 1..30, reduce: s do
+            acc -> State.stream_message(acc, {:entry, :system, "row"})
+          end
+        end)
+
+      armed =
+        State.stream_message(entries_state, {
+          :question,
+          make_ref(),
+          %{question: "Pick one", options: options, multiple: false}
+        })
+
+      # The giant choice claims the whole area: the log rect collapses to
+      # zero rows, so a click over the box selects NOTHING — the honest
+      # mapping through the choice-aware rect (no phantom rows).
+      %{log: log} =
+        View.regions(armed.size, State.input_line_count(armed), State.overlay?(armed), true)
+
+      assert log.height == 0
+      {clicked, _copy} = State.select_mouse(armed, "down", 10, 22, [])
+      assert clicked.selection == nil
+
+      # A SMALLER choice leaves the log visible: clicks anchor inside the
+      # real (shrunken) rect — never past it.
+      small =
+        State.stream_message(entries_state, {
+          :question,
+          make_ref(),
+          %{
+            question: "Pick one",
+            options: [%{"label" => "a"}, %{"label" => "b"}],
+            multiple: false
+          }
+        })
+
+      %{log: small_log} =
+        View.regions(small.size, State.input_line_count(small), State.overlay?(small), true)
+
+      assert small_log.height > 0
+
+      # Clicks over the box (and past it) CLAMP to the log rect's bottom
+      # edge — the same content row for both — never inventing phantom
+      # rows under the taller box.
+      {clicked_small, _copy} = State.select_mouse(small, "down", 10, 22, [])
+      {clicked_below, _copy2} = State.select_mouse(small, "down", 10, 23, [])
+
+      {{_from, _fx}, {to_row, _tx}} = Selection.range(clicked_small.selection)
+      {{_from2, _fx2}, {to_row2, _tx2}} = Selection.range(clicked_below.selection)
+      assert to_row == to_row2
+      # The anchor sits at the clamp edge: the viewport's last content row.
+      assert to_row == State.log_line_count(small) - 1
+    end
+
+    # interior < 3 (degenerate frames, delta re-review #2's P3): at 80x10
+    # the clamp floors at 3 rows (interior 1) — the scroll must still aim
+    # AT the selection, keeping it on the one visible row.
+    test "the scroll never aims past the selection on degenerate interiors" do
+      alias ExRatatui.CellSession
+
+      options = for i <- 1..10, do: %{"label" => "option-#{i}", "description" => "d"}
+
+      armed =
+        State.stream_message(new_state(), {
+          :question,
+          make_ref(),
+          %{question: "Pick one", options: options, multiple: false}
+        })
+
+      moved =
+        Enum.reduce(1..9, armed, fn _i, state ->
+          {state, _nil} = State.handle_key(state, "down", [])
+          state
+        end)
+
+      assert moved.choice.selected == 9
+
+      session = CellSession.new(80, 10)
+
+      :ok =
+        CellSession.draw(
+          session,
+          View.render(moved, %ExRatatui.Frame{width: 80, height: 10})
+        )
+
+      snap = CellSession.take_cells(session)
+      CellSession.close(session)
+      text = Enum.map_join(snap.cells, "", & &1.symbol)
+
+      assert text =~ "option-10"
+      refute text =~ "option-1 "
+    end
+
+    defp asking_state do
+      State.stream_message(new_state(), {
+        :question,
+        make_ref(),
+        %{
+          question: "Which database?",
+          options: [
+            %{"label" => "Postgres", "description" => "sturdy default"},
+            %{"label" => "SQLite"}
+          ],
+          multiple: false
+        }
+      })
+    end
+
+    defp regions_of(state) do
+      View.regions(
+        state.size,
+        State.input_line_count(state),
+        State.overlay?(state),
+        state.choice != nil
+      )
     end
 
     test "the context span reads the accounting call over the agent's snapshot" do
@@ -928,6 +1195,31 @@ defmodule DashFloat.TUI.ViewTest do
       assert rest.content == "read_file lib/foo.ex"
       assert rest.style == Theme.style(:dim)
     end
+
+    # The question tool's row (#134, ADR 0028): the question IS the payload —
+    # one flattened line, capped with `…` when it runs long.
+    test "a question call row carries the question as its summary" do
+      {_text, [_blank, line]} = Render.tool_call("question", args("Which database?"))
+
+      [gear, rest] = line.spans
+      assert gear.content == "⚙ "
+      assert rest.content == "question Which database?"
+
+      long = String.duplicate("w", 80)
+      {_text, [_blank, long_line]} = Render.tool_call("question", args(long <> "\nnext"))
+
+      [^gear, long_rest] = long_line.spans
+      assert long_rest.content == "question " <> String.duplicate("w", 60) <> "…"
+    end
+
+    test "a question call with no question string renders bare, never crashes" do
+      {_text, [_blank, line]} = Render.tool_call("question", %{})
+
+      [_gear, rest] = line.spans
+      assert rest.content == "question"
+    end
+
+    defp args(question), do: %{"question" => question, "options" => [%{"label" => "a"}]}
 
     test "tool result output indents two spaces, dim, verbatim" do
       {_text, [_blank, first | output]} = Render.tool_result("read_file", "ok", "one\ntwo")
@@ -1716,6 +2008,13 @@ defmodule DashFloat.TUI.ViewTest do
     state
     |> View.render(%ExRatatui.Frame{width: 80, height: 24})
     |> Enum.at(3)
+  end
+
+  # The input region's flat text: the composer's placeholder/draft view, or
+  # the choice box's rows while a choice replaces it (ADR 0028).
+  defp input_text(state) do
+    {widget, _rect} = input(state)
+    Enum.map_join(widget.text, "\n", &flatten/1)
   end
 
   defp log_widget(state, w, h) do

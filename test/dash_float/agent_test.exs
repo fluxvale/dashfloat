@@ -6,8 +6,8 @@ end
 
 defmodule AgentTestVetAsk do
   @moduledoc false
-  @spec verdict(term(), term(), term(), term()) :: {:ask}
-  def verdict(_provider, _call, _lines, _opts), do: {:ask}
+  @spec verdict(term(), term(), term(), term()) :: {:ask, String.t()}
+  def verdict(_provider, _call, _lines, _opts), do: {:ask, "destroys things"}
 end
 
 defmodule AgentTestVetFail do
@@ -27,10 +27,10 @@ end
 defmodule AgentTestVetParked do
   @moduledoc false
   # Parks until messaged — the agent's cancel is the message that resolves it.
-  @spec verdict(term(), term(), term(), term()) :: {:ask}
+  @spec verdict(term(), term(), term(), term()) :: {:ask, String.t()}
   def verdict(_provider, _call, _lines, _opts) do
     receive do
-      _any -> {:ask}
+      _any -> {:ask, "late"}
     end
   end
 end
@@ -42,6 +42,18 @@ defmodule AgentTestVetParkedAllow do
   def verdict(_provider, _call, _lines, _opts) do
     receive do
       _any -> {:allow}
+    end
+  end
+end
+
+defmodule AgentTestVetParkedAsk do
+  @moduledoc false
+  # Parks until messaged — the released verdict is an ask WITH its reason,
+  # so a test can switch the mode mid-check and still exercise the ask arm
+  # of the confirm-arming entry (ADR 0016 §3's re-read).
+  def verdict(_provider, _call, _lines, _opts) do
+    receive do
+      _any -> {:ask, "touches production"}
     end
   end
 end
@@ -301,6 +313,17 @@ defmodule DashFloat.AgentTest do
     ctx.tmp_dir
     |> Path.join(relative)
     |> File.exists?()
+  end
+
+  # The decoded tool-result object for `id` inside a forwarded request body
+  # — what the model actually received for the call.
+  defp tool_result_body(body, id) do
+    body
+    |> Jason.decode!()
+    |> Map.fetch!("messages")
+    |> Enum.find(&(&1["tool_call_id"] == id))
+    |> Map.fetch!("content")
+    |> Jason.decode!()
   end
 
   defp sandbox_parent_file?(ctx, name) do
@@ -797,11 +820,13 @@ defmodule DashFloat.AgentTest do
              "edit_file",
              "execute_command",
              "list_directory",
+             "question",
              "web_search"
            ]
 
     # No :synthetic opt: discovery finds nothing on a loopback host — the
-    # advertised array stays the base five.
+    # advertised array stays the base six (the question tool rides every
+    # mode, ADR 0028).
     {plain, _sup} = start_agent(server, ctx.tmp_dir)
 
     send(plain, {:prompt, self(), "search disabled", []})
@@ -818,7 +843,8 @@ defmodule DashFloat.AgentTest do
              "write_file",
              "edit_file",
              "execute_command",
-             "list_directory"
+             "list_directory",
+             "question"
            ]
 
     assert_receive {:phase, :idle}, 2_000
@@ -1487,7 +1513,7 @@ defmodule DashFloat.AgentTest do
   end
 
   @tag :tmp_dir
-  test "auto confirms when the vetter asks: nothing runs before approval", ctx do
+  test "auto asks -> AUTO-REJECT: nothing runs, the reason reaches log and model (#135)", ctx do
     server =
       start_server([
         call_tool_episode("call_s", "execute_command", %{"command" => "touch asked.txt"}),
@@ -1498,18 +1524,28 @@ defmodule DashFloat.AgentTest do
     send(agent, {:prompt, self(), "run it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
-    assert_receive {:entry, :system, "[safety check: needs confirmation]"}, 2_000
-    assert_receive {:confirm, ref, %{id: "call_s"}}, 2_000
-    refute sandbox_exists?(ctx, "asked.txt")
+    # Binary by spec (ADR 0028's 0016 amendment): the ask verdict never arms
+    # a prompt — the preview lands as the receipt of the refusal, a system
+    # entry carries the reason, and the model is told blocked:"auto" + reason.
+    assert_receive {:tool_preview, %{id: "call_s", name: "execute_command"}}, 2_000
+    assert_receive {:entry, :system, "[auto: rejected execute_command — destroys things]"}, 2_000
 
-    send(agent, {:confirm_decision, ref, :approved})
-    assert_receive {:tool_result, %{id: "call_s", ok: true}}, 2_000
-    assert sandbox_exists?(ctx, "asked.txt")
+    assert_receive {:tool_result, %{id: "call_s", ok: false, status: status}}, 2_000
+    assert status == "auto-rejected: destroys things"
+
+    refute sandbox_exists?(ctx, "asked.txt")
     assert_receive {:phase, :idle}, 2_000
+    refute_received {:confirm, _ref, _preview}
+
+    # The reason rides the tool result the next episode carries.
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+
+    assert %{"ok" => false, "blocked" => "auto", "reason" => "destroys things"} =
+             tool_result_body(body, "call_s")
   end
 
   @tag :tmp_dir
-  test "a failed check degrades to confirm: auto never becomes unchained", ctx do
+  test "a failed check auto-rejects too — AUTO's gray default, never a prompt (#135)", ctx do
     server =
       start_server([
         call_tool_episode("call_f", "execute_command", %{"command" => "touch failed.txt"}),
@@ -1520,19 +1556,22 @@ defmodule DashFloat.AgentTest do
     send(agent, {:prompt, self(), "run it", []})
     assert_receive {:sse_request, "POST", _, _, _first}, 2_000
 
-    assert_receive {:entry, :system, "[safety check unavailable — confirming]"}, 2_000
-    assert_receive {:confirm, ref, %{id: "call_f"}}, 2_000
-    refute sandbox_exists?(ctx, "failed.txt")
+    # The gray default (ADR 0016's 0028 amendment): a check that cannot
+    # answer rejects — fail-closed without prompting. Auto never becomes
+    # unchained, and it never asks either.
+    assert_receive {:entry, :system, entry}, 2_000
+    assert entry == "[auto: rejected execute_command — safety check unavailable — boom]"
 
-    send(agent, {:confirm_decision, ref, :rejected})
-    assert_receive {:tool_result, %{id: "call_f", ok: false, status: "rejected"}}, 2_000
+    assert_receive {:tool_result, %{id: "call_f", ok: false, status: "auto-rejected: " <> _}},
+                   2_000
+
     assert_receive {:phase, :idle}, 2_000
     refute sandbox_exists?(ctx, "failed.txt")
+    refute_received {:confirm, _ref, _preview}
   end
 
   @tag :tmp_dir
-  test "an out-of-contract verdict fails safe: confirm with the unavailable entry, no crash",
-       ctx do
+  test "an out-of-contract verdict auto-rejects: fail-closed, no crash, no prompt", ctx do
     server =
       start_server([
         call_tool_episode("call_g", "execute_command", %{"command" => "touch garbage.txt"}),
@@ -1543,15 +1582,14 @@ defmodule DashFloat.AgentTest do
     send(agent, {:prompt, self(), "run it", []})
     assert_receive {:phase, :checking}, 2_000
 
-    # The garbage verdict may neither run the call nor kill the GenServer:
-    # the fail-safe arms the confirm, the entry naming what happened.
-    assert_receive {:entry, :system, "[safety check unavailable — confirming]"}, 2_000
-    assert_receive {:confirm, ref, %{id: "call_g"}}, 2_000
-    refute sandbox_exists?(ctx, "garbage.txt")
-
-    send(agent, {:confirm_decision, ref, :rejected})
-    assert_receive {:tool_result, %{id: "call_g", ok: false, status: "rejected"}}, 2_000
+    # The garbage verdict may neither run the call nor kill the GenServer —
+    # and under the never-ask contract it may not prompt either.
+    assert_receive {:entry, :system, "[auto: rejected execute_command — " <> _}, 2_000
+    assert_receive {:tool_result, %{id: "call_g", ok: false, status: "auto-rejected" <> _}}, 2_000
     assert_receive {:phase, :idle}, 2_000
+
+    refute sandbox_exists?(ctx, "garbage.txt")
+    refute_received {:confirm, _ref, _preview}
     assert Process.alive?(agent)
   end
 
@@ -1565,6 +1603,260 @@ defmodule DashFloat.AgentTest do
     refute_receive {:phase, _phase}, 200
     refute_receive {:sse_request, "POST", _, _, _body}, 200
     assert Process.alive?(agent)
+  end
+
+  # The older-producer shapes (#78's fallback clause): a stream_done report
+  # WITHOUT the reasoning key still resolves every arm — hand-built sends,
+  # a regressed producer — read as no thinking, never a crash.
+  @tag :tmp_dir
+  test "a reasoning-less stream_done still runs the tool batch", ctx do
+    server = start_server([{:send, @headers}, {:send, "data: [DONE]\n\n"}, :close])
+    # A stalled script never answers; the fabricated report below resolves.
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+    send(agent, {:prompt, self(), "go", []})
+    assert_receive {:sse_request, "POST", _, _, _body}, 2_000
+
+    send(
+      agent,
+      {:stream_done,
+       %{
+         content: "",
+         tool_calls: [
+           %{id: "call_nr", name: "write_file", args: %{"path" => "nr.txt", "content" => "x"}}
+         ],
+         cancelled: false
+       }}
+    )
+
+    assert_receive {:confirm, ref, %{id: "call_nr"}}, 2_000
+    send(agent, {:confirm_decision, ref, :approved})
+    assert_receive {:tool_result, %{id: "call_nr", ok: true}}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "a reasoning-less cancelled stream_done still ends the turn", ctx do
+    server = start_server([final_episode("unused")])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+    send(agent, {:prompt, self(), "go", []})
+    assert_receive {:sse_request, "POST", _, _, _body}, 2_000
+
+    send(agent, {:stream_done, %{content: "partial", tool_calls: [], cancelled: true}})
+
+    assert_receive {:entry, :system, "[cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  ## The question tool (#134, ADR 0028) — and the three together
+
+  defp question_episode(id, args) do
+    call_tool_episode(id, "question", args)
+  end
+
+  @tag :tmp_dir
+  test "the question tool asks through the choice seam; the answer returns to the model", ctx do
+    server =
+      start_server([
+        question_episode("call_q", %{
+          "question" => "Which database?",
+          "options" => [
+            %{"label" => "Postgres", "description" => "sturdy"},
+            %{"label" => "SQLite"}
+          ],
+          "multiple" => false
+        }),
+        final_episode("picked")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+    send(agent, {:prompt, self(), "ask me", []})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    # The ask rides the composer-replacement seam, the phase parks on
+    # :asking, and the tool row names the question.
+    assert_receive {:tool_call, %{id: "call_q", name: "question", args: args}}, 2_000
+    assert Enum.map(args["options"], & &1["label"]) == ["Postgres", "SQLite"]
+
+    assert_receive {:phase, :asking}, 2_000
+
+    assert_receive {:question, ref, %{question: "Which database?", multiple: false} = payload},
+                   2_000
+
+    assert [%{"label" => "Postgres", "description" => "sturdy"}, %{"label" => "SQLite"}] =
+             payload.options
+
+    # No gate ever saw it — no preview, no confirm, no check.
+    refute_received {:tool_preview, _preview}
+    refute_received {:confirm, _ref, _preview}
+
+    send(agent, {:question_decision, ref, {:answered, ["Postgres"]}})
+
+    assert_receive {:tool_result, %{id: "call_q", ok: true, status: "answered: Postgres"}},
+                   2_000
+
+    # The next episode's request carries the answer as the tool result.
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+    assert %{"ok" => true, "answers" => ["Postgres"]} = tool_result_body(body, "call_q")
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "a multi question returns every answer in option order", ctx do
+    server =
+      start_server([
+        question_episode("call_m", %{
+          "question" => "Which langs?",
+          "options" => [%{"label" => "Elixir"}, %{"label" => "Rust"}],
+          "multiple" => true
+        }),
+        final_episode("ok")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+    send(agent, {:prompt, self(), "ask", []})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+    assert_receive {:question, ref, %{multiple: true}}, 2_000
+
+    send(agent, {:question_decision, ref, {:answered, ["Rust", "Elixir"]}})
+
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+    assert %{"ok" => true, "answers" => ["Rust", "Elixir"]} = tool_result_body(body, "call_m")
+  end
+
+  @tag :tmp_dir
+  test "Esc dismisses: the model receives an explicit cancelled answer, never silence", ctx do
+    server =
+      start_server([
+        question_episode("call_d", %{
+          "question" => "Proceed?",
+          "options" => [%{"label" => "Yes"}, %{"label" => "No"}]
+        }),
+        final_episode("adapted")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+    send(agent, {:prompt, self(), "ask", []})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+    assert_receive {:question, ref, _payload}, 2_000
+
+    send(agent, {:question_decision, ref, :dismissed})
+
+    assert_receive {:tool_result, %{id: "call_d", ok: false, status: "cancelled"}}, 2_000
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+    assert %{"ok" => false, "cancelled" => true} = tool_result_body(body, "call_d")
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "bad question args are an honest validation error, no ask", ctx do
+    server =
+      start_server([
+        question_episode("call_bad", %{"question" => "Q?", "options" => []}),
+        final_episode("recovered")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+    send(agent, {:prompt, self(), "ask", []})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    assert_receive {:tool_result, %{id: "call_bad", ok: false, status: "error: " <> _}}, 2_000
+    refute_received {:question, _ref, _payload}
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "a stale question decision is ignored (the ref discipline)", ctx do
+    server =
+      start_server([
+        question_episode("call_s1", %{
+          "question" => "Q1?",
+          "options" => [%{"label" => "a"}]
+        }),
+        final_episode("done")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+    send(agent, {:prompt, self(), "ask", []})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+    assert_receive {:question, ref, _payload}, 2_000
+
+    # A decision from a ref that never armed changes nothing.
+    send(agent, {:question_decision, make_ref(), {:answered, ["forged"]}})
+    refute_receive {:tool_result, %{id: "call_s1"}}, 200
+
+    send(agent, {:question_decision, ref, {:answered, ["a"]}})
+    assert_receive {:tool_result, %{id: "call_s1", ok: true}}, 2_000
+  end
+
+  # The three together (#133 #134 #135, ADR 0028): AUTO's bypass of the
+  # permission prompt must not break the choice flows — the question tool
+  # still asks (it IS a question), the dangerous call auto-rejects with a
+  # reason, and nothing prompts; BUILD's approval still arms the choice.
+  @tag :tmp_dir
+  test "auto: a question asks while a dangerous call auto-rejects — no prompt anywhere",
+       ctx do
+    frames =
+      tool_frames("call_q", "question", [
+        Jason.encode!(%{
+          "question" => "Style?",
+          "options" => [%{"label" => "Bold"}]
+        })
+      ]) ++
+        tool_frames_1("call_x", "execute_command", [~s({"command":"rm -rf /"})])
+
+    server =
+      start_server([
+        [{:send, [@headers | frames]}, {:send, "data: [DONE]\n\n"}, :close],
+        final_episode("all settled")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetAsk)
+    send(agent, {:prompt, self(), "go", []})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    # The question asks — the sanctioned human reach in AUTO.
+    assert_receive {:phase, :asking}, 2_000
+    assert_receive {:question, q_ref, _payload}, 2_000
+    send(agent, {:question_decision, q_ref, {:answered, ["Bold"]}})
+
+    # The dangerous call resolves through the vet: AUTO-REJECT, never a
+    # prompt — the reason reaches the log and the model.
+    assert_receive {:phase, :checking}, 2_000
+    assert_receive {:entry, :system, "[auto: rejected execute_command — destroys things]"}, 2_000
+
+    assert_receive {:tool_result, %{id: "call_x", status: "auto-rejected: destroys things"}},
+                   2_000
+
+    assert_receive {:sse_request, "POST", _, _, body}, 2_000
+    assert %{"ok" => true, "answers" => ["Bold"]} = tool_result_body(body, "call_q")
+    assert %{"ok" => false, "blocked" => "auto"} = tool_result_body(body, "call_x")
+
+    assert_receive {:phase, :idle}, 2_000
+    refute_received {:confirm, _ref, _preview}
+  end
+
+  @tag :tmp_dir
+  test "build keeps the approval choice after AUTO's change — one widget, both modes",
+       ctx do
+    server =
+      start_server([
+        call_tool_episode("call_w", "write_file", %{
+          "path" => "kept.txt",
+          "content" => "x"
+        }),
+        final_episode("written")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+    send(agent, {:prompt, self(), "write it", []})
+    assert_receive {:sse_request, "POST", _, _, _first}, 2_000
+
+    # BUILD's unchanged boundary: the confirm arms (the UI renders it as the
+    # choice question) and approves execute.
+    assert_receive {:confirm, ref, %{id: "call_w", name: "write_file"}}, 2_000
+    send(agent, {:confirm_decision, ref, :approved})
+
+    assert_receive {:tool_result, %{id: "call_w", ok: true}}, 2_000
+    assert sandbox_exists?(ctx, "kept.txt")
   end
 
   @tag :tmp_dir
@@ -1633,10 +1925,11 @@ defmodule DashFloat.AgentTest do
   end
 
   @tag :tmp_dir
-  test "a vetter killed mid-check degrades to confirm — the DOWN fail-safe", ctx do
+  test "a vetter killed mid-check auto-rejects — the DOWN fail-safe, never a prompt", ctx do
     server =
       start_server([
-        call_tool_episode("call_kd", "execute_command", %{"command" => "touch downed.txt"})
+        call_tool_episode("call_kd", "execute_command", %{"command" => "touch downed.txt"}),
+        final_episode("done")
       ])
 
     {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParked)
@@ -1647,15 +1940,17 @@ defmodule DashFloat.AgentTest do
     |> vetting_pid()
     |> Process.exit(:kill)
 
-    assert_receive {:entry, :system, "[safety check unavailable — confirming]"}, 2_000
-    assert_receive {:confirm, ref, %{id: "call_kd"}}, 2_000
-    refute sandbox_exists?(ctx, "downed.txt")
+    # A death the body could not report resolves as a failed check (ADR 0012)
+    # — and a failed check rejects under the never-ask contract (ADR 0028).
+    assert_receive {:entry, :system, "[auto: rejected execute_command — " <> _}, 2_000
 
-    # The armed confirm still completes the batch normally.
-    send(agent, {:confirm_decision, ref, :approved})
-    assert_receive {:tool_result, %{id: "call_kd", ok: true}}, 2_000
-    assert sandbox_exists?(ctx, "downed.txt")
+    assert_receive {:tool_result, %{id: "call_kd", ok: false, status: "auto-rejected" <> _}},
+                   2_000
+
     assert_receive {:phase, :idle}, 2_000
+
+    refute sandbox_exists?(ctx, "downed.txt")
+    refute_received {:confirm, _ref, _preview}
   end
 
   @tag :tmp_dir
@@ -1712,6 +2007,34 @@ defmodule DashFloat.AgentTest do
     assert Jason.decode!(tool_result_of(second_body, "call_pl")["content"]) ==
              %{"ok" => false, "blocked" => "plan"}
 
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "auto→build mid-check: an ask verdict confirms with the needs-confirmation entry",
+       ctx do
+    server =
+      start_server([
+        call_tool_episode("call_ba", "execute_command", %{"command" => "echo late"}),
+        final_episode("settled")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParkedAsk)
+    send(agent, {:prompt, self(), "go", []})
+    assert_receive {:phase, :checking}, 2_000
+
+    vet = vetting_pid(agent)
+    send(agent, {:set_mode, self(), :build})
+    assert_receive {:mode, :build}, 2_000
+    send(vet, :release)
+
+    # Under BUILD the ask verdict arms the confirm with its truthful entry
+    # — the one arm a live :vet gate can no longer reach (ADR 0028).
+    assert_receive {:entry, :system, "[safety check: needs confirmation]"}, 2_000
+    assert_receive {:confirm, ref, %{id: "call_ba"}}, 2_000
+
+    send(agent, {:confirm_decision, ref, :rejected})
+    assert_receive {:tool_result, %{id: "call_ba", ok: false, status: "rejected"}}, 2_000
     assert_receive {:phase, :idle}, 2_000
   end
 
@@ -4572,13 +4895,18 @@ defmodule DashFloat.AgentTest do
     File.write!(image, <<1, 2, 3>>)
 
     server = start_server([final_episode()])
-    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    # A nicknamed model names the nickname in the refusal (ADR 0018 §4).
+    {:ok, base_provider} = provider(server)
+    nicknamed_provider = %{base_provider | nickname: "flashy"}
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, provider: {:ok, nicknamed_provider})
 
     send(agent, {:prompt, self(), "hi", [image]})
     refute_receive {:sse_request, _, _, _, _}, 200
 
     assert_receive {:entry, :system,
-                    "[images: model test-model does not accept images — attach refused]"},
+                    "[images: model flashy does not accept images — attach refused]"},
                    1_000
 
     assert_receive {:phase, :idle}, 1_000

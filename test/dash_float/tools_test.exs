@@ -137,6 +137,44 @@ defmodule DashFloat.ToolsTest do
                      "required" => []
                    }
                  }
+               },
+               %{
+                 "type" => "function",
+                 "function" => %{
+                   "name" => "question",
+                   "description" =>
+                     "Ask the user a direct question and wait for their answer. The question renders as a choice list in the input field: the user picks with arrows and Enter (space toggles answers when multiple is true) or dismisses with Esc, which answers cancelled. Use it whenever a decision or preference belongs to the user — never guess when you can ask.",
+                   "parameters" => %{
+                     "type" => "object",
+                     "properties" => %{
+                       "question" => %{
+                         "type" => "string",
+                         "description" => "The question to show the user.",
+                         "minLength" => 1
+                       },
+                       "options" => %{
+                         "type" => "array",
+                         "description" =>
+                           "Answer options (1-10): objects with a nonempty label and an optional description.",
+                         "items" => %{
+                           "type" => "object",
+                           "properties" => %{
+                             "label" => %{"type" => "string", "minLength" => 1},
+                             "description" => %{"type" => "string"}
+                           },
+                           "required" => ["label"]
+                         }
+                       },
+                       "multiple" => %{
+                         "type" => "boolean",
+                         "description" =>
+                           "Allow multiple answers (the user toggles with space). Default false.",
+                         "default" => false
+                       }
+                     },
+                     "required" => ["question", "options"]
+                   }
+                 }
                }
              ]
     end
@@ -145,7 +183,7 @@ defmodule DashFloat.ToolsTest do
       assert {:ok, _encoded} = Jason.encode(Tools.schema())
     end
 
-    test "an explicit nil context is the same five-tool list" do
+    test "an explicit nil context is the same six-tool list" do
       assert Tools.schema(nil) == Tools.schema()
     end
 
@@ -163,6 +201,7 @@ defmodule DashFloat.ToolsTest do
                "edit_file",
                "execute_command",
                "list_directory",
+               "question",
                "web_search"
              ]
 
@@ -195,6 +234,58 @@ defmodule DashFloat.ToolsTest do
     test "read_file fills offset and limit defaults" do
       assert Tools.validate("read_file", %{"path" => "lib/a.ex"}) ==
                {:ok, %{"path" => "lib/a.ex", "offset" => 1, "limit" => 2_000}}
+    end
+
+    # The question tool (#134, ADR 0028): descriptions optional everywhere,
+    # options normalized to exactly label+description, multiple defaults
+    # false, and the count bounded (the choice box's height).
+    test "question normalizes options and defaults multiple to false" do
+      assert Tools.validate("question", %{
+               "question" => "Which?",
+               "options" => [%{"label" => "A", "description" => "x"}, %{"label" => "B"}]
+             }) ==
+               {:ok,
+                %{
+                  "question" => "Which?",
+                  "options" => [
+                    %{"label" => "A", "description" => "x"},
+                    %{"label" => "B", "description" => nil}
+                  ],
+                  "multiple" => false
+                }}
+
+      assert Tools.validate("question", %{
+               "question" => "Q",
+               "options" => [%{"label" => "A"}],
+               "multiple" => true
+             }) ==
+               {:ok,
+                %{
+                  "question" => "Q",
+                  "options" => [%{"label" => "A", "description" => nil}],
+                  "multiple" => true
+                }}
+    end
+
+    test "question rejects empty options, too many options, and bad shapes" do
+      bad = [
+        %{"question" => "Q", "options" => []},
+        %{
+          "question" => "Q",
+          "options" => [%{"label" => "A"} | List.duplicate(%{"label" => "x"}, 10)]
+        },
+        %{"question" => "Q", "options" => [%{"label" => ""}]},
+        %{"question" => "Q", "options" => [%{"label" => "A", "description" => 5}]},
+        %{"question" => "Q", "options" => [%{"description" => "no label"}]},
+        %{"question" => "Q", "options" => "not a list"},
+        %{"question" => "Q", "options" => [%{"label" => "A"}], "multiple" => "yes"},
+        %{"question" => "", "options" => [%{"label" => "A"}]}
+      ]
+
+      for args <- bad do
+        assert {:error, message} = Tools.validate("question", args)
+        assert is_binary(message)
+      end
     end
 
     test "read_file keeps explicit valid values" do

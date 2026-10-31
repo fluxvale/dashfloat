@@ -938,6 +938,20 @@ defmodule DashFloat.TUI.StateTest do
       assert {^state, {:confirm, :rejected}} = State.handle_key(state, "esc", [])
     end
 
+    test "arrows move the choice; Down+Enter answers Reject (ADR 0028)" do
+      {state, _ref} = confirming()
+
+      {moved, nil} = State.handle_key(state, "down", [])
+      assert moved.choice.selected == 1
+
+      assert {^moved, {:confirm, :rejected}} = State.handle_key(moved, "enter", [])
+
+      # Up wraps back to Approve.
+      {wrapped, nil} = State.handle_key(moved, "up", [])
+      assert wrapped.choice.selected == 0
+      assert {^wrapped, {:confirm, :approved}} = State.handle_key(wrapped, "enter", [])
+    end
+
     test "quit keys still quit mid-decision" do
       {state, _ref} = confirming()
       assert {_state, :quit} = State.handle_key(state, "q", ["ctrl"])
@@ -953,8 +967,9 @@ defmodule DashFloat.TUI.StateTest do
             {"x", []},
             {"enter", ["shift"]},
             {"enter", ["alt"]},
-            {"up", []},
-            {"page_up", []}
+            {"page_up", []},
+            # Space on a single-select approval is a no-op move, not an edit.
+            {" ", []}
           ] do
         {^state, nil} = State.handle_key(state, code, mods)
       end
@@ -962,11 +977,28 @@ defmodule DashFloat.TUI.StateTest do
       assert State.input_text(state) == ""
     end
 
-    test "confirm_decided clears the confirm; the phase waits for the agent" do
+    test "the in-flight draft is preserved under the replacement and restored after" do
+      ref = make_ref()
+      draft = %{new_state() | input: ExRatatui.textarea_new()}
+      ExRatatui.textarea_set_value(draft.input, "keep me")
+
+      armed = State.stream_message(draft, {:confirm, ref, confirm_request(["+ x"])})
+      assert armed.choice != nil
+      assert State.input_text(armed) == "keep me"
+
+      {answered, {:confirm, :approved}} = State.handle_key(armed, "enter", [])
+      decided = State.confirm_decided(answered)
+
+      assert decided.choice == nil
+      assert State.input_text(decided) == "keep me"
+    end
+
+    test "confirm_decided clears the confirm and the choice; the phase waits for the agent" do
       {state, _ref} = confirming()
       decided = State.confirm_decided(state)
 
       assert decided.confirm == nil
+      assert decided.choice == nil
       assert decided.phase == :confirming
 
       # After the decision the keys route normally again (no swallowing,
@@ -976,6 +1008,95 @@ defmodule DashFloat.TUI.StateTest do
 
       {typed, nil} = State.handle_key(decided, "x", [])
       assert State.input_text(typed) == "x"
+    end
+  end
+
+  describe "handle_key/3 — the model's question (ADR 0028)" do
+    defp asking(opts \\ []) do
+      State.stream_message(new_state(), {:question, make_ref(), question_msg(opts)})
+    end
+
+    defp question_msg(opts \\ []) do
+      %{
+        question: Keyword.get(opts, :question, "Which database?"),
+        options:
+          Keyword.get(opts, :options, [
+            %{"label" => "Postgres", "description" => "the sturdy default"},
+            %{"label" => "SQLite"},
+            %{"label" => "MySQL"}
+          ]),
+        multiple: Keyword.get(opts, :multiple, false)
+      }
+    end
+
+    test "arming replaces the composer: choice up, phase :asking, ghost reaped" do
+      state = asking()
+
+      assert state.choice.kind == :ask
+      assert state.choice.question == "Which database?"
+      assert state.phase == :asking
+      assert Enum.map(state.choice.options, & &1.label) == ["Postgres", "SQLite", "MySQL"]
+      # The ghost (#91 interplay, ADR 0028): dismissed and reaped while the
+      # choice owns the input surface.
+      assert state.suggestion == nil
+      assert state.suggest_reap == true
+    end
+
+    test "arrows move, Enter answers with the selected label, draft preserved" do
+      draft = new_state()
+      ExRatatui.textarea_set_value(draft.input, "half-typed")
+
+      armed = State.stream_message(draft, {:question, make_ref(), question_msg()})
+      # Question + blank + (Postgres 2: description) + SQLite + MySQL +
+      # blank + hint = 8 rows.
+      assert State.input_line_count(armed) == 8
+      assert State.input_text(armed) == "half-typed"
+
+      {moved_state, nil} = State.handle_key(armed, "down", [])
+      assert moved_state.choice.selected == 1
+
+      assert {^moved_state, {:question_answer, {:answered, ["SQLite"]}}} =
+               State.handle_key(moved_state, "enter", [])
+
+      decided = State.question_decided(moved_state)
+      assert decided.choice == nil
+      assert State.input_text(decided) == "half-typed"
+    end
+
+    test "multi: space toggles, Enter answers every checked label in order" do
+      state = asking(multiple: true)
+
+      {one, nil} = State.handle_key(state, " ", [])
+      assert MapSet.to_list(one.choice.checked) == [0]
+
+      {moved, nil} = State.handle_key(one, "down", [])
+      {two, nil} = State.handle_key(moved, " ", [])
+
+      assert {^two, {:question_answer, {:answered, ["Postgres", "SQLite"]}}} =
+               State.handle_key(two, "enter", [])
+    end
+
+    test "Esc dismisses — an explicit answer, never a silent drop" do
+      state = asking()
+
+      assert {^state, {:question_answer, :dismissed}} = State.handle_key(state, "esc", [])
+    end
+
+    test "every other key is swallowed — mode cycle, palette, typing" do
+      state = asking()
+
+      for {code, mods} <- [{"tab", ["shift"]}, {"p", ["ctrl"]}, {"x", []}, {"page_up", []}] do
+        {^state, nil} = State.handle_key(state, code, mods)
+      end
+
+      assert State.input_text(state) == ""
+      assert state.mode == :build
+      assert state.palette == nil
+    end
+
+    test "any phase message supersedes the ask — the composer restores" do
+      superseded = State.stream_message(asking(), {:phase, :streaming})
+      assert superseded.choice == nil
     end
   end
 
@@ -2026,12 +2147,15 @@ defmodule DashFloat.TUI.StateTest do
 
       assert state.phase == :confirming
 
-      # The activity row is up while confirming: the viewport is 12 rows
-      # (ADR 0015's footer took one from the log, its #129 gap two more).
-      bottom = State.effective_scroll(state, 12)
+      # The activity row is up while confirming AND the choice replaces the
+      # composer (ADR 0028): the approve widget takes its full 6 rows (the
+      # choice's clamp is the area minus chrome, not the draft's third) —
+      # 8 bordered rows against the empty draft's 3 — so the viewport is 7
+      # rows (12 minus the activity row's minus the box's growth).
+      bottom = State.effective_scroll(state, 7)
       wheeled = State.wheel_scroll(state, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 12) == bottom - 3
+      assert State.effective_scroll(wheeled, 7) == bottom - 3
     end
 
     test "new content does not move an unfollowed view, but clamping still holds" do

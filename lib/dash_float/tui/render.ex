@@ -151,7 +151,25 @@ defmodule DashFloat.TUI.Render do
   defp name_with_summary(name, ""), do: name
   defp name_with_summary(name, summary), do: name <> " " <> summary
 
-  defp args_summary(args), do: Map.get(args, "path") || Map.get(args, "command") || ""
+  # The question tool's row summary (#134, ADR 0028): the question itself,
+  # one flat line capped at 60 graphemes — the row's payload is the question.
+  @question_summary_cap 60
+
+  defp args_summary(args), do: path_or_command(args) || question_summary(args)
+
+  defp path_or_command(args), do: Map.get(args, "path") || Map.get(args, "command")
+
+  defp question_summary(%{"question" => question}) when is_binary(question) do
+    flat = String.replace(question, "\n", " ")
+
+    if String.length(flat) <= @question_summary_cap do
+      flat
+    else
+      String.slice(flat, 0, @question_summary_cap) <> "…"
+    end
+  end
+
+  defp question_summary(_args), do: ""
 
   defp output_rows(output) do
     output

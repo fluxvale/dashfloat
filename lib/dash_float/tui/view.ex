@@ -8,6 +8,7 @@ defmodule DashFloat.TUI.View do
 
   alias DashFloat.Config.Onboarding
   alias DashFloat.Mode
+  alias DashFloat.TUI.Choice
   alias DashFloat.TUI.Palette
   alias DashFloat.TUI.Selection
   alias DashFloat.TUI.State
@@ -28,7 +29,8 @@ defmodule DashFloat.TUI.View do
     streaming: {"Streaming", :status_busy},
     executing_tool: {"Running tool", :status_tool},
     checking: {"Checking", :status_tool},
-    confirming: {"Confirm", :status_tool}
+    confirming: {"Confirm", :status_tool},
+    asking: {"Asking", :status_tool}
   }
 
   # The mode span's role (ADR 0016 §8) — display truth, kept local to the
@@ -69,13 +71,21 @@ defmodule DashFloat.TUI.View do
   Splits `width` x `height` into status (1 row), log (rest), the breathing
   gap (`@gap` blank rows — issue #129), activity (1 row while an overlay
   exists — an active phase, the exit prompt, or the open attach prompt —
-  else 0), input (`2 + input_lines` rows, clamped to a third of the frame),
-  and the permanent stats footer (1 row, ADR 0015) — the whole chrome inset
-  by two cells per side. The gap sits between the transcript and the
-  composer CLUSTER (activity + input + footer are one unit); nothing
-  renders into it.
+  else 0), input (`2 + input_lines` rows, clamped — see below), and the
+  permanent stats footer (1 row, ADR 0015) — the whole chrome inset by two
+  cells per side. The gap sits between the transcript and the composer
+  CLUSTER (activity + input + footer are one unit); nothing renders into
+  it.
+
+  `choice?` widens the input clamp for a pending choice widget (ADR 0028):
+  the composer's growth is capped at a third of the frame (a runaway
+  DRAFT must not eat the screen), but the choice that REPLACES it is
+  bounded by construction (≤ 10 options, ≤ 24 rows) and is the only
+  surface showing the options — it may claim up to the area minus
+  status/footer/activity/a last log row, and the widget scrolls inside
+  whatever remains (`choice_scroll/2`) when even that overflows.
   """
-  @spec regions({integer(), integer()}, integer(), boolean()) :: %{
+  @spec regions({integer(), integer()}, integer(), boolean(), boolean()) :: %{
           status: Rect.t(),
           log: Rect.t(),
           gap: Rect.t(),
@@ -83,9 +93,9 @@ defmodule DashFloat.TUI.View do
           input: Rect.t(),
           footer: Rect.t()
         }
-  def regions({width, height}, input_lines, active?)
+  def regions({width, height}, input_lines, active?, choice? \\ false)
       when is_integer(width) and is_integer(height) and is_integer(input_lines) and
-             is_boolean(active?) do
+             is_boolean(active?) and is_boolean(choice?) do
     area = inset_area(width, height)
 
     [status, log, gap, activity, input, footer] =
@@ -94,7 +104,7 @@ defmodule DashFloat.TUI.View do
         {:min, 0},
         {:length, gap_height(area.height, active?)},
         {:length, if(active?, do: 1, else: 0)},
-        {:length, input_height(input_lines, area.height)},
+        {:length, input_height(input_lines, area.height, choice?)},
         {:length, 1}
       ])
 
@@ -130,14 +140,19 @@ defmodule DashFloat.TUI.View do
     }
   end
 
-  @doc "Input region height: borders plus draft lines, capped at a third of the frame."
-  @spec input_height(integer(), integer()) :: pos_integer()
-  def input_height(input_lines, height) do
-    max_third = max(div(height, 3), 3)
+  @doc """
+  Input region height: borders plus draft lines, capped at a third of the
+  frame. A pending choice (ADR 0028) may claim the frame minus
+  status/footer/activity/one log row instead — bounded by construction,
+  and the only surface showing the options.
+  """
+  @spec input_height(integer(), integer(), boolean()) :: pos_integer()
+  def input_height(input_lines, height, choice? \\ false) do
+    cap = if choice?, do: max(height - 4, 3), else: max(div(height, 3), 3)
 
     input_lines
     |> Kernel.+(2)
-    |> min(max_third)
+    |> min(cap)
     |> max(3)
   end
 
@@ -158,14 +173,21 @@ defmodule DashFloat.TUI.View do
   def render(%State{} = state, %ExRatatui.Frame{width: width, height: height}) do
     # The transient row exists for an active phase OR an armed exit guard
     # (issue #28; ADR 0006 amendment) — even while idle.
-    regions = regions({width, height}, State.input_line_count(state), State.overlay?(state))
+    regions =
+      regions(
+        {width, height},
+        State.input_line_count(state),
+        State.overlay?(state),
+        state.choice != nil
+      )
+
     area = inset_area(width, height)
 
     [
       {status_widget(state, regions.log.height), regions.status},
       {log_widget(state, regions.log.height), regions.log},
       {activity_widget(state), regions.activity},
-      {input_widget(state), regions.input},
+      {input_widget(state, regions.input), regions.input},
       {footer_widget(state, regions.footer.width), regions.footer}
     ] ++ palette_widgets(state, area) ++ title_dialog_widgets(state, area)
   end
@@ -820,18 +842,44 @@ defmodule DashFloat.TUI.View do
   end
 
   defp activity_label(%{phase: :confirming}), do: "Approve this change?"
+  defp activity_label(%{phase: :asking}), do: "Waiting for your answer…"
   defp activity_label(%{phase: :executing_tool}), do: "Running tool…"
   defp activity_label(%{phase: :checking}), do: "Checking…"
   defp activity_label(%{stats: %{tokens: 0}}), do: "Thinking…"
   defp activity_label(_state), do: "Streaming…"
 
-  # The confirming decision replaces the interrupt hint (Esc rejects there).
+  # The confirming decision replaces the interrupt hint (Esc rejects there);
+  # so does a pending question (Esc dismisses — an explicit cancelled answer,
+  # never silent, ADR 0028).
   defp activity_hint(%{phase: :confirming}), do: "  ⏎ approve · esc reject"
+  defp activity_hint(%{phase: :asking}), do: "  esc dismiss"
   defp activity_hint(_state), do: "  esc interrupt"
 
   ## Input
 
-  defp input_widget(state) do
+  # A pending choice (ADR 0028) temporarily REPLACES the composer: the same
+  # rounded box the textarea lives in carries the question, the options, and
+  # the answer hints instead. The textarea's own state is untouched
+  # underneath — the draft is preserved by construction and restores the
+  # moment the choice resolves. A widget taller than the region SCROLLS to
+  # keep the selected option visible (hostile review P0-1: hidden options
+  # must never stay answerable).
+  defp input_widget(%State{choice: %Choice{} = choice} = _state, rect) do
+    interior = max(rect.height - 2, 1)
+
+    %Paragraph{
+      text: choice_lines(choice),
+      block: %Block{
+        title: Span.new("❯ ", style: Theme.style(:accent)),
+        borders: [:all],
+        border_type: :rounded,
+        border_style: Theme.style(:dim)
+      },
+      scroll: {choice_scroll(choice, interior), 0}
+    }
+  end
+
+  defp input_widget(state, _rect) do
     %Textarea{
       state: state.input,
       block: %Block{
@@ -875,6 +923,81 @@ defmodule DashFloat.TUI.View do
       |> Enum.map_join(" ", fn {_attachment, n} -> "[Image ##{n}]" end)
 
     Span.new("❯ " <> chips, style: Theme.style(:accent))
+  end
+
+  # The choice widget's rows (ADR 0028), matching `Choice.height/1` exactly:
+  # the question, a blank, one row per option (two when it carries a
+  # description), a blank, and the hint row. Long labels and descriptions
+  # clip at the box's width — the height arithmetic stays count-based (the
+  # wizard's option-list vocabulary: ❯ selected, dim otherwise).
+  defp choice_lines(%Choice{} = choice) do
+    [
+      Line.new([Span.new(choice.question, style: Theme.style(:assistant))]),
+      Line.new([Span.new("")])
+    ] ++
+      option_rows(choice) ++
+      [Line.new([Span.new("")], style: Theme.style(:dim)), choice_hint(choice)]
+  end
+
+  defp option_rows(%Choice{} = choice) do
+    choice.options
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {option, index} -> option_row(choice, option, index) end)
+  end
+
+  defp option_row(%Choice{} = choice, option, index) do
+    marker = if index == choice.selected, do: "❯ ", else: "  "
+    box = if index in choice.checked, do: "[x] ", else: "[ ] "
+
+    label =
+      if choice.multi?,
+        do: marker <> box <> option.label,
+        else: marker <> option.label
+
+    row = Line.new([Span.new(label, style: option_style(choice, index))])
+
+    case option.description do
+      nil ->
+        [row]
+
+      description ->
+        [row, Line.new([Span.new("    " <> description, style: Theme.style(:dim))])]
+    end
+  end
+
+  defp option_style(%Choice{selected: selected}, index)
+       when index == selected,
+       do: Theme.style(:accent)
+
+  defp option_style(_choice, _index), do: Theme.style(:dim)
+
+  defp choice_hint(%Choice{kind: :approve}),
+    do: Line.new([Span.new("↑↓ move · ⏎ answer · esc reject", style: Theme.style(:hint))])
+
+  defp choice_hint(%Choice{multi?: true}),
+    do:
+      Line.new([
+        Span.new("↑↓ move · space toggle · ⏎ answer · esc dismiss", style: Theme.style(:hint))
+      ])
+
+  defp choice_hint(%Choice{}),
+    do: Line.new([Span.new("↑↓ move · ⏎ answer · esc dismiss", style: Theme.style(:hint))])
+
+  # The scroll offset that keeps the SELECTED option on screen when the
+  # widget overflows its (already widened) region: scroll down just enough
+  # to carry the selection with two rows of tail (the blank and, when it
+  # fits, the hint), never past the last row, never negative. The tail
+  # budget floors at zero on degenerate interiors (< 3 rows) so the aim
+  # never over-scrolls past the selection itself.
+  defp choice_scroll(%Choice{} = choice, interior) do
+    total = Choice.height(choice)
+
+    if total <= interior do
+      0
+    else
+      aim = Choice.selected_row(choice) - max(interior - 3, 0)
+      max(0, min(aim, total - interior))
+    end
   end
 
   # The composer's cursor artifact (ADR 0015 §1, amended by issue #104):
