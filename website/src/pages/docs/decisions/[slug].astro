@@ -8,7 +8,7 @@ export function getStaticPaths() {
 
 const { slug } = Astro.params;
 const adr = listAdrs().find((a) => a.slug === slug)!;
-const html = renderMarkdown(readAdr(slug!) ?? "");
+const html = renderMarkdown(readAdr(slug!));
 ---
 
 <Base
