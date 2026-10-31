@@ -52,6 +52,11 @@ defmodule DashFloat.TUI.View do
   # derive from, so they can never disagree.
   @session_picker_pct 85
 
+  # The model/profile pickers' width in percent of the inset area (#152):
+  # popup width and row-cap budget derive from the same constant, the
+  # @session_picker_pct discipline.
+  @picker_pct 50
+
   # The breathing gap between the transcript and the composer cluster
   # (issue #129; ADR 0015's 2026-10-31 amendment): two blank rows — the
   # margin language's own rhythm — between the log's bottom and whatever
@@ -865,9 +870,10 @@ defmodule DashFloat.TUI.View do
   # must never stay answerable).
   defp input_widget(%State{choice: %Choice{} = choice} = _state, rect) do
     interior = max(rect.height - 2, 1)
+    inner = max(rect.width - 2, 1)
 
     %Paragraph{
-      text: choice_lines(choice),
+      text: choice_lines(choice, inner),
       block: %Block{
         title: Span.new("❯ ", style: Theme.style(:accent)),
         borders: [:all],
@@ -926,32 +932,38 @@ defmodule DashFloat.TUI.View do
 
   # The choice widget's rows (ADR 0028), matching `Choice.height/1` exactly:
   # the question, a blank, one row per option (two when it carries a
-  # description), a blank, and the hint row. Long labels and descriptions
-  # clip at the box's width — the height arithmetic stays count-based (the
-  # wizard's option-list vocabulary: ❯ selected, dim otherwise).
-  defp choice_lines(%Choice{} = choice) do
+  # description), a blank, and the hint row. Every row caps at the box's
+  # render-time inner width (#152, the class sweep's fourth surface: option
+  # labels and descriptions are model-authored and unbounded, and the
+  # ADR 0028 clip silently ate them) — `Wrap.fit_head` by cells, one `…`
+  # cut, the marker chrome surviving, so the height arithmetic stays
+  # count-based AND the payload is honestly marked, never invisibly
+  # clipped (the wizard's option-list vocabulary: ❯ selected, dim
+  # otherwise).
+  defp choice_lines(%Choice{} = choice, inner) do
     [
-      Line.new([Span.new(choice.question, style: Theme.style(:assistant))]),
+      Line.new([Span.new(Wrap.fit_head(choice.question, inner), style: Theme.style(:assistant))]),
       Line.new([Span.new("")])
     ] ++
-      option_rows(choice) ++
+      option_rows(choice, inner) ++
       [Line.new([Span.new("")], style: Theme.style(:dim)), choice_hint(choice)]
   end
 
-  defp option_rows(%Choice{} = choice) do
+  defp option_rows(%Choice{} = choice, inner) do
     choice.options
     |> Enum.with_index()
-    |> Enum.flat_map(fn {option, index} -> option_row(choice, option, index) end)
+    |> Enum.flat_map(fn {option, index} -> option_row(choice, option, index, inner) end)
   end
 
-  defp option_row(%Choice{} = choice, option, index) do
+  # The label is the row's payload; the marker (`❯ ` / the checkbox) is
+  # chrome and survives the cut — the budget is the inner width minus the
+  # marker's own cells.
+  defp option_row(%Choice{} = choice, option, index, inner) do
     marker = if index == choice.selected, do: "❯ ", else: "  "
     box = if index in choice.checked, do: "[x] ", else: "[ ] "
 
-    label =
-      if choice.multi?,
-        do: marker <> box <> option.label,
-        else: marker <> option.label
+    prefix = if choice.multi?, do: marker <> box, else: marker
+    label = prefix <> Wrap.fit_head(option.label, max(inner - Wrap.width(prefix), 1))
 
     row = Line.new([Span.new(label, style: option_style(choice, index))])
 
@@ -960,8 +972,14 @@ defmodule DashFloat.TUI.View do
         [row]
 
       description ->
-        [row, Line.new([Span.new("    " <> description, style: Theme.style(:dim))])]
+        [row, description_line(description, inner)]
     end
+  end
+
+  defp description_line(description, inner) do
+    indent = "    "
+    shown = indent <> Wrap.fit_head(description, max(inner - Wrap.width(indent), 1))
+    Line.new([Span.new(shown, style: Theme.style(:dim))])
   end
 
   defp option_style(%Choice{selected: selected}, index)
@@ -1051,6 +1069,21 @@ defmodule DashFloat.TUI.View do
 
   # "id (context detail) · current" — the marker only on the provider's
   # current model, the detail only when the catalog carries a context.
+  # The whole label caps at the popup's render-time inner width (#152,
+  # the #146 class's last picker): the id is user-controlled on custom
+  # OpenAI-compatible endpoints, so no fixed shrink can promise fit. Drop
+  # order when the budget is tight: the `· current` marker, then the
+  # context detail — the rightmost scaffolding — lose cells first; the id
+  # is the row's payload and the last to lose cells, and when the id
+  # ALONE overflows one `…` cut lands in its tail (the head, where model
+  # ids are distinguished, survives). The #146 mechanism: one plain
+  # string in a clipping List, one cut, no span ladder. The inner width
+  # is measured against the popup the renderer actually draws (50% of
+  # the inset area, truncating division, minus borders — 36 cells at 80
+  # cols). The wider-percent alternative (the session picker's 85%) was
+  # weighed in the issue and rejected: when the row overflows it is the
+  # scaffolding that drops and the id rides whole, so the drop order,
+  # not the width, carries the payload — the fit makes any width safe.
   defp render_palette(
          %State{
            palette: %Palette{kind: :models, items: entries, selected: selected},
@@ -1058,15 +1091,33 @@ defmodule DashFloat.TUI.View do
          },
          area
        ) do
-    items = Enum.map(entries, &model_item(&1.model, &1.context, config.model))
+    items =
+      Enum.map(
+        entries,
+        &Wrap.fit_head(
+          model_item(&1.model, &1.context, config.model),
+          picker_inner(area.width, @picker_pct)
+        )
+      )
+
     [picker("Models", items, selected, area)]
   end
 
+  # The profile picker rides the same cap at the same inner width (#152):
+  # the name IS the row's whole payload — no scaffolding exists to drop
+  # first, one `…` cut when the name alone overflows.
   defp render_palette(
          %State{palette: %Palette{kind: :profiles, items: names, selected: selected}},
          area
        ) do
-    [picker("Profiles", names, selected, area)]
+    [
+      picker(
+        "Profiles",
+        Enum.map(names, &Wrap.fit_head(&1, picker_inner(area.width, @picker_pct))),
+        selected,
+        area
+      )
+    ]
   end
 
   # The session picker (issue #128): rows run long (preview · time ·
@@ -1087,14 +1138,23 @@ defmodule DashFloat.TUI.View do
          %State{palette: %Palette{kind: :sessions, items: rows, selected: selected}},
          area
        ) do
-    inner = max(div(area.width * @session_picker_pct, 100) - 2, 1)
-
     [
-      picker("Sessions", Enum.map(rows, &Wrap.fit_head(&1.label, inner)), selected, area,
+      picker(
+        "Sessions",
+        Enum.map(rows, &Wrap.fit_head(&1.label, picker_inner(area.width, @session_picker_pct))),
+        selected,
+        area,
         width: @session_picker_pct
       )
     ]
   end
+
+  # A picker popup's inner width (#146, shared by #152): the percent the
+  # Rust renderer actually draws the popup at (truncating division), minus
+  # the List block's borders, floored at 1 for degenerate frames. The
+  # popup's width and the row cap's budget derive from the one formula, so
+  # they can never disagree.
+  defp picker_inner(width, pct), do: max(div(width * pct, 100) - 2, 1)
 
   # The detail rides the status bar's own humanize ladder (999 reads "999",
   # not "0k"); the marker only on the provider's current model.
@@ -1106,8 +1166,8 @@ defmodule DashFloat.TUI.View do
   end
 
   # The shared picker popup (ADR 0020): the model/profile pickers at the
-  # historical 50% width; `width:` overrides for wider rows (the session
-  # picker, issue #128).
+  # historical 50% width — both capped at that popup's inner width (#152);
+  # `width:` overrides for wider rows (the session picker, issue #128).
   defp picker(title, items, selected, area, opts \\ []) do
     {%Popup{
        content: %ExRatatui.Widgets.List{
@@ -1122,7 +1182,7 @@ defmodule DashFloat.TUI.View do
            border_style: Theme.style(:dim)
          }
        },
-       percent_width: opts[:width] || 50,
+       percent_width: opts[:width] || @picker_pct,
        percent_height: 40
      }, area}
   end

@@ -131,7 +131,10 @@ The palette renders last (on top) in `View.render/2`'s widget list. Command
 lists (autocomplete and Ctrl+P alike — "the same list") go through
 `SlashCommands.render_autocomplete/2`; the model and profile pickers build
 `Popup` + `List` with custom labels (`· current` marker, context detail).
-Styles come from `Theme.style/1` roles only (ADR 0006).
+Styles come from `Theme.style/1` roles only (ADR 0006). The custom labels
+cap at the popup's render-time inner width, `…` marking the cut
+([ADR 0015](0015-input-surface-cursor-stats-ghost.md)'s #152 amendment —
+the #146 width class).
 
 ## Alternatives considered
 
