@@ -463,3 +463,31 @@ and the region's height flows from the widget's rows, not the draft's.
 - **Attachment chips do not render while replaced** (they are the
   composer title's chrome); the pending set is untouched underneath and
   reappears with the restored composer.
+
+## Amendment (2026-11-01, issue #139): the width discipline is measured by the renderer's classifier
+
+**Status:** Accepted. The #130 amendment's width discipline — which groups
+drop, in what order — is unchanged; what changes is the ruler. The footer
+originally measured candidate rows with a private approximation
+(`String.length` plus one cell per astral-plane grapheme), which
+undercounts BMP-wide glyphs: every Han/Hangul/fullwidth grapheme counts
+one cell to the approximation and two to the terminal, so a footer
+carrying a CJK cwd or model name could believe a row fit that actually
+overflowed, clipping a span the ladder had promised whole (#139, recorded
+imprecision from #137's audit).
+
+- **One classifier for both surfaces.** The footer now measures span
+  widths with the transcript renderer's own classifier — `Wrap.width`
+  (the module pinned cell-by-cell against `ex_ratatui`'s unicode-width in
+  `wrap_test.exs`) — so the transcript and the footer can never disagree
+  about how many cells a string occupies. No second width classifier
+  exists in the TUI; the footer's approximation is deleted, not kept
+  alongside. (The attach row's and the rename dialog's naive
+  `String.length` accounting is the same bug class and survives this
+  amendment — filed as #144, not settled here.)
+- **The drop ladder's arithmetic is cell-accurate for wide glyphs.** The
+  #130 rung order is untouched; only its measurements improve. At 80 cols
+  a CJK cwd drops exactly when its measured width (two cells per Han
+  grapheme) overflows the rect — never one cell late, which is precisely
+  the clip the approximation could ship — and the never-drop rate lands
+  whole behind it.

@@ -34,6 +34,10 @@ when its tag is cut.
 - Dependency bump: `ex_ratatui` 0.17.1 → 0.19.0 (`rustler_precompiled` rides to 0.10.1; OTP 29 now loads its own NIF-2.18 precompile instead of the 2.17 ABI build). Rendered output verified pixel-identical by frame-hash comparison of pty captures, and the idle cursor blink re-measured at its recorded 2.0 renders/s / ~50 B per frame.
 - The transcript snaps to its tail only when a message is sent (Enter — messages and commands alike); typing, pasting, drops, chip pops, and completions leave the view exactly where the reader parked it, and a reply arriving while scrolled up never yanks it. Reverses #110's typing snap, with the owner's reasoning recorded in ADR 0006 (#131).
 
+### Fixed
+
+- The stats footer measures every span's display width with the transcript renderer's own width classifier (`Wrap.width`) instead of a private grapheme-count approximation, so BMP-wide glyphs — a CJK cwd or model name — count two cells apiece: the drop ladder lands cell-accurately at every width, and a wide-glyph footer can no longer clip a span the math believed already fit (ADR 0015 amendment) (#139).
+
 ## [0.4.0] - 2026-10-31
 
 ### Added

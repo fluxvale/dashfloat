@@ -284,6 +284,13 @@ FONT_CANDIDATES_EMOJI = [
     "/usr/share/fonts/noto/NotoColorEmoji.ttf",
     "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
 ]
+# CJK coverage (BMP-wide Han/Hangul glyphs — issue #139's footer captures)
+# the mono fonts likewise lack: an outline font drawn at the cell's own
+# size, same rig-side fallback idea as the emoji one.
+FONT_CANDIDATES_CJK = [
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+]
 
 # A conventional dark-terminal palette; pyte names -> hex.
 PALETTE = {
@@ -383,8 +390,17 @@ def paint(draw, metrics, ch, px, py):
         draw.rectangle([px, py, px + cell_w, py + cell_h], fill=bg)
     if ch.data and ch.data != " ":
         emoji = emoji_font()
-        if emoji is not None and not glyph_covered(font, ch.data):
-            draw_emoji(draw, emoji, ch.data, px, py, cell_w, cell_h)
+        if not glyph_covered(font, ch.data):
+            # CJK first, but only when the CJK font actually covers the
+            # glyph (same .notdef probe as the primary font): the emoji
+            # strike stays the fallback for everything the outline fonts
+            # lack too — 📎 must keep its color font, never go tofu.
+            cjk = cjk_font(font.size)
+            if cjk is not None and glyph_covered(cjk, ch.data):
+                draw.text((px, py), ch.data, font=cjk,
+                          fill=fg if not ch.bold else _bold_fg(fg))
+            elif emoji is not None:
+                draw_emoji(draw, emoji, ch.data, px, py, cell_w, cell_h)
         else:
             draw.text((px, py), ch.data, font=font,
                       fill=fg if not ch.bold else _bold_fg(fg))
@@ -429,6 +445,25 @@ def emoji_font():
                     _EMOJI_FONT = None
                 break
     return _EMOJI_FONT
+
+
+_CJK_FONTS: dict[int, object] = {}
+
+
+def cjk_font(size):
+    """The first installed CJK outline font at `size` — memoized per size
+    (the .ttc is ~19 MB; reopening it per uncovered cell would crawl in a
+    GIF replay) — or None when no candidate exists or loads."""
+    if size not in _CJK_FONTS:
+        _CJK_FONTS[size] = None
+        for path in FONT_CANDIDATES_CJK:
+            if os.path.exists(path):
+                try:
+                    _CJK_FONTS[size] = ImageFont.truetype(path, size)
+                    break
+                except OSError:
+                    continue
+    return _CJK_FONTS[size]
 
 
 def draw_emoji(draw, font, glyph, px, py, cell_w, cell_h):
@@ -659,10 +694,13 @@ class MockHandler(BaseHTTPRequestHandler):
         pass  # silence — the mock never talks over the capture
 
     # The interaction-surface captures (issues #133/#134/#135): a FIFO of
-    # scripted episodes the _sse stream pops one per chat connection —
-    # ("tools", [(id, name, args_json), ...]) streams a tool-calling
-    # episode; ("text", "...") streams that prose. Empty: the stock reply.
-    # The vet's own fresh-context completion is detected by its
+    # scripted episodes — ("tools", [(id, name, args_json), ...]) a
+    # tool-calling episode, ("text", "...") that prose. DEAD, kept only so
+    # the episode-dependent scenarios still enqueue: nothing pops this
+    # queue (the consumer was lost in the #133–#135 era; #142 deleted its
+    # unused corpse and this note replaced the false claim), so those
+    # scenarios cannot regenerate — see issue #143 for the wire-or-drop
+    # decision. The vet's own fresh-context completion is detected by its
     # instruction and answered with VET_REPLY (issue #135's still).
     EPISODES: list = []
     VET_REPLY = '{"decision":"confirm","reason":"deletes files outside the project"}'
@@ -737,25 +775,9 @@ class MockHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(frame)}\n\n".encode())
             self.wfile.flush()
             time.sleep(0.13)
-        self._usage_and_done()
+        self._usage_and_done(req, reasoning_deltas)
 
-    def _stream_tool_calls(self, calls):
-        for index, (call_id, name, args_json) in enumerate(calls):
-            opening = {"choices": [{"index": 0, "delta": {"tool_calls": [{
-                "index": index, "id": call_id, "type": "function",
-                "function": {"name": name, "arguments": ""}}]}}]}
-            self.wfile.write(f"data: {json.dumps(opening)}\n\n".encode())
-            self.wfile.flush()
-            time.sleep(0.13)
-            fragment = {"choices": [{"index": 0, "delta": {"tool_calls": [{
-                "index": index,
-                "function": {"arguments": args_json}}]}}]}
-            self.wfile.write(f"data: {json.dumps(fragment)}\n\n".encode())
-            self.wfile.flush()
-            time.sleep(0.13)
-        self._usage_and_done()
-
-    def _usage_and_done(self):
+    def _usage_and_done(self, req, reasoning_deltas):
         # The usage frame mirrors what a real provider reports: the request's
         # own size in tokens (bytes/4 over the messages — the same heuristic
         # ADR 0022 §1 uses between frames), so the footer's tokens-used span
@@ -783,7 +805,8 @@ class App:
 
     def __init__(self, mix_args=("run", "--no-halt"), no_ghost=False,
                  context=524288, resume=None, images=False, cols=COLS,
-                 rows=ROWS, base_url=None, unlabeled=False, model="glm-5.3"):
+                 rows=ROWS, base_url=None, unlabeled=False, model="glm-5.3",
+                 nickname="Sol"):
         self.cols, self.rows = cols, rows
         self.sink = None  # callable(bytes) set during read loop
         self.screen = pyte.Screen(cols, rows)
@@ -844,7 +867,7 @@ class App:
                 "    providers: [{\n"
                 f"{label_field}"
                 f"      baseUrl: '{base}',\n"
-                f"      models: [{{ nickname: 'Sol', model: '{model}'"
+                f"      models: [{{ nickname: '{nickname}', model: '{model}'"
                 f"{context_field}{images_field} }}],\n"
                 "    }],\n"
                 "  }],\n"
@@ -2316,6 +2339,12 @@ def main():
     # footer's provider span before the still is written.
     ap.add_argument("--base-url", default=None,
                     help="override the scratch settings' provider baseUrl")
+    ap.add_argument("--model", default=None,
+                    help="override the scratch settings' model name (outranks "
+                         "the scenario's own choice, like --base-url)")
+    ap.add_argument("--nickname", default=None,
+                    help="override the scratch settings' model nickname "
+                         "(default Sol) — the footer shows the nickname")
     ap.add_argument("--unlabeled", action="store_true",
                     help="drop the provider's settings label — the host degrades in")
     ap.add_argument("--expect-label", default=None,
@@ -2382,11 +2411,13 @@ def main():
     if context is None and args.scenario not in ("stock-compact", "default-window"):
         context = 524288
     images = args.scenario in ("attach", "drop-image")
-    # The CLI flag (issue #109) outranks a scenario's own base URL choice.
+    # The CLI flags (issue #109's precedent) outrank a scenario's own
+    # choices.
     app = App(no_ghost=args.no_ghost, context=context, resume=resume,
               images=images, cols=args.cols, rows=args.rows,
               base_url=args.base_url or base_url, unlabeled=args.unlabeled,
-              model=model)
+              model=args.model or model,
+              nickname=args.nickname or "Sol")
 
     def assert_claims():
         if args.style_claim:
