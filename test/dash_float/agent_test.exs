@@ -46,6 +46,18 @@ defmodule AgentTestVetParkedAllow do
   end
 end
 
+defmodule AgentTestVetParkedAsk do
+  @moduledoc false
+  # Parks until messaged — the released verdict is an ask WITH its reason,
+  # so a test can switch the mode mid-check and still exercise the ask arm
+  # of the confirm-arming entry (ADR 0016 §3's re-read).
+  def verdict(_provider, _call, _lines, _opts) do
+    receive do
+      _any -> {:ask, "touches production"}
+    end
+  end
+end
+
 defmodule DashFloat.AgentTest do
   @moduledoc false
   # The Phase 3 end-to-end suite: a scripted tool-calling stream through the
@@ -1593,6 +1605,47 @@ defmodule DashFloat.AgentTest do
     assert Process.alive?(agent)
   end
 
+  # The older-producer shapes (#78's fallback clause): a stream_done report
+  # WITHOUT the reasoning key still resolves every arm — hand-built sends,
+  # a regressed producer — read as no thinking, never a crash.
+  @tag :tmp_dir
+  test "a reasoning-less stream_done still runs the tool batch", ctx do
+    server = start_server([{:send, @headers}, {:send, "data: [DONE]\n\n"}, :close])
+    # A stalled script never answers; the fabricated report below resolves.
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+    send(agent, {:prompt, self(), "go", []})
+    assert_receive {:sse_request, "POST", _, _, _body}, 2_000
+
+    send(
+      agent,
+      {:stream_done,
+       %{
+         content: "",
+         tool_calls: [
+           %{id: "call_nr", name: "write_file", args: %{"path" => "nr.txt", "content" => "x"}}
+         ],
+         cancelled: false
+       }}
+    )
+
+    assert_receive {:confirm, ref, %{id: "call_nr"}}, 2_000
+    send(agent, {:confirm_decision, ref, :approved})
+    assert_receive {:tool_result, %{id: "call_nr", ok: true}}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "a reasoning-less cancelled stream_done still ends the turn", ctx do
+    server = start_server([final_episode("unused")])
+    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+    send(agent, {:prompt, self(), "go", []})
+    assert_receive {:sse_request, "POST", _, _, _body}, 2_000
+
+    send(agent, {:stream_done, %{content: "partial", tool_calls: [], cancelled: true}})
+
+    assert_receive {:entry, :system, "[cancelled]"}, 2_000
+    assert_receive {:phase, :idle}, 2_000
+  end
+
   ## The question tool (#134, ADR 0028) — and the three together
 
   defp question_episode(id, args) do
@@ -1954,6 +2007,34 @@ defmodule DashFloat.AgentTest do
     assert Jason.decode!(tool_result_of(second_body, "call_pl")["content"]) ==
              %{"ok" => false, "blocked" => "plan"}
 
+    assert_receive {:phase, :idle}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "auto→build mid-check: an ask verdict confirms with the needs-confirmation entry",
+       ctx do
+    server =
+      start_server([
+        call_tool_episode("call_ba", "execute_command", %{"command" => "echo late"}),
+        final_episode("settled")
+      ])
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, mode: :auto, vetter: AgentTestVetParkedAsk)
+    send(agent, {:prompt, self(), "go", []})
+    assert_receive {:phase, :checking}, 2_000
+
+    vet = vetting_pid(agent)
+    send(agent, {:set_mode, self(), :build})
+    assert_receive {:mode, :build}, 2_000
+    send(vet, :release)
+
+    # Under BUILD the ask verdict arms the confirm with its truthful entry
+    # — the one arm a live :vet gate can no longer reach (ADR 0028).
+    assert_receive {:entry, :system, "[safety check: needs confirmation]"}, 2_000
+    assert_receive {:confirm, ref, %{id: "call_ba"}}, 2_000
+
+    send(agent, {:confirm_decision, ref, :rejected})
+    assert_receive {:tool_result, %{id: "call_ba", ok: false, status: "rejected"}}, 2_000
     assert_receive {:phase, :idle}, 2_000
   end
 
@@ -4814,13 +4895,18 @@ defmodule DashFloat.AgentTest do
     File.write!(image, <<1, 2, 3>>)
 
     server = start_server([final_episode()])
-    {agent, _sup} = start_agent(server, ctx.tmp_dir)
+
+    # A nicknamed model names the nickname in the refusal (ADR 0018 §4).
+    {:ok, base_provider} = provider(server)
+    nicknamed_provider = %{base_provider | nickname: "flashy"}
+
+    {agent, _sup} = start_agent(server, ctx.tmp_dir, provider: {:ok, nicknamed_provider})
 
     send(agent, {:prompt, self(), "hi", [image]})
     refute_receive {:sse_request, _, _, _, _}, 200
 
     assert_receive {:entry, :system,
-                    "[images: model test-model does not accept images — attach refused]"},
+                    "[images: model flashy does not accept images — attach refused]"},
                    1_000
 
     assert_receive {:phase, :idle}, 1_000
