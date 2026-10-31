@@ -391,11 +391,12 @@ def paint(draw, metrics, ch, px, py):
     if ch.data and ch.data != " ":
         emoji = emoji_font()
         if not glyph_covered(font, ch.data):
-            # CJK first: an outline font at the cell's own size renders
-            # the wide pair naturally (the trailing cell pyte left empty);
-            # the emoji strike only when no CJK font exists.
+            # CJK first, but only when the CJK font actually covers the
+            # glyph (same .notdef probe as the primary font): the emoji
+            # strike stays the fallback for everything the outline fonts
+            # lack too — 📎 must keep its color font, never go tofu.
             cjk = cjk_font(font.size)
-            if cjk is not None:
+            if cjk is not None and glyph_covered(cjk, ch.data):
                 draw.text((px, py), ch.data, font=cjk,
                           fill=fg if not ch.bold else _bold_fg(fg))
             elif emoji is not None:
@@ -446,15 +447,23 @@ def emoji_font():
     return _EMOJI_FONT
 
 
+_CJK_FONTS: dict[int, object] = {}
+
+
 def cjk_font(size):
-    """The first installed CJK outline font at `size`, or None."""
-    for path in FONT_CANDIDATES_CJK:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                return None
-    return None
+    """The first installed CJK outline font at `size` — memoized per size
+    (the .ttc is ~19 MB; reopening it per uncovered cell would crawl in a
+    GIF replay) — or None when no candidate exists or loads."""
+    if size not in _CJK_FONTS:
+        _CJK_FONTS[size] = None
+        for path in FONT_CANDIDATES_CJK:
+            if os.path.exists(path):
+                try:
+                    _CJK_FONTS[size] = ImageFont.truetype(path, size)
+                    break
+                except OSError:
+                    continue
+    return _CJK_FONTS[size]
 
 
 def draw_emoji(draw, font, glyph, px, py, cell_w, cell_h):
@@ -685,10 +694,13 @@ class MockHandler(BaseHTTPRequestHandler):
         pass  # silence — the mock never talks over the capture
 
     # The interaction-surface captures (issues #133/#134/#135): a FIFO of
-    # scripted episodes the _sse stream pops one per chat connection —
-    # ("tools", [(id, name, args_json), ...]) streams a tool-calling
-    # episode; ("text", "...") streams that prose. Empty: the stock reply.
-    # The vet's own fresh-context completion is detected by its
+    # scripted episodes — ("tools", [(id, name, args_json), ...]) a
+    # tool-calling episode, ("text", "...") that prose. DEAD, kept only so
+    # the episode-dependent scenarios still enqueue: nothing pops this
+    # queue (the consumer was lost in the #133–#135 era; #142 deleted its
+    # unused corpse and this note replaced the false claim), so those
+    # scenarios cannot regenerate — see issue #143 for the wire-or-drop
+    # decision. The vet's own fresh-context completion is detected by its
     # instruction and answered with VET_REPLY (issue #135's still).
     EPISODES: list = []
     VET_REPLY = '{"decision":"confirm","reason":"deletes files outside the project"}'

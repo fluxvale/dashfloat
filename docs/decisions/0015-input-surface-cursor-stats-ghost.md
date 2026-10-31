@@ -480,9 +480,11 @@ imprecision from #137's audit).
   widths with the transcript renderer's own classifier — `Wrap.width`
   (the module pinned cell-by-cell against `ex_ratatui`'s unicode-width in
   `wrap_test.exs`) — so the transcript and the footer can never disagree
-  about how many cells a string occupies. No wcwidth-like logic exists
-  anywhere else in the TUI; the footer's approximation is deleted, not
-  kept alongside.
+  about how many cells a string occupies. No second width classifier
+  exists in the TUI; the footer's approximation is deleted, not kept
+  alongside. (The attach row's and the rename dialog's naive
+  `String.length` accounting is the same bug class and survives this
+  amendment — filed as #144, not settled here.)
 - **The drop ladder's arithmetic is cell-accurate for wide glyphs.** The
   #130 rung order is untouched; only its measurements improve. At 80 cols
   a CJK cwd drops exactly when its measured width (two cells per Han
