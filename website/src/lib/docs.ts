@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { marked, type Tokens } from "marked";
+import { ADR_FILE } from "./adr.mjs";
 
 // Docs are read from the repo itself (README.md + docs/decisions/*.md) at
 // build time — this directory is website/, so the repo root is one level up.
@@ -72,6 +73,21 @@ export function renderMarkdown(md: string): string {
   return marked.parser(tokens);
 }
 
+// Plain inline text for the docs index — raw markdown in a title or status
+// cell is exactly what verify-build's leak guard rejects, so strip the
+// family at the source (ADR 0010's `mix release` title shipped raw until
+// issue #36): links and images reduce to their labels, emphasis/strike/
+// code markers vanish. Mirrors MARKDOWN_LEAK in scripts/verify-build.mjs.
+function plainInline(text: string): string {
+  return text
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\[[^\]]*\]/g, "$1")
+    .replace(/(\*\*|__|~~|`|\*)/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 // The Status bullet can wrap over several source lines and carry markdown
 // (bold, links). Capture the whole bullet, reduce it to plain text, and keep
 // the first clause — "Accepted" for an amended ADR, exactly what the repo's
@@ -86,14 +102,7 @@ function plainStatus(md: string): string {
     if (line.trim() === "" || /^(\-\s|#)/.test(line)) break;
     bullet.push(line.trim());
   }
-  const text = bullet
-    .join(" ")
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
-    .replace(/\*\*/g, "")
-    .replace(/`/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  const first = text.split(";")[0]!.trim();
+  const first = plainInline(bullet.join(" ")).split(";")[0]!.trim();
   return first === "" ? "Accepted" : first;
 }
 
@@ -103,24 +112,36 @@ export function listAdrs(): AdrMeta[] {
   }
   return fs
     .readdirSync(decisionsDir)
-    .filter((f) => /^\d{4}-.*\.md$/.test(f))
+    .filter((f) => ADR_FILE.test(f))
     .sort()
     .map((file) => {
       const md = fs.readFileSync(path.join(decisionsDir, file), "utf8");
       const heading = md.match(/^# (\d{4}) — (.+)$/m);
+      if (!heading) {
+        throw new Error(
+          `${file} lacks the house "# NNNN — title" heading — its /docs index row would degrade to the raw filename`,
+        );
+      }
       return {
         slug: file.replace(/\.md$/, ""),
-        number: heading?.[1] ?? file.slice(0, 4),
-        title: heading?.[2] ?? file,
+        number: heading[1]!,
+        title: plainInline(heading[2]!),
         status: plainStatus(md),
       };
     });
 }
 
-export function readAdr(slug: string): string | null {
-  if (!/^\d{4}-[a-z0-9-]+$/.test(slug)) return null;
+// Reading for a page FAILS the build on a misnamed or missing ADR — an
+// unmatchable slug used to render an empty page instead (issue #36).
+export function readAdr(slug: string): string {
+  if (!ADR_FILE.test(`${slug}.md`)) {
+    throw new Error(
+      `ADR slug "${slug}" does not match ${ADR_FILE} — rename the decision file, do not build an empty page`,
+    );
+  }
   const file = path.join(decisionsDir, `${slug}.md`);
-  return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null;
+  if (!fs.existsSync(file)) throw new Error(`docs/decisions/${slug}.md does not exist`);
+  return fs.readFileSync(file, "utf8");
 }
 
 export function readReadme(): string {

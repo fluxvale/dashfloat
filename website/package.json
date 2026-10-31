@@ -2,8 +2,12 @@
   "name": "dashfloat-website",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "dev": "astro dev",
+    "test": "node --test",
     "build": "astro build && node scripts/verify-build.mjs",
     "preview": "astro preview"
   },

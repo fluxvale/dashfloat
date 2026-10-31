@@ -1,6 +1,6 @@
-# ADR 0024: Herdr integration: state reporting, resume command, pane release
+# 0024 — Herdr integration: state reporting, resume command, pane release
 
-- **Status**: Accepted; **amended 2026-10-31** ([ADR 0028](0028-choice-widget-and-ask-user.md),
+- **Status:** Accepted; **amended 2026-10-31** ([ADR 0028](0028-choice-widget-and-ask-user.md),
   issues #133/#134 — the blocked message carries the QUESTION TEXT itself, and the
   `:asking` phase joins the blocked family; see
   [Amendment (2026-10-31, ADR 0028): blocked-with-message carries the question text](#amendment-2026-10-31-adr-0028-blocked-with-message-carries-the-question-text)
