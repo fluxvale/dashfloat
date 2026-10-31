@@ -39,6 +39,22 @@ defmodule Mix.Tasks.Lint.WorkflowsTest do
     assert output =~ "shellcheck: clean"
   end
 
+  # The stub refuses to run (exit 3) unless a .yaml workflow is on its argv,
+  # so a re-narrowed glob (back to *.yml) can never pass this test silently.
+  test "a .yaml workflow reaches actionlint", %{project: project} do
+    seed_cache(
+      actionlint: ~s{case "$*" in *deploy.yaml*) exit 0;; *) exit 3;; esac},
+      shellcheck: "exit 0"
+    )
+
+    output =
+      File.cd!(project, fn ->
+        capture_io(fn -> assert Workflows.run([]) == :ok end)
+      end)
+
+    assert output =~ "actionlint: clean"
+  end
+
   test "actionlint findings red the step", %{project: project} do
     seed_cache(actionlint: "echo 'bad.yml:1:1: boom'; exit 1", shellcheck: "exit 0")
 
@@ -87,6 +103,8 @@ defmodule Mix.Tasks.Lint.WorkflowsTest do
     File.mkdir_p!(workflows)
     ci_yml = Path.join(workflows, "ci.yml")
     File.write!(ci_yml, "on: push\n")
+    deploy_yaml = Path.join(workflows, "deploy.yaml")
+    File.write!(deploy_yaml, "on: push\n")
     install_sh = Path.join(dir, "install.sh")
     File.write!(install_sh, "#!/bin/sh\nexit 0\n")
     dir
