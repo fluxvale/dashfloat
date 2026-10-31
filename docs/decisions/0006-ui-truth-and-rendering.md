@@ -696,7 +696,10 @@ and the user-row styling in the [theme table](#theme-as-data) and
   input, footer, and the palette/setup screens alike) and `content_width/1`,
   so the whole chrome moves together and the log rect is still the wrap
   width, by construction. At 80×24 the idle log keeps 15 rows — the
-  top/bottom air is what makes the window read as framed.
+  top/bottom air is what makes the window read as framed. *(The row count
+  is superseded 2026-10-31, #129: **13 rows** — the breathing gap took two
+  more; see [ADR 0015](0015-input-surface-cursor-stats-ghost.md)'s
+  #129/#130 amendment.)*
 
 ## Amendment (2026-10-31, issue #104): the idle cursor blinks
 
@@ -772,9 +775,11 @@ stand unchanged — this amendment only removes what #110 had added on top.
   the view to the row.
 - **The ONE re-pin gesture is a dispatched submit (Enter).** `submit/2`
   re-pins after a real dispatch — a plain message (the existing clause),
-  a command (new: typed or the palette's filtered Enter, which previously
-  did not re-pin — Enter is Enter), an unknown-bare-slash warn. A no-op
-  Enter (blank draft, mid-stream) pins nothing.
+  a command (new: typed, the palette's filtered Enter, or the MODAL
+  command palette's Enter — none of which re-pinned before — Enter is
+  Enter), an unknown-bare-slash warn. The model/profile pickers are
+  selectors, not sends: nothing lands in the transcript, so they keep the
+  reader's place. A no-op Enter (blank draft, mid-stream) pins nothing.
 - **A reply arriving while scrolled up does not yank the view** —
   verified, not assumed: the scroll intent is top-anchored (an offset
   from the log's first display row), so streaming tokens and landed

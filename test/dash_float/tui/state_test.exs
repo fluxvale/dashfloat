@@ -1883,6 +1883,59 @@ defmodule DashFloat.TUI.StateTest do
       refute recalled.follow?
     end
 
+    # The remaining composer edits, each pinned (ADR 0006's #131 amendment
+    # enumerates them; hostile review F6): a chip pop, the ghost Tab, and
+    # the filter's completion Tab all leave the parked view alone.
+    test "a chip pop on an empty draft stays put" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+
+      chipped = %{paged | attachments: [%{path: "/p/a.png", name: "a.png", kb: 1}]}
+      {popped, nil} = State.handle_key(chipped, "backspace", [])
+      refute popped.follow?
+      assert popped.scroll == paged.scroll
+      assert popped.attachments == []
+    end
+
+    test "the ghost Tab stays put" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+
+      ghosted = %{paged | suggestion: "tell me more"}
+      {landed, nil} = State.handle_key(ghosted, "tab", [])
+      refute landed.follow?
+      assert landed.scroll == paged.scroll
+      assert State.input_text(landed) == "tell me more"
+    end
+
+    test "the filter's completion Tab stays put" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+
+      {typed, nil} = State.handle_key(paged, "/", [])
+      assert typed.palette != nil
+      {completed, nil} = State.handle_key(typed, "tab", [])
+      refute completed.follow?
+      assert completed.scroll == paged.scroll
+      assert State.input_text(completed) =~ "/"
+    end
+
+    # The modal command palette's Enter is a dispatched submit too (ADR
+    # 0006's #131 amendment: Enter is Enter) — it re-pins like the typed
+    # and filtered forms.
+    test "the modal palette's command Enter re-pins" do
+      base = full_state(100)
+      {paged, nil} = State.handle_key(base, "page_up", [])
+      refute paged.follow?
+
+      {opened, nil} = State.handle_key(paged, "p", ["ctrl"])
+      assert opened.palette != nil
+
+      {run, nil} = State.handle_key(opened, "enter", [])
+      assert run.follow?
+      assert run.scroll == 0
+    end
+
     test "follow pins to the bottom as content grows" do
       state = full_state(50)
       assert State.effective_scroll(state, 20) == 80

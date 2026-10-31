@@ -92,7 +92,7 @@ defmodule DashFloat.TUI.View do
       ExRatatui.Layout.split(area, :vertical, [
         {:length, 1},
         {:min, 0},
-        {:length, gap_height(area.height)},
+        {:length, gap_height(area.height, active?)},
         {:length, if(active?, do: 1, else: 0)},
         {:length, input_height(input_lines, area.height)},
         {:length, 1}
@@ -101,12 +101,15 @@ defmodule DashFloat.TUI.View do
     %{status: status, log: log, gap: gap, activity: activity, input: input, footer: footer}
   end
 
-  # The gap collapses before the chrome does: on a frame too short to carry
-  # status + gap + a minimal composer + footer, the air goes first — the
-  # layout degrades the way the margin amendment's degenerate rule does
-  # (never raise, never go negative).
-  defp gap_height(area_height) when area_height < 1 + @gap + 3 + 1, do: 0
-  defp gap_height(_area_height), do: @gap
+  # The gap collapses before the chrome does: on a frame whose inset height
+  # cannot carry status + gap + (the activity row, when one exists) + a
+  # minimal composer + footer, the air goes first — the layout degrades
+  # the way the margin amendment's degenerate rule does (never raise,
+  # never go negative).
+  defp gap_height(area_height, active?) do
+    demand = 1 + @gap + (if(active?, do: 1, else: 0) + 3) + 1
+    if area_height < demand, do: 0, else: @gap
+  end
 
   @doc """
   The wrap width at a frame width: the log rect's width (same inset as
@@ -563,10 +566,27 @@ defmodule DashFloat.TUI.View do
     |> List.flatten()
   end
 
+  # Display width, not grapheme count: the footer's span vocabulary can
+  # carry one emoji glyph (📎, two cells — String.length would undercount
+  # by one and a boundary-fit candidate would clip). Everything else in
+  # the vocabulary (❯, ·, ASCII) is one cell.
+  # Display width, not grapheme count: the footer's span vocabulary can
+  # carry one emoji glyph (📎, two cells — String.length would undercount
+  # by one and a boundary-fit candidate would clip). Everything else in
+  # the vocabulary (❯, ·, ASCII) is one cell.
   defp spans_width(spans) do
     spans
-    |> Enum.map(&String.length(&1.content))
+    |> Enum.map(&(String.length(&1.content) + wide_glyphs(&1.content)))
     |> Enum.sum()
+  end
+
+  # One extra cell per grapheme whose first codepoint sits in the astral
+  # plane — the honest cheap approximation for a span vocabulary whose
+  # only wide glyph is 📎 (U+1F4CE).
+  defp wide_glyphs(content) do
+    content
+    |> String.graphemes()
+    |> Enum.count(fn grapheme -> hd(String.to_charlist(grapheme)) > 0xFFFF end)
   end
 
   # The capability glyph (ADR 0018 §1): 📎 beside the model label while the

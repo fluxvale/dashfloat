@@ -65,6 +65,20 @@ defmodule DashFloat.TUI.ViewTest do
       assert View.input_height(1, 6) == 3
     end
 
+    # The air collapses before the chrome does (issue #129): the demand the
+    # gap must yield to includes the activity row when one exists.
+    test "the gap collapses first on degenerate frames, counting the activity row" do
+      # Idle: status(1) + gap(2) + input(3) + footer(1) = 7 — at inset 7 the
+      # gap holds and the log takes 0; at 6 the air goes.
+      assert View.regions({80, 7 + 4}, 1, false).gap.height == 2
+      assert View.regions({80, 6 + 4}, 1, false).gap.height == 0
+
+      # With the activity row up the demand is 8: at inset 7 the air goes
+      # (not to 1 — the collapse is whole), at 8 it holds.
+      assert View.regions({80, 7 + 4}, 1, true).gap.height == 0
+      assert View.regions({80, 8 + 4}, 1, true).gap.height == 2
+    end
+
     test "degenerate frames collapse regions without raising" do
       %{status: status, log: log, activity: activity, input: input, footer: footer} =
         View.regions({1, 1}, 1, true)
@@ -490,6 +504,84 @@ defmodule DashFloat.TUI.ViewTest do
 
       assert footer_text(new_state(provider: provider)) =~ "zai - Sol"
       refute footer_text(new_state(provider: provider)) =~ "(work)"
+    end
+
+    # The width discipline (ADR 0015's #130 amendment): the stats pair may
+    # never clip, so the optional groups drop from the left in reverse
+    # urgency — cwd, then context, then ttft; the glyph, the model label,
+    # and the rate are never dropped. Rung by rung, against the footer
+    # rect's real width.
+    test "the drop ladder yields cwd, then context, then ttft — never the rate" do
+      # A PINNED cwd label (the state stores the FORMATTED label — State.new
+      # runs format_cwd): the ladder's arithmetic must not depend on where
+      # the suite happens to check out (32 display cells).
+      base = new_state(provider: provider(128_000))
+
+      full =
+        base
+        |> Map.put(:cwd, "~/FluxVale/dashfloat-129-surface")
+        |> Map.put(:phase, :streaming)
+        |> State.stream_message({:token, "a"}, 1_400)
+        |> State.stream_message({:token, "b"}, 1_500)
+        |> State.stream_message(
+          {:context,
+           %{messages: [%{role: "user", content: "ab"}], anchor: %{tokens: 4_100, index: 1}}}
+        )
+        |> Map.put(:stats, %{
+          new_state().stats
+          | sent_at: 0,
+            ttft_ms: 1_400,
+            rate: 32.0,
+            tokens: 0,
+            first_token_at: nil,
+            last_token_at: nil
+        })
+
+      # Everything fits at a wide footer (rect = frame − 4; the full row
+      # is 93 cells).
+      all = footer_text(full, 100)
+      assert all =~ "~/FluxVale" and all =~ "4.1k/128k · 3.2%" and all =~ "ttft 1.4s · 32 tok/s"
+
+      # 80 cols: the cwd yields, the context and the pair stay.
+      at_80 = footer_text(full, 80)
+      refute at_80 =~ "~/FluxVale"
+      assert at_80 =~ "x - test-model · 4.1k/128k · 3.2% · ttft 1.4s · 32 tok/s"
+
+      # Narrower: the context snapshot yields too, ttft + rate stay.
+      at_52 = footer_text(full, 52)
+      refute at_52 =~ "~/FluxVale"
+      refute at_52 =~ "4.1k/128k"
+      assert at_52 =~ "x - test-model · ttft 1.4s · 32 tok/s"
+
+      # Narrower still: ttft yields, the rate NEVER does.
+      at_36 = footer_text(full, 36)
+      refute at_36 =~ "ttft"
+      assert at_36 =~ "x - test-model · 32 tok/s"
+
+      # Degenerate: even alone, the rate is the last candidate standing.
+      assert footer_text(full, 22) =~ "32 tok/s"
+    end
+
+    # The 📎 glyph is two display cells (ADR 0018 §1): a boundary-fit
+    # candidate must count it wide — String.length would undercount by one
+    # and ship a clipped rate (hostile review F3).
+    test "the ladder counts the 📎 glyph at two cells" do
+      capable =
+        {:ok, %DashFloat.Config{base_url: "http://x", model: "glm", api_key: "k", images: true}}
+
+      capable_state = new_state(provider: capable)
+      state = Map.put(capable_state, :cwd, "~/FluxVale/dashfloat-129-surface")
+
+      # The full row is 47 display cells: ❯-head(34) + "x - glm"(7) +
+      # " 📎"(3 — the glyph's two cells plus its space). At rect 47 the cwd
+      # survives; at 46 it must already be gone — the one-cell difference
+      # is exactly the glyph's second cell, which String.length would have
+      # undercounted and shipped clipped. (The pinned cwd label is the
+      # FORMATTED one — 32 cells.)
+      assert footer_text(state, 51) =~ "~/FluxVale"
+      assert footer_text(state, 51) =~ "x - glm 📎"
+      refute footer_text(state, 50) =~ "~/FluxVale"
+      assert footer_text(state, 50) =~ "❯ · x - glm 📎"
     end
 
     # The capability glyph (ADR 0018 §1): visible before any attach attempt.
@@ -1553,9 +1645,13 @@ defmodule DashFloat.TUI.ViewTest do
     widget.text
   end
 
-  defp footer_text(state) do
-    [line] = footer_line(state)
-    Enum.map_join(line.spans, "", & &1.content)
+  defp footer_text(state, width \\ 80) do
+    widgets = View.render(state, %ExRatatui.Frame{width: width, height: 24})
+    {widget, _rect} = Enum.at(widgets, 4)
+
+    widget.text
+    |> List.first()
+    |> then(&Enum.map_join(&1.spans, "", fn span -> span.content end))
   end
 
   defp activity(state, w \\ 80) do

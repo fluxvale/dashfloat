@@ -1105,7 +1105,7 @@ defmodule DashFloat.TUI.State do
 
   defp route_key(%{palette: %Palette{mode: :modal} = palette} = state, "enter", mods, _now)
        when mods in [[], ["ctrl"]],
-       do: execute_palette(state, palette)
+       do: execute_palette(state, palette, :enter)
 
   defp route_key(%{palette: %Palette{mode: :filter} = palette} = state, "up", _modifiers, _now),
     do: {%{state | palette: Palette.move(palette, :up)}, nil}
@@ -1571,16 +1571,21 @@ defmodule DashFloat.TUI.State do
 
   # Palette Enter — the same rule in both modes (ADR 0020). The modal command
   # palette runs with empty args and pushes NO history: nothing was typed.
-  defp execute_palette(state, %Palette{kind: :commands, items: items, selected: selected}) do
+  # The command-kind Enter re-pins like every dispatched submit (issue #131:
+  # Enter is Enter); the model/profile pickers are selectors, not sends —
+  # nothing lands in the transcript, so the reader's place keeps.
+  defp execute_palette(state, %Palette{kind: :commands, items: items, selected: selected}, :enter) do
     state
     |> dismiss_suggestion()
     |> Map.put(:palette, nil)
     |> then(&run_command(&1, Enum.at(items, selected).name, ""))
+    |> then(fn {state, action} -> {follow_tail(state), action} end)
   end
 
-  defp execute_palette(state, %Palette{kind: :models} = palette), do: pick_model(state, palette)
+  defp execute_palette(state, %Palette{kind: :models} = palette, _enter),
+    do: pick_model(state, palette)
 
-  defp execute_palette(state, %Palette{kind: :profiles, items: names, selected: selected}) do
+  defp execute_palette(state, %Palette{kind: :profiles, items: names, selected: selected}, _enter) do
     {%{state | palette: nil}, {:select_profile, Enum.at(names, selected)}}
   end
 
@@ -1985,13 +1990,6 @@ defmodule DashFloat.TUI.State do
     if to_row >= base, do: %{state | selection: nil}, else: state
   end
 
-  # The turn's rate freezes here — the WHOLE-RESPONSE average over the
-  # decode window, first→last token (issue #130's refinement: steady decode
-  # speed; send→done would fold TTFT in and drag the number down). The
-  # turn's ttft is NOT cleared — both spans persist in the footer after the
-  # turn ends until the next send. The context total is NOT banked — the
-  # footer's tokens-used span reads Accounting.usage/3 off the agent's
-  # context snapshot (ADR 0015 §2 amendment, issue #67 stage 2).
   # The turn's rate freezes here — the WHOLE-RESPONSE average over the
   # decode window, first→last token (issue #130's refinement: steady decode
   # speed; send→done would fold TTFT in and drag the number down). The

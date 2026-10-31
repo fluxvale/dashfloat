@@ -413,11 +413,16 @@ rule, #67 stage 2: `1.4`, `2`, `32`).
   replaces the per-delta estimate, so the frozen average divides real
   tokens), and a single token (zero-width window) honestly yields no
   rate.
-- **Persistence: both spans outlive the turn; the next send retires
+- **Persistence: both spans outlive the turn; the next SEND retires
   them.** After `{:phase, :idle}` the footer keeps the finished turn's
-  `ttft … · … tok/s` as its record; the next dispatched submit stamps a
-  new `sent_at` and clears `ttft_ms`/`rate` — so a streaming footer shows
-  the new turn's ttft once a token lands and never a stale tok/s.
+  `ttft … · … tok/s` as its record; the next **send** — a plain-message
+  submit, the one submit that opens a model turn — stamps a new `sent_at`
+  and clears `ttft_ms`/`rate`, so a streaming footer shows the new turn's
+  ttft once a token lands and never a stale tok/s. Command submits (typed,
+  filter-Enter, or the modal palette — all dispatched submits under ADR
+  0006's #131 re-pin rule) deliberately do NOT touch the stats: no model
+  turn follows them, so the finished turn's record stays until a real
+  send supersedes it.
 - **Width discipline: the pair may never clip.** At 80 cols the full row
   (`❯ cwd · model · used/window · % · ttft · tok/s`) overflows; the
   optional groups drop from the left in reverse order of urgency — the
