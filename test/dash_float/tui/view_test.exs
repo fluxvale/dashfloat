@@ -1433,7 +1433,7 @@ defmodule DashFloat.TUI.ViewTest do
       # space-separates wide glyphs (each trailing cell renders blank).
       state = new_state(setup: %Onboarding{step: :custom_url, draft: String.duplicate("汉", 80)})
 
-      assert [{%ExRatatui.Widgets.Paragraph{text: lines}, _}] =
+      assert [{%ExRatatui.Widgets.Paragraph{text: lines}, _rect}] =
                View.render(state, %ExRatatui.Frame{width: 80, height: 24})
 
       rendered =
@@ -1460,7 +1460,7 @@ defmodule DashFloat.TUI.ViewTest do
       for wizard <- steps do
         state = new_state(setup: wizard)
 
-        assert [{%ExRatatui.Widgets.Paragraph{}, _}] =
+        assert [{%ExRatatui.Widgets.Paragraph{}, _rect}] =
                  View.render(state, %ExRatatui.Frame{width: 10, height: 5})
       end
     end
@@ -1992,7 +1992,7 @@ defmodule DashFloat.TUI.ViewTest do
 
       state = %{new_state() | palette: palette}
 
-      assert [{%ExRatatui.Widgets.Popup{content: %ExRatatui.Widgets.List{items: items}}, _}] =
+      assert [{%ExRatatui.Widgets.Popup{content: %ExRatatui.Widgets.List{items: items}}, _area}] =
                state
                |> View.render(%ExRatatui.Frame{width: 80, height: 24})
                |> Enum.take(-1)
@@ -2035,7 +2035,7 @@ defmodule DashFloat.TUI.ViewTest do
 
       state = %{new_state() | palette: palette}
 
-      assert [{%ExRatatui.Widgets.Popup{content: %ExRatatui.Widgets.List{items: items}}, _}] =
+      assert [{%ExRatatui.Widgets.Popup{content: %ExRatatui.Widgets.List{items: items}}, _area}] =
                state
                |> View.render(%ExRatatui.Frame{width: 80, height: 24})
                |> Enum.take(-1)
@@ -2055,7 +2055,7 @@ defmodule DashFloat.TUI.ViewTest do
 
       state = %{new_state() | palette: palette}
 
-      assert length(View.render(state, %ExRatatui.Frame{width: 12, height: 5})) >= 1
+      assert [_widget | _rest] = View.render(state, %ExRatatui.Frame{width: 12, height: 5})
     end
 
     test "a filter palette is idle-only: an active phase renders no palette widgets" do
