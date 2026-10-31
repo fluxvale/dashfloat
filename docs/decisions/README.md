@@ -51,3 +51,4 @@ their replacement.
 | [0027](0027-exit-resume-command-and-resume-picker.md) | Exit prints the resume command; /resume opens an in-session session picker | Accepted |
 | [0028](0028-choice-widget-and-ask-user.md) | The choice widget: approvals as questions, the ask-user tool, AUTO's binary resolve | Accepted |
 | [0029](0029-rig-reply-end-needles-are-exchange-unique.md) | Capture-rig reply-end needles are exchange-unique: numbered stock replies, wrap-collapsed waits | Accepted |
+| [0030](0030-sysprompt-tool-prose-derives-from-the-registry.md) | The system prompt's tool prose derives from the tool registry: count, names, and approval grouping render from `Tools.names/1` | Accepted |

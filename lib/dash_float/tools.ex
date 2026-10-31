@@ -8,7 +8,7 @@ defmodule DashFloat.Tools do
   advertised contract and the enforced one cannot drift.
 
   web_search rides the same table but is advertised only when the session
-  carries a Synthetic context (ADR 0021 §6); `validate/2` stays total over the
+  carries a Synthetic context (ADR 0021 §7); `validate/2` stays total over the
   table on purpose — a model hallucinating web_search without a key gets a
   normal validation pass, then the runner errors honestly at run time.
   """
@@ -226,16 +226,27 @@ defmodule DashFloat.Tools do
   def class(name), do: Map.get(@classes, name, :risky)
 
   @doc """
+  The catalogue's advertised names, in order — the one derivation both the
+  `tools` array (`schema/1`) and the system prompt's tool prose render from,
+  so the advertised contract and the prose cannot drift (ADR 0030).
+  web_search drops out without a Synthetic context (ADR 0021 §7).
+  """
+  @spec names(term()) :: [String.t()]
+  def names(synthetic \\ nil) do
+    if synthetic, do: @order, else: List.delete(@order, "web_search")
+  end
+
+  @doc """
   The OpenAI `tools` array advertising the catalogue. web_search is
   advertised only when `synthetic` — the session's Synthetic context — is
-  present (ADR 0021 §6); without one the array is the base six-tool list
+  present (ADR 0021 §7); without one the array is the base six-tool list
   (the question tool rides every mode, ADR 0028).
   """
   @spec schema(term()) :: [map()]
   def schema(synthetic \\ nil) do
-    order = if synthetic, do: @order, else: List.delete(@order, "web_search")
-
-    Enum.map(order, fn name ->
+    synthetic
+    |> names()
+    |> Enum.map(fn name ->
       params = @params[name]
 
       %{
