@@ -47,6 +47,11 @@ defmodule DashFloat.TUI.View do
   # width — which IS the wrap width — shrinks with it.
   @margin 2
 
+  # The session picker popup's width in percent of the inset area (#146):
+  # the one constant the popup's width and the row cap's budget both
+  # derive from, so they can never disagree.
+  @session_picker_pct 85
+
   # The breathing gap between the transcript and the composer cluster
   # (issue #129; ADR 0015's 2026-10-31 amendment): two blank rows — the
   # margin language's own rhythm — between the log's bottom and whatever
@@ -206,11 +211,11 @@ defmodule DashFloat.TUI.View do
     ]
   end
 
-  defp wizard_lines(%{step: :profile_name, draft: draft}, _width) do
+  defp wizard_lines(%{step: :profile_name, draft: draft}, width) do
     [
       {"Name your first profile — it becomes the default.", :assistant},
       blank(),
-      input_line(draft, false),
+      input_line(draft, false, width),
       hint("⏎ accept · backspace edit · esc back")
     ]
   end
@@ -222,32 +227,32 @@ defmodule DashFloat.TUI.View do
     ] ++ [blank(), hint("↑↓ move · ⏎ choose · esc back")]
   end
 
-  defp wizard_lines(%{step: :custom_url, draft: draft}, _width) do
+  defp wizard_lines(%{step: :custom_url, draft: draft}, width) do
     [
       {"The provider's base URL (OpenAI-compatible).", :assistant},
       blank(),
-      input_line(draft, false),
+      input_line(draft, false, width),
       hint("⏎ accept · esc back")
     ]
   end
 
-  defp wizard_lines(%{step: :label, draft: draft}, _width) do
+  defp wizard_lines(%{step: :label, draft: draft}, width) do
     [
       {"Label this provider (optional — defaults to the URL host).", :assistant},
       blank(),
-      input_line(draft, false),
+      input_line(draft, false, width),
       hint("⏎ accept · esc back")
     ]
   end
 
   # No refused write pending: Enter's promise is the immediate 0600 write.
 
-  defp wizard_lines(%{step: :key, draft: draft, error: nil}, _width) do
+  defp wizard_lines(%{step: :key, draft: draft, error: nil}, width) do
     [
       {"The API key: paste it, type $ENV_VAR to use a reference,", :assistant},
       {"or leave it empty to skip.", :assistant},
       blank(),
-      input_line(draft, true),
+      input_line(draft, true, width),
       hint("⏎ accept · written to keys.json5 (0600) immediately · esc back")
     ]
   end
@@ -264,7 +269,7 @@ defmodule DashFloat.TUI.View do
       {"The API key: paste it, type $ENV_VAR to use a reference,", :assistant},
       {"or leave it empty to skip.", :assistant},
       blank(),
-      input_line(draft, true)
+      input_line(draft, true, width)
     ] ++
       error_lines(error, width) ++
       [blank(), hint("apply the remedy · ⏎ retries the write")]
@@ -289,11 +294,11 @@ defmodule DashFloat.TUI.View do
   # here with its reason as a dim note between the title and the input —
   # informational, never styled as an error.
 
-  defp wizard_lines(%{step: :model_manual, draft: draft, note: nil}, _width) do
+  defp wizard_lines(%{step: :model_manual, draft: draft, note: nil}, width) do
     [
       {"The model id.", :assistant},
       blank(),
-      input_line(draft, false),
+      input_line(draft, false, width),
       hint("⏎ accept · empty skips · nickname defaults to the id · esc back")
     ]
   end
@@ -303,7 +308,7 @@ defmodule DashFloat.TUI.View do
       {"The model id.", :assistant}
       | note_lines(note, width)
     ] ++
-      [blank(), input_line(draft, false)] ++
+      [blank(), input_line(draft, false, width)] ++
       [hint("⏎ accept · empty skips · nickname defaults to the id · esc back")]
   end
 
@@ -326,38 +331,38 @@ defmodule DashFloat.TUI.View do
       [blank(), hint("apply the remedy · ⏎ on done retries the write · esc back")]
   end
 
-  defp wizard_lines(%{step: :mcp_name, draft: draft}, _width) do
+  defp wizard_lines(%{step: :mcp_name, draft: draft}, width) do
     [
       {"MCP server name.", :assistant},
       blank(),
-      input_line(draft, false),
+      input_line(draft, false, width),
       hint("⏎ accept · empty skips · esc back")
     ]
   end
 
-  defp wizard_lines(%{step: :mcp_command, draft: draft}, _width) do
+  defp wizard_lines(%{step: :mcp_command, draft: draft}, width) do
     [
       {"MCP command (e.g. uvx).", :assistant},
       blank(),
-      input_line(draft, false),
+      input_line(draft, false, width),
       hint("⏎ accept · empty cancels · esc back")
     ]
   end
 
-  defp wizard_lines(%{step: :mcp_args, draft: draft}, _width) do
+  defp wizard_lines(%{step: :mcp_args, draft: draft}, width) do
     [
       {"MCP arguments (space-separated, optional).", :assistant},
       blank(),
-      input_line(draft, false),
+      input_line(draft, false, width),
       hint("⏎ accept · esc back")
     ]
   end
 
-  defp wizard_lines(%{step: :mcp_token, draft: draft}, _width) do
+  defp wizard_lines(%{step: :mcp_token, draft: draft}, width) do
     [
       {"Token environment variable (optional).", :assistant},
       blank(),
-      input_line(draft, true),
+      input_line(draft, true, width),
       hint("stored as $VAR — the value never lands in a file · esc back")
     ]
   end
@@ -422,9 +427,16 @@ defmodule DashFloat.TUI.View do
 
   defp loop_option(_wizard, :done), do: "Done — write the config and start"
 
-  defp input_line(draft, masked) do
+  # The cursor-editing surfaces' tail-showing rule (#144, applied to the
+  # wizard by #147): the draft tail-fits into the box's inner width minus
+  # the `❯ ` prefix and the cursor's own cell, `…` marking the dropped
+  # head — the block cursor (where editing happens) never leaves the
+  # screen. The masked form rides the same budget: one cell per star, but
+  # a long masked draft overflows exactly the same way.
+  defp input_line(draft, masked, width) do
     shown = if masked, do: String.duplicate("*", String.length(draft)), else: draft
-    {"❯ " <> shown <> "█", :assistant}
+    budget = max(box_inner(width) - Wrap.width("❯ ") - 1, 1)
+    {"❯ " <> Wrap.fit_tail(shown, budget) <> "█", :assistant}
   end
 
   # A selection list: the wizard's options with the chosen one highlighted.
@@ -443,14 +455,15 @@ defmodule DashFloat.TUI.View do
 
   # A refused write's message (issue #39): error and remedy, word-wrapped to
   # the setup box's inner width (frame minus margin and borders) so the
-  # remedy is never clipped — floored at 1 for degenerate frames, never above
-  # the true inner width. The log view's wrapper supplies the semantics
+  # remedy is never clipped — floored at 1 for degenerate frames (on frames
+  # so small even that exceeds the true inner, the renderer clips — never a
+  # crash). The log view's wrapper supplies the semantics
   # (ADR 0009's never-clipped remedy): word wrap with a glyph-boundary
   # fallback for tokens wider than the row — paths in remedies — so nothing
   # is silently clipped mid-token (issue #42).
   defp error_lines(message, width) do
     message
-    |> wrap_remedy(max(width - 2 * @margin - 2, 1))
+    |> wrap_remedy(box_inner(width))
     |> Enum.map(&{&1, :error})
   end
 
@@ -459,9 +472,13 @@ defmodule DashFloat.TUI.View do
   # error.
   defp note_lines(message, width) do
     message
-    |> wrap_remedy(max(width - 2 * @margin - 2, 1))
+    |> wrap_remedy(box_inner(width))
     |> Enum.map(&{&1, :dim})
   end
+
+  # The setup box's inner width: frame minus margin and borders, floored
+  # at 1 for degenerate frames.
+  defp box_inner(width), do: max(width - 2 * @margin - 2, 1)
 
   defp wrap_remedy(text, width) do
     [Line.new([Span.new(text)])]
@@ -1053,15 +1070,30 @@ defmodule DashFloat.TUI.View do
   end
 
   # The session picker (issue #128): rows run long (preview · time ·
-  # provider · model), so the popup takes 85% — at 80 cols the inner width
-  # is ~62, and the preview's 40-column cap (#144) keeps the preview side
-  # of the row inside it; the uncapped metadata tail is recorded
-  # imprecision (issue #146).
+  # provider · model), so the popup takes 85%. The WHOLE row — not just
+  # the preview half (#144) — is capped at the popup's inner width
+  # (#146): the List clips rather than wraps, and the metadata tail is
+  # unbounded (user-chosen profile and model names), so no fixed preview
+  # shrink can promise the row fits — only the render-time budget can.
+  # When the budget is tight the tail drops first — model, then provider,
+  # then time; the preview is the row's identity payload and the last
+  # thing to lose cells. That is the footer ladder's rule (ADR 0015 §2's
+  # #130 amendment: drop the scaffolding, keep the payload whole) by a
+  # simpler mechanism: one plain string, one `…` cut, no span groups to
+  # ladder. The percentage is measured against the popup the Rust
+  # renderer actually draws (truncating division, verified against the
+  # buffer at 60–143 cols).
   defp render_palette(
          %State{palette: %Palette{kind: :sessions, items: rows, selected: selected}},
          area
        ) do
-    [picker("Sessions", Enum.map(rows, & &1.label), selected, area, width: 85)]
+    inner = max(div(area.width * @session_picker_pct, 100) - 2, 1)
+
+    [
+      picker("Sessions", Enum.map(rows, &Wrap.fit_head(&1.label, inner)), selected, area,
+        width: @session_picker_pct
+      )
+    ]
   end
 
   # The detail rides the status bar's own humanize ladder (999 reads "999",
