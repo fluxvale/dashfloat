@@ -314,17 +314,22 @@ defmodule DashFloat.HerdrTest do
 
   describe "the real delivery path (Herdr's newline-JSON socket)" do
     # A stand-in Herdr server: accepts one connection per request, answers
-    # the ack line, and forwards what it heard to the test. Socket paths
-    # stay short — the OS caps a unix socket path at ~107 bytes, and ExUnit's
-    # tmp_dir names are longer than that.
+    # the ack line, and forwards what it heard to the test. Each socket
+    # owns a short UNIQUE directory, created right here: nothing else in
+    # the suite makes /tmp/opencode, so deriving a path inside it without
+    # creating the directory raced the whole suite on a fresh runner
+    # (issue #121, ADR 0025). Paths stay short — the OS caps a unix socket
+    # path at ~107 bytes, and ExUnit's tmp_dir names are longer than that.
     defp short_socket(name) do
-      path = "/tmp/opencode/herdr-test-#{name}-#{System.unique_integer([:positive])}.sock"
-      on_exit(fn -> File.rm(path) end)
-      path
+      dir = "/tmp/opencode/herdr-#{name}-#{System.unique_integer([:positive])}"
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+      Path.join(dir, "s.sock")
     end
 
     defp start_herdr_standin(path, reply? \\ true) do
       test = self()
+      # A killed earlier run can leak its socket at the same unique path.
       File.rm(path)
 
       {:ok, listen} =
@@ -355,6 +360,20 @@ defmodule DashFloat.HerdrTest do
       after
         5_000 -> :ok
       end
+    end
+
+    test "the standin owns its socket directory: created fresh, unique per socket" do
+      # Issue #121: the helper must create the directory itself — nothing
+      # else in the suite guarantees /tmp/opencode exists on a fresh
+      # runner — and every socket gets its own directory, never a shared
+      # parent another test could be mid-way through using.
+      a = short_socket("hermetic-a")
+      b = short_socket("hermetic-b")
+      dir_a = Path.dirname(a)
+      dir_b = Path.dirname(b)
+
+      assert File.dir?(dir_a)
+      assert dir_a != dir_b
     end
 
     test "a report connects, sends the JSON line, and reads one reply" do
