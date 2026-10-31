@@ -26,7 +26,7 @@ a future slice; the catalog entries were kept in state for exactly this
 picker). Issue #69 graduates that slice: slash-prefix commands in the composer
 with an autocomplete popup, and Ctrl+P opening the same list as a palette.
 
-The pinned `ex_ratatui ~> 0.17.1` already ships purpose-built widgets nothing
+The pinned `ex_ratatui ~> 0.19.0` already ships purpose-built widgets nothing
 used yet: `Widgets.SlashCommands` (`parse/1`, `match_commands/2`,
 `render_autocomplete/2`) and `Widgets.Popup` + `Widgets.List`.
 
