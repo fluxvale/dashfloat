@@ -507,8 +507,9 @@ imprecision from #137's audit).
 **Status:** Accepted (issues
 [#146](https://github.com/fluxvale/dashfloat/issues/146) and
 [#147](https://github.com/fluxvale/dashfloat/issues/147), found by #144's
-hostile review). Both are completion work on the [#144
-amendment](#amendment-2026-11-01-issue-139-the-width-discipline-is-measured-by-the-renderers-classifier)'s
+hostile review). Both are completion work on the [#139
+amendment](#amendment-2026-11-01-issue-139-the-width-discipline-is-measured-by-the-renderers-classifier)
+(the amendment that settled #144)'s
 class — the fit functions (`Wrap.fit_head/fit_tail`) already existed;
 this records where they were still not applied. **Amends** [ADR
 0027](0027-exit-resume-command-and-resume-picker.md) §2's row clause and

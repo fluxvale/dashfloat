@@ -1445,6 +1445,9 @@ defmodule DashFloat.TUI.ViewTest do
     end
 
     test "every wizard input step renders on a degenerate frame without raising (issue #147)" do
+      # Width 9 — not 10 — is the degenerate frame that matters: the box
+      # inner floors to 3 and the draft budget to max(3 − 3, 1) = 1, so
+      # the floor itself is the exercised path, not just nearby.
       steps = [
         %Onboarding{step: :profile_name, draft: String.duplicate("a", 40)},
         %Onboarding{step: :custom_url, draft: String.duplicate("a", 40)},
@@ -1461,7 +1464,7 @@ defmodule DashFloat.TUI.ViewTest do
         state = new_state(setup: wizard)
 
         assert [{%ExRatatui.Widgets.Paragraph{}, _rect}] =
-                 View.render(state, %ExRatatui.Frame{width: 10, height: 5})
+                 View.render(state, %ExRatatui.Frame{width: 9, height: 5})
       end
     end
 

@@ -455,8 +455,9 @@ defmodule DashFloat.TUI.View do
 
   # A refused write's message (issue #39): error and remedy, word-wrapped to
   # the setup box's inner width (frame minus margin and borders) so the
-  # remedy is never clipped — floored at 1 for degenerate frames, never above
-  # the true inner width. The log view's wrapper supplies the semantics
+  # remedy is never clipped — floored at 1 for degenerate frames (on frames
+  # so small even that exceeds the true inner, the renderer clips — never a
+  # crash). The log view's wrapper supplies the semantics
   # (ADR 0009's never-clipped remedy): word wrap with a glyph-boundary
   # fallback for tokens wider than the row — paths in remedies — so nothing
   # is silently clipped mid-token (issue #42).

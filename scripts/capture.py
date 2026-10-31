@@ -165,7 +165,7 @@ Scenarios:
     wizard-draft
                 the #147 wizard still: boots the first-run wizard (no
                 scratch settings), walks to the custom-URL typing step,
-                types a 123-cell draft — the input line tail-fits (`…`
+                types a 124-cell draft — the input line tail-fits (`…`
                 head-clip) so the block cursor stays on screen; asserted
                 on the rendered row before the still is written
     exit-print  the exit print (issue #127): one exchange persists and
@@ -1508,7 +1508,7 @@ class App:
               f"{row.strip()[:70]}…")
 
     # The #147 wizard still: boot into the first-run wizard, walk to the
-    # custom-URL typing step, and type a 123-cell draft. Asserted on the
+    # custom-URL typing step, and type a 124-cell draft. Asserted on the
     # RENDERED row before the still: the head clips (`❯ …`), the draft's
     # last 70 cells ride whole at the block cursor — the cursor never
     # leaves the screen (the attach row's and title dialog's rule).
