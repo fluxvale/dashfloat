@@ -6,7 +6,7 @@ defmodule DashFloat.ToolsTest do
   alias DashFloat.Tools
 
   describe "schema/1" do
-    test "returns the five tools in the exact OpenAI shape" do
+    test "returns the six tools in the exact OpenAI shape" do
       assert Tools.schema() == [
                %{
                  "type" => "function",
