@@ -155,7 +155,15 @@ defmodule DashFloat.ToolsTest do
                        "options" => %{
                          "type" => "array",
                          "description" =>
-                           "Answer options (1-10): objects with a nonempty label and an optional description."
+                           "Answer options (1-10): objects with a nonempty label and an optional description.",
+                         "items" => %{
+                           "type" => "object",
+                           "properties" => %{
+                             "label" => %{"type" => "string", "minLength" => 1},
+                             "description" => %{"type" => "string"}
+                           },
+                           "required" => ["label"]
+                         }
                        },
                        "multiple" => %{
                          "type" => "boolean",

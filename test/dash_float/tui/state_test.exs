@@ -2148,14 +2148,14 @@ defmodule DashFloat.TUI.StateTest do
       assert state.phase == :confirming
 
       # The activity row is up while confirming AND the choice replaces the
-      # composer (ADR 0028): the approve widget needs 6 rows (question,
-      # blank, two options, blank, hint) but the third-of-frame cap holds it
-      # at 6 — three rows taller than the empty draft's 3 — so the viewport
-      # is 9 rows (12 minus the activity row's minus one more from the box).
-      bottom = State.effective_scroll(state, 9)
+      # composer (ADR 0028): the approve widget takes its full 6 rows (the
+      # choice's clamp is the area minus chrome, not the draft's third) —
+      # 8 bordered rows against the empty draft's 3 — so the viewport is 7
+      # rows (12 minus the activity row's minus the box's growth).
+      bottom = State.effective_scroll(state, 7)
       wheeled = State.wheel_scroll(state, :up)
       refute wheeled.follow?
-      assert State.effective_scroll(wheeled, 9) == bottom - 3
+      assert State.effective_scroll(wheeled, 7) == bottom - 3
     end
 
     test "new content does not move an unfollowed view, but clamping still holds" do

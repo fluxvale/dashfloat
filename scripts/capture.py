@@ -1560,6 +1560,8 @@ class App:
             "the approval's Approve option never rendered"
         assert self.find_row("  Reject") is not None, \
             "the approval's Reject option never rendered"
+        assert self.find_row("↑↓ move · ⏎ answer · esc reject") is not None, \
+            "the approval's hint row is clipped — the keys are unreadable"
         self.wait_quiet()
         # Move to Reject and back — the motion the GIF must show — then
         # approve.
@@ -1590,6 +1592,10 @@ class App:
         self.wait_for("Which database should the config target?", timeout=10)
         assert self.find_row("❯ Postgres") is not None, \
             "the question's first option never rendered selected"
+        assert self.find_row("SQLite") is not None, \
+            "the question's second option is clipped"
+        assert self.find_row("↑↓ move · ⏎ answer · esc dismiss") is not None, \
+            "the question's hint row is clipped"
         self.wait_quiet()
         self.send(self.DOWN)
         time.sleep(0.4)
@@ -1613,6 +1619,10 @@ class App:
         self.wait_for("Which runtimes need setup docs?", timeout=10)
         assert self.find_row("[ ] Elixir") is not None, \
             "the multi question's checkboxes never rendered"
+        assert self.find_row("[ ] Python") is not None, \
+            "the multi question's last option is clipped"
+        assert self.find_row("space toggle") is not None, \
+            "the multi question's hint row is clipped"
         self.wait_quiet()
         self.send(self.SPACE)          # check Elixir
         time.sleep(0.4)

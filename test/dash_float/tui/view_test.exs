@@ -238,13 +238,13 @@ defmodule DashFloat.TUI.ViewTest do
                {%ExRatatui.Widgets.Paragraph{}, _footer}
              ] = widgets
 
-      # The box sizes from the widget: question + blank + (Postgres 2:
-      # description) + SQLite + blank + hint = 7 rows, borders capped at a
-      # third of the frame.
+      # The choice's clamp is the area minus status/footer/activity/one
+      # log row (hostile review P0-1: the options are the payload) — the
+      # 7-row question box gets its full 9 rows at the stock geometry.
       assert State.input_line_count(state) == 7
       regions = regions_of(state)
       assert {:ok, input} = Map.fetch(regions, :input)
-      assert input.height == 6
+      assert input.height == 9
 
       text = input_text(state)
       assert text =~ "Which database?"
@@ -252,6 +252,71 @@ defmodule DashFloat.TUI.ViewTest do
       assert text =~ "  SQLite"
       assert text =~ "    sturdy default"
       assert text =~ "↑↓ move · ⏎ answer · esc dismiss"
+    end
+
+    # P0-1's regression proof at the DRAWN CELLS: at the stock 80x24 a
+    # 10-option question WITH descriptions (24 rows) overflows even the
+    # widened clamp — the box must SCROLL with the selection, so the
+    # last option is visible (and answerable with eyes open) when
+    # selected, and the first is honestly scrolled away.
+    test "an overflowing choice scrolls to keep the selected option visible" do
+      alias ExRatatui.CellSession
+
+      options = for i <- 1..10, do: %{"label" => "option-#{i}", "description" => "d#{i}"}
+
+      armed =
+        State.stream_message(new_state(), {
+          :question,
+          make_ref(),
+          %{question: "Pick one", options: options, multiple: false}
+        })
+
+      moved =
+        Enum.reduce(1..9, armed, fn _i, state ->
+          {state, _nil} = State.handle_key(state, "down", [])
+          state
+        end)
+
+      assert moved.choice.selected == 9
+
+      session = CellSession.new(80, 24)
+
+      :ok =
+        CellSession.draw(session, View.render(moved, %ExRatatui.Frame{width: 80, height: 24}))
+
+      snap = CellSession.take_cells(session)
+      CellSession.close(session)
+      text = Enum.map_join(snap.cells, "", & &1.symbol)
+
+      assert text =~ "option-10"
+      refute text =~ "option-1 "
+    end
+
+    # The plain 10-option list (14 rows) fits the widened clamp whole at
+    # the stock geometry — every option and the hint visible, no scroll.
+    test "a 10-option question without descriptions fits whole" do
+      alias ExRatatui.CellSession
+
+      options = for i <- 1..10, do: %{"label" => "option-#{i}"}
+
+      armed =
+        State.stream_message(new_state(), {
+          :question,
+          make_ref(),
+          %{question: "Pick one", options: options, multiple: false}
+        })
+
+      session = CellSession.new(80, 24)
+
+      :ok =
+        CellSession.draw(session, View.render(armed, %ExRatatui.Frame{width: 80, height: 24}))
+
+      snap = CellSession.take_cells(session)
+      CellSession.close(session)
+      text = Enum.map_join(snap.cells, "", & &1.symbol)
+
+      for i <- 1..10, do: assert(text =~ "option-#{i}")
+      assert text =~ "esc dismiss"
     end
 
     test "an approval renders its fixed two-choice set in the same box" do
@@ -304,7 +369,12 @@ defmodule DashFloat.TUI.ViewTest do
     end
 
     defp regions_of(state) do
-      View.regions(state.size, State.input_line_count(state), State.overlay?(state))
+      View.regions(
+        state.size,
+        State.input_line_count(state),
+        State.overlay?(state),
+        state.choice != nil
+      )
     end
 
     test "the context span reads the accounting call over the agent's snapshot" do

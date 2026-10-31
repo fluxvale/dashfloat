@@ -53,6 +53,14 @@ defmodule DashFloat.Tools.VetterTest do
     assert is_binary(reason) and reason != ""
   end
 
+  # Hostile review P2-4: a blank or control-character reason is nil's
+  # sibling — the generic wording, never an empty dash or stray bytes.
+  test "a blank or control-only reason falls to the generic wording" do
+    server = start_server(completion(~s({"decision":"confirm","reason":"  \\r "})))
+    assert {:ask, reason} = vet(server)
+    assert reason == "flagged by the auto safety check"
+  end
+
   test "an unparseable reply is a failed check" do
     server = start_server(completion("Sounds good!"))
     assert {:error, "safety check returned unparseable output"} = vet(server)

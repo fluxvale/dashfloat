@@ -212,8 +212,13 @@ defmodule DashFloat.Tools.Vetter do
   defp clean_reason(nil), do: @fallback_reason
 
   defp clean_reason(reason) when is_binary(reason) do
-    reason
-    |> String.replace("\n", " ")
-    |> String.slice(0, @reason_cap)
+    cleaned =
+      reason
+      |> String.replace("\n", " ")
+      |> String.replace(~r/[\x00-\x1F\x7F]/, "")
+
+    if String.trim(cleaned) == "",
+      do: @fallback_reason,
+      else: String.slice(cleaned, 0, @reason_cap)
   end
 end

@@ -129,8 +129,24 @@ defmodule DashFloat.TUI.Choice do
   a blank, and the hint row.
   """
   @spec height(t()) :: pos_integer()
-  def height(%__MODULE__{options: options} = _choice) do
-    rows = Enum.map(options, &if(&1.description, do: 2, else: 1))
-    Enum.sum(rows) + 4
+  def height(%__MODULE__{options: options} = _choice),
+    do: rows_of(options) + 4
+
+  @doc """
+  The selected option's FIRST content row (0-based, the same arithmetic as
+  `height/1`): question and blank lead, then the option rows in order. The
+  input box's scroll keeps this row visible (ADR 0028).
+  """
+  @spec selected_row(t()) :: non_neg_integer()
+  def selected_row(%__MODULE__{options: options, selected: selected}),
+    do: 2 + rows_of(Enum.take(options, selected))
+
+  defp rows_of(options) do
+    options
+    |> Enum.map(&option_row_count/1)
+    |> Enum.sum()
   end
+
+  defp option_row_count(%{description: nil}), do: 1
+  defp option_row_count(_option), do: 2
 end

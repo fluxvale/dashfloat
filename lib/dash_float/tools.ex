@@ -391,9 +391,26 @@ defmodule DashFloat.Tools do
       |> maybe_put("maximum", param.maximum)
       |> maybe_put("default", param.default)
       |> maybe_put("minLength", min_length)
+      |> maybe_put("items", items(param.type))
 
     {param.name, prop}
   end
+
+  # The question tool's options (#134): the item shape advertised exactly
+  # as validation enforces it — the catalogue's advertised/enforced
+  # no-drift rule (ADR 0016 §2's principle), so models do not guess.
+  defp items(:options) do
+    %{
+      "type" => "object",
+      "properties" => %{
+        "label" => %{"type" => "string", "minLength" => 1},
+        "description" => %{"type" => "string"}
+      },
+      "required" => ["label"]
+    }
+  end
+
+  defp items(_type), do: nil
 
   defp maybe_put(prop, _json_key, :none), do: prop
   defp maybe_put(prop, _json_key, nil), do: prop

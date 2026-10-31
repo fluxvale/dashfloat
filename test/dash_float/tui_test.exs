@@ -2661,11 +2661,11 @@ defmodule DashFloat.TUITest do
   # once idle, with the bottom offset under the real rendered viewport (the
   # margin took two rows off the log height — issue #28).
   defp viewport(state) do
-    View.regions(state.size, State.input_line_count(state), false).log.height
+    View.regions(state.size, State.input_line_count(state), false, state.choice != nil).log.height
   end
 
   defp active_viewport(state) do
-    View.regions(state.size, State.input_line_count(state), true).log.height
+    View.regions(state.size, State.input_line_count(state), true, state.choice != nil).log.height
   end
 
   defp tall_log(pid) do

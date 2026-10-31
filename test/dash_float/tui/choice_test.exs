@@ -121,6 +121,28 @@ defmodule DashFloat.TUI.ChoiceTest do
       approve = Choice.approve(make_ref(), "edit_file")
       assert Choice.height(approve) == 6
     end
+
+    test "selected_row: question and blank lead, descriptions count" do
+      choice =
+        Choice.ask(
+          make_ref(),
+          "Q?",
+          [
+            %{"label" => "a", "description" => "x"},
+            %{"label" => "b"},
+            %{"label" => "c"}
+          ],
+          false
+        )
+
+      assert Choice.selected_row(choice) == 2
+
+      second = Choice.move(choice, :down)
+      assert Choice.selected_row(second) == 4
+
+      third = Choice.move(second, :down)
+      assert Choice.selected_row(third) == 5
+    end
   end
 
   defp ask_three do

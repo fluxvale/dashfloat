@@ -2965,7 +2965,9 @@ defmodule DashFloat.TUI.State do
   end
 
   defp log_height(state) do
-    %{log: log} = View.regions(state.size, input_line_count(state), overlay?(state))
+    %{log: log} =
+      View.regions(state.size, input_line_count(state), overlay?(state), state.choice != nil)
+
     log.height
   end
 

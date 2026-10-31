@@ -71,13 +71,21 @@ defmodule DashFloat.TUI.View do
   Splits `width` x `height` into status (1 row), log (rest), the breathing
   gap (`@gap` blank rows — issue #129), activity (1 row while an overlay
   exists — an active phase, the exit prompt, or the open attach prompt —
-  else 0), input (`2 + input_lines` rows, clamped to a third of the frame),
-  and the permanent stats footer (1 row, ADR 0015) — the whole chrome inset
-  by two cells per side. The gap sits between the transcript and the
-  composer CLUSTER (activity + input + footer are one unit); nothing
-  renders into it.
+  else 0), input (`2 + input_lines` rows, clamped — see below), and the
+  permanent stats footer (1 row, ADR 0015) — the whole chrome inset by two
+  cells per side. The gap sits between the transcript and the composer
+  CLUSTER (activity + input + footer are one unit); nothing renders into
+  it.
+
+  `choice?` widens the input clamp for a pending choice widget (ADR 0028):
+  the composer's growth is capped at a third of the frame (a runaway
+  DRAFT must not eat the screen), but the choice that REPLACES it is
+  bounded by construction (≤ 10 options, ≤ 24 rows) and is the only
+  surface showing the options — it may claim up to the area minus
+  status/footer/activity/a last log row, and the widget scrolls inside
+  whatever remains (`choice_scroll/2`) when even that overflows.
   """
-  @spec regions({integer(), integer()}, integer(), boolean()) :: %{
+  @spec regions({integer(), integer()}, integer(), boolean(), boolean()) :: %{
           status: Rect.t(),
           log: Rect.t(),
           gap: Rect.t(),
@@ -85,9 +93,9 @@ defmodule DashFloat.TUI.View do
           input: Rect.t(),
           footer: Rect.t()
         }
-  def regions({width, height}, input_lines, active?)
+  def regions({width, height}, input_lines, active?, choice? \\ false)
       when is_integer(width) and is_integer(height) and is_integer(input_lines) and
-             is_boolean(active?) do
+             is_boolean(active?) and is_boolean(choice?) do
     area = inset_area(width, height)
 
     [status, log, gap, activity, input, footer] =
@@ -96,7 +104,7 @@ defmodule DashFloat.TUI.View do
         {:min, 0},
         {:length, gap_height(area.height, active?)},
         {:length, if(active?, do: 1, else: 0)},
-        {:length, input_height(input_lines, area.height)},
+        {:length, input_height(input_lines, area.height, choice?)},
         {:length, 1}
       ])
 
@@ -132,14 +140,19 @@ defmodule DashFloat.TUI.View do
     }
   end
 
-  @doc "Input region height: borders plus draft lines, capped at a third of the frame."
-  @spec input_height(integer(), integer()) :: pos_integer()
-  def input_height(input_lines, height) do
-    max_third = max(div(height, 3), 3)
+  @doc """
+  Input region height: borders plus draft lines, capped at a third of the
+  frame. A pending choice (ADR 0028) may claim the frame minus
+  status/footer/activity/one log row instead — bounded by construction,
+  and the only surface showing the options.
+  """
+  @spec input_height(integer(), integer(), boolean()) :: pos_integer()
+  def input_height(input_lines, height, choice? \\ false) do
+    cap = if choice?, do: max(height - 4, 3), else: max(div(height, 3), 3)
 
     input_lines
     |> Kernel.+(2)
-    |> min(max_third)
+    |> min(cap)
     |> max(3)
   end
 
@@ -160,14 +173,21 @@ defmodule DashFloat.TUI.View do
   def render(%State{} = state, %ExRatatui.Frame{width: width, height: height}) do
     # The transient row exists for an active phase OR an armed exit guard
     # (issue #28; ADR 0006 amendment) — even while idle.
-    regions = regions({width, height}, State.input_line_count(state), State.overlay?(state))
+    regions =
+      regions(
+        {width, height},
+        State.input_line_count(state),
+        State.overlay?(state),
+        state.choice != nil
+      )
+
     area = inset_area(width, height)
 
     [
       {status_widget(state, regions.log.height), regions.status},
       {log_widget(state, regions.log.height), regions.log},
       {activity_widget(state), regions.activity},
-      {input_widget(state), regions.input},
+      {input_widget(state, regions.input), regions.input},
       {footer_widget(state, regions.footer.width), regions.footer}
     ] ++ palette_widgets(state, area) ++ title_dialog_widgets(state, area)
   end
@@ -841,8 +861,12 @@ defmodule DashFloat.TUI.View do
   # rounded box the textarea lives in carries the question, the options, and
   # the answer hints instead. The textarea's own state is untouched
   # underneath — the draft is preserved by construction and restores the
-  # moment the choice resolves.
-  defp input_widget(%State{choice: %Choice{} = choice} = _state) do
+  # moment the choice resolves. A widget taller than the region SCROLLS to
+  # keep the selected option visible (hostile review P0-1: hidden options
+  # must never stay answerable).
+  defp input_widget(%State{choice: %Choice{} = choice} = _state, rect) do
+    interior = max(rect.height - 2, 1)
+
     %Paragraph{
       text: choice_lines(choice),
       block: %Block{
@@ -851,11 +875,11 @@ defmodule DashFloat.TUI.View do
         border_type: :rounded,
         border_style: Theme.style(:dim)
       },
-      scroll: {0, 0}
+      scroll: {choice_scroll(choice, interior), 0}
     }
   end
 
-  defp input_widget(state) do
+  defp input_widget(state, _rect) do
     %Textarea{
       state: state.input,
       block: %Block{
@@ -958,6 +982,20 @@ defmodule DashFloat.TUI.View do
 
   defp choice_hint(%Choice{}),
     do: Line.new([Span.new("↑↓ move · ⏎ answer · esc dismiss", style: Theme.style(:hint))])
+
+  # The scroll offset that keeps the SELECTED option on screen when the
+  # widget overflows its (already widened) region: scroll down just enough
+  # to carry the selection with two rows of tail (the blank and, when it
+  # fits, the hint), never past the last row, never negative.
+  defp choice_scroll(%Choice{} = choice, interior) do
+    total = Choice.height(choice)
+
+    if total <= interior do
+      0
+    else
+      max(0, min(Choice.selected_row(choice) - (interior - 3), total - interior))
+    end
+  end
 
   # The composer's cursor artifact (ADR 0015 §1, amended by issue #104):
   # absent while the pane is unfocused, a 500 ms on/off blink while idle —

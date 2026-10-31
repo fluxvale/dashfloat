@@ -699,7 +699,7 @@ defmodule DashFloat.Agent do
         %__MODULE__{tool_slot: {:vetting, _check_ref, mon_ref, _pid, call, preview}} = state
       ) do
     state = %{state | tool_slot: :none}
-    resolve_vet(state, call, preview, {:error, :vetter_died})
+    resolve_vet(state, call, preview, {:error, "the safety check died"})
   end
 
   # A cancelled vetter dying before it could report aborts the batch like its
