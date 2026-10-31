@@ -67,6 +67,24 @@ replay into a snapshot screen is heavy machinery for a rig).
 - If the app ever retries a stock request on a new connection, the retry
   takes the next number and the scenario's wait times out — a loud capture
   failure, which is the rig's contract (fail, never ship).
-- `test/dash_float/rig_needle_test.exs` pins the source invariants (no bare
-  reply-body needle; the sentinel is defined, stamped, and waited on; waits
-  match wrap-collapsed text). It is red on the pre-fix rig by construction.
+- **Load-bearing invariant (hostile-review finding): the reopened apps never
+  submit.** The per-run counter reset means a resumed app's screen already
+  replays the first app's persisted `— turn-1.` reply — the first
+  reopened-app scenario that SUBMITS would see `wait_for(stock_closing(1))`
+  satisfied instantly by replayed text. A future reopened-submit scenario
+  must account for replayed closings (skip replays, or key its needle past
+  the replay boundary).
+- `flat_text` joins the whole screen with single spaces: a multi-word needle
+  can match across what were separate regions. No current needle can (the
+  sentinel is one token; UI needles are row-local), but needles added near
+  region boundaries should stay row-local.
+- A reply-end gate must use content visible in the CURRENT scroll state:
+  `scenario_scrolled_stream` parks the view off the tail, so its reply's
+  closing is below the viewport by design — the turn's end gates on the
+  activity row retiring (`wait_gone("Streaming")`, visible in every scroll
+  state), never on reply text.
+- `test/dash_float/rig_needle_test.exs` pins the source invariants: every
+  literal wait needle is frozen in an allowlist (a new one is a visible
+  diff), no wait draws from the stock body or `REPLY_TOKENS`, the reply-end
+  family rides `stock_closing` (site count never shrinks), and both waits
+  match wrap-collapsed text. It is red on the pre-fix rig by construction.

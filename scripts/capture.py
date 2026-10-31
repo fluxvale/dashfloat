@@ -1930,6 +1930,13 @@ class App:
             f"a streaming reply yanked the parked view: {span!r} -> {now!r}"
         assert re.search(r"ttft \d+(\.\d+)?s", self.footer_span()), \
             f"no ttft span while streaming: {self.footer_span()!r}"
+        # The no-yank asserts above are deliberately mid-stream. This
+        # scenario parks the view AWAY from the tail, so the reply's
+        # closing text is below the viewport by design — gate the turn's
+        # end on the activity row retiring instead (visible in every
+        # scroll state), never on the reply text (the #125 review).
+        self.wait_gone("Streaming")
+        self.wait_quiet()
 
     # The #130 footer, both cadences asserted before their stills: while
     # streaming ttft shows ALONE (no live tok/s — the owner's refinement),
