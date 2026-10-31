@@ -31,6 +31,8 @@ defmodule DashFloat.RigNeedleTest do
                       "Models",
                       "Sessions",
                       "Session title",
+                      "first run",
+                      "base URL",
                       "Streaming",
                       "↑↓ scroll",
                       "attach",
