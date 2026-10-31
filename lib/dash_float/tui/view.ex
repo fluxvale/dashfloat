@@ -570,10 +570,6 @@ defmodule DashFloat.TUI.View do
   # carry one emoji glyph (📎, two cells — String.length would undercount
   # by one and a boundary-fit candidate would clip). Everything else in
   # the vocabulary (❯, ·, ASCII) is one cell.
-  # Display width, not grapheme count: the footer's span vocabulary can
-  # carry one emoji glyph (📎, two cells — String.length would undercount
-  # by one and a boundary-fit candidate would clip). Everything else in
-  # the vocabulary (❯, ·, ASCII) is one cell.
   defp spans_width(spans) do
     spans
     |> Enum.map(&(String.length(&1.content) + wide_glyphs(&1.content)))
@@ -582,11 +578,18 @@ defmodule DashFloat.TUI.View do
 
   # One extra cell per grapheme whose first codepoint sits in the astral
   # plane — the honest cheap approximation for a span vocabulary whose
-  # only wide glyph is 📎 (U+1F4CE).
+  # only wide glyph is 📎 (U+1F4CE). BMP-wide input (a CJK nickname, say)
+  # is undercounted — recorded imprecision. Never raises: an invalid-UTF-8
+  # grapheme (a raw byte in an OS cwd is legal on Linux) counts plain.
   defp wide_glyphs(content) do
     content
     |> String.graphemes()
-    |> Enum.count(fn grapheme -> hd(String.to_charlist(grapheme)) > 0xFFFF end)
+    |> Enum.count(fn grapheme ->
+      case String.next_codepoint(grapheme) do
+        {<<cp::utf8>>, _rest} -> cp > 0xFFFF
+        _other -> false
+      end
+    end)
   end
 
   # The capability glyph (ADR 0018 §1): 📎 beside the model label while the

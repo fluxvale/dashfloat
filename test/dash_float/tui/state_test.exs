@@ -1936,6 +1936,33 @@ defmodule DashFloat.TUI.StateTest do
       assert run.scroll == 0
     end
 
+    # The pickers are selectors, not sends (the same amendment): nothing
+    # lands in the transcript, so the reader's place keeps. (Opening /model
+    # re-pins — a dispatched submit — so the view parks AFTER it opens.)
+    test "the model picker's Enter keeps the reader's place" do
+      config = %DashFloat.Config{base_url: "http://x", model: "m2", api_key: "k"}
+
+      parked = full_state(100)
+
+      with_catalog =
+        parked
+        |> Map.put(:provider, {:ok, config})
+        |> Map.put(:catalog, %{"http://x" => [%{model: "m1"}, %{model: "m2"}]})
+
+      {opened, nil} = enter_typed(with_catalog, "/model")
+      assert opened.palette != nil
+
+      # The wheel is focus-free (ADR 0006): it parks the view even while
+      # the modal palette swallows keys.
+      wheeled = State.wheel_scroll(opened, :up)
+      refute wheeled.follow?
+
+      {picked, _action} = State.handle_key(wheeled, "enter", [])
+      refute picked.follow?
+      assert picked.scroll == wheeled.scroll
+      assert picked.palette == nil
+    end
+
     test "follow pins to the bottom as content grows" do
       state = full_state(50)
       assert State.effective_scroll(state, 20) == 80

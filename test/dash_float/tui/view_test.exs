@@ -584,6 +584,15 @@ defmodule DashFloat.TUI.ViewTest do
       assert footer_text(state, 50) =~ "❯ · x - glm 📎"
     end
 
+    # The width math never raises on hostile input (delta review N2): an
+    # invalid-UTF-8 byte in the cwd — legal in an OS path on Linux — is
+    # counted plain, and the footer still renders.
+    test "an invalid-UTF-8 cwd renders without raising" do
+      state = Map.put(new_state(), :cwd, <<0xFF>>)
+      assert footer_text(state, 80) =~ "❯"
+      assert footer_text(state, 80) =~ "—"
+    end
+
     # The capability glyph (ADR 0018 §1): visible before any attach attempt.
     test "shows 📎 beside the label only for an image-capable provider" do
       capable =
