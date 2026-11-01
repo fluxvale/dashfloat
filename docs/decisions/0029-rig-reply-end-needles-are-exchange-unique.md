@@ -63,11 +63,10 @@ replay into a snapshot screen is heavy machinery for a rig).
 
 ## Consequences
 
-- ~~A future episode dispatch in the mock must pop `EPISODES` before taking a
+- A future episode dispatch in the mock must pop `EPISODES` before taking a
   stock number — episode replies carry their own unique text and take none
-  (marked at the counter in `_sse`).~~ Voided by the
-  [issue #143 amendment](#amendment-2026-11-02-issue-143-the-episodes-queue-is-dropped-not-wired):
-  the queue was dropped, never wired.
+  (marked at the counter in `_sse`). *(Voided — 2026-11-02, #143: the
+  queue was dropped, never wired — see the amendment below.)*
 - If the app ever retries a stock request on a new connection, the retry
   takes the next number and the scenario's wait times out — a loud capture
   failure, which is the rig's contract (fail, never ship).
@@ -96,7 +95,9 @@ replay into a snapshot screen is heavy machinery for a rig).
 ## Amendment (2026-11-02, issue #143): the EPISODES queue is dropped, not wired
 
 **Status:** Accepted (the owner's standing default — dead code misleads —
-read in the decision card and not countermanded; git-revert reversible).
+declared by the operating PA and not countermanded; the fork and its
+reversibility are recorded in issue #143 and its closing PR, and the
+morning-revert path below).
 The Context's "separate follow-up" is resolved: of the wire-or-drop fork,
 the rig **drops** the interaction-surface episode machinery.
 
