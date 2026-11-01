@@ -54,20 +54,21 @@ Investigation on the lane disproved the Python-3.14 attribution:
 ## Alternatives considered
 
 - **Bump pyte to a release supporting Python 3.14** (the issue's first
-  candidate) — no such release exists: 0.8.2 (2024) is the latest. The
-  fix exists only on unreleased master, which changed rendering semantics
-  (grapheme clusters, `wcswidth` per cluster) enough to shift the rig's
-  asserted frames; a git-commit pin would also make the venv setup
-  fragile.
+  candidate) — no such release exists: 0.8.2 (2024) is the latest, and
+  the fix exists only on unreleased master (whose rendering semantics
+  did change — grapheme clusters, per-cluster `wcswidth`; untested
+  against this rig's asserted frames). A git-commit pin would also make
+  the venv setup fragile.
 - **Pin the rig venv to Python 3.13** (the issue's second candidate) —
   treats a symptom the interpreter does not cause. The race exists on
   every Python version; the pin would add rig tooling (a version manager
   constraint or a second interpreter) and leave the crash latent for the
   next loaded overnight run.
 - **Upstream first** — correct long-term, but the rig must be whole now;
-  the shim is ~12 lines and disappears into upstream's own fix whenever a
-  pyte release lands (master's `wcswidth(char)` already survives empty
-  stubs).
+  the shim is ~12 lines. When a pyte release finally lands, removing it
+  is a deliberate diff, not a free deletion: master survives empty
+  stubs but yields nothing for them (the row renders one char shorter),
+  where `RigScreen` preserves the column with a blank.
 
 ## Consequences
 
