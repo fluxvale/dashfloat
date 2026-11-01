@@ -57,3 +57,4 @@ their replacement.
 | [0031](0031-actionlint-inside-the-ci-gate.md) | actionlint inside the `mix ci` gate: sha256-pinned binaries fetched by the gate itself, no PATH lookup, no skip | Accepted |
 | [0032](0032-installer-refusal-contract.md) | The installer's glibc-floor refusal contract: specific message, exit 1, nothing installed — asserted by the smokes, pinned by mix ci | Accepted |
 | [0033](0033-idle-time-auto-compaction.md) | Idle-time auto-compaction: a cache-TTL-derived idle timer over the shared eviction pass | Proposed |
+| [0034](0034-rig-pyte-orphaned-stub-tolerance.md) | The capture rig's pyte screen renders orphaned wide-char stubs as blanks (race tolerance, not a Python pin); the rig venv's setup pins its package versions | Accepted |
