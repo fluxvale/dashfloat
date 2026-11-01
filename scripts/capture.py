@@ -9,10 +9,12 @@ to PNG stills and GIF motion (PIL), and probes the idle render rate
 Everything is pty-driven end to end: no widget dumps, no test-mode
 buffers. The captures are ground truth for visual and motion claims.
 
-One-time setup (any venv; kept outside the repo):
+One-time setup (any venv; kept outside the repo). Versions are pinned
+exactly — the rig's rendering is only reproducible if every capture
+lane runs the same pyte/wcwidth tables and Pillow (ADR 0034):
 
     python3 -m venv /tmp/opencode/capvenv
-    /tmp/opencode/capvenv/bin/pip install pyte pillow
+    /tmp/opencode/capvenv/bin/pip install pyte==0.8.2 wcwidth==0.9.4 pillow==13.0.0
 
 Usage (from a worktree root, against the CURRENT tree's code):
 
@@ -247,6 +249,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pyte
 import re
 import shlex
+from wcwidth import wcwidth
 from PIL import Image, ImageDraw, ImageFont
 
 COLS, ROWS = 80, 24
@@ -851,6 +854,43 @@ class MockHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+class RigScreen(pyte.Screen):
+    """The rig's screen: pyte 0.8.2's `display` made race-tolerant.
+
+    pyte writes a `data=""` stub cell after every wide (2-cell) glyph.
+    When one pty chunk overwrites a wide glyph's lead cell with a
+    narrow one, the stub is orphaned until the next chunk rewrites it —
+    and `display`'s `wcwidth(char[0])` IndexErrors on the empty string
+    if the poller reads in that window (issue #160: the attach/drop
+    image scenarios' 📎 rows are the only dynamically rewritten wide
+    content, so the race clustered there). The orphan renders as the
+    blank a real terminal shows for the leftover continuation cell.
+    Python-version-independent — pyte's only 3.14-sensitive input
+    (unicodedata) never fires on this app's stream, which contains no
+    combining marks; widths come from the pinned wcwidth tables.
+    See ADR 0034."""
+
+    @property
+    def display(self) -> list[str]:
+        rows = []
+        for y in range(self.lines):
+            line = self.buffer[y]
+            cells = []
+            wide = False
+            for x in range(self.columns):
+                if wide:          # the wide glyph's stub — skipped
+                    wide = False
+                    continue
+                data = line[x].data
+                if not data:      # orphaned stub — a blank cell
+                    cells.append(" ")
+                    continue
+                wide = wcwidth(data[0]) == 2
+                cells.append(data)
+            rows.append("".join(cells))
+        return rows
+
+
 class App:
     """The real TUI under a real pty, plus the capture operations."""
 
@@ -870,7 +910,7 @@ class App:
         # (a wizard boot means the scratch config was missed) stands down.
         self._wizard = wizard
         self.sink = None  # callable(bytes) set during read loop
-        self.screen = pyte.Screen(cols, rows)
+        self.screen = RigScreen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         # The FULL byte history from boot (t, chunk): a GIF replay must
         # start at boot so static chrome (borders, labels, footer, log)
@@ -1220,7 +1260,7 @@ class App:
         cell_w, cell_h, _ = metrics
         frames = []
         step = 1000 / fps
-        replay = pyte.Screen(self.cols, self.rows)
+        replay = RigScreen(self.cols, self.rows)
         # Freeze the reader's feed FIRST, atomically with the stream swap
         # (see _frozen/_feed_lock): the replay below drives this stream in
         # order; any byte the reader thread feeds concurrently reorders the
