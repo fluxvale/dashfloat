@@ -192,6 +192,62 @@ instructions instead of a reply. This live-key run is the manual smoke step —
 the test suite is offline and deterministic (recorded SSE fixtures plus a
 loopback server).
 
+**The reading surface stays parked.** The transcript snaps to its tail only
+when you send — Enter on a message or a slash command alike; typing, pasting,
+a dropped attachment, a scroll — all of it leaves the view exactly where the
+reader parked it, and a reply streaming in while you are scrolled up never
+yanks it back (the [ADR 0006](docs/decisions/0006-ui-truth-and-rendering.md)
+amendment). The status footer reports honest speed ([ADR
+0015](docs/decisions/0015-input-surface-cursor-stats-ghost.md)'s #130
+amendment): `ttft 1.4s` (send → the reply's first token; thinking doesn't start
+the clock) appears once it lands, and a completed reply is joined by
+`32 tok/s` — a
+whole-response average, total tokens over the reply's own decode window,
+never the live instantaneous value that flatters the tail. Both spans
+persist after the turn ends and retire at the next send; when the footer
+gets tight, the cwd drops before either stat does. A two-row gap breathes
+between the transcript and the composer.
+
+**Model thinking gets a block of its own** ([ADR
+0005](docs/decisions/0005-llm-streaming-engine.md) + [ADR
+0006](docs/decisions/0006-ui-truth-and-rendering.md) amendments). While the
+model reasons, a live eight-row window grows in place, tail-following; when
+the reply lands it collapses to one summary line — `◔ Thinking · 342 tokens
+· 8.1s`. Ctrl+R expands the most recent block: arrows, PageUp/PageDown, Home
+and End scroll inside it while it holds focus (Enter still sends, typing
+still reaches the composer), the wheel scrolls inside when the notch lands
+on the block, and Esc or Ctrl+R folds it back. A thinking turn's full
+reasoning is saved with the session and replays on resume as the same
+collapsed block.
+
+![The reasoning block: live growth, the collapsed summary line, Ctrl+R expand, scrolling inside, collapse](https://raw.githubusercontent.com/fluxvale/dashfloat/main/docs/screenshots/78/01-reasoning-block.gif)
+
+**Tool calls are structured and gated.** Seven tools ship — `read_file`,
+`list_directory`, `write_file`, `edit_file`, `execute_command`, `web_search`
+(only on a Synthetic provider), and `question` — under four interaction modes cycled
+with Shift+Tab ([ADR 0016](docs/decisions/0016-interaction-modes.md)): Plan
+previews a call and never runs it, Build (the default) runs safe calls and
+asks before anything else, Auto never asks, and Unchained runs everything
+unchecked. `/mode` selects by name.
+
+**Asking renders as a choice in the input field** ([ADR
+0028](docs/decisions/0028-choice-widget-and-ask-user.md)). An approval
+replaces the composer with `Approve write_file?` and a fixed [Approve,
+Reject] set — arrows move, Enter answers, Esc rejects — and any draft you
+were typing sits underneath and returns after. The model can ask you
+directly through the same widget: its `question` tool renders labelled
+options — single-select with arrows + Enter, multi-select with Space
+toggling (an empty submit means "none of these"), and Esc answers an
+explicit `cancelled`, never a silent drop. The answer returns to the model
+as the tool's result, in every mode.
+
+![An approval rendered as a multiple-choice question in the composer](https://raw.githubusercontent.com/fluxvale/dashfloat/main/docs/screenshots/133/approve-as-choices.gif)
+
+**Auto mode runs or refuses.** Safe calls execute silently, and anything the
+safety check flags — or a check that itself fails — is refused on the spot,
+the reason recorded in the transcript and returned to the model as
+`{"ok":false,"blocked":"auto","reason":…}` so it can adapt.
+
 **Sessions persist.** Every turn is saved under
 `~/.local/share/dashfloat/sessions/` (`XDG_DATA_HOME` respected) — one JSON
 file per session, mode 0600, because a transcript carries code and tool
@@ -212,6 +268,16 @@ count, and the session file records what was dropped. A malformed or
 newer-version session file refuses loudly, naming the path — it is never
 auto-deleted or rewritten. Details:
 [ADR 0014](docs/decisions/0014-session-persistence.md).
+
+Getting back in is one command. Quitting with a session behind you prints
+the way back — `dashfloat --resume <title>` (the title, shell-quoted) or,
+untitled, `dashfloat --resume <id>`; nothing prints when nothing persisted.
+From inside a session, `/resume` opens a keyboard-navigable picker over
+saved sessions — title or first-message preview, relative time, profile ·
+model, most recent first; Enter switches in place, Esc cancels untouched.
+Design: [ADR 0027](docs/decisions/0027-exit-resume-command-and-resume-picker.md).
+
+![The /resume session picker](https://raw.githubusercontent.com/fluxvale/dashfloat/main/docs/screenshots/128/01-resume-picker.gif)
 
 ## Stack
 
