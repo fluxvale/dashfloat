@@ -267,22 +267,19 @@ jobs:
 
           ## What's new in $VERSION
 
-          Ten features since 0.3.0:
+          The biggest DashFloat release yet — twenty-five changes since 0.4.0:
 
-          - **A transcript you can read.** Your messages render bold behind an accent \`❯\` marker — set apart from the model's replies on every terminal palette, light or dark — and the distinction survives session resume.
-          - **Room to breathe.** The whole interface keeps two cells of air from the screen edges — transcript, status line, composer, and popups alike — so text no longer hugs the borders.
-          - **The footer names provider and model.** The model span reads \`zai - glm-5.3\` (provider - model) instead of a profile label, and a \`/model\` pick updates it on the spot.
-          - **\`/title\` opens a dialog.** Bare \`/title\` opens a centered input pre-filled with the live title; a refused rename shows the reason in the dialog with your draft kept, and Esc cancels.
-          - **The idle cursor blinks.** The composer's cursor pulses on its own timer while the agent waits, so the input surface reads alive on every terminal palette.
-          - **Tab completes slash commands.** While the autocomplete popup shows matches, Tab completes the highlighted command into the composer — arrows move the pick, Enter runs it, Tab types it for you.
-          - **Typing snaps the transcript to the tail.** Scroll back to reread something; typing in the composer brings the view back to the live end of the conversation.
-          - **Drop an image to attach it.** Dragging an image file into the terminal becomes a numbered \`[Image #1]\` chip in the composer instead of pasted path text; Backspace on an empty draft pops the newest chip, and Ctrl+O still works.
-          - **Context stats work out of the box.** Stock presets carry seeded context windows and a provider's fetched model list is read for its real ones, so the footer's tokens/percent and \`/compact\` work on a fresh install; a model no source knows falls back to a documented default — visibly marked, never silent.
-          - **Herdr support.** Running inside a Herdr pane, DashFloat reports its state — idle, working, or blocked with the pending decision named — so the pane shows when input awaits you, and a restored Herdr session reopens DashFloat on the right \`--resume\` command.
+          - **\`dashfloat update\` keeps you current.** One command checks the latest GitHub release against the running version and updates the install in place — sha256-verified download, atomic swap, a start-up smoke of the new binary, rollback on failure; Homebrew installs print the \`brew upgrade dashfloat\` handoff, anything else refuses with both options. \`dashfloat update --check\` is the scriptable form: prints the latest version, exits 0 when current, 1 when outdated, 2 when the check itself failed.
+          - **Pick up where you left off.** Quitting with a session underway prints the exact command that reopens it (\`dashfloat --resume <title-or-id>\` — the title when one is set, else the id), and \`/resume\` opens a keyboard-navigable picker over saved sessions — title or first-message preview, relative time, provider · model, most recent first; Enter switches in place, Esc cancels untouched.
+          - **A chat surface that reads.** A two-row breathing gap separates transcript and composer in every scroll state; the footer shows \`ttft 1.4s · 32 tok/s\` — time-to-first-token measured send to first token, plus an honest whole-response tok/s average (total tokens over the decode window, never the flattering live value); and the transcript snaps to its tail only when you send a message — a view scrolled back to reread stays parked where you left it.
+          - **Decisions land in the input field.** Tool approvals render as a multiple-choice question — \`Approve write_file?\` answered with arrows + Enter, rejected with Esc, your in-flight draft preserved underneath; the model can ask you a direct question with labelled options (single- or multi-select, Space toggling) and acts on your answer; and Auto mode never interrupts — safe calls run silently, dangerous calls auto-reject with the reason recorded and returned so it can adapt.
+          - **Thinking, visible but contained.** Model reasoning renders as a small collapsible block — one summary line collapsed (\`◔ Thinking · 342 tokens · 8.1s\`), an eight-row scrollable window expanded, growing live while it thinks, and a thinking turn's full reasoning replays on resume.
+          - **A quality wave underneath.** Wide glyphs — CJK paths, emoji titles, wide model names — no longer clip: the footer, the model/profile and session pickers, the title dialog, and the model's own option labels all measure real display cells; and the onboarding wizard's model list can no longer repopulate under the wrong provider after a fast edit or a slow fetch.
+          - **A verified installer refusal contract.** The installer enforces the glibc floor itself — a below-floor host is refused before anything is downloaded — and both release smokes assert that exact refusal instead of accepting any failure.
 
-          Also fixed: resuming a session saved by 0.3.0 crashed at startup (the system prompt is re-derived at boot and no longer breaks replay), and \`dashfloat --resume <id> --profile p\` no longer exits with \`No file named --resume\` (release-launcher user flags were being dropped into Elixir's CLI).
+          Also fixed: the v0.4.0 install smoke on Debian 11 passed for the wrong reason — the missing-libcrypto check fired first and masked the glibc floor, which was never exercised; the floor is now the installer's own preflight (see above) and every smoke proves it.
 
-          Upgrading: re-run the install command below — it replaces the previous version and keeps your sessions. On macOS, \`brew upgrade dashfloat\` does the same once the tap catches up with the release.
+          Upgrading: run \`dashfloat update\` — it replaces the previous version in place and keeps your sessions (\`dashfloat update --check\` to look first); re-running the install command below does the same. On macOS, \`brew upgrade dashfloat\` once the tap catches up with the release.
 
           ## Install
 
