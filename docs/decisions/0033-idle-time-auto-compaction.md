@@ -152,8 +152,9 @@ arm_delay     = max(@min_quiet, deadline − now)    # deadline passed ⇒ @min_
   eviction, the one-remaining-turn rule (the user's most recent question is
   never dropped), and the pinned leading system message
   ([ADR 0019](0019-session-system-prompt.md)'s rule, threaded through the
-  pass). "Never below a floor that keeps recent context whole" is §4's
-  existing guarantee; the idle path adds no new floor because it needs none.
+  pass). "Never below a floor that keeps recent context whole" is ADR 0022
+  §4's existing guarantee; the idle path adds no new floor because it needs
+  none.
 - Confirmed against the harvest counter-argument (issue design question 2):
   harvesting expiring cache only pays when compaction is otherwise *needed*.
   Below 80% the window is not at risk; an idle compaction there would (today)
@@ -263,7 +264,8 @@ is the seam §8 sketches.
   everything). One pass, two announcement policies; still no forked loop.
 - The `compactions` record gains an additive optional `"source"` key
   (`"idle" | "prompt" | "manual"`): diagnostics only, tolerated on load,
-  dropped by older binaries on re-save — exactly §6's existing tradeoff.
+  dropped by older binaries on re-save — exactly ADR 0022 §6's existing
+  tradeoff.
   The drop entry **is** the user-visible marker; DashFloat has no `/undo`
   surface and none is added (the dropped turns are not recoverable from the
   compacted file; undo would be its own lane, not a rider on this one).
@@ -365,10 +367,12 @@ whether it may:
   timer disarms until the next user turn. An unbounded retry would bill one
   summarize per idle window on a persistently-failing provider with nobody
   watching (an overnight terminal at the 300 s default ≈ hundreds of paid
-  attempts); the user's next turn re-arms and the failure is visible in the
-  log by then. Never a partial replacement; persistence is one write on
-  success (the summary replaces the summarized turns atomically). The
-  `instructions` sub-key stays inert until stage 2 proper.
+  attempts); the user's next turn re-arms, and the give-up is logged, not
+  rendered — one Logger line, no transcript entry (§5's rule: an
+  agent-initiated pass that does not act is not heard). Never a partial
+  replacement; persistence is one write on success (the summary replaces
+  the summarized turns atomically). The `instructions` sub-key stays inert
+  until stage 2 proper.
 - The remaining stage-2 shape choice (summary as a synthetic message vs a
   pinned block) belongs to the stage-2 lane; this ADR pins only the timer
   contract and the failure posture.
