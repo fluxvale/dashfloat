@@ -12,6 +12,8 @@ when its tag is cut.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-01
+
 ### Fixed
 
 - The onboarding wizard's `/models` results carry provider identity: every fetch result is tagged at creation with `{base_url, fetch_epoch}` and the picker populates only on an exact match with the pending provider and the current fetch generation — a stale list (a slow fetch from a previous provider selection, or the pre-edit key's list landing after esc-back and a key edit) is refused inertly instead of repopulating the picker under the wrong provider, and the current generation's result is guaranteed to land (a failed task spawn degrades to the manual fallback with a note, closing the hang-at-`:fetching` hole); the wizard's fetch tests now run hermetically against the loopback standin, never the live Z.AI endpoint (ADR 0009, issue #87 amendment) (#87).
