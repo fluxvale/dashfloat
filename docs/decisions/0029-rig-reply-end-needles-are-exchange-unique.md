@@ -5,6 +5,8 @@
 - **Implements:** [issue #125](https://github.com/fluxvale/dashfloat/issues/125).
 - **Pattern precedent:** the F7 caveat's own remedy (`wait_for` a content
   needle, not quiet) — this ADR makes that remedy structurally safe.
+- **Amendment:** [2026-11-02, issue #143](#amendment-2026-11-02-issue-143-the-episodes-queue-is-dropped-not-wired)
+  (the never-landed episode dispatch is void — the queue was deleted).
 
 ## Context
 
@@ -61,9 +63,11 @@ replay into a snapshot screen is heavy machinery for a rig).
 
 ## Consequences
 
-- A future episode dispatch in the mock must pop `EPISODES` before taking a
+- ~~A future episode dispatch in the mock must pop `EPISODES` before taking a
   stock number — episode replies carry their own unique text and take none
-  (marked at the counter in `_sse`).
+  (marked at the counter in `_sse`).~~ Voided by the
+  [issue #143 amendment](#amendment-2026-11-02-issue-143-the-episodes-queue-is-dropped-not-wired):
+  the queue was dropped, never wired.
 - If the app ever retries a stock request on a new connection, the retry
   takes the next number and the scenario's wait times out — a loud capture
   failure, which is the rig's contract (fail, never ship).
@@ -88,3 +92,25 @@ replay into a snapshot screen is heavy machinery for a rig).
   diff), no wait draws from the stock body or `REPLY_TOKENS`, the reply-end
   family rides `stock_closing` (site count never shrinks), and both waits
   match wrap-collapsed text. It is red on the pre-fix rig by construction.
+
+## Amendment (2026-11-02, issue #143): the EPISODES queue is dropped, not wired
+
+**Status:** Accepted (the owner's standing default — dead code misleads —
+read in the decision card and not countermanded; git-revert reversible).
+The Context's "separate follow-up" is resolved: of the wire-or-drop fork,
+the rig **drops** the interaction-surface episode machinery.
+
+- **Deleted:** `MockHandler.EPISODES`, `App.script/1`, the never-landed
+  vet dispatch (`VET_REPLY`, `is_vet_request` — zero callers since the
+  #141 era), the four unreachable scenarios (`approve-choice`,
+  `question-single`, `question-multi`, `auto-reject` — never in the
+  argparse menu), their dispatch branches, and their entries in the
+  needle allowlist. The sentinel-site floor (≥9) is untouched: those
+  scenarios waited on literals, not `stock_closing`.
+- **Kept:** the shipped captures in `docs/screenshots/133–135/` as frozen
+  evidence — the widget behavior they prove is app behavior (ADR 0028)
+  with its own unit/integration tests; only the rig's ability to
+  regenerate them died (with the queue, not with this ADR).
+- **If the owner rules wire-in-the-morning:** revert the squash — the
+  scenarios' text is in git history, and the wiring rule this ADR
+  recorded (pop before taking a number) is the design to implement.
