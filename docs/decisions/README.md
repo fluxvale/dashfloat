@@ -6,7 +6,9 @@ This directory contains Architecture Decision Records (ADRs) for DashFloat.
 
 Each ADR uses a lightweight Nygard-style format:
 
-- **Status** — Accepted / Superseded / Deprecated
+- **Status** — Proposed / Accepted / Superseded / Deprecated
+  (Proposed = parked at the owner's plan gate — design recorded, nothing
+  implemented or binding until the status moves to Accepted)
 - **Date** — when the decision was made
 - **Context** — the forces at play and the problem being solved
 - **Decision** — what we chose
@@ -54,3 +56,4 @@ their replacement.
 | [0030](0030-sysprompt-tool-prose-derives-from-the-registry.md) | The system prompt's tool prose derives from the tool registry: count, names, and approval grouping render from `Tools.names/1` | Accepted |
 | [0031](0031-actionlint-inside-the-ci-gate.md) | actionlint inside the `mix ci` gate: sha256-pinned binaries fetched by the gate itself, no PATH lookup, no skip | Accepted |
 | [0032](0032-installer-refusal-contract.md) | The installer's glibc-floor refusal contract: specific message, exit 1, nothing installed — asserted by the smokes, pinned by mix ci | Accepted |
+| [0033](0033-idle-time-auto-compaction.md) | Idle-time auto-compaction: a cache-TTL-derived idle timer over the shared eviction pass | Proposed |
