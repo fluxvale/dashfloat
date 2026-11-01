@@ -199,8 +199,9 @@ reader parked it, and a reply streaming in while you are scrolled up never
 yanks it back (the [ADR 0006](docs/decisions/0006-ui-truth-and-rendering.md)
 amendment). The status footer reports honest speed ([ADR
 0015](docs/decisions/0015-input-surface-cursor-stats-ghost.md)'s #130
-amendment): `ttft 1.4s` (send → first token) appears with the turn's first
-streamed token, and a completed reply is joined by `32 tok/s` — a
+amendment): `ttft 1.4s` (send → the reply's first token; thinking doesn't start
+the clock) appears once it lands, and a completed reply is joined by
+`32 tok/s` — a
 whole-response average, total tokens over the reply's own decode window,
 never the live instantaneous value that flatters the tail. Both spans
 persist after the turn ends and retire at the next send; when the footer
@@ -223,7 +224,7 @@ collapsed block.
 
 **Tool calls are structured and gated.** Seven tools ship — `read_file`,
 `list_directory`, `write_file`, `edit_file`, `execute_command`, `web_search`
-(needs a Synthetic key), and `question` — under four interaction modes cycled
+(only on a Synthetic provider), and `question` — under four interaction modes cycled
 with Shift+Tab ([ADR 0016](docs/decisions/0016-interaction-modes.md)): Plan
 previews a call and never runs it, Build (the default) runs safe calls and
 asks before anything else, Auto never asks, and Unchained runs everything
